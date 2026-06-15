@@ -1,0 +1,38 @@
+name: mfa_chinese
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - openfst>=1.7                     # Kaldi FST (conda-forge only, required by MFA)
+  - pip
+  - pip:
+    # === Pipeline direct dependencies ===
+    - Montreal_Forced_Aligner==3.3.9 # MFA forced alignment engine
+    - numpy==2.4.6
+    - scipy==1.17.1
+    - soundfile==0.13.1
+    - pypinyin==0.55.0              # Chinese text → pinyin conversion
+    - pyyaml==6.0.3                 # Config file parsing
+    # === MFA core runtime dependencies ===
+    - kalpy-kaldi==0.9.0            # Kaldi Python bindings for MFA
+    - praatio==6.2.2                # TextGrid I/O
+    - librosa==0.11.0               # Audio feature extraction
+    - click==8.4.1
+    - rich==15.0.0                  # Terminal output formatting
+    - rich-click==1.9.8             # Click + Rich integration
+    - SQLAlchemy==2.0.50            # MFA database backend
+    - tqdm==4.67.3                  # Progress bars
+    - scikit-learn==1.9.0           # Machine learning (MFA alignment)
+    - matplotlib==3.10.9            # Plotting (MFA diagnostics)
+    - requests==2.34.2              # HTTP (MFA model download)
+    - kneed==0.8.6                  # Knee/elbow detection (MFA)
+    - joblib==1.5.3                 # Parallel joblib caching
+    - numba==0.65.1                 # JIT compilation for MFA
+    - llvmlite==0.47.0              # LLVM bindings for numba
+    - soxr==1.1.0                   # High-quality audio resampling
+    - audioread==3.0.1              # Multi-format audio reading
+    - platformdirs==4.10.0          # Platform-appropriate config paths
+    - pooch==1.9.0                  # Data download management
+    - decorator==5.3.1              # Decorator utilities
+    - typing_extensions==4.15.0     # Type hints backport

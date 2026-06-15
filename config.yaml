@@ -1,0 +1,90 @@
+# Chinese MFA Pipeline Configuration
+# ====================================
+# CLI arguments override values in this file.
+# To port to a new computer, change `workspace` and `python_path`.
+
+# ---- Workspace (all generated data goes here) ----
+workspace: D:/MFA_post_process/workspace
+
+# ---- Input ----
+data_dir: data_dir                  # Source directory (wav + txt in subdirs)
+txt_suffix: qwen3-api               # Only match txt files with this suffix (e.g. firered, qwen3-api)
+
+# ---- Output directories (relative to workspace) ----
+audio_dir: audio                    # Trimmed WAV (original sample rate, e.g. 32kHz)
+pinyin_dir: pinyin                  # Chinese text converted to pinyin
+# Note: audio is auto-resampled to 16kHz in temp/audio_16k/ before MFA.
+# Final TextGrid timestamps match both sample rates.
+aligned_dir: aligned                # Raw MFA alignment TextGrids
+output_dir: output                  # Final 5-tier TextGrids (passed QC)
+filtered_dir: filtered              # TextGrids that failed QC
+validate_dir: validate              # MFA validation output
+temp_dir: temp                      # MFA temporary files
+
+# ---- Model & Dictionary (relative to project root) ----
+models_dir: models/mfa              # MFA model root
+acoustic_model: mandarin_mfa        # MFA acoustic model name
+mfa_dict: dict/mfa_ipa.dict         # Pronunciation dictionary
+pinyin_dict: dict/fullpinyin_enword.dict   # Source pinyin dictionary
+
+# ---- Python environment ----
+python_path: ""                     # Path to Python with MFA installed (auto-detect if empty)
+
+# ---- Step 1: Trim Silence ----
+trim:
+  max_silence_sec: 1.0              # Internal silence max (truncate longer)
+  sil_vol_threshold: 0.005          # RMS threshold for silence detection
+  sil_len_threshold: 0.08           # Minimum silence segment length (sec)
+  normalize_edges: true             # Normalize start/end silence
+  target_edge_silence_sec: 0.5      # Target silence at edges
+  edge_silence_threshold: 0.001     # RMS threshold for edge detection
+  edge_frame_length: 1024           # Frame length for edge detection
+  target_sr: null                   # Output sample rate (null = keep original)
+  workers: 8                        # Parallel workers
+
+# ---- Step 2: Prepare Corpus ----
+prepare:
+  copy_wav: false                   # Copy WAVs (false = use trimmed audio from step 1)
+  keep_punctuation: true            # Keep punctuation in pinyin output
+
+# ---- Step 3: Resample for MFA (auto, 16kHz in temp) ----
+# No config needed — uses audio_dir, outputs to temp/audio_16k/
+# Cleaned automatically after alignment completes.
+
+# ---- Step 4 & 5: MFA ----
+mfa:
+  num_jobs: 8                       # Parallel jobs for MFA
+  single_speaker: true              # Single speaker mode
+  output_format: long_textgrid      # TextGrid format
+  clean: true                       # Clean temp files
+  no_tokenization: true             # Skip tokenization (use dictionary directly)
+
+# ---- Step 6: Postprocess ----
+postprocess:
+  # Silence merging
+  merge_silence: true
+  min_sil_merge_sec: 0.2            # Max silence duration to merge
+
+  # Short word fix
+  fix_short_word: true
+  short_word_max_sec: 0.25          # Max duration for short word detection
+  flank_silence_sec: 0.4            # Min flanking silence for short-word context
+  short_word_search_window: 0.5     # Search window after short word
+
+  # BGM detection
+  detect_bgm: true
+  bgm_noise_floor_ratio: 2.0        # Silence energy > noise_floor * N → suspect
+  bgm_min_sil_dur: 0.3              # Min silence duration to check
+  bgm_speech_ratio: 1.0             # Silence energy > avg_speech * N → suspect
+  bgm_min_energy: 0.01              # Absolute min RMS to trigger
+
+  # Quality filters
+  filter_suspicious: true
+  filter_short_phone_sec: 0.005     # Min phone duration
+  filter_long_word_sec: 1.5         # Max word duration
+  filter_min_word_sec: 0.15         # Min word duration for coverage check
+  filter_min_phone_coverage: 0.25   # Min phone coverage ratio
+  filter_edge_gap_sec: 0.35         # Max gap at word edges
+  filter_flank_silence_sec: 0.4     # Min flanking silence for short-word detection
+  filter_long_consonant_sec: 999.0  # Max consonant duration (999 = disabled)
+  filter_long_vowel_sec: 999.0      # Max vowel duration (999 = disabled)
