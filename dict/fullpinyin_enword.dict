@@ -1177,7 +1177,7 @@ nuan1 n uan1
 nuan2 n uan2
 nuan3 n uan3
 nuan4 n uan4
-nuan5 n uan5 
+nuan5 n uan5
 nun1 n un1
 nun2 n un2
 nun3 n un3
@@ -1773,12 +1773,12 @@ wen2 uen2
 wen3 uen3
 wen4 uen4
 wen5 uen5
-weng1 ueng1  
+weng1 ueng1
 weng2 ueng2
 weng3 ueng3
 weng4 ueng4
 weng5 ueng5
-wo1 uo1  
+wo1 uo1
 wo2 uo2
 wo3 uo3
 wo4 uo4
@@ -1910,14 +1910,14 @@ yi4 i4
 yi5 i5
 yin1 in1
 yin2 in2
-yin3 in3 
-yin4 in4 
-yin5 in5 
-ying1 ing1 
-ying2 ing2 
-ying3 ing3 
-ying4 ing4 
-ying5 ing5 
+yin3 in3
+yin4 in4
+yin5 in5
+ying1 ing1
+ying2 ing2
+ying3 ing3
+ying4 ing4
+ying5 ing5
 yo1 iou1
 yo2 iou2
 yo3 iou3
@@ -2169,5 +2169,42 @@ AI EY1 AY1
 COSPLAY K AO1 S P L EY1
 IP AY2 P IY2
 BGM  B IY1 JH IY1 EH1 M
+n2 n2
+n3 n3
+n4 n4
+m1 m1
+m2 m2
+m3 m3
+m4 m4
 <PAUSE> sil
 [PAUSE] sp
+UHM UHM
+BREATHING BREATHING
+COUGH COUGH
+SIGH SIGH
+LAUGHTER LAUGHTER
+SURPRISE-OH SURPRISE-OH
+SURPRISE-AH SURPRISE-AH
+SURPRISE-WA SURPRISE-WA
+SURPRISE-YO SURPRISE-YO
+DISSATISFACTION-HNN DISSATISFACTION-HNN
+CONFIRMATION-EN CONFIRMATION-EN
+QUESTION-EN QUESTION-EN
+QUESTION-OH QUESTION-OH
+QUESTION-AH QUESTION-AH
+QUESTION-EI QUESTION-EI
+QUESTION-HUH QUESTION-HUH
+QUESTION-YI QUESTION-YI
+HUM HUM
+HISS HISS
+TSK TSK
+WHISTLE WHISTLE
+BURP BURP
+SNORE SNORE
+YAWN YAWN
+GROAN GROAN
+SNEEZE SNEEZE
+SNIFF SNIFF
+CRYING CRYING
+PAUSE PAUSE
+SHH SHH

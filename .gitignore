@@ -3,6 +3,42 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Workspace outputs (generated)
+workspace/
+workspace_*/
+output/
+output_*/
+filtered/
+aligned/
+validate/
+temp/
+ctc_pretg/
+ctc_pretg_adj/
+ctc_adjusted/
+audio/
+audio_16k/
+pinyin/
+*.TextGrid
+*.lab
+*_tokens.jsonl
+*_punct.json
+manifest.json
+summary.txt
+postprocess_report.jsonl
+tone_mapping.json
+
+# Large model files (downloaded separately)
+models/Multilingual-NVASR/
+
+# Project data (user-provided)
+data_dir/
+
+# MFA runtime
+models/mfa/command_history.yaml
+models/mfa/global_config.yaml
+models/mfa/joblib_cache/
+models/mfa/temp/
+
 # Conda environment
 .env/
 
@@ -10,5 +46,6 @@ __pycache__/
 .vscode/
 .idea/
 
-# Workspace output (generated data)
-workspace/
+# OS
+.DS_Store
+Thumbs.db

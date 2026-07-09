@@ -22,9 +22,58 @@ except ModuleNotFoundError:
 
 SUFFIX_PATTERN = re.compile(r"_(firered|qwen3|qwen3-api)$")
 
+# 管线支持的标点白名单
+ALLOWED_PUNCT = set("，。！？、；：…,.!?;:")
+
+
+def clean_unsupported_punct(text: str) -> str:
+    """过滤白名单外的非 CJK 标点 (如 」『』【】等), 保留 CJK/英文/数字/标签."""
+    result: list[str] = []
+    for ch in text:
+        if ch in ALLOWED_PUNCT:
+            result.append(ch)
+        elif '一' <= ch <= '鿿' or '㐀' <= ch <= '䶿':
+            result.append(ch)
+        elif ch.isalpha() or ch.isdigit() or ch == '-':
+            result.append(ch)
+        elif ch.isspace():
+            result.append(ch)
+        elif ch in '<|>[]':
+            result.append(ch)
+    return ''.join(result)
+
+
+# ─── NVV 标签 → MFA 大写 token 映射 (与 ctc_prealign.py 共享逻辑) ───
+
+NVV_TO_MFA: dict[str, str] = {
+    "Breathing": "BREATHING", "Laughter": "LAUGHTER", "Burp": "BURP",
+    "Cough": "COUGH", "Crying": "CRYING", "Groan": "GROAN", "Hiss": "HISS",
+    "Hum": "HUM", "Shh": "SHH", "Sigh": "SIGH", "Sneeze": "SNEEZE",
+    "Sniff": "SNIFF", "Snore": "SNORE", "Tsk": "TSK", "Uhm": "UHM",
+    "Whistle": "WHISTLE", "Yawn": "YAWN",
+    "Question-yi": "QUESTION-YI", "Question-en": "QUESTION-EN",
+    "Question-oh": "QUESTION-OH", "Question-ah": "QUESTION-AH",
+    "Question-ei": "QUESTION-EI", "Question-huh": "QUESTION-HUH",
+    "Surprise-oh": "SURPRISE-OH", "Surprise-ah": "SURPRISE-AH",
+    "Surprise-wa": "SURPRISE-WA", "Surprise-yo": "SURPRISE-YO",
+    "Confirmation-en": "CONFIRMATION-EN",
+    "Dissatisfaction-hnn": "DISSATISFACTION-HNN", "Pause": "PAUSE",
+}
+
+_NVV_RE = re.compile(r'\[([A-Za-z][^\]]*?)\]')
+
+def _nvv_replace(m: re.Match) -> str:
+    inner = m.group(1)
+    return NVV_TO_MFA.get(inner, inner.upper().replace(" ", "-"))
+
 
 def text_to_pinyin(text: str, keep_punctuation: bool = True) -> str:
-    """Convert Chinese text to pinyin with tone numbers."""
+    """Convert Chinese text to pinyin with tone numbers.
+
+    Pre-processes [NVV] labels → UPPERCASE tokens for MFA dictionary matching.
+    """
+    # 预处理: [Question-yi] → QUESTION-YI (避免被 pypinyin 拆散)
+    text = _NVV_RE.sub(_nvv_replace, text)
     parts = []
     buf = ""
     for ch in text:
@@ -105,7 +154,7 @@ def match_by_directory(data_dir: Path, txt_suffix: str | None = None) -> list[di
 
 def prepare_corpus(data_dir: Path, corpus_dir: Path, overwrite: bool = False,
                    keep_punctuation: bool = True, copy_wav: bool = True,
-                   txt_suffix: str | None = None) -> dict:
+                   txt_suffix: str | None = None) -> dict[str, object]:
     if copy_wav:
         wav_dir = corpus_dir / "wav"
         txt_dir = corpus_dir / "txt"
@@ -137,6 +186,7 @@ def prepare_corpus(data_dir: Path, corpus_dir: Path, overwrite: bool = False,
             continue
 
         raw_text = Path(m["txt_path"]).read_text(encoding="utf-8").strip()
+        raw_text = clean_unsupported_punct(raw_text)
         if not raw_text:
             skipped += 1
             continue

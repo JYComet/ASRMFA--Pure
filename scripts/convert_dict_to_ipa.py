@@ -82,6 +82,9 @@ FINAL_SEGMENTS = {
     've':   ['ɥ', 'e*'],
     'vn':   ['y*', 'n'],
     'van':  ['ɥ', 'e*', 'n'],
+    # Syllabic nasals (standalone nasal syllables: 嗯 n, 呣 m)
+    'n':    ['n̩*'],
+    'm':    ['m̩*'],
     # Special
     'er':   ['ə*', 'ɻ'],
     'io':   ['j', 'o*'],

@@ -36,6 +36,11 @@ from pathlib import Path
 import numpy as np
 import soundfile
 
+try:
+    from audio_utils import resample_audio
+except ImportError:
+    from .audio_utils import resample_audio
+
 
 def detect_silence_at_beginning(
     wav: np.ndarray,
@@ -242,13 +247,7 @@ def process_one_file(
     if len(audio.shape) > 1:
         audio = audio[:, 0]
     if target_sr and target_sr != sr:
-        from scipy.signal import decimate, resample_poly
-        if sr % target_sr == 0:
-            audio = decimate(audio.astype('float64'), sr // target_sr, ftype='iir').astype('float32')
-        else:
-            import numpy as np
-            gcd = np.gcd(sr, target_sr)
-            audio = resample_poly(audio.astype('float64'), target_sr // gcd, sr // gcd).astype('float32')
+        audio = resample_audio(audio, sr, target_sr)
         sr = target_sr
 
     trimmed = trim_excessive_silence(
