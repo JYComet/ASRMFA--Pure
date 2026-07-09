@@ -46,6 +46,9 @@ prepare:
   copy_wav: false
   keep_punctuation: true
 
+# ---- Resample ----
+keep_16k_audio: true                # Keep temp 16kHz audio after pipeline (default true)
+
 # ---- CTC directories (relative to workspace) ----
 ctc_pretg: ctc_pretg
 ctc_pretg_adj: ctc_pretg_adj

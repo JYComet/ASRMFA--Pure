@@ -16,6 +16,7 @@ acoustic_model: mandarin_mfa
 mfa_dict: dict/mfa_ipa.dict
 pinyin_dict: dict/fullpinyin_enword.dict
 python_path: ""
+keep_16k_audio: true
 
 trim:
   max_silence_sec: 1.0

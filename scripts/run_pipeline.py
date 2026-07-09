@@ -613,13 +613,16 @@ def main():
                 print("  Stopping. Use --force to continue on errors.")
                 break
 
-    # Clean up temporary 16kHz audio (only if resample step ran)
+    # Clean up temporary 16kHz audio (default keep, configurable via keep_16k_audio)
+    keep_16k = cfg.get("keep_16k_audio", True)
     if "resample" in run_list:
         mfa_audio = temp_dir / "audio_16k"
-        if mfa_audio.exists():
+        if mfa_audio.exists() and not keep_16k:
             import shutil
             shutil.rmtree(str(mfa_audio))
             print(f"  Cleaned temp: {mfa_audio}")
+        elif mfa_audio.exists():
+            print(f"  Kept 16kHz audio: {mfa_audio}")
 
     print(f"\n{'#'*60}")
     print(f"  {'FAILED' if failed else 'DONE'}: {', '.join(failed) if failed else 'Success'}")
