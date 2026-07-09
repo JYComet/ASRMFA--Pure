@@ -8,8 +8,12 @@ Applies three transformations to every final TextGrid:
   3. All tiers: wrap bare NVV labels with angle brackets,
      e.g. ``BREATHING`` → ``<BREATHING>``.
 
+Processes BOTH ``output/`` (passed QC) and ``filtered/`` (failed QC).
+Filtered files are written to a ``filtered/`` subdirectory so you can
+still review them with proper NVV bracketing and silence normalization.
+
 Usage:
-  python finalize_textgrids.py --input-dir output/ --output-dir finalized/
+  python finalize_textgrids.py --input-dir output/ --filtered-dir filtered/ --output-dir finalized/
 """
 
 import argparse
@@ -19,10 +23,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
-# Reuse the TextGrid parser / writer from postprocess_textgrids
-from postprocess_textgrids import parse_textgrid, write_textgrid, SILENCE_LABELS
+from postprocess_textgrids import parse_textgrid, write_textgrid
 
-# Full set of NVV token names (uppercase as they appear in TextGrids)
 NVV_NAMES: set[str] = {
     "BREATHING", "LAUGHTER", "BURP", "COUGH", "CRYING", "GROAN",
     "HISS", "HUM", "SHH", "SIGH", "SNEEZE", "SNIFF", "SNORE",
@@ -39,13 +41,11 @@ def is_nvv(text: str) -> bool:
 
 
 def is_silence(text: str) -> bool:
-    """True for any ``<spN>`` silence label."""
     return (text.startswith("<sp") and text.endswith(">")
             and len(text) == 5 and text[3].isdigit())
 
 
 def process_textgrid(input_path: Path, output_path: Path) -> bool:
-    """Apply the three finalization passes. Returns True on success."""
     try:
         tg = parse_textgrid(input_path)
     except Exception as exc:
@@ -56,37 +56,32 @@ def process_textgrid(input_path: Path, output_path: Path) -> bool:
     if n_tiers < 1:
         return False
 
-    # ── Pass: wrap bare NVV names with < > in every tier ────────────────
+    # Pass: wrap bare NVV names with < > in every tier
     for tier in tg.tiers:
         for iv in tier.intervals:
-            bare = iv.text
-            if bare and is_nvv(bare):
-                iv.text = f"<{bare}>"
+            if iv.text and is_nvv(iv.text):
+                iv.text = f"<{iv.text}>"
 
-    # ── Pass: tier 1 raw_text → prepend <sp1> ──────────────────────────
+    # Pass: tier 1 → prepend <sp1>
     raw = tg.tiers[0]
     if raw.intervals:
         first_text = raw.intervals[0].text.strip()
         if first_text and not first_text.startswith("<sp"):
             raw.intervals[0].text = f"<sp1>{first_text}"
 
-    # ── Pass: tiers 2-5 → first <spN> → <sp1> ─────────────────────────
+    # Pass: tiers 2-5 → first <spN> → <sp1>
     for t_idx in range(1, min(n_tiers, 5)):
         tier = tg.tiers[t_idx]
-        replaced = False
         for iv in tier.intervals:
             if is_silence(iv.text):
                 iv.text = "<sp1>"
-                replaced = True
                 break
-        if not replaced:
-            # Also check if it's a bare sp0/sp1/sp2/sp3 without brackets
+        else:
             for iv in tier.intervals:
                 if iv.text in {"<eps>", "sil", "sp"}:
                     continue
                 if iv.text.startswith("sp") and len(iv.text) == 3 and iv.text[2].isdigit():
                     iv.text = "<sp1>"
-                    replaced = True
                     break
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -94,46 +89,73 @@ def process_textgrid(input_path: Path, output_path: Path) -> bool:
     return True
 
 
+def finalize_dir(input_dir: Path, output_dir: Path, overwrite: bool) -> tuple[int, int]:
+    """Process all TextGrids in *input_dir*, write to *output_dir*.
+    Returns (done, skipped)."""
+    if not input_dir.is_dir():
+        return 0, 0
+    textgrids = sorted(input_dir.glob("*.TextGrid"))
+    if not textgrids:
+        return 0, 0
+
+    done = skipped = 0
+    for tg_path in textgrids:
+        out_path = output_dir / tg_path.name
+        if out_path.exists() and not overwrite:
+            skipped += 1
+            continue
+        if process_textgrid(tg_path, out_path):
+            done += 1
+    return done, skipped
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Final TextGrid cleanup: <sp1> prefix, normalize first silence, "
                     "wrap NVV labels with <>.")
     parser.add_argument("--input-dir", required=True,
-                        help="Directory containing output TextGrids.")
+                        help="Directory with OK (passed-QC) TextGrids.")
+    parser.add_argument("--filtered-dir", default=None,
+                        help="Directory with filtered (failed-QC) TextGrids.")
     parser.add_argument("--output-dir", required=True,
-                        help="Directory to write final TextGrids.")
-    parser.add_argument("--overwrite", action="store_true",
-                        help="Overwrite existing output files.")
+                        help="Directory to write finalized TextGrids.")
+    parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
+    filtered_dir = Path(args.filtered_dir) if args.filtered_dir else None
 
-    if not input_dir.is_dir():
-        print(f"ERROR: input directory not found: {input_dir}")
+    if not input_dir.is_dir() and not (filtered_dir and filtered_dir.is_dir()):
+        print(f"ERROR: no input TextGrids found")
         sys.exit(1)
 
-    textgrids = sorted(input_dir.glob("*.TextGrid"))
-    if not textgrids:
-        print(f"  No .TextGrid files found in {input_dir}")
-        return
+    total_done = 0
+    total_skipped = 0
 
-    done = 0
-    skipped = 0
-    for tg_path in textgrids:
-        out_path = output_dir / tg_path.name
-        if out_path.exists() and not args.overwrite:
-            skipped += 1
-            continue
-        if process_textgrid(tg_path, out_path):
-            done += 1
+    # OK files → finalized/ root
+    ok_out = output_dir
+    d, s = finalize_dir(input_dir, ok_out, args.overwrite)
+    total_done += d
+    total_skipped += s
+    if d or s:
+        print(f"  OK:       {d} finalized" +
+              (f" ({s} skipped, use --overwrite)" if s else "") +
+              f" → {ok_out}")
 
-        # Show one sample of the transformation
-        if done == 1 and not args.overwrite:
-            pass  # suppress noisy first-time logging
+    # Filtered files → finalized/filtered/
+    if filtered_dir:
+        filt_out = output_dir / "filtered"
+        d, s = finalize_dir(filtered_dir, filt_out, args.overwrite)
+        total_done += d
+        total_skipped += s
+        if d or s:
+            print(f"  Filtered: {d} finalized" +
+                  (f" ({s} skipped, use --overwrite)" if s else "") +
+                  f" → {filt_out}")
 
-    print(f"  Finalized {done} TextGrid(s){' (' + str(skipped) + ' skipped, use --overwrite)' if skipped else ''}"
-          f" → {output_dir}")
+    print(f"  Total finalized: {total_done}" +
+          (f" ({total_skipped} skipped)" if total_skipped else ""))
 
 
 if __name__ == "__main__":

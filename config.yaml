@@ -15,9 +15,8 @@ txt_suffix:                         # Only match txt files with this suffix (e.g
 audio_dir: audio                    # Trimmed WAV
 pinyin_dir: pinyin                  # Chinese text converted to pinyin
 aligned_dir: aligned                # Raw MFA alignment TextGrids
-output_dir: output                  # Final TextGrids (passed QC)
-filtered_dir: filtered              # TextGrids that failed QC
-finalized_dir: finalized            # Finalized TextGrids (<sp1>, NVV brackets)
+output_dir: output                  # Final TextGrids (passed QC, NVV-bracketed, sp1-normalized)
+filtered_dir: filtered              # TextGrids that failed QC (also NVV-bracketed, sp1-normalized)
 validate_dir: validate              # MFA validation output
 temp_dir: temp                      # MFA temporary files
 
@@ -108,16 +107,13 @@ mfa:
 # │   └── *.TextGrid                 #   Praat, 2 tiers: words + phones
 # │
 # ├── output/                        # Step postprocess (passed QC)
-# │   ├── *.TextGrid                 #   Praat, 5 tiers:
+# │   ├── *.TextGrid                 #   Praat, 5 tiers — NVV-bracketed, sp1-normalized:
 # │   │                              #     raw_text / pinyin / hanzi / words / pinyin_phones
 # │   ├── tone_mapping.json          #   IPA↔Pinyin bidirectional reference table
 # │   └── postprocess_report.jsonl   #   Per-file processing report (JSONL)
 # │
 # ├── filtered/                      # Step postprocess (failed QC)
-# │   └── *.TextGrid                 #   5-tier, routed here on filter triggers
-# │
-# ├── finalized/                     # Step finalize
-# │   └── *.TextGrid                 #   5-tier, <sp1> normalized, NVVs in <brackets>
+# │   └── *.TextGrid                 #   5-tier, also NVV-bracketed, sp1-normalized
 # │
 # └── temp/                          # MFA temporary files (auto-cleaned)
 #
@@ -146,8 +142,6 @@ output_spec:
     - output/tone_mapping.json
     - output/postprocess_report.jsonl
     - filtered/*.TextGrid
-  finalize:
-    - finalized/*.TextGrid
 
 # ---- Step 8: Postprocess ----
 postprocess:

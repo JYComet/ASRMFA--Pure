@@ -2,7 +2,7 @@
 """
 Complete Chinese MFA forced alignment pipeline.
 
-Steps: trim -> resample -> prealign -> normalize -> adjust -> validate -> align -> postprocess -> finalize
+Steps: trim -> resample -> prealign -> normalize -> adjust -> validate -> align -> postprocess
 
 Usage:
   python scripts/run_pipeline.py                              # all steps, use config.yaml
@@ -463,23 +463,6 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                       ctx["models_dir"], "Step 7: Post-processing")
 
 
-def step_finalize(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
-    """Final TextGrid cleanup: <sp1> prefix, normalize first silence, wrap NVV with <>."""
-    finalize_out = ctx["finalized_dir"]
-    if finalize_out.exists() and any(finalize_out.glob("*.TextGrid")) and not args.overwrite:
-        print(f"  Finalized TextGrids exist: {finalize_out}. Use --overwrite to re-run.")
-        return 0
-
-    finalize_args = [
-        "--input-dir", str(ctx["output_dir"]),
-        "--output-dir", str(finalize_out),
-    ]
-    if args.overwrite:
-        finalize_args.append("--overwrite")
-    return run_python(SCRIPTS_DIR / "finalize_textgrids.py", finalize_args, mfa_python,
-                      ctx["models_dir"], "Step 8: Finalize TextGrids")
-
-
 # ---------------------------------------------------------------------------
 # Output validation
 # ---------------------------------------------------------------------------
@@ -513,8 +496,7 @@ STEPS = {
     "adjust": ("Adjust CTC boundaries (energy-based)", step_adjust_ctc),
     "validate": ("MFA validate", step_mfa_validate),
     "align": ("MFA align (NVASR corpus + CTC anchors)", step_mfa_align),
-    "postprocess": ("Post-processing", step_postprocess),
-    "finalize": ("Finalize TextGrids", step_finalize),
+    "postprocess": ("Post-processing (includes NVV brackets + sp1 normalization)", step_postprocess),
 }
 
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
@@ -570,7 +552,6 @@ def main():
     filtered_dir = workspace / cfg.get("filtered_dir", "filtered")
     validate_dir = workspace / cfg.get("validate_dir", "validate")
     temp_dir = workspace / cfg.get("temp_dir", "temp")
-    finalized_dir = workspace / cfg.get("finalized_dir", "finalized")
 
     # Models & dicts: relative to PROJECT_ROOT
     models_dir = resolve_path(PROJECT_ROOT, cfg.get("models_dir", "models/mfa"))
@@ -623,7 +604,6 @@ def main():
         "validate": [validate_dir, temp_dir, _ctc_pretg_dir],
         "align": [aligned_dir, temp_dir, _ctc_pretg_dir],
         "postprocess": [output_dir, filtered_dir],
-        "finalize": [finalized_dir],
     }
     created: set[Path] = set()
     for s in run_list:
@@ -648,7 +628,6 @@ def main():
         "mfa_audio_dir": workspace / "audio_16k",
         "ctc_pretg": workspace / cfg.get("ctc_pretg", "ctc_pretg"),
         "ctc_pretg_adj": workspace / cfg.get("ctc_pretg_adj", "ctc_pretg_adj"),
-        "finalized_dir": finalized_dir,
     }
 
     failed = []

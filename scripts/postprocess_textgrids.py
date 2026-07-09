@@ -44,7 +44,6 @@ CHINESE_SHORT_WORDS = {
     "de5", "le5", "zhe5", "ne5", "ma5", "ba5", "a5", "ya5",
 }
 
-
 @dataclass
 class Interval:
     xmin: float
@@ -69,6 +68,61 @@ class TextGrid:
     xmin: float
     xmax: float
     tiers: list[Tier]
+
+
+# ---------------------------------------------------------------------------
+# NVV bracket + sp1 normalization (runs BEFORE QC filtering)
+# ---------------------------------------------------------------------------
+
+NVV_NAMES: set[str] = {
+    "BREATHING", "LAUGHTER", "BURP", "COUGH", "CRYING", "GROAN",
+    "HISS", "HUM", "SHH", "SIGH", "SNEEZE", "SNIFF", "SNORE",
+    "TSK", "UHM", "WHISTLE", "YAWN",
+    "QUESTION-YI", "QUESTION-EN", "QUESTION-OH", "QUESTION-AH",
+    "QUESTION-EI", "QUESTION-HUH",
+    "SURPRISE-OH", "SURPRISE-AH", "SURPRISE-WA", "SURPRISE-YO",
+    "CONFIRMATION-EN", "DISSATISFACTION-HNN",
+}
+
+_NVV_PATTERN = re.compile(
+    r"(?<![A-Z-])("
+    + "|".join(re.escape(name) for name in sorted(NVV_NAMES, key=len, reverse=True))
+    + r")(?![A-Z-])"
+)
+
+_SP_PREFIX_PATTERN = re.compile(r"^<sp[0-9]>")
+
+
+def _finalize_textgrid(tg: TextGrid) -> None:
+    """Apply final normalizations **before** QC filtering.
+
+    Transforms every tier *in-place*:
+      1. Wrap bare NVV names with ``< >`` in all intervals (standalone
+         AND embedded inside long single-interval text).
+      2. Tier 1 (raw_text): prepend ``<sp1>`` if not already present.
+      3. Tiers 2–5: rename the first ``<spN>`` to ``<sp1>``.
+    """
+    for t_idx, tier in enumerate(tg.tiers):
+        for iv in tier.intervals:
+            if not iv.text:
+                continue
+            iv.text = _NVV_PATTERN.sub(r"<\1>", iv.text)
+
+        if t_idx == 0:
+            first_iv = tier.intervals[0] if tier.intervals else None
+            if first_iv and first_iv.text.strip() and not first_iv.text.startswith("<sp"):
+                first_iv.text = f"<sp1>{first_iv.text}"
+        elif t_idx <= 4:
+            for iv in tier.intervals:
+                if not iv.text:
+                    continue
+                if _SP_PREFIX_PATTERN.match(iv.text):
+                    iv.text = _SP_PREFIX_PATTERN.sub("<sp1>", iv.text, count=1)
+                    break
+                if (iv.text.startswith("<sp") and iv.text.endswith(">")
+                        and len(iv.text) == 5 and iv.text[3].isdigit()):
+                    iv.text = "<sp1>"
+                    break
 
 
 # ---------------------------------------------------------------------------
@@ -2586,6 +2640,9 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
 
     # Drop phones tier (IPA) — used internally, not needed in final output
     new_tg.tiers = [t for t in new_tg.tiers if t.name != "phones"]
+
+    # ── Finalize: NVV brackets + sp1 normalization (AFTER phones drop, BEFORE write) ──
+    _finalize_textgrid(new_tg)
 
     if out_path.exists() and not args.overwrite:
         raise FileExistsError(f"Output exists: {out_path}")
