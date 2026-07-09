@@ -768,21 +768,41 @@ def _extract_word_chars(text: str) -> list[str]:
 
 
 def _build_hanzi_tier(words_tier: Tier, raw_text: str) -> Tier:
-    """Create a hanzi tier with one CJC character per non-silence word interval."""
-    # Strip <sp1> prefix for character alignment
+    """Create a hanzi tier with one CJC character per non-silence word interval.
+
+    NVV tokens (BREATHING, SURPRISE-OH, etc.) use their labels directly.
+    When raw_text concatenates adjacent NVV tokens without a space (e.g.
+    "BREATHINGSURPRISE-OH"), the merged alpha block in chars is consumed
+    once and subsequent NVV tokens use their own text without advancing.
+    """
     chars = _extract_word_chars(raw_text.replace('<sp1>', ''))
     intervals = []
     char_idx = 0
     for iv in words_tier.intervals:
         if is_silence(iv.text) or not iv.text.strip():
             intervals.append(Interval(iv.xmin, iv.xmax, silence_label(iv.duration)))
+        elif is_nvv_token(iv.text):
+            intervals.append(Interval(iv.xmin, iv.xmax, iv.text))
+            # Consume merged alpha block (covers 1+ consecutive NVV tokens)
+            if char_idx < len(chars) and _is_nvv_block(chars[char_idx]):
+                char_idx += 1
         else:
+            # Skip leftover alpha blocks (already consumed by prior NVV)
+            while char_idx < len(chars) and _is_nvv_block(chars[char_idx]):
+                char_idx += 1
             if char_idx < len(chars):
                 intervals.append(Interval(iv.xmin, iv.xmax, chars[char_idx]))
                 char_idx += 1
             else:
                 intervals.append(Interval(iv.xmin, iv.xmax, iv.text))
     return Tier("hanzi", words_tier.xmin, words_tier.xmax, intervals)
+
+
+def _is_nvv_block(s: str) -> bool:
+    """True if s is a non-CJK alpha block (NVV label or concatenated NVV labels)."""
+    if not s:
+        return False
+    return all(c.isupper() or c.isdigit() or c == '-' for c in s)
 
 
 def _word_rms(audio: list[float], sr: int, xmin: float, xmax: float) -> float:
@@ -2189,15 +2209,6 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                     new_tg.tiers[i] = rebuilt
                     break
 
-    # BGM/noise detection — moved to final check after all processing
-    bgm_issues = []
-
-    # Filter
-    align_issues = []
-    if args.filter_suspicious:
-        align_issues = detect_issues(new_tg, args, wav_path if wav_path.exists() else None,
-                                     wav_audio, wav_sr)
-
     # Relabel all silences
     new_tiers = []
     for tier in new_tg.tiers:
@@ -2490,89 +2501,32 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         if sp_in_mid:
             filter_reasons.append("mid_sp")
 
-    # suspicious_alignment (来自 detect_issues, 已包含 short_phone 等)
+    # Alignment quality check — on final boundaries (after snap + inject)
+    align_issues = []
+    if args.filter_suspicious:
+        align_issues = detect_issues(new_tg, args, wav_path if wav_path.exists() else None,
+                                     wav_audio, wav_sr)
     if align_issues:
         filter_reasons.append("suspicious_alignment")
+        report["alignment_issues"] = align_issues
 
     # unexpected_silence
     if sil_filter_reasons:
         filter_reasons.extend(sil_filter_reasons)
 
-    # BGM + word_in_silence: 用处理后的最终边界检测
-    if wav_audio is not None and words_tier is not None:
-        if args.detect_bgm:
-            fs = max(1, int(args.bgm_frame_ms / 1000.0 * wav_sr))
-            hs = max(1, int(args.bgm_hop_ms / 1000.0 * wav_sr))
-            all_rms = frame_rms(wav_audio, fs, hs)
-            nf_bgm = median(sorted(all_rms)[:max(1, int(len(all_rms) * 0.6))]) if all_rms else 1e-6
-            nf_bgm = max(nf_bgm, 1e-6)
-            bgm_threshold = max(nf_bgm * args.bgm_noise_floor_ratio, 0.005)
-            speech_energies = []
-            suspect_intervals = []
-            total_sil_dur = 0.0
-            suspect_dur = 0.0
-            for iv in words_tier.intervals:
-                if not is_silence(iv.text):
-                    if iv.text.strip():
-                        e = _word_rms(wav_audio, wav_sr, iv.xmin, iv.xmax)
-                        if e > 0:
-                            speech_energies.append(e)
-                    continue
-                if iv.xmax - iv.xmin < args.bgm_min_sil_dur:
-                    continue
-                sil_energy = _word_rms(wav_audio, wav_sr, iv.xmin, iv.xmax)
-                total_sil_dur += iv.xmax - iv.xmin
-                if sil_energy > bgm_threshold:
-                    suspect_intervals.append({"xmin": round(iv.xmin, 3), "xmax": round(iv.xmax, 3),
-                                              "duration": round(iv.xmax - iv.xmin, 3),
-                                              "energy": round(sil_energy, 6),
-                                              "noise_floor": round(nf_bgm, 6)})
-                    suspect_dur += iv.xmax - iv.xmin
-            if suspect_intervals:
-                avg_speech = sum(speech_energies) / len(speech_energies) if speech_energies else 0
-                suspect_ratio = suspect_dur / total_sil_dur if total_sil_dur > 0 else 0
-                if suspect_ratio > args.bgm_speech_ratio * 0.1:
-                    bgm_issues.append({"rule": "bgm_suspect",
-                                       "noise_floor": round(nf_bgm, 6),
-                                       "avg_speech_energy": round(avg_speech, 6),
-                                       "suspect_intervals": len(suspect_intervals),
-                                       "suspect_ratio": round(suspect_ratio, 3),
-                                       "total_sil_dur": round(total_sil_dur, 3),
-                                       "suspect_dur": round(suspect_dur, 3),
-                                       "details": suspect_intervals})
-                    if bgm_issues:
-                        report["bgm_issues"] = bgm_issues
-        # word_in_silence
-        if args.filter_suspicious and args.filter_word_energy_ratio > 0:
-            fs = max(1, int(0.02 * wav_sr))
-            hs = max(1, int(0.01 * wav_sr))
-            all_rms = frame_rms(wav_audio, fs, hs)
-            nf = median(sorted(all_rms)[:max(1, int(len(all_rms) * 0.15))]) if all_rms else 1e-6
-            threshold = max(nf * args.filter_word_energy_ratio, 0.003)
-            for iv in words_tier.intervals:
-                if is_silence(iv.text) or not iv.text.strip():
-                    continue
-                if iv.text.strip() in '，。…！？、；：':
-                    continue
-                w_energy = _word_rms(wav_audio, wav_sr, iv.xmin, iv.xmax)
-                if 0 < w_energy < threshold:
-                    align_issues.append({"rule": "word_in_silence", "text": iv.text,
-                                         "energy": round(w_energy, 6),
-                                         "noise_floor": round(nf, 6)})
-        # 更新 BGM + word_in_silence 到过滤原因
-        if bgm_issues and "bgm_suspect" not in filter_reasons:
-            filter_reasons.append("bgm_suspect")
-            report["bgm_issues"] = bgm_issues
-        if any(i["rule"] == "word_in_silence" for i in align_issues):
-            if "word_in_silence" not in filter_reasons:
-                filter_reasons.append("word_in_silence")
+    # BGM detection — on final boundaries
+    bgm_issues = []
+    if args.detect_bgm:
+        bgm_issues = detect_bgm_suspect(new_tg, wav_path if wav_path.exists() else None, args,
+                                        wav_audio, wav_sr)
+    if bgm_issues:
+        filter_reasons.append("bgm_suspect")
+        report["bgm_issues"] = bgm_issues
 
     # 统一设置过滤状态和输出路径
     if filter_reasons:
         report["status"] = "filtered_" + "_".join(filter_reasons)
         report["filter_reasons"] = filter_reasons
-        if align_issues:
-            report["alignment_issues"] = align_issues
         out_path = filtered_dir / tg_path.name
         stale = output_dir / tg_path.name
     else:
