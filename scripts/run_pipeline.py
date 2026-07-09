@@ -2,7 +2,7 @@
 """
 Complete Chinese MFA forced alignment pipeline.
 
-Steps: trim -> resample -> prealign -> normalize -> adjust -> validate -> align -> postprocess
+Steps: trim -> resample -> prealign -> normalize -> adjust -> validate -> align -> postprocess -> finalize
 
 Usage:
   python scripts/run_pipeline.py                              # all steps, use config.yaml
@@ -463,6 +463,44 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                       ctx["models_dir"], "Step 7: Post-processing")
 
 
+def step_finalize(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
+    """Final TextGrid cleanup: <sp1> prefix, normalize first silence, wrap NVV with <>."""
+    finalize_out = ctx["finalized_dir"]
+    if finalize_out.exists() and any(finalize_out.glob("*.TextGrid")) and not args.overwrite:
+        print(f"  Finalized TextGrids exist: {finalize_out}. Use --overwrite to re-run.")
+        return 0
+
+    finalize_args = [
+        "--input-dir", str(ctx["output_dir"]),
+        "--output-dir", str(finalize_out),
+    ]
+    if args.overwrite:
+        finalize_args.append("--overwrite")
+    return run_python(SCRIPTS_DIR / "finalize_textgrids.py", finalize_args, mfa_python,
+                      ctx["models_dir"], "Step 8: Finalize TextGrids")
+
+
+# ---------------------------------------------------------------------------
+# Output validation
+# ---------------------------------------------------------------------------
+
+def validate_step_output(step_name: str, workspace: Path, spec: dict) -> list[str]:
+    """Check that expected output files exist for *step_name*.
+
+    Returns a list of failure descriptions (empty = all OK).
+    """
+    patterns = spec.get(step_name, [])
+    if not patterns:
+        return []
+
+    failures: list[str] = []
+    for pattern in patterns:
+        matches = list(workspace.glob(pattern))
+        if not matches:
+            failures.append(f"  MISSING: {pattern}")
+    return failures
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -476,6 +514,7 @@ STEPS = {
     "validate": ("MFA validate", step_mfa_validate),
     "align": ("MFA align (NVASR corpus + CTC anchors)", step_mfa_align),
     "postprocess": ("Post-processing", step_postprocess),
+    "finalize": ("Finalize TextGrids", step_finalize),
 }
 
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
@@ -498,6 +537,8 @@ def main():
                         help="Override output directory from config.")
     parser.add_argument("--python", type=str, default=None,
                         help="Override Python path from config.")
+    parser.add_argument("--validate", action="store_true",
+                        help="Validate output structure after each step (uses output_spec in config).")
     args = parser.parse_args()
 
     if args.list_steps:
@@ -509,8 +550,13 @@ def main():
     cfg = load_config(Path(args.config))
     print(f"Config: {args.config}")
 
-    # Resolve workspace and paths (relative paths → PROJECT_ROOT, absolute stay as-is)
-    workspace = resolve_path(PROJECT_ROOT, cfg.get("workspace")) or (PROJECT_ROOT / "workspace")
+    # Resolve workspace and paths
+    # All pipeline output goes under output/<workspace>/ — never pollutes
+    # the project root or random external directories.
+    output_root = PROJECT_ROOT / "output"
+    output_root.mkdir(parents=True, exist_ok=True)
+    workspace_name = cfg.get("workspace", "default")
+    workspace = output_root / workspace_name
     workspace.mkdir(parents=True, exist_ok=True)
 
     # Input: relative to PROJECT_ROOT (or absolute / CLI override)
@@ -524,6 +570,7 @@ def main():
     filtered_dir = workspace / cfg.get("filtered_dir", "filtered")
     validate_dir = workspace / cfg.get("validate_dir", "validate")
     temp_dir = workspace / cfg.get("temp_dir", "temp")
+    finalized_dir = workspace / cfg.get("finalized_dir", "finalized")
 
     # Models & dicts: relative to PROJECT_ROOT
     models_dir = resolve_path(PROJECT_ROOT, cfg.get("models_dir", "models/mfa"))
@@ -576,6 +623,7 @@ def main():
         "validate": [validate_dir, temp_dir, _ctc_pretg_dir],
         "align": [aligned_dir, temp_dir, _ctc_pretg_dir],
         "postprocess": [output_dir, filtered_dir],
+        "finalize": [finalized_dir],
     }
     created: set[Path] = set()
     for s in run_list:
@@ -600,6 +648,7 @@ def main():
         "mfa_audio_dir": workspace / "audio_16k",
         "ctc_pretg": workspace / cfg.get("ctc_pretg", "ctc_pretg"),
         "ctc_pretg_adj": workspace / cfg.get("ctc_pretg_adj", "ctc_pretg_adj"),
+        "finalized_dir": finalized_dir,
     }
 
     failed = []
@@ -612,6 +661,15 @@ def main():
             if not args.force:
                 print("  Stopping. Use --force to continue on errors.")
                 break
+        elif args.validate:
+            issues = validate_step_output(step_name, workspace,
+                                          cfg.get("output_spec", {}))
+            if issues:
+                print(f"  [VALIDATE] {step_name} — output check failed:")
+                for issue in issues:
+                    print(f"    {issue}")
+            else:
+                print(f"  [VALIDATE] {step_name} — OK")
 
     # Clean up temporary 16kHz audio (default keep, configurable via keep_16k_audio)
     keep_16k = cfg.get("keep_16k_audio", True)

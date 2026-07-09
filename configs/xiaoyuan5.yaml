@@ -1,5 +1,5 @@
 # xiaoyuan5 — 5 条音频测试
-workspace: workspace_xiaoyuan5
+workspace: xiaoyuan5
 data_dir: ../video/xiaoyuan5
 txt_suffix:
 audio_dir: audio

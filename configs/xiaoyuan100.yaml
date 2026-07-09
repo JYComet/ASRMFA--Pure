@@ -1,5 +1,5 @@
 # xiaoyuan100 — 100 条音频
-workspace: workspace_xiaoyuan100
+workspace: xiaoyuan100
 data_dir: data_dir/xiaoyuan100
 txt_suffix:
 audio_dir: audio

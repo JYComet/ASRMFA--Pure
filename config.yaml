@@ -4,8 +4,8 @@
 # Absolute paths also work if you prefer to keep data elsewhere.
 # CLI arguments (--data-dir, --output-dir, --python) override these values.
 
-# ---- Workspace (all generated data goes here) ----
-workspace: workspace
+# ---- Workspace (all generated data goes under output/<workspace>/) ----
+workspace: default
 
 # ---- Input ----
 data_dir: data_dir                  # Source directory (wav + txt in subdirs)
@@ -17,6 +17,7 @@ pinyin_dir: pinyin                  # Chinese text converted to pinyin
 aligned_dir: aligned                # Raw MFA alignment TextGrids
 output_dir: output                  # Final TextGrids (passed QC)
 filtered_dir: filtered              # TextGrids that failed QC
+finalized_dir: finalized            # Finalized TextGrids (<sp1>, NVV brackets)
 validate_dir: validate              # MFA validation output
 temp_dir: temp                      # MFA temporary files
 
@@ -74,6 +75,79 @@ mfa:
   output_format: long_textgrid
   clean: true
   no_tokenization: true
+
+# ============================================================================
+# Output Structure Specification
+# ============================================================================
+# Each pipeline step writes to a predictable subdirectory under workspace/.
+# This spec doubles as documentation for users and as the schema for
+# ``--validate`` output checks.
+#
+# workspace/
+# ├── audio/                         # Step trim
+# │   └── **/*.wav                   #   Silence-trimmed, preserves input dir tree
+# │
+# ├── ctc_pretg/                     # Step prealign
+# │   ├── *.TextGrid                 #   Praat, 2 tiers: words + pauses
+# │   ├── *.lab                      #   Space-separated pinyin+NVV transcript
+# │   ├── *_tokens.jsonl             #   Per-word CTC timestamps (JSONL)
+# │   ├── *_punct.json               #   Punctuation CTC anchors (JSON array)
+# │   ├── *_text_raw.txt             #   Raw ASR text (with emotion/lang tags)
+# │   ├── *_text_cn.txt              #   Clean Chinese text (NVVs bare, nums→cn)
+# │   ├── manifest.json              #   Full file index (JSON array)
+# │   └── summary.txt                #   Human-readable processing report
+# │
+# ├── ctc_pretg_adj/                 # Step adjust
+# │   ├── *.TextGrid                 #   Praat, 1 tier: words (energy-adjusted)
+# │   ├── *.lab                      #   Copied from ctc_pretg (unmodified)
+# │   ├── *_tokens.jsonl             #   Adjusted per-word timestamps
+# │   ├── *_punct.json               #   Adjusted punctuation anchors
+# │   └── *_text_cn.txt              #   Copied from ctc_pretg (unmodified)
+# │
+# ├── aligned/                       # Step align (MFA)
+# │   └── *.TextGrid                 #   Praat, 2 tiers: words + phones
+# │
+# ├── output/                        # Step postprocess (passed QC)
+# │   ├── *.TextGrid                 #   Praat, 5 tiers:
+# │   │                              #     raw_text / pinyin / hanzi / words / pinyin_phones
+# │   ├── tone_mapping.json          #   IPA↔Pinyin bidirectional reference table
+# │   └── postprocess_report.jsonl   #   Per-file processing report (JSONL)
+# │
+# ├── filtered/                      # Step postprocess (failed QC)
+# │   └── *.TextGrid                 #   5-tier, routed here on filter triggers
+# │
+# ├── finalized/                     # Step finalize
+# │   └── *.TextGrid                 #   5-tier, <sp1> normalized, NVVs in <brackets>
+# │
+# └── temp/                          # MFA temporary files (auto-cleaned)
+#
+# Output spec key for --validate (must match section keys below).
+# Each step lists required file patterns that MUST exist after the step runs.
+# A "$WILDCARD" sentinel means "at least one match"; a literal name is required.
+output_spec:
+  trim:
+    - audio/**/*.wav
+  prealign:
+    - ctc_pretg/*.TextGrid
+    - ctc_pretg/*.lab
+    - ctc_pretg/*_tokens.jsonl
+    - ctc_pretg/*_text_cn.txt
+    - ctc_pretg/manifest.json
+    - ctc_pretg/summary.txt
+  adjust:
+    - ctc_pretg_adj/*.TextGrid
+    - ctc_pretg_adj/*.lab
+    - ctc_pretg_adj/*_tokens.jsonl
+    - ctc_pretg_adj/*_text_cn.txt
+  align:
+    - aligned/*.TextGrid
+  postprocess:
+    - output/*.TextGrid
+    - output/tone_mapping.json
+    - output/postprocess_report.jsonl
+    - filtered/*.TextGrid
+  finalize:
+    - finalized/*.TextGrid
 
 # ---- Step 8: Postprocess ----
 postprocess:

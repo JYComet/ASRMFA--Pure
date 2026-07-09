@@ -1,5 +1,5 @@
 # bushi (补时) 数据集
-workspace: workspace_bushi
+workspace: bushi
 data_dir: ../video/补时
 txt_suffix:
 audio_dir: audio
