@@ -2233,10 +2233,6 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     if args.enable_text_correction:
         new_tg = _finalise_textgrid(new_tg, raw_text, pinyin_text, args)
 
-    # 输出路径先默认 output, 最终检查时再决定是否重定向到 filtered
-    out_path = output_dir / tg_path.name
-    stale = filtered_dir / tg_path.name
-
     # Snap MFA word boundaries to CTC anchors, remap phones proportionally
     tokens_path = txt_dir / f"{stem}_tokens.jsonl"
     punct_path = txt_dir / f"{stem}_punct.json"
@@ -2588,8 +2584,12 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     new_tg.tiers = [t for t in new_tg.tiers if t.name != "phones"]
 
     if out_path.exists() and not args.overwrite:
-        raise FileExistsError(f"Output exists: {out_path}")
-    if stale.exists() and args.overwrite:
+        report["status"] = "skipped"
+        report["output"] = str(out_path)
+        return report
+    # When moving a file from one category to the other (e.g. filtered → output
+    # after an alignment fix), clean up the old copy
+    if stale.exists():
         stale.unlink()
     write_textgrid(new_tg, out_path)
     report["output"] = str(out_path)
