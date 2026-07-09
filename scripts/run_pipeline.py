@@ -597,7 +597,7 @@ def main():
         "output_dir": output_dir, "filtered_dir": filtered_dir,
         "validate_dir": validate_dir, "models_dir": models_dir,
         "temp_dir": temp_dir, "mfa_dict": mfa_dict,
-        "mfa_audio_dir": temp_dir / "audio_16k",
+        "mfa_audio_dir": workspace / "audio_16k",
         "ctc_pretg": workspace / cfg.get("ctc_pretg", "ctc_pretg"),
         "ctc_pretg_adj": workspace / cfg.get("ctc_pretg_adj", "ctc_pretg_adj"),
     }
@@ -616,7 +616,7 @@ def main():
     # Clean up temporary 16kHz audio (default keep, configurable via keep_16k_audio)
     keep_16k = cfg.get("keep_16k_audio", True)
     if "resample" in run_list:
-        mfa_audio = temp_dir / "audio_16k"
+        mfa_audio = workspace / "audio_16k"
         if mfa_audio.exists() and not keep_16k:
             import shutil
             shutil.rmtree(str(mfa_audio))

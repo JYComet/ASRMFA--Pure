@@ -38,12 +38,12 @@ ctc_prealign:
   model_path: "models/Multilingual-NVASR"
   device: cuda:0
   python: ""
-  limit: 0
+  limit: 10
   timeout: 3600
 
 ctc_adjust:
   enabled: true
-  limit: 0
+  limit: 10
 
 mfa:
   num_jobs: 8
