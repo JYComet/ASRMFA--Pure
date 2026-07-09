@@ -70,25 +70,72 @@ chinese_mfa_pipeline/
 
 ## 快速开始
 
+### 1. 安装环境 (仅首次)
+
 ```bash
-# 1. 安装环境 (仅首次)
-setup_env.bat
-
-# 2. 放入数据
-mkdir -p data_dir/my_task
-cp /path/to/audio/*.wav data_dir/my_task/
-cp /path/to/text/*.txt  data_dir/my_task/
-
-# 3. 跑全流程
-python scripts/run_pipeline.py --data-dir data_dir/my_task
-
-# 4. 或用任务配置
-python scripts/run_pipeline.py --config configs/xiaoyuan5.yaml
-
-# 5. 单步运行
-python scripts/run_pipeline.py --step prealign
-python scripts/run_pipeline.py --skip-to postprocess --overwrite
+setup_env.bat       # Windows
+bash setup.sh       # Linux / macOS
 ```
+
+### 2. 放入数据
+
+```
+data_dir/{task_name}/
+├── audio_001.wav          # 16kHz+ 单声道 WAV
+├── audio_001.txt          # 同名中文文本 (UTF-8), 可选
+├── audio_002.wav
+├── audio_002.txt
+└── ...
+```
+
+无参考文本时管线会使用 NVASR ASR 输出作为文本，同样可用。
+
+文本文件若带引擎后缀（如 `audio_001_qwen3-api.txt`），管线自动匹配同名 wav。
+
+### 3. 创建任务配置（2 行即可）
+
+每个任务只需一个 YAML 文件，指定 **输出目录名** 和 **输入数据路径**：
+
+```yaml
+# configs/my_task.yaml
+workspace: my_task          # 输出文件夹名
+data_dir: data_dir/my_task  # 输入数据路径 (相对项目根, 或绝对路径)
+```
+
+所有其他参数都有内置默认值，无需重复编写。查看 [`config.yaml`](config.yaml) 了解全部可选字段。
+
+### 4. 运行
+
+```bash
+# 全流程
+python scripts/run_pipeline.py --config configs/my_task.yaml
+
+# 跳过前几步, 从 prealign 开始 (数据已预处理好时)
+python scripts/run_pipeline.py --config configs/my_task.yaml --skip-to prealign --overwrite
+
+# 只跑单步
+python scripts/run_pipeline.py --config configs/my_task.yaml --step postprocess
+
+# 覆盖已有输出
+python scripts/run_pipeline.py --config configs/my_task.yaml --overwrite
+```
+
+### 让 AI 帮你创建配置
+
+在 Claude Code 中直接说：
+
+> "处理 `data_dir/xxx` 下的音频，编写对应的配置文件"
+
+AI 会自动：
+1. 检查数据目录（文件数量、有无参考文本）
+2. 创建最小的 2 行配置文件
+3. 运行管线，报告结果
+
+如果想调整参数，如：
+
+> "处理 `data_dir/xxx`，静音裁剪阈值调到 0.02，MFA 用 4 线程"
+
+AI 只会在配置中覆写这两个字段，其余沿用默认值。
 
 ## 输入数据格式
 

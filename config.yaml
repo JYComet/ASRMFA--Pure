@@ -1,171 +1,93 @@
-# Chinese MFA Pipeline Configuration
-# ====================================
-# All paths are relative to the project root (chinese_mfa_pipeline/).
-# Absolute paths also work if you prefer to keep data elsewhere.
-# CLI arguments (--data-dir, --output-dir, --python) override these values.
-
-# ---- Workspace (all generated data goes under output/<workspace>/) ----
-workspace: default
-
-# ---- Input ----
-data_dir: data_dir                  # Source directory (wav + txt in subdirs)
-txt_suffix:                         # Only match txt files with this suffix (e.g. qwen3-api)
-
-# ---- Output directories (relative to workspace) ----
-audio_dir: audio                    # Trimmed WAV
-pinyin_dir: pinyin                  # Chinese text converted to pinyin
-aligned_dir: aligned                # Raw MFA alignment TextGrids
-output_dir: output                  # Final TextGrids (passed QC, NVV-bracketed, sp1-normalized)
-filtered_dir: filtered              # TextGrids that failed QC (also NVV-bracketed, sp1-normalized)
-validate_dir: validate              # MFA validation output
-temp_dir: temp                      # MFA temporary files
-
-# ---- Model & Dictionary (relative to project root) ----
-models_dir: models/mfa              # MFA model root
-acoustic_model: mandarin_mfa        # MFA acoustic model name
-mfa_dict: dict/mfa_ipa.dict         # Pronunciation dictionary
-pinyin_dict: dict/fullpinyin_enword.dict  # Source pinyin dictionary
-
-# ---- Python environment (auto-detect if empty) ----
-python_path: ""                     # Path to Python with MFA installed. Empty = auto-detect from conda envs.
-
-# ---- Step 1: Trim Silence ----
-trim:
-  max_silence_sec: 1.0
-  sil_vol_threshold: 0.005
-  sil_len_threshold: 0.08
-  normalize_edges: true
-  target_edge_silence_sec: 0.5
-  edge_silence_threshold: 0.001
-  edge_frame_length: 1024
-  target_sr: null
-  workers: 8
-
-# ---- Step 2: Prepare Corpus ----
-prepare:
-  copy_wav: false
-  keep_punctuation: true
-
-# ---- Resample ----
-keep_16k_audio: true                # Keep temp 16kHz audio after pipeline (default true)
-
-# ---- CTC directories (relative to workspace) ----
-ctc_pretg: ctc_pretg
-ctc_pretg_adj: ctc_pretg_adj
-
-# ---- Step 4: CTC Pre-alignment (NVASR -> MFA anchors) ----
-ctc_prealign:
-  enabled: true
-  model_path: "models/Multilingual-NVASR"   # relative to project root
-  device: cuda:0
-  python: ""                                # Python with funasr+torch. Empty = use current Python.
-  limit: 0
-  timeout: 3600
-
-# ---- Step 5: Energy-based CTC boundary adjustment ----
-ctc_adjust:
-  enabled: true
-  limit: 0
-
-# ---- Step 6 & 7: MFA ----
-mfa:
-  num_jobs: 8
-  single_speaker: true
-  output_format: long_textgrid
-  clean: true
-  no_tokenization: true
-
-# ============================================================================
-# Output Structure Specification
-# ============================================================================
-# Each pipeline step writes to a predictable subdirectory under workspace/.
-# This spec doubles as documentation for users and as the schema for
-# ``--validate`` output checks.
+# ═══════════════════════════════════════════════════════════════════════════
+# Chinese MFA Pipeline — 参考配置 / 内置默认值
+# ═══════════════════════════════════════════════════════════════════════════
 #
-# workspace/
-# ├── audio/                         # Step trim
-# │   └── **/*.wav                   #   Silence-trimmed, preserves input dir tree
-# │
-# ├── ctc_pretg/                     # Step prealign
-# │   ├── *.TextGrid                 #   Praat, 2 tiers: words + pauses
-# │   ├── *.lab                      #   Space-separated pinyin+NVV transcript
-# │   ├── *_tokens.jsonl             #   Per-word CTC timestamps (JSONL)
-# │   ├── *_punct.json               #   Punctuation CTC anchors (JSON array)
-# │   ├── *_text_raw.txt             #   Raw ASR text (with emotion/lang tags)
-# │   ├── *_text_cn.txt              #   Clean Chinese text (NVVs bare, nums→cn)
-# │   ├── manifest.json              #   Full file index (JSON array)
-# │   └── summary.txt                #   Human-readable processing report
-# │
-# ├── ctc_pretg_adj/                 # Step adjust
-# │   ├── *.TextGrid                 #   Praat, 1 tier: words (energy-adjusted)
-# │   ├── *.lab                      #   Copied from ctc_pretg (unmodified)
-# │   ├── *_tokens.jsonl             #   Adjusted per-word timestamps
-# │   ├── *_punct.json               #   Adjusted punctuation anchors
-# │   └── *_text_cn.txt              #   Copied from ctc_pretg (unmodified)
-# │
-# ├── aligned/                       # Step align (MFA)
-# │   └── *.TextGrid                 #   Praat, 2 tiers: words + phones
-# │
-# ├── output/                        # Step postprocess (passed QC)
-# │   ├── *.TextGrid                 #   Praat, 5 tiers — NVV-bracketed, sp1-normalized:
-# │   │                              #     raw_text / pinyin / hanzi / words / pinyin_phones
-# │   ├── tone_mapping.json          #   IPA↔Pinyin bidirectional reference table
-# │   └── postprocess_report.jsonl   #   Per-file processing report (JSONL)
-# │
-# ├── filtered/                      # Step postprocess (failed QC)
-# │   └── *.TextGrid                 #   5-tier, also NVV-bracketed, sp1-normalized
-# │
-# └── temp/                          # MFA temporary files (auto-cleaned)
+# 任务配置文件只需写与默认值不同的字段 (通常只需要 workspace + data_dir).
+# 运行: python scripts/run_pipeline.py --config config.yaml
+#       python scripts/run_pipeline.py --config configs/xiaoyuan5.yaml
 #
-# Output spec key for --validate (must match section keys below).
-# Each step lists required file patterns that MUST exist after the step runs.
-# A "$WILDCARD" sentinel means "at least one match"; a literal name is required.
-output_spec:
-  trim:
-    - audio/**/*.wav
-  prealign:
-    - ctc_pretg/*.TextGrid
-    - ctc_pretg/*.lab
-    - ctc_pretg/*_tokens.jsonl
-    - ctc_pretg/*_text_cn.txt
-    - ctc_pretg/manifest.json
-    - ctc_pretg/summary.txt
-  adjust:
-    - ctc_pretg_adj/*.TextGrid
-    - ctc_pretg_adj/*.lab
-    - ctc_pretg_adj/*_tokens.jsonl
-    - ctc_pretg_adj/*_text_cn.txt
-  align:
-    - aligned/*.TextGrid
-  postprocess:
-    - output/*.TextGrid
-    - output/tone_mapping.json
-    - output/postprocess_report.jsonl
-    - filtered/*.TextGrid
+# 所有字段都有内置默认值 (见 run_pipeline.py::DEFAULT_CFG).
+# 以下列出的是默认值, 注释掉表示使用默认即可.
 
-# ---- Step 8: Postprocess ----
-postprocess:
-  merge_silence: true
-  min_sil_merge_sec: 0.2
-  fix_short_word: true
-  short_word_max_sec: 0.25
-  flank_silence_sec: 0.4
-  short_word_search_window: 0.5
-  detect_bgm: true
-  bgm_noise_floor_ratio: 2.0
-  bgm_min_sil_dur: 0.3
-  bgm_speech_ratio: 1.0
-  bgm_min_energy: 0.01
-  filter_suspicious: true
-  filter_short_phone_sec: 0.005
-  filter_long_word_sec: 1.5
-  filter_min_word_sec: 0.15
-  filter_min_word_dur_sec: 0.02
-  filter_word_energy_ratio: 2.0
-  filter_min_phone_coverage: 0.25
-  filter_edge_gap_sec: 0.35
-  filter_flank_silence_sec: 0.4
-  filter_long_consonant_sec: 999.0
-  filter_long_vowel_sec: 999.0
-  enable_text_correction: true
-  handle_unexpected_sil: false
+# ── 必填 (无默认值) ──────────────────────────────────────────────────────
+# workspace: my_task           # 工作区名 (相对路径 = 相对于当前目录)
+# data_dir: data_dir/my_task   # 输入目录, 含 wav + txt
+
+# ── 输出子目录 (相对于 workspace) ────────────────────────────────────────
+# audio_dir: audio
+# pinyin_dir: pinyin
+# aligned_dir: aligned
+# output_dir: output
+# filtered_dir: filtered
+# validate_dir: validate
+# temp_dir: temp
+# ctc_pretg: ctc_pretg
+# ctc_pretg_adj: ctc_pretg_adj
+
+# ── 模型 & 词典 (相对于项目根) ──────────────────────────────────────────
+# models_dir: models/mfa
+# acoustic_model: mandarin_mfa
+# mfa_dict: dict/mfa_ipa.dict
+# pinyin_dict: dict/fullpinyin_enword.dict
+# python_path: ""              # 空 = 自动检测 conda env
+
+# ── 音频预处理 ──────────────────────────────────────────────────────────
+# trim:
+#   max_silence_sec: 1.0
+#   sil_vol_threshold: 0.005
+#   sil_len_threshold: 0.08
+#   normalize_edges: true
+#   target_edge_silence_sec: 0.5
+#   edge_silence_threshold: 0.001
+#   edge_frame_length: 1024
+#   target_sr: null
+#   workers: 8
+
+# ── CTC 预对齐 ──────────────────────────────────────────────────────────
+# ctc_prealign:
+#   enabled: true
+#   model_path: "models/Multilingual-NVASR"
+#   device: cuda:0
+#   python: ""
+#   limit: 0
+#   timeout: 3600
+
+# ── CTC 边界能量修正 ────────────────────────────────────────────────────
+# ctc_adjust:
+#   enabled: true
+#   limit: 0
+
+# ── MFA ─────────────────────────────────────────────────────────────────
+# mfa:
+#   num_jobs: 8
+#   single_speaker: true
+#   output_format: long_textgrid
+#   clean: true
+#   no_tokenization: true
+
+# ── 后处理 ──────────────────────────────────────────────────────────────
+# postprocess:
+#   merge_silence: true
+#   min_sil_merge_sec: 0.2
+#   fix_short_word: true
+#   short_word_max_sec: 0.25
+#   flank_silence_sec: 0.4
+#   short_word_search_window: 0.5
+#   detect_bgm: true
+#   bgm_noise_floor_ratio: 2.0
+#   bgm_min_sil_dur: 0.3
+#   bgm_speech_ratio: 1.0
+#   bgm_min_energy: 0.01
+#   filter_suspicious: true
+#   filter_short_phone_sec: 0.015
+#   filter_long_word_sec: 1.0
+#   filter_min_word_sec: 0.15
+#   filter_min_word_dur_sec: 0.02
+#   filter_word_energy_ratio: 2.0
+#   filter_min_phone_coverage: 0.35
+#   filter_edge_gap_sec: 0.25
+#   filter_flank_silence_sec: 0.4
+#   filter_long_consonant_sec: 999.0
+#   filter_long_vowel_sec: 999.0
+#   enable_text_correction: true
+#   handle_unexpected_sil: true

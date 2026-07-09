@@ -2,14 +2,21 @@
 """
 Complete Chinese MFA forced alignment pipeline.
 
-Steps: trim -> resample -> prealign -> normalize -> adjust -> validate -> align -> postprocess
+Full mode:  trim -> resample -> prealign -> normalize -> adjust -> validate -> align -> postprocess
+ctc_ready:  link -> resample -> adjust -> validate -> align -> postprocess
+            (skip trim/prealign/normalize — use pre-existing NVASR CTC output)
 
 Usage:
-  python scripts/run_pipeline.py                              # all steps, use config.yaml
-  python scripts/run_pipeline.py --data-dir E:/path/to/data   # override input
-  python scripts/run_pipeline.py --step align                 # single step
-  python scripts/run_pipeline.py --skip-to align              # from align onward
-  python scripts/run_pipeline.py --config my_config.yaml      # custom config file
+  # Full pipeline
+  python scripts/run_pipeline.py --config configs/my_task.yaml
+
+  # ctc_ready mode — audio already trimmed + NVASR CTC already run
+  python scripts/run_pipeline.py --ctc-ready E:/path/to/ctc_output --data-dir E:/path/to/audio
+
+  # Single step / partial run
+  python scripts/run_pipeline.py --step align
+  python scripts/run_pipeline.py --skip-to align
+  python scripts/run_pipeline.py --config my_config.yaml
 """
 
 import argparse
@@ -29,15 +36,138 @@ DEFAULT_CONFIG = PROJECT_ROOT / "config.yaml"
 
 
 # ---------------------------------------------------------------------------
+# Built-in defaults — task configs only need to specify what differs
+# ---------------------------------------------------------------------------
+
+DEFAULT_CFG: dict = {
+    "mode": "full",               # "full" | "ctc_ready"
+    "workspace": "workspace",
+    "data_dir": "data_dir",
+    "txt_suffix": "",
+    "audio_dir": "audio",
+    "pinyin_dir": "pinyin",
+    "aligned_dir": "aligned",
+    "output_dir": "output",
+    "filtered_dir": "filtered",
+    "validate_dir": "validate",
+    "temp_dir": "temp",
+    "ctc_pretg": "ctc_pretg",
+    "ctc_pretg_adj": "ctc_pretg_adj",
+    "models_dir": "models/mfa",
+    "acoustic_model": "mandarin_mfa",
+    "mfa_dict": "dict/mfa_ipa.dict",
+    "pinyin_dict": "dict/fullpinyin_enword.dict",
+    "python_path": "",
+    "keep_16k_audio": True,
+    "ctc_ready": {
+        "ctc_dir": "",             # pre-existing NVASR CTC output dir
+        "text_dir": "",            # optional reference .txt dir (defaults to data_dir)
+        "require_all": True,       # skip stems missing any of the 6 CTC files
+        "stem_range": None,        # optional [start, end] inclusive range filter
+        "stems": None,             # optional explicit list of stems to process
+    },
+    "trim": {
+        "max_silence_sec": 1.0,
+        "sil_vol_threshold": 0.005,
+        "sil_len_threshold": 0.08,
+        "normalize_edges": True,
+        "target_edge_silence_sec": 0.5,
+        "edge_silence_threshold": 0.001,
+        "edge_frame_length": 1024,
+        "target_sr": None,
+        "workers": 8,
+    },
+    "prepare": {"copy_wav": False, "keep_punctuation": True},
+    "ctc_prealign": {
+        "enabled": True,
+        "model_path": "models/Multilingual-NVASR",
+        "device": "cuda:0",
+        "python": "",
+        "limit": 0,
+        "timeout": 3600,
+    },
+    "ctc_adjust": {"enabled": True, "limit": 0},
+    "mfa": {
+        "num_jobs": 8,
+        "single_speaker": True,
+        "output_format": "long_textgrid",
+        "clean": True,
+        "no_tokenization": True,
+    },
+    "postprocess": {
+        "merge_silence": True,
+        "min_sil_merge_sec": 0.2,
+        "fix_short_word": True,
+        "short_word_max_sec": 0.25,
+        "flank_silence_sec": 0.4,
+        "short_word_search_window": 0.5,
+        "detect_bgm": True,
+        "bgm_noise_floor_ratio": 2.0,
+        "bgm_min_sil_dur": 0.3,
+        "bgm_speech_ratio": 1.0,
+        "bgm_min_energy": 0.01,
+        "filter_suspicious": True,
+        "filter_short_phone_sec": 0.015,
+        "filter_long_word_sec": 1.0,
+        "filter_min_word_sec": 0.15,
+        "filter_min_word_dur_sec": 0.02,
+        "filter_word_energy_ratio": 2.0,
+        "filter_min_phone_coverage": 0.35,
+        "filter_edge_gap_sec": 0.25,
+        "filter_flank_silence_sec": 0.4,
+        "filter_long_consonant_sec": 999.0,
+        "filter_long_vowel_sec": 999.0,
+        "enable_text_correction": True,
+        "handle_unexpected_sil": True,
+    },
+    "output_spec": {
+        "trim": ["audio/**/*.wav"],
+        "prealign": [
+            "ctc_pretg/*.TextGrid", "ctc_pretg/*.lab",
+            "ctc_pretg/*_tokens.jsonl", "ctc_pretg/*_text_cn.txt",
+            "ctc_pretg/manifest.json", "ctc_pretg/summary.txt",
+        ],
+        "adjust": [
+            "ctc_pretg_adj/*.TextGrid", "ctc_pretg_adj/*.lab",
+            "ctc_pretg_adj/*_tokens.jsonl", "ctc_pretg_adj/*_text_cn.txt",
+        ],
+        "align": ["aligned/*.TextGrid"],
+        "postprocess": [
+            "output/*.TextGrid", "output/tone_mapping.json",
+            "output/postprocess_report.jsonl", "filtered/*.TextGrid",
+        ],
+    },
+}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge *override* into *base*.  Returns a new dict."""
+    import copy
+    result = copy.deepcopy(base)
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = copy.deepcopy(v)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Config loading
 # ---------------------------------------------------------------------------
 
 def load_config(config_path: Path) -> dict:
+    """Load config file and merge with built-in defaults.
+
+    Task configs only need ``workspace`` and ``data_dir`` — everything
+    else inherits sensible defaults from :data:`DEFAULT_CFG`.
+    """
     if not config_path.exists():
         print(f"ERROR: Config file not found: {config_path}")
         sys.exit(1)
     with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        user_cfg = yaml.safe_load(f) or {}
+    return _deep_merge(DEFAULT_CFG, user_cfg)
 
 
 def resolve_path(base: Path, value: str | None) -> Path | None:
@@ -170,49 +300,112 @@ def step_trim_silence(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                       "Step 1: Audio Preprocessing")
 
 
-def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
-    """Resample trimmed audio to 16kHz for MFA."""
+def _resample_one(wav_path: Path, audio_dir: Path, out_dir: Path,
+                  target_sr: int, overwrite: bool) -> tuple[str, bool, str]:
+    """Worker for parallel resample (module-level, pickleable)."""
     import shutil
     import soundfile as sf
     sys.path.insert(0, str(SCRIPTS_DIR))
     from audio_utils import resample_audio
 
+    rel = wav_path.relative_to(audio_dir)
+    out = out_dir / rel
+    if out.exists() and not overwrite:
+        return (str(rel), False, "skipped")
+
+    # Fast path: read only samplerate, hard-link if already at target
+    try:
+        info = sf.info(str(wav_path))
+        sr = info.samplerate
+    except Exception:
+        sr = 0
+    if sr == target_sr:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(str(wav_path), str(out))
+            return (str(rel), True, "linked")
+        except OSError:
+            shutil.copy2(str(wav_path), str(out))
+            return (str(rel), True, "copied")
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    audio, sr = sf.read(str(wav_path), dtype='float32')
+    if audio.ndim > 1:
+        audio = audio[:, 0]
+    if sr != target_sr:
+        audio = resample_audio(audio, sr, target_sr)
+    sf.write(str(out), audio, target_sr, subtype='PCM_16')
+    return (str(rel), True, "resampled")
+
+
+def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
+    """Resample trimmed audio to 16kHz for MFA (parallelised)."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import multiprocessing as mp
+
     audio_dir = ctx["audio_dir"]
     mfa_audio_dir = ctx["mfa_audio_dir"]
     target_sr = 16000
+    overwrite = args.overwrite
 
-    wavs = list(audio_dir.rglob("*.wav"))
+    # Use scandir for fast flat-listing (common case)
+    wavs: list[Path] = []
+    try:
+        with os.scandir(str(audio_dir)) as it:
+            for entry in it:
+                if entry.is_file() and entry.name.endswith(".wav"):
+                    wavs.append(Path(entry.path))
+    except OSError:
+        pass
+    if not wavs:
+        wavs = list(audio_dir.rglob("*.wav"))  # fallback to recursive
+
     if not wavs:
         print("  No WAVs found in audio dir.")
         return 1
 
     existing = list(mfa_audio_dir.rglob("*.wav")) if mfa_audio_dir.exists() else []
-    if len(existing) >= len(wavs) and not args.overwrite:
+    if len(existing) >= len(wavs) and not overwrite:
         print(f"  {len(existing)} resampled WAVs already exist. Use --overwrite to redo.")
         return 0
 
     mfa_audio_dir.mkdir(parents=True, exist_ok=True)
-    done = 0
-    for wav in wavs:
-        rel = wav.relative_to(audio_dir)
-        out = mfa_audio_dir / rel
-        if out.exists() and not args.overwrite:
-            done += 1
-            continue
-        out.parent.mkdir(parents=True, exist_ok=True)
-        audio, sr = sf.read(str(wav))
-        if len(audio.shape) > 1:
-            audio = audio[:, 0]
-        if sr != target_sr:
-            audio = resample_audio(audio, sr, target_sr)
-        else:
-            shutil.copy2(str(wav), str(out))
-            done += 1
-            continue
-        sf.write(str(out), audio, target_sr)
-        done += 1
-    print(f"  Resampled {done} WAVs to {target_sr}Hz → {mfa_audio_dir}")
-    return 0
+
+    n_workers = min(cfg.get("mfa", {}).get("num_jobs", mp.cpu_count()),
+                    len(wavs), mp.cpu_count())
+    done = skipped = 0
+    actions: dict[str, int] = {}
+
+    if n_workers <= 1 or len(wavs) <= 4:
+        # Sequential for small jobs
+        for wav in wavs:
+            _, ok, action = _resample_one(wav, audio_dir, mfa_audio_dir,
+                                          target_sr, overwrite)
+            if ok:
+                done += 1
+            else:
+                skipped += 1
+            actions[action] = actions.get(action, 0) + 1
+    else:
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(_resample_one, w, audio_dir, mfa_audio_dir,
+                            target_sr, overwrite): w
+                for w in wavs
+            }
+            for fut in as_completed(futures):
+                _, ok, action = fut.result()
+                if ok:
+                    done += 1
+                else:
+                    skipped += 1
+                actions[action] = actions.get(action, 0) + 1
+
+    parts = [f"{done} done"]
+    for action, n in sorted(actions.items()):
+        parts.append(f"{n} {action}")
+    print(f"  Resampled to {target_sr}Hz → {mfa_audio_dir}  ({', '.join(parts)})")
+    return 0 if done > 0 else 1
 
 
 def step_mfa_validate(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
@@ -488,7 +681,292 @@ def validate_step_output(step_name: str, workspace: Path, spec: dict) -> list[st
 # Main
 # ---------------------------------------------------------------------------
 
+SCRIPTS_DIR = PROJECT_ROOT / "scripts"
+
+
+# ---------------------------------------------------------------------------
+# File-index helpers — O(1) stem lookups without recursive scanning
+# ---------------------------------------------------------------------------
+
+def _build_file_index(root: Path, suffix: str, recurse: bool = True) -> dict[str, Path]:
+    """Build ``{stem: path}`` index for files ending with *suffix*.
+
+    Uses ``os.scandir`` for fast single-level listing; only recurses into
+    subdirectories when *recurse* is True and the top-level scan yields nothing.
+    """
+    index: dict[str, Path] = {}
+
+    def _scan(dirpath: Path) -> int:
+        n = 0
+        try:
+            for entry in os.scandir(str(dirpath)):
+                if entry.is_file() and entry.name.endswith(suffix):
+                    stem = entry.name[:-len(suffix)]
+                    if stem not in index:
+                        index[stem] = Path(entry.path)
+                        n += 1
+        except OSError:
+            pass
+        return n
+
+    n = _scan(root)
+
+    if recurse and n == 0:
+        # Top-level empty — try one level of subdirectories
+        try:
+            for entry in os.scandir(str(root)):
+                if entry.is_dir():
+                    _scan(Path(entry.path))
+        except OSError:
+            pass
+
+    return index
+
+
+def _link_or_copy(src: Path, dst: Path) -> bool:
+    """Hard-link *src* → *dst*; fall back to copy if cross-device.
+
+    Returns True on success, False if *src* does not exist.
+    """
+    if not src.exists():
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        dst.unlink()
+    try:
+        os.link(str(src), str(dst))
+    except OSError:
+        import shutil
+        shutil.copy2(str(src), str(dst))
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Step: link (ctc_ready mode) — validate pre-existing NVASR output
+# ---------------------------------------------------------------------------
+
+_CTC_SUFFIXES = [
+    ".TextGrid", ".lab", "_tokens.jsonl", "_punct.json",
+    "_text_cn.txt", "_text_raw.txt",
+]
+
+
+def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
+    """Validate pre-existing NVASR CTC output and prepare workspace.
+
+    Scans the CTC directory for ``.lab`` files (single-level, no recursion),
+    matches audio by stem, validates all 6 NVASR output files per stem, then
+    hard-links audio + CTC files into the workspace so the pipeline can
+    proceed from ``resample`` onward.
+    """
+    import json as _json
+
+    cr = cfg.get("ctc_ready", {})
+
+    # ── Resolve source directories ──
+    ctc_dir_src = Path(cr["ctc_dir"])
+    if not ctc_dir_src.is_absolute():
+        ctc_dir_src = PROJECT_ROOT / ctc_dir_src
+    if not ctc_dir_src.exists():
+        print(f"ERROR: CTC directory not found: {ctc_dir_src}")
+        return 1
+
+    audio_src = ctx["data_dir"]  # data_dir IS the audio source in ctc_ready
+    if not audio_src.exists():
+        print(f"ERROR: Audio directory not found: {audio_src}")
+        return 1
+
+    text_src = Path(cr.get("text_dir", "")) if cr.get("text_dir") else audio_src
+    if not text_src.is_absolute():
+        text_src = PROJECT_ROOT / text_src
+
+    print(f"  CTC dir:   {ctc_dir_src}")
+    print(f"  Audio dir: {audio_src}")
+    if text_src != audio_src:
+        print(f"  Text dir:  {text_src}")
+
+    # ── 1. Scan CTC dir for .lab files (single-level, no recursion) ──
+    stems: list[str] = []
+    try:
+        with os.scandir(str(ctc_dir_src)) as it:
+            for entry in it:
+                if entry.is_file() and entry.name.endswith(".lab"):
+                    stems.append(entry.name[:-4])
+    except OSError as e:
+        print(f"ERROR: Cannot read CTC directory: {e}")
+        return 1
+
+    if not stems:
+        print("ERROR: No .lab files found in CTC directory.")
+        return 1
+    stems.sort()
+    print(f"  Found {len(stems)} stems via .lab scan")
+
+    # ── 1b. Filter stems by explicit list or range (if configured) ──
+    stem_filter = cr.get("stems", None)     # explicit list: ["35000", 35001, ...]
+    stem_range = cr.get("stem_range", None) # [start, end] inclusive
+
+    if stem_filter is not None:
+        allow = {str(s) for s in stem_filter}
+        stems = [s for s in stems if s in allow]
+        print(f"  Filtered to {len(stems)} stems (explicit list)")
+    elif stem_range is not None:
+        lo, hi = stem_range
+        if isinstance(lo, int) and isinstance(hi, int):
+            stems = [s for s in stems if lo <= int(s) <= hi]
+        else:
+            lo_s, hi_s = str(lo), str(hi)
+            stems = [s for s in stems if lo_s <= s <= hi_s]
+        print(f"  Filtered to {len(stems)} stems (range {lo}–{hi})")
+
+    if not stems:
+        print("ERROR: No stems match the filter criteria.")
+        return 1
+
+    # ── 2. Build audio index ──
+    # When filtered: direct lookup per stem (avoids scanning 100K+ files).
+    # Otherwise: single-level scan (fast for moderate directories).
+    audio_index: dict[str, Path] = {}
+    is_filtered = stem_filter is not None or stem_range is not None
+    if is_filtered:
+        for stem in stems:
+            # Try exact match first
+            wav_path = audio_src / f"{stem}.wav"
+            if wav_path.exists():
+                audio_index[stem] = wav_path
+                continue
+            # Try zero-padded variants (e.g., stem="35000" → "035000.wav")
+            if stem.isdigit():
+                found = False
+                for width in (5, 6, 7, 8):
+                    wav_path = audio_src / f"{stem.zfill(width)}.wav"
+                    if wav_path.exists():
+                        audio_index[stem] = wav_path
+                        found = True
+                        break
+                if found:
+                    continue
+            # Fallback: glob search in subdirectories
+            candidates = list(audio_src.glob(f"**/{stem}.wav"))
+            if candidates:
+                audio_index[stem] = candidates[0]
+        print(f"  Audio check: {len(audio_index)}/{len(stems)} matched"
+              f"{' (direct)' if len(audio_index) == len(stems) else ''}")
+    else:
+        audio_index = _build_file_index(audio_src, ".wav")
+        print(f"  Audio index: {len(audio_index)} WAV files")
+
+    # ── 3. Build text index (single-level) ──
+    text_index: dict[str, Path] = {}
+    if text_src.exists():
+        if is_filtered:
+            for stem in stems:
+                txt_path = text_src / f"{stem}.txt"
+                if txt_path.exists():
+                    text_index[stem] = txt_path
+            if text_index:
+                print(f"  Text check:  {len(text_index)}/{len(stems)} matched")
+        else:
+            text_index = _build_file_index(text_src, ".txt")
+            print(f"  Text index:  {len(text_index)} TXT files")
+
+    # ── 4. Validate per stem ──
+    require_all = cr.get("require_all", True)
+    valid: list[str] = []
+    missing_audio: list[str] = []
+    incomplete_ctc: list[tuple[str, str]] = []
+
+    for stem in stems:
+        if stem not in audio_index:
+            missing_audio.append(stem)
+            continue
+        # Check CTC completeness
+        if require_all:
+            for suffix in _CTC_SUFFIXES:
+                if not (ctc_dir_src / f"{stem}{suffix}").exists():
+                    incomplete_ctc.append((stem, suffix))
+                    break
+            if any(s == suffix for s, suffix in incomplete_ctc if s == stem):
+                continue
+        valid.append(stem)
+
+    # ── 5. Report ──
+    print(f"\n  Valid stems:    {len(valid)}")
+    if missing_audio:
+        print(f"  Missing audio:  {len(missing_audio)}")
+        for s in missing_audio[:5]:
+            print(f"    - {s}")
+        if len(missing_audio) > 5:
+            print(f"    ... and {len(missing_audio) - 5} more")
+    if incomplete_ctc:
+        print(f"  Incomplete CTC: {len(incomplete_ctc)}")
+        for s, suffix in incomplete_ctc[:5]:
+            print(f"    - {s}{suffix}")
+        if len(incomplete_ctc) > 5:
+            print(f"    ... and {len(incomplete_ctc) - 5} more")
+
+    if not valid:
+        print("ERROR: No valid stems — nothing to process.")
+        return 1
+
+    # ── 6. Link audio → workspace/audio/ ──
+    audio_out = ctx["audio_dir"]
+    audio_out.mkdir(parents=True, exist_ok=True)
+    linked = 0
+    for stem in valid:
+        if _link_or_copy(audio_index[stem], audio_out / f"{stem}.wav"):
+            linked += 1
+    print(f"\n  Audio linked: {linked} → {audio_out}")
+
+    # ── 7. Link CTC files → workspace/ctc_pretg/ ──
+    ctc_out = ctx["ctc_pretg"]
+    ctc_out.mkdir(parents=True, exist_ok=True)
+    ctc_linked = 0
+    for stem in valid:
+        for suffix in _CTC_SUFFIXES:
+            src = ctc_dir_src / f"{stem}{suffix}"
+            if src.exists():
+                if _link_or_copy(src, ctc_out / f"{stem}{suffix}"):
+                    ctc_linked += 1
+    print(f"  CTC linked:  {ctc_linked} → {ctc_out}")
+
+    # ── 8. Copy/link reference text (.txt from text_dir) ──
+    if text_index:
+        txt_linked = 0
+        for stem in valid:
+            if stem in text_index:
+                # Copy to ctc_pretg so postprocess can find it
+                dst = ctc_out / f"{stem}_ref.txt"
+                if not dst.exists() or args.overwrite:
+                    _link_or_copy(text_index[stem], dst)
+                    txt_linked += 1
+        if txt_linked:
+            print(f"  Text refs:   {txt_linked} → {ctc_out}")
+
+    # ── 9. Save manifest for debugging ──
+    manifest = {
+        "mode": "ctc_ready",
+        "ctc_dir_src": str(ctc_dir_src),
+        "audio_src": str(audio_src),
+        "n_stems": len(stems),
+        "n_valid": len(valid),
+        "n_missing_audio": len(missing_audio),
+        "n_incomplete_ctc": len(incomplete_ctc),
+        "stems": valid,
+    }
+    (ctc_out / "ctc_ready_manifest.json").write_text(
+        _json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"  Ready for MFA pipeline ({len(valid)} stems)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Step registry — must come after all step functions are defined
+# ---------------------------------------------------------------------------
+
 STEPS = {
+    "link": ("Link pre-existing CTC output (ctc_ready mode)", step_link_ctc),
     "trim": ("Audio preprocessing", step_trim_silence),
     "resample": ("Resample to 16kHz for MFA", step_resample_for_mfa),
     "prealign": ("CTC pre-alignment (NVASR → MFA anchors)", step_prealign),
@@ -499,7 +977,8 @@ STEPS = {
     "postprocess": ("Post-processing (includes NVV brackets + sp1 normalization)", step_postprocess),
 }
 
-SCRIPTS_DIR = PROJECT_ROOT / "scripts"
+FULL_STEP_ORDER = list(STEPS.keys())
+CTC_READY_STEP_ORDER = ["link", "resample", "adjust", "validate", "align", "postprocess"]
 
 
 def main():
@@ -521,6 +1000,11 @@ def main():
                         help="Override Python path from config.")
     parser.add_argument("--validate", action="store_true",
                         help="Validate output structure after each step (uses output_spec in config).")
+    parser.add_argument("--mode", type=str, default=None,
+                        choices=["full", "ctc_ready"],
+                        help="Pipeline mode (default: from config, or 'full').")
+    parser.add_argument("--ctc-ready", type=str, default=None, metavar="CTC_DIR",
+                        help="Enable ctc_ready mode: path to pre-existing NVASR CTC output.")
     args = parser.parse_args()
 
     if args.list_steps:
@@ -531,6 +1015,18 @@ def main():
     # Load config
     cfg = load_config(Path(args.config))
     print(f"Config: {args.config}")
+
+    # ── Resolve pipeline mode ──
+    mode = args.mode or cfg.get("mode", "full")
+    if args.ctc_ready:
+        mode = "ctc_ready"
+        cfg.setdefault("ctc_ready", {})["ctc_dir"] = args.ctc_ready
+        print(f"ctc_ready mode: CTC dir = {args.ctc_ready}")
+
+    if mode not in ("full", "ctc_ready"):
+        print(f"ERROR: Unknown mode: {mode}")
+        sys.exit(1)
+    print(f"Pipeline mode: {mode}")
 
     # Resolve workspace and paths
     # All pipeline output goes under output/<workspace>/ — never pollutes
@@ -573,8 +1069,17 @@ def main():
         print(f"ERROR: MFA dictionary not found at {mfa_dict}")
         sys.exit(1)
 
-    # Resolve steps
-    step_order = list(STEPS.keys())
+    # Resolve steps — order depends on pipeline mode
+    if mode == "ctc_ready":
+        step_order = CTC_READY_STEP_ORDER
+    else:
+        step_order = FULL_STEP_ORDER
+
+    # ctc_ready mode: skip trim/prealign/normalize unconditionally
+    if mode == "ctc_ready":
+        for skip_s in ("trim", "prealign", "normalize"):
+            setattr(args, f"skip_{skip_s}", True)
+
     if args.step:
         if args.step not in STEPS:
             print(f"Unknown step: {args.step}")
@@ -584,6 +1089,8 @@ def main():
         if args.skip_to not in STEPS:
             print(f"Unknown step: {args.skip_to}")
             sys.exit(1)
+        if args.skip_to not in step_order:
+            step_order.append(args.skip_to)
         run_list = step_order[step_order.index(args.skip_to):]
     else:
         run_list = list(step_order)
@@ -597,6 +1104,7 @@ def main():
     _ctc_pretg_dir = workspace / cfg.get("ctc_pretg", "ctc_pretg")
     _ctc_pretg_adj_dir = workspace / cfg.get("ctc_pretg_adj", "ctc_pretg_adj")
     step_dirs = {
+        "link": [audio_dir, _ctc_pretg_dir],
         "trim": [audio_dir, temp_dir],
         "resample": [temp_dir],
         "prealign": [_ctc_pretg_dir],
@@ -613,7 +1121,7 @@ def main():
                 created.add(d)
 
     print(f"\n{'#'*60}")
-    print(f"  Chinese MFA Pipeline")
+    print(f"  Chinese MFA Pipeline  [{mode}]")
     print(f"  Input:  {data_dir}")
     print(f"  Output: {output_dir}")
     print(f"  Steps:  {' -> '.join(run_list)}")

@@ -3,8 +3,8 @@
 Pre-MFA CTC anchor boundary adjustment using audio energy analysis.
 
 在 MFA 前用音频能量修正 CTC 锚点边界:
-- 句首 / 标点后词首: 检查是否多截取了静音 → 推后 start
-- 句尾 / 标点前词尾: 检查是否有语音延续 → 延长 end; 或是否多留静音 → 缩短 end
+- 句首 / 标点後词首: 检査是否多截取了静音 → 推後 start
+- 句尾 / 标点前词尾: 检査是否有语音延续 → 延长 end; 或是否多留静音 → 缩短 end
 - 同步调整标点位置
 
 数据流:
@@ -18,144 +18,117 @@ import json
 import math
 import re
 import shutil
+import sys
 from pathlib import Path
 
+import numpy as np
 
-# ===== Audio I/O =====
-
-def load_audio(wav_path: Path) -> tuple[list[float], int]:
-    import soundfile as sf
-    audio, sr = sf.read(str(wav_path))
-    if len(audio.shape) > 1:
-        audio = audio[:, 0]
-    return [float(s) for s in audio], sr
-
-
-# ===== Energy analysis =====
-
-def frame_rms(audio: list[float], sr: int, frame_ms: float = 10.0,
-              hop_ms: float = 5.0) -> list[float]:
-    fs = max(1, int(frame_ms / 1000.0 * sr))
-    hs = max(1, int(hop_ms / 1000.0 * sr))
-    if len(audio) < fs:
-        return []
-    return [math.sqrt(sum(s * s for s in audio[i:i + fs]) / fs + 1e-12)
-            for i in range(0, len(audio) - fs + 1, hs)]
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+from audio_energy import (
+    load_audio, frame_rms, word_rms,
+    noise_floor_from_rms, global_noise_floor,
+    speech_onset, speech_offset, median,
+)
 
 
-def median(values: list[float]) -> float:
-    if not values:
-        return 0.0
-    s = sorted(values)
-    m = len(s) // 2
-    return s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2.0
+# ===== Speech boundary search (vectorised) =====
 
-
-def global_noise_floor(audio: list[float], sr: int) -> float:
-    """Estimate global noise floor from quietest 15% of frames."""
-    rms = frame_rms(audio, sr, frame_ms=20.0, hop_ms=10.0)
-    if not rms:
-        return 1e-6
-    s = sorted(rms)
-    bot = s[:max(1, int(len(s) * 0.15))]
-    return max(median(bot), 1e-8)
-
-
-# ===== Speech boundary search =====
-
-def search_energy_transition(
-    audio: list[float], sr: int,
-    anchor_time: float,
-    search_fwd_s: float,
-    noise_floor: float,
-    hop_ms: float = 5.0,
-    direction: str = "rise",
-) -> float | None:
-    """
-    Search around anchor_time for an energy transition.
-
-    direction="rise": search forward to find where RMS rises (word start push later)
-    direction="fall": search to find where RMS drops below threshold (word end)
-      - If anchor is in speech, search forward for the drop
-      - If anchor is already in silence, search backward for where speech ended
-    """
-    hs = max(1, int(hop_ms / 1000.0 * sr))
-    fs = max(1, int(0.01 * sr))
+def _search_energy_rise(audio: np.ndarray, sr: int,
+                        anchor_time: float, search_fwd_s: float,
+                        noise_floor: float) -> float | None:
+    """Search forward from *anchor_time* for sustained energy rise."""
+    fs = max(1, int(0.005 * sr))          # 5 ms frames
     threshold = noise_floor * 3.0
-    min_run = max(1, int(0.03 / (hop_ms / 1000.0)))
+    min_run = max(1, int(0.03 / 0.005))   # 6 frames @ 5 ms
 
-    if direction == "fall":
-        # 先检查锚点处是否已经是静音 (语音可能已在前方结束)
-        check_s = int(max(0, anchor_time) * sr)
-        check_e = min(len(audio), int((anchor_time + 0.05) * sr))
-        if check_e > check_s + fs:
-            check_seg = audio[check_s:check_e]
-            check_rms = frame_rms(check_seg, sr, frame_ms=10.0, hop_ms=hop_ms)
-            if check_rms and all(v < threshold for v in check_rms[:min(3, len(check_rms))]):
-                # 锚点已在静音中 → 向左搜索语音终点
-                t_start = max(0, anchor_time - 0.4)
-                t_end = min(len(audio) / sr, anchor_time + 0.05)
-                s = int(t_start * sr); e = int(t_end * sr)
-                if e <= s + fs: return None
-                seg = audio[s:e]
-                rms_vals = frame_rms(seg, sr, frame_ms=10.0, hop_ms=hop_ms)
-                n = len(rms_vals)
-                if n < 10: return None
-                # 从锚点向左找最后一个高于阈值的帧
-                anchor_idx = int((anchor_time - t_start) * 1000 / hop_ms)
-                anchor_idx = min(anchor_idx, n - 1)
-                last_above = None
-                for i in range(anchor_idx - min_run, 0, -1):
-                    if all(rms_vals[i + j] > threshold for j in range(min_run)):
-                        last_above = i + min_run
-                        break
-                if last_above is not None:
-                    t = t_start + last_above * hop_ms / 1000.0
+    s = int(anchor_time * sr)
+    e = min(len(audio), int((anchor_time + search_fwd_s) * sr))
+    if e <= s + fs * min_run:
+        return None
+
+    rms, frame_dur = frame_rms(audio[s:e], sr, frame_ms=5.0)
+    if len(rms) < min_run:
+        return None
+
+    onset = speech_onset(rms, 0, threshold, min_consecutive=min_run)
+    if onset is None:
+        return None
+    t = anchor_time + onset * frame_dur
+    return t if t > anchor_time + 0.015 else None
+
+
+def _search_energy_fall(audio: np.ndarray, sr: int,
+                        anchor_time: float, search_fwd_s: float,
+                        noise_floor: float) -> float | None:
+    """Search for energy fall: extend word end forward, or shorten backward."""
+    fs = max(1, int(0.005 * sr))
+    threshold = noise_floor * 3.0
+    min_run = max(1, int(0.03 / 0.005))
+
+    # First: check if anchor is already in silence → search backward
+    check_s = int(max(0, anchor_time) * sr)
+    check_e = min(len(audio), int((anchor_time + 0.05) * sr))
+    if check_e > check_s + fs:
+        check_rms, _ = frame_rms(audio[check_s:check_e], sr, frame_ms=10.0)
+        if len(check_rms) >= 3 and np.all(check_rms[:3] < threshold):
+            # Anchor in silence — search backward from anchor
+            t_start = max(0, anchor_time - 0.4)
+            t_end = min(len(audio) / sr, anchor_time + 0.05)
+            s = int(t_start * sr); e = int(t_end * sr)
+            if e <= s + fs:
+                return None
+            rms, frame_dur = frame_rms(audio[s:e], sr, frame_ms=10.0)
+            n = len(rms)
+            if n < 10:
+                return None
+            anchor_idx = int((anchor_time - t_start) / frame_dur)
+            anchor_idx = min(anchor_idx, n - 1)
+            # Search backward from anchor for last above-threshold
+            search_end = max(0, anchor_idx - min_run)
+            for i in range(search_end, 0, -1):
+                if np.all(rms[i:i + min_run] > threshold):
+                    t = t_start + (i + min_run) * frame_dur
                     if anchor_time - t > 0.03:
                         return t
-                return None
+                    break
+            return None
 
-    # 默认: 从 anchor 向前搜索
-    t_start = anchor_time
-    t_end = min(len(audio) / sr, anchor_time + search_fwd_s)
-    s = int(t_start * sr)
-    e = int(t_end * sr)
-    if e <= s + fs:
-        return None
-    seg = audio[s:e]
-    rms_vals = frame_rms(seg, sr, frame_ms=10.0, hop_ms=hop_ms)
-    n = len(rms_vals)
-    if n < 10:
+    # Forward search for energy drop
+    s = int(anchor_time * sr)
+    e = min(len(audio), int((anchor_time + search_fwd_s) * sr))
+    if e <= s + fs * min_run:
         return None
 
-    if direction == "rise":
-        for i in range(0, n - min_run):
-            if all(rms_vals[i + j] > threshold for j in range(min_run)):
-                t = t_start + i * hop_ms / 1000.0
-                if t > anchor_time + 0.015:
-                    return t
-    else:  # "fall"
-        for i in range(0, n - min_run):
-            if all(rms_vals[i + j] < threshold for j in range(min_run)):
-                t = t_start + i * hop_ms / 1000.0
-                if abs(t - anchor_time) > 0.015:
-                    return t
+    rms, frame_dur = frame_rms(audio[s:e], sr, frame_ms=5.0)
+    if len(rms) < min_run:
+        return None
+
+    below = np.where(rms < threshold)[0]
+    for i in range(len(below) - min_run + 1):
+        if below[i + min_run - 1] - below[i] == min_run - 1:
+            t = anchor_time + below[i] * frame_dur
+            if abs(t - anchor_time) > 0.015:
+                return t
+            break
     return None
 
 
 # ===== Main adjustment =====
 
 def adjust_boundaries(tokens: list[dict], punct: list[dict],
-                      audio: list[float], sr: int) -> tuple[list[dict], list[dict], dict]:
+                      audio: np.ndarray, sr: int
+                      ) -> tuple[list[dict], list[dict], dict]:
     stats = {"start_adj": 0, "end_extend": 0, "end_shorten": 0, "punct_adj": 0}
 
     def _is_nvv(w: str) -> bool:
         return bool(re.match(r'^[A-Z][A-Z0-9-]*[A-Z0-9]$', w))
 
-    nf = global_noise_floor(audio, sr)
+    # Pre-compute global RMS once (reused for noise floor)
+    full_rms, rms_frame_dur = frame_rms(audio, sr, frame_ms=20.0)
+    nf = noise_floor_from_rms(full_rms, bottom_pct=0.15)
 
     # --- Part 1: word start boundaries (sentence start / after punctuation) ---
-    # 只对紧接标点/句首的普通词做 start 修正, NVV 和非首词不动
     for idx, tok in enumerate(tokens):
         if _is_nvv(tok["word"]):
             continue
@@ -171,9 +144,7 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
         if not check:
             continue
 
-        onset = search_energy_transition(
-            audio, sr, tok["start_s"], search_fwd_s=0.40,
-            noise_floor=nf, direction="rise")
+        onset = _search_energy_rise(audio, sr, tok["start_s"], 0.40, nf)
         if onset is None or onset <= tok["start_s"] + 0.02:
             continue
 
@@ -186,7 +157,6 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
         tok["start_s"] = round(new_start, 3)
         tok["start_ms"] = round(new_start * 1000, 1)
 
-        # 如果 onset 在 end 之后, 推后 end, 但不能越过下一个词的 start
         if onset >= tok["end_s"]:
             pushed_end = onset + min_dur
             if idx + 1 < len(tokens):
@@ -206,7 +176,6 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
                 stats["punct_adj"] += 1
 
     # --- Part 2: word end boundaries (sentence end / before punctuation) ---
-    # 只对标点前/句尾的普通词做 end 修正, NVV 不动
     for idx, tok in enumerate(tokens):
         if _is_nvv(tok["word"]):
             continue
@@ -223,9 +192,7 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
         if not check:
             continue
 
-        offset = search_energy_transition(
-            audio, sr, tok["end_s"], search_fwd_s=0.35,
-            noise_floor=nf, direction="fall")
+        offset = _search_energy_fall(audio, sr, tok["end_s"], 0.35, nf)
         if offset is None or abs(offset - tok["end_s"]) < 0.02:
             continue
 
@@ -233,8 +200,6 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
         new_end = round(offset, 3)
 
         if new_end > old_end:
-            # Speech continues past the word boundary -> extend
-            # 不能越过下一个非 NVV 词的 start
             if next_tok and not _is_nvv(next_tok["word"]):
                 if new_end >= next_tok["start_s"] - 0.02:
                     new_end = next_tok["start_s"] - 0.02
@@ -248,9 +213,7 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
                     p["start_s"] = new_end
                     p["start_ms"] = round(new_end * 1000, 1)
                     stats["punct_adj"] += 1
-
         elif new_end < old_end - 0.04:
-            # Energy already dropped before word end -> shorten
             if new_end <= tok["start_s"] + 0.04:
                 continue
             tok["end_s"] = new_end
@@ -277,16 +240,9 @@ def _quote(value: str) -> str:
 
 def rebuild_textgrid(orig_tg: Path, out_tg: Path,
                      tokens: list[dict], punct: list[dict]) -> None:
-    """Rebuild TextGrid words tier with adjusted timestamps (no regex)."""
     tg_text = orig_tg.read_text(encoding="utf-8")
-
-    # Extract overall duration from xmax line
     m = re.search(r'^xmax = ([\d.]+)', tg_text, re.MULTILINE)
     duration_s = float(m.group(1)) if m else tokens[-1]["end_s"] + 1.0
-
-    # Build combined interval list sorted by start time
-    def _is_nvv(w: str) -> bool:
-        return bool(re.match(r'^[A-Z][A-Z0-9-]*[A-Z0-9]$', w))
 
     all_items = []
     for t in tokens:
@@ -307,7 +263,6 @@ def rebuild_textgrid(orig_tg: Path, out_tg: Path,
     if cursor < duration_s - 0.005:
         intervals.append((cursor, duration_s, ""))
 
-    # Write entire TextGrid from scratch (reliable, no format fragility)
     lines = [
         'File type = "ooTextFile"', 'Object class = "TextGrid"', "",
         f"xmin = {_fmt(0)} ", f"xmax = {_fmt(duration_s)} ",
@@ -353,7 +308,7 @@ def process_one(stem: str, ctc_dir: Path, audio_dir: Path,
 
     orig_tg = ctc_dir / f"{stem}.TextGrid"
     if orig_tg.exists():
-        rebuild_textgrid(orig_tg, out_dir / f"{stem}.TextGrid",
+        rebuild_textgrid(orig_tg, out_tg / f"{stem}.TextGrid",
                         adj_tokens, adj_punct)
 
     for suffix in [".lab", "_text_cn.txt"]:

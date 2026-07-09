@@ -543,8 +543,8 @@ def build_pinyin_phones_tier(phones_tier: Tier,
             new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, w_iv.text))
             continue
 
-        # NVV token: one self-referential phone
-        if is_nvv_token(w_iv.text):
+        # NVV / English token: one self-referential phone
+        if is_nvv_token(w_iv.text) or is_english_token(w_iv.text):
             new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, w_iv.text))
             continue
 
@@ -647,19 +647,23 @@ def handle_unexpected_silences(textgrid: TextGrid, pinyin_text: str) -> list[str
 
     filter_reasons = []
 
-    # Process gaps in REVERSE order (to preserve indices during deletion)
-    for k in range(n - 1, 0, -1):
+    # Build delete markers for sp0 merges (avoid O(n²) list deletion)
+    to_delete_words: set[int] = set()
+    to_delete_phones: set[int] = set()
+    to_delete_pp: set[int] = set()
+    merge_ops: list[tuple[int, int, float]] = []  # (word_idx, sil_idx, sil_xmax)
+
+    for k in range(1, n):
         sil_label = gap_sil[k]
         has_punct = gap_punct[k]
         if sil_label is None or has_punct:
-            continue  # no silence, or silence expected (punctuation present)
+            continue
 
-        # Silence without punctuation — unexpected pause
         if sil_label in ("<sp1>", "<sp2>", "<sp3>"):
             filter_reasons.append("unexpected_silence")
             continue
 
-        # <sp0>: merge into previous word (word index = tg_word_idx[k-1])
+        # <sp0>: merge into previous word
         prev_word_idx = tg_word_idx[k - 1]
         sil_idx = None
         for j in range(prev_word_idx + 1, tg_word_idx[k]):
@@ -672,44 +676,46 @@ def handle_unexpected_silences(textgrid: TextGrid, pinyin_text: str) -> list[str
         sil_iv = words_tier.intervals[sil_idx]
         prev_w_iv = words_tier.intervals[prev_word_idx]
 
-        # Extend word
-        prev_w_iv.xmax = sil_iv.xmax
+        # Record merge op (apply after all scans, avoids index shifting hell)
+        merge_ops.append((prev_word_idx, sil_idx, sil_iv.xmax))
+        to_delete_words.add(sil_idx)
 
+        # Find matching silence in phones & pp tiers
+        for pi, p in enumerate(phones_tier.intervals):
+            if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
+               and abs(p.xmax - sil_iv.xmax) < 0.01:
+                to_delete_phones.add(pi)
+                break
+        for pi, p in enumerate(pp_tier.intervals):
+            if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
+               and abs(p.xmax - sil_iv.xmax) < 0.01:
+                to_delete_pp.add(pi)
+                break
+
+    # Apply merge ops (extend word + last phone)
+    for prev_wi, sil_idx, sil_xmax in merge_ops:
+        prev_w = words_tier.intervals[prev_wi]
+        prev_w.xmax = sil_xmax
         # Extend last phone of previous word
         for pi in range(len(phones_tier.intervals) - 1, -1, -1):
             p = phones_tier.intervals[pi]
-            if not is_silence(p.text) and p.text != 'spn' and abs(p.xmax - sil_iv.xmin) < 0.01:
-                p.xmax = sil_iv.xmax
-                # Fix next interval's xmin
+            if not is_silence(p.text) and p.text != 'spn' \
+               and abs(p.xmax - words_tier.intervals[sil_idx].xmin) < 0.01:
+                p.xmax = sil_xmax
                 if pi + 1 < len(phones_tier.intervals):
-                    phones_tier.intervals[pi + 1].xmin = sil_iv.xmax
+                    phones_tier.intervals[pi + 1].xmin = sil_xmax
                 break
 
-        # Remove silence from all three tiers
-        for tier, idxs in [
-            (words_tier, (sil_idx,)),
-            (phones_tier, ()),
-            (pp_tier, ()),
-        ]:
-            pass  # handled below
-
-        # Remove from words tier
-        del words_tier.intervals[sil_idx]
-        # Remove matching from phones tier (find by time match)
-        for pi, p in enumerate(phones_tier.intervals):
-            if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 and abs(p.xmax - sil_iv.xmax) < 0.01:
-                del phones_tier.intervals[pi]
-                break
-        # Remove matching from pinyin_phones tier
-        for pi, p in enumerate(pp_tier.intervals):
-            if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 and abs(p.xmax - sil_iv.xmax) < 0.01:
-                del pp_tier.intervals[pi]
-                break
-
-        # Update tg_word_idx for subsequent iterations (indices shifted after deletion)
-        for i in range(len(tg_word_idx)):
-            if tg_word_idx[i] > sil_idx:
-                tg_word_idx[i] -= 1
+    # One-pass filter: keep non-deleted intervals (O(n) instead of O(n²))
+    if to_delete_words:
+        words_tier.intervals = [iv for i, iv in enumerate(words_tier.intervals)
+                                if i not in to_delete_words]
+    if to_delete_phones:
+        phones_tier.intervals = [iv for i, iv in enumerate(phones_tier.intervals)
+                                 if i not in to_delete_phones]
+    if to_delete_pp:
+        pp_tier.intervals = [iv for i, iv in enumerate(pp_tier.intervals)
+                             if i not in to_delete_pp]
 
     # Clean up zero-duration remnants in all tiers
     for tier in (words_tier, phones_tier, pp_tier):
@@ -822,31 +828,80 @@ def _extract_word_chars(text: str) -> list[str]:
 
 
 def _build_hanzi_tier(words_tier: Tier, raw_text: str) -> Tier:
-    """Create a hanzi tier with one CJC character per non-silence word interval."""
-    # Strip <sp1> prefix for character alignment
+    """Create a hanzi tier with one CJC character per non-silence word interval.
+
+    English tokens are self-referential (the token text itself as hanzi label)
+    and consume the next alpha group from the chars list.
+    """
     chars = _extract_word_chars(raw_text.replace('<sp1>', ''))
     intervals = []
     char_idx = 0
     for iv in words_tier.intervals:
         if is_silence(iv.text) or not iv.text.strip():
             intervals.append(Interval(iv.xmin, iv.xmax, silence_label(iv.duration)))
-        else:
-            if char_idx < len(chars):
-                intervals.append(Interval(iv.xmin, iv.xmax, chars[char_idx]))
+        elif is_english_token(iv.text):
+            # Self-referential: use token text as hanzi
+            intervals.append(Interval(iv.xmin, iv.xmax, iv.text))
+            # Consume the next alpha group from chars (if present)
+            if char_idx < len(chars) and chars[char_idx].isascii() and chars[char_idx].isalpha():
                 char_idx += 1
-            else:
-                intervals.append(Interval(iv.xmin, iv.xmax, iv.text))
+        elif char_idx < len(chars):
+            intervals.append(Interval(iv.xmin, iv.xmax, chars[char_idx]))
+            char_idx += 1
+        else:
+            intervals.append(Interval(iv.xmin, iv.xmax, iv.text))
     return Tier("hanzi", words_tier.xmin, words_tier.xmax, intervals)
 
 
-def _word_rms(audio: list[float], sr: int, xmin: float, xmax: float) -> float:
-    """Mean absolute amplitude of a time slice."""
+# ---------------------------------------------------------------------------
+# Audio I/O (NumPy-based — shared with audio_energy.py)
+# ---------------------------------------------------------------------------
+
+def load_audio(path: Path) -> tuple["np.ndarray", int]:
+    """Load WAV as float32 mono numpy array.  Returns (audio, sample_rate)."""
+    import numpy as _np
+    import soundfile as _sf
+    data, sr = _sf.read(str(path), dtype="float32")
+    if data.ndim > 1:
+        data = data[:, 0].copy()
+    return _np.ascontiguousarray(data, dtype=_np.float32), int(sr)
+
+
+# ---------------------------------------------------------------------------
+# Energy helpers (NumPy vectorised)
+# ---------------------------------------------------------------------------
+
+def _frame_rms_vec(audio, sr: int, frame_ms: float = 5.0
+                   ) -> tuple["np.ndarray", float]:
+    """RMS per frame (vectorised).  Returns (rms, frame_dur_s)."""
+    import numpy as _np
+    fs = max(1, int(frame_ms / 1000.0 * sr))
+    n_frames = max(0, (len(audio) - fs) // fs + 1)
+    if n_frames == 0:
+        return _np.array([], dtype=_np.float32), 0.0
+    frames = audio[:n_frames * fs].reshape(n_frames, fs)
+    rms = _np.sqrt(_np.mean(frames.astype(_np.float64) ** 2, axis=1) + 1e-12)
+    return rms.astype(_np.float32), fs / sr
+
+
+def _word_rms(audio, sr: int, xmin: float, xmax: float) -> float:
+    """Mean absolute amplitude in time slice [xmin, xmax)."""
+    import numpy as _np
     s = max(0, int(xmin * sr))
     e = min(len(audio), int(xmax * sr))
     if e <= s:
         return 0.0
-    seg = [abs(v) for v in audio[s:e]]
-    return sum(seg) / len(seg) if seg else 0.0
+    return float(_np.mean(_np.abs(audio[s:e])))
+
+
+def _noise_floor(audio, sr: int, bottom_pct: float = 0.10) -> float:
+    """Estimate noise floor from quietest *bottom_pct* of 5ms frames."""
+    import numpy as _np
+    rms, _ = _frame_rms_vec(audio, sr, frame_ms=5.0)
+    if len(rms) == 0:
+        return 0.0
+    k = max(1, int(len(rms) * bottom_pct))
+    return float(_np.partition(rms, k)[k])
 
 
 def _is_cjk(ch: str) -> bool:
@@ -854,9 +909,26 @@ def _is_cjk(ch: str) -> bool:
 
 
 def is_nvv_token(s: str) -> bool:
-    """Check if token is an NVV uppercase label (BREATHING, QUESTION-YI, etc.)."""
+    """Check if token is an NVV label (BREATHING, QUESTION-YI, etc.)."""
+    return s.upper() in NVV_NAMES
+
+
+def is_english_token(token: str) -> bool:
+    """Token is English alpha: not NVV, not CJK, not pinyin syllable with tone.
+
+    English tokens are self-referential in MFA dict (like NVV) and use
+    CTC-only boundaries.  E.g. "li", "ve", "A", "I", "AI", "live".
+    """
     import re as _re
-    return bool(_re.match(r'^[A-Z][A-Z0-9-]*[A-Z0-9]$', s))
+    if not token or not token.isalpha():
+        return False
+    if not token.isascii():
+        return False  # CJK chars are alpha in Python but not English
+    if is_nvv_token(token):
+        return False
+    if _re.match(r'^[a-z]+[1-5]$', token):
+        return False
+    return True
 
 
 def _is_word_like(s: str) -> bool:
@@ -970,90 +1042,90 @@ def build_corrected_text(words_tier: Tier, raw_text: str, pinyin_text: str) -> s
 # Energy-based fix (unchanged)
 # ---------------------------------------------------------------------------
 
-def load_audio(path: Path) -> tuple[list[float], int]:
-    with wave.open(str(path), "rb") as wav:
-        ch = wav.getnchannels()
-        sw = wav.getsampwidth()
-        sr = wav.getframerate()
-        frames = wav.readframes(wav.getnframes())
-    if sw == 1:
-        return [(s - 128) / 128.0 for s in frames[::ch]], sr
-    if sw in {2, 4}:
-        tc = "h" if sw == 2 else "i"
-        scale = float(2 ** (8 * sw - 1))
-        samples = array.array(tc)
-        samples.frombytes(frames)
-        return [samples[i] / scale for i in range(0, len(samples), ch)], sr
-    raise ValueError(f"Unsupported sample width: {sw}")
+# (load_audio / frame_rms / median replaced by NumPy vectorised versions above)
 
 
-def frame_rms(audio: list[float], frame_size: int, hop_size: int) -> list[float]:
+def _frame_rms_legacy(audio, frame_size: int, hop_size: int):
+    """Compatibility wrapper — use _frame_rms_vec for new code."""
+    import numpy as _np
     if len(audio) < frame_size:
         return []
-    return [math.sqrt(sum(s * s for s in audio[s:s + frame_size]) / frame_size + 1e-12)
-            for s in range(0, len(audio) - frame_size + 1, hop_size)]
+    n_frames = (len(audio) - frame_size) // hop_size + 1
+    if n_frames <= 0:
+        return []
+    # Build frame indices (non-vectorised but much faster than element-wise)
+    idx = _np.arange(n_frames) * hop_size
+    frames = _np.array([audio[i:i + frame_size] for i in idx])
+    rms = _np.sqrt(_np.mean(frames.astype(_np.float64) ** 2, axis=1) + 1e-12)
+    return rms.tolist()
 
 
-def median(values: list[float]) -> float:
-    if not values:
+def _median_legacy(values) -> float:
+    """Compatibility wrapper — use np.median for new code."""
+    import numpy as _np
+    if not hasattr(values, '__len__') or len(values) == 0:  # type: ignore[arg-type]
         return 0.0
-    s = sorted(values)
-    m = len(s) // 2
-    return s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2.0
+    return float(_np.median(_np.asarray(values, dtype=_np.float64)))
+
+# Alias old names to legacy wrappers (all callers continue to work)
+frame_rms = _frame_rms_legacy
+median = _median_legacy
 
 
 def find_speech_in_silence(
-    audio: list[float], sr: int, sil_start: float, sil_end: float,
+    audio, sr: int, sil_start: float, sil_end: float,
     search_sec: float, frame_ms: float, hop_ms: float,
     thresh_ratio: float, min_region_sec: float,
 ) -> tuple[float, float] | None:
+    """Find speech burst inside a silence region (vectorised)."""
+    import numpy as _np
     search_end = min(sil_end, sil_start + search_sec)
     ss = max(0, int(sil_start * sr))
     es = min(len(audio), int(search_end * sr))
     if es <= ss:
         return None
-    seg = audio[ss:es]
-    fs = max(1, int(frame_ms / 1000.0 * sr))
-    hs = max(1, int(hop_ms / 1000.0 * sr))
-    rms = frame_rms(seg, fs, hs)
-    if not rms:
+    rms, frame_dur = _frame_rms_vec(audio[ss:es], sr, frame_ms=hop_ms)
+    if len(rms) == 0:
         return None
     tail = rms[max(0, int(len(rms) * 0.6)):]
-    noise = median(tail) if tail else median(rms)
-    peak = max(rms)
+    noise = float(_np.median(tail)) if len(tail) > 0 else float(_np.median(rms))
+    peak = float(_np.max(rms))
     threshold = max(noise * thresh_ratio, peak * 0.15)
-    active = [v > threshold for v in rms]
     min_f = max(1, int(min_region_sec / (hop_ms / 1000.0)))
+    active = rms > threshold
+    # Find first sustained active run
     first = None
-    for i in range(len(active)):
-        if sum(active[i:i + min_f]) >= min_f:
+    for i in range(len(active) - min_f + 1):
+        if _np.all(active[i:i + min_f]):
             first = i
             break
     if first is None:
         return None
+    # Find first sustained inactive run after 'first'
     last = None
-    for i in range(first, len(active)):
-        if not active[i] and sum(1 for j in range(i, min(i + min_f, len(active))) if not active[j]) >= min_f:
+    for i in range(first + min_f, len(active) - min_f + 1):
+        if _np.all(~active[i:i + min_f]):
             last = i
             break
     if last is None:
-        last = max(i for i, v in enumerate(active) if v) + 1
-    sp_start = sil_start + first * hop_ms / 1000.0
-    sp_end = sil_start + last * hop_ms / 1000.0 + frame_ms / 1000.0
+        last = int(_np.max(_np.where(active)[0])) + 1
+    sp_start = sil_start + first * frame_dur
+    sp_end = sil_start + last * frame_dur + frame_ms / 1000.0
     sp_end = min(sp_end, sil_end)
     if sp_end - sp_start < min_region_sec or sp_start - sil_start > 0.35:
         return None
     return sp_start, sp_end
 
 
-def nonzero_mean(segment: list[float]) -> float:
-    """Mean absolute amplitude of non-zero values in a segment."""
-    if not segment:
+def nonzero_mean(segment) -> float:
+    """Mean absolute amplitude, ignoring near-zero samples (vectorised)."""
+    import numpy as _np
+    seg = _np.asarray(segment, dtype=_np.float32)
+    nz = _np.abs(seg)
+    mask = nz > 1e-12
+    if not mask.any():
         return 0.0
-    nonzero = [abs(v) for v in segment if abs(v) > 1e-12]
-    if not nonzero:
-        return 0.0
-    return sum(nonzero) / len(nonzero)
+    return float(_np.mean(nz[mask]))
 
 
 def merge_short_silences(textgrid: TextGrid, wav_path: Path | None, args,
@@ -1895,13 +1967,13 @@ def _merge_nvv_ellipsis(words_tier: Tier, pp_tier: Tier | None,
 def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
                                   search_window: float = 0.2,
                                   min_word_dur: float = 0.03) -> Tier:
-    """词落在静音段时向后搜索语音起点, 整体后移 (不越过后词)."""
-    fs = max(1, int(0.02 * sr))
-    hs = max(1, int(0.01 * sr))
-    all_rms = frame_rms(audio, fs, hs)
-    if not all_rms:
+    """词落在静音段时向后搜索语音起点, 整体后移 (不越过后词).  Vectorised."""
+    import numpy as _np
+    all_rms, _ = _frame_rms_vec(audio, sr, frame_ms=10.0)
+    if len(all_rms) == 0:
         return words_tier
-    nf = median(sorted(all_rms)[:max(1, int(len(all_rms) * 0.15))])
+    k = max(1, int(len(all_rms) * 0.15))
+    nf = float(_np.partition(all_rms, k)[k])
     threshold = max(nf * 3.0, 0.005)
 
     intervals = list(words_tier.intervals)
@@ -1919,8 +1991,9 @@ def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
         # 检查整词能量: 是否完全在静音中
         w_ss = max(0, int(word_start * sr))
         w_ee = min(len(audio), int(word_end * sr))
-        word_seg = audio[w_ss:w_ee] if w_ee > w_ss else []
-        word_rms = float(sum(abs(v) for v in word_seg)) / len(word_seg) if len(word_seg) else 0
+        if w_ee <= w_ss:
+            continue
+        word_rms = float(_np.mean(_np.abs(audio[w_ss:w_ee])))
 
         if word_rms >= threshold:
             continue  # 词有能量, 不需要整体移动
@@ -1939,19 +2012,21 @@ def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
             continue
 
         frame_s = max(1, int(0.005 * sr))
-        onset = None
-        for pos in range(s_sample, e_sample, frame_s):
-            pe = min(pos + frame_s, len(audio))
-            chunk = audio[pos:pe]
-            rms_val = float(sum(abs(v) for v in chunk)) / len(chunk) if len(chunk) else 0
-            if rms_val > threshold:
-                onset = pos / sr
-                break
+        n_frames = (e_sample - s_sample) // frame_s
+        if n_frames <= 0:
+            continue
+        frames = audio[s_sample:s_sample + n_frames * frame_s].reshape(n_frames, frame_s)
+        frame_rms_arr = _np.mean(_np.abs(frames), axis=1)
+        above = _np.where(frame_rms_arr > threshold)[0]
+        if len(above) == 0:
+            continue
+        onset = (s_sample + above[0] * frame_s) / sr
 
         if onset is None or onset <= word_start:
             continue
 
         # 整体后移: 不越过后词, 空间不够则放弃
+        dur = word_end - word_start
         new_start = onset
         new_end = onset + dur
         if i + 1 < n:
@@ -2014,8 +2089,8 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
         start_diff = abs(mfa_start - ctc_start)
         end_diff = abs(mfa_end - ctc_end)
         use_mfa = (start_diff <= snap_threshold and end_diff <= snap_threshold)
-        # NVV 不参考 MFA: MFA 没有 NVV 声学模型, 直接用 CTC 锚点
-        if is_nvv_token(mfa_iv.text):
+        # NVV / English 不参考 MFA: MFA 没有声学模型, 直接用 CTC 锚点
+        if is_nvv_token(mfa_iv.text) or is_english_token(mfa_iv.text):
             use_mfa = False
         # 保护: MFA 词过短时信任 CTC (避免 yi4 30ms 这类情况)
         ctc_dur = ctc_end - ctc_start
@@ -2183,16 +2258,20 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # Tier 2: pinyin with punctuation (from corpus txt)
     pinyin_text = txt_path.read_text(encoding="utf-8").strip()
 
-    # Fix <unk> from MFA: self-referential NVV tokens (BREATHING etc.) not in
-    # MFA acoustic model get replaced with <unk>.  Restore from .lab tokens.
+    # Fix <unk> from MFA: self-referential NVV / English tokens (BREATHING,
+    # li, ve etc.) not in MFA acoustic model get replaced with <unk>.
+    # Restore from .lab tokens.
     lab_tokens = pinyin_text.split()
     lab_idx = 0
     for iv in words_tier.intervals:
         if is_silence(iv.text) or iv.text.strip() in ("", "<eps>"):
             continue
         if lab_idx < len(lab_tokens):
-            if iv.text.strip() == "<unk>" and is_nvv_token(lab_tokens[lab_idx]):
-                iv.text = lab_tokens[lab_idx]
+            lab_token = lab_tokens[lab_idx]
+            if iv.text.strip() == "<unk>" and (
+                is_nvv_token(lab_token) or is_english_token(lab_token)
+            ):
+                iv.text = lab_token
             lab_idx += 1
 
     raw_tier = Tier("raw_text", tg.xmin, tg.xmax,

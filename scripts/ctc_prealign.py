@@ -82,6 +82,20 @@ def chars_and_pinyin(text: str):
     return chars, pinyins
 
 
+# ── NVV known names (shared with postprocess_textgrids.py) ──
+NVV_NAMES: set[str] = {
+    "BREATHING", "LAUGHTER", "BURP", "COUGH", "CRYING", "GROAN",
+    "HISS", "HUM", "SHH", "SIGH", "SNEEZE", "SNIFF", "SNORE",
+    "TSK", "UHM", "WHISTLE", "YAWN",
+    "QUESTION-YI", "QUESTION-EN", "QUESTION-OH", "QUESTION-AH",
+    "QUESTION-EI", "QUESTION-HUH",
+    "SURPRISE-OH", "SURPRISE-AH", "SURPRISE-WA", "SURPRISE-YO",
+    "CONFIRMATION-EN", "DISSATISFACTION-HNN",
+}
+
+_NVV_NAMES_UPPER = {n.upper() for n in NVV_NAMES}
+
+
 def is_pinyin_syllable(token: str) -> bool:
     """检查 token 是否为有效的拼音音节 (可被 MFA 词典识别).
 
@@ -94,9 +108,25 @@ def is_pinyin_syllable(token: str) -> bool:
 
 
 def is_nvv_token(token: str) -> bool:
-    """检查 token 是否为 NVV 大写标签 (QUESTION-YI, BREATHING 等)."""
-    import re
-    return bool(re.match(r'^[A-Z][A-Z0-9-]*[A-Z0-9]$', token))
+    """检查 token 是否为 NVV 标签 (BREATHING, QUESTION-YI 等)."""
+    return token.upper() in _NVV_NAMES_UPPER
+
+
+def is_english_token(token: str) -> bool:
+    """Token is English alpha: not CJK, not NVV, not pinyin syllable with tone.
+
+    English tokens (like "li", "ve", "A", "I", "AI", "live") are treated
+    as self-referential MFA dict entries and use CTC-only boundaries.
+    """
+    if not token or not token.isalpha():
+        return False
+    if not token.isascii():
+        return False  # CJK chars are alpha in Python but not English
+    if is_nvv_token(token):
+        return False
+    if is_pinyin_syllable(token):
+        return False
+    return True
 
 
 def load_mfa_word_set(dict_path: Path | None) -> set[str] | None:
@@ -531,8 +561,59 @@ def clean_unsupported_punct(text: str) -> str:
     return ''.join(result)
 
 
-def find_ref_text(stem: str, data_dir: Path) -> str | None:
-    """在 data_dir 递归搜索与 stem 匹配的原始中文文本."""
+def _build_txt_index(data_dir: Path) -> dict[str, Path]:
+    """Build {stem: path} index for .txt files — single scan, O(1) lookup."""
+    index: dict[str, Path] = {}
+    # Single-level scan first (fast, handles flat directories)
+    try:
+        with os.scandir(str(data_dir)) as it:
+            for entry in it:
+                if entry.is_file() and entry.name.endswith(".txt"):
+                    stem = entry.name[:-4]
+                    if stem not in index:
+                        index[stem] = Path(entry.path)
+    except OSError:
+        pass
+    # One level of subdirectories if top-level empty
+    if not index:
+        try:
+            with os.scandir(str(data_dir)) as it:
+                for entry in it:
+                    if entry.is_dir():
+                        try:
+                            with os.scandir(entry.path) as it2:
+                                for e2 in it2:
+                                    if e2.is_file() and e2.name.endswith('.txt'):
+                                        stem = e2.name[:-4]
+                                        if stem not in index:
+                                            index[stem] = Path(e2.path)
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+    return index
+
+
+def find_ref_text(stem: str, data_dir: Path,
+                  txt_index: dict[str, Path] | None = None) -> str | None:
+    """Look up reference text for *stem* using pre-built index or rglob fallback."""
+    # Use index if provided (O(1) lookup)
+    if txt_index is not None:
+        path = txt_index.get(stem)
+        if path:
+            return path.read_text(encoding="utf-8").strip()
+        for suffix in ("_qwen3-api", "_qwen3", "_firered"):
+            path = txt_index.get(f"{stem}{suffix}")
+            if path:
+                return path.read_text(encoding="utf-8").strip()
+        m = re.search(r"_(firered|qwen3|qwen3-api)$", stem)
+        if m:
+            path = txt_index.get(stem[:m.start()])
+            if path:
+                return path.read_text(encoding="utf-8").strip()
+        return None
+
+    # Fallback: slow rglob (for backward compatibility)
     candidates = list(data_dir.rglob(f"{stem}.txt"))
     if candidates:
         return candidates[0].read_text(encoding="utf-8").strip()
@@ -586,9 +667,13 @@ def main():
     ref_texts: dict[str, str] = {}
     missing_ref = []
     skipped_jp = []
+    # Build text index once (O(1) lookup per stem, no repeated rglob)
+    txt_index = _build_txt_index(args.data_dir)
+    print(f"  已索引 {len(txt_index)} 个文本文件")
+
     for wav_path in wav_files:
         stem = wav_path.stem
-        ref = find_ref_text(stem, args.data_dir)
+        ref = find_ref_text(stem, args.data_dir, txt_index)
         if ref:
             if has_japanese(ref):
                 skipped_jp.append(stem)
@@ -667,11 +752,12 @@ def main():
                 if mfa_words is not None:
                     return token in mfa_words
                 return True
-            # 英文/数字 (可能有)
-            if token.isalpha() or token.isdigit():
-                if mfa_words is not None:
-                    return token in mfa_words
-                return len(token) <= 1  # 单个字母/数字保留
+            # 英文 token — self-referential, 自动加入 MFA 词典
+            if is_english_token(token):
+                return True
+            # 数字
+            if token.isdigit():
+                return True
             return False
 
         # 将 CTC 对齐 token 映射到 MFA 词条
@@ -843,6 +929,35 @@ def main():
         except Exception as e:
             print(f"  FAIL {stem}: {e}")
             fail += 1
+
+    # ── Auto-add English tokens to MFA dictionary ──
+    # English tokens (like "li", "ve", "A", "I") are self-referential
+    # in the MFA dict — MFA can't model them acoustically, so they get
+    # CTC-only boundaries like NVV tokens.
+    if args.dict_path and args.dict_path.exists():
+        english_tokens_found: set[str] = set()
+        for entry in manifest:
+            for w in entry.get("_words", []):
+                token = w["word"]
+                if is_english_token(token):
+                    english_tokens_found.add(token)
+
+        if english_tokens_found:
+            existing = set()
+            with open(args.dict_path, encoding='utf-8-sig') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        existing.add(line.split()[0])
+            new_tokens = sorted(t for t in english_tokens_found if t not in existing)
+            if new_tokens:
+                with open(args.dict_path, 'a', encoding='utf-8') as f:
+                    for t in new_tokens:
+                        f.write(f"{t} {t}\n")
+                print(f"  Added {len(new_tokens)} English tokens to MFA dict: {', '.join(new_tokens)}")
+                mfa_words = load_mfa_word_set(args.dict_path)
+            else:
+                print(f"  English tokens already in MFA dict: {', '.join(sorted(english_tokens_found))}")
 
     # ── 保存 manifest + 逐词 tokens JSONL ──
     with open(args.output_dir / "manifest.json", "w", encoding="utf-8") as f:
