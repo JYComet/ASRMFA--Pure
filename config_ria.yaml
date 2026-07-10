@@ -1,3 +1,6 @@
 # RIA — 2 条合成音频 (无参考文本, ASR-only)
 workspace: ws_ria
 data_dir: data_dir/ria
+
+postprocess:
+  handle_unexpected_sil: true

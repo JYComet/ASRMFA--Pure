@@ -30,7 +30,7 @@ python scripts/trim_silence_batch.py --input-dir data\raw_wav --output-dir data\
 
 import argparse
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from pathlib import Path
 
 import numpy as np
@@ -42,57 +42,57 @@ except ImportError:
     from .audio_utils import resample_audio
 
 
-def detect_silence_at_beginning(
-    wav: np.ndarray,
-    sr: int,
-    silence_threshold: float = 0.01,
-    frame_length: int = 1024,
+def _detect_silence_at_beginning_vec(
+    wav: np.ndarray, sr: int, silence_threshold: float = 0.01, frame_length: int = 1024
 ) -> float:
+    """Vectorised: find leading silence duration using reshape + argmax."""
     frame_count = len(wav) // frame_length
-    silence_duration = 0.0
-    for i in range(frame_count):
-        start_idx = i * frame_length
-        end_idx = min((i + 1) * frame_length, len(wav))
-        frame = wav[start_idx:end_idx]
-        rms = np.sqrt(np.mean(frame ** 2)) if len(frame) > 0 else 0.0
-        if rms < silence_threshold:
-            silence_duration += frame_length / sr
-        else:
-            break
-    return silence_duration
+    if frame_count == 0:
+        return 0.0
+    frames = wav[:frame_count * frame_length].reshape(frame_count, frame_length)
+    rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
+    first_speech = np.argmax(rms >= silence_threshold)
+    if first_speech == 0 and rms[0] >= silence_threshold:
+        return 0.0
+    if first_speech == 0 and np.all(rms < silence_threshold):
+        return frame_count * frame_length / sr
+    return float(first_speech * frame_length / sr)
 
 
-def detect_silence_at_end(
-    wav: np.ndarray,
-    sr: int,
-    silence_threshold: float = 0.01,
-    frame_length: int = 1024,
+def _detect_silence_at_end_vec(
+    wav: np.ndarray, sr: int, silence_threshold: float = 0.01, frame_length: int = 1024
 ) -> float:
+    """Vectorised: find trailing silence duration (reversed frame scan)."""
     frame_count = len(wav) // frame_length
-    silence_duration = 0.0
-    for i in range(frame_count):
-        start_idx = max(0, len(wav) - (i + 1) * frame_length)
-        end_idx = len(wav) - i * frame_length
-        frame = wav[start_idx:end_idx]
-        rms = np.sqrt(np.mean(frame ** 2)) if len(frame) > 0 else 0.0
-        if rms < silence_threshold:
-            silence_duration += frame_length / sr
-        else:
-            break
-    return silence_duration
+    if frame_count == 0:
+        return 0.0
+    frames = wav[:frame_count * frame_length].reshape(frame_count, frame_length)
+    rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
+    # Scan reversed: find first speech frame from end
+    reversed_rms = rms[::-1]
+    first_speech_from_end = np.argmax(reversed_rms >= silence_threshold)
+    if first_speech_from_end == 0 and reversed_rms[0] >= silence_threshold:
+        return 0.0
+    if first_speech_from_end == 0 and np.all(reversed_rms < silence_threshold):
+        return frame_count * frame_length / sr
+    return float(first_speech_from_end * frame_length / sr)
+
+# Keep old names as aliases for compatibility
+detect_silence_at_beginning = _detect_silence_at_beginning_vec
+detect_silence_at_end = _detect_silence_at_end_vec
 
 
 def normalize_start_end_silence(
-    audio: np.ndarray,
-    sr: int,
+    audio: np.ndarray, sr: int,
     target_silence_sec: float = 0.5,
     silence_threshold: float = 0.01,
     frame_length: int = 1024,
 ) -> np.ndarray:
-    beginning_silence = detect_silence_at_beginning(
+    """Normalise leading/trailing silence to *target_silence_sec*."""
+    beginning_silence = _detect_silence_at_beginning_vec(
         audio, sr, silence_threshold=silence_threshold, frame_length=frame_length
     )
-    end_silence = detect_silence_at_end(
+    end_silence = _detect_silence_at_end_vec(
         audio, sr, silence_threshold=silence_threshold, frame_length=frame_length
     )
 
@@ -100,52 +100,49 @@ def normalize_start_end_silence(
     beginning_samples = int(beginning_silence * sr)
     end_samples = int(end_silence * sr)
 
-    # beginning
+    # --- beginning ---
     if beginning_silence > target_silence_sec:
-        start_idx = max(0, beginning_samples - target_samples)
-        processed = audio[start_idx:]
+        audio = audio[beginning_samples - target_samples:]
     elif beginning_silence < target_silence_sec:
-        padding_needed = target_samples - beginning_samples
-        processed = np.concatenate(
-            [np.zeros(padding_needed, dtype=np.float32), audio.astype(np.float32)]
-        )
+        pad = target_samples - beginning_samples
+        audio = np.concatenate([np.zeros(pad, dtype=np.float32),
+                                np.asarray(audio, dtype=np.float32)])
     else:
-        processed = audio.astype(np.float32)
+        audio = np.asarray(audio, dtype=np.float32)
 
-    # end
-    new_end_silence = detect_silence_at_end(
-        processed, sr, silence_threshold=silence_threshold, frame_length=frame_length
-    )
-    new_end_samples = int(new_end_silence * sr)
-    if new_end_silence > target_silence_sec:
-        end_idx = len(processed) - (new_end_samples - target_samples)
-        processed = processed[: max(0, end_idx)]
-    elif new_end_silence < target_silence_sec:
-        padding_needed = target_samples - new_end_samples
-        processed = np.concatenate(
-            [processed, np.zeros(padding_needed, dtype=np.float32)]
-        )
-    return processed
+    # --- end (offset by beginning padding, no re-scan needed) ---
+    pad_offset = max(0, target_samples - beginning_samples) if beginning_silence < target_silence_sec else 0
+    effective_end = end_silence
+    if pad_offset > 0 and beginning_silence < target_silence_sec:
+        # Audio was padded at front; end silence unchanged but frame alignment shifted
+        effective_end = end_silence
+
+    end_samples_actual = int(effective_end * sr)
+    if effective_end > target_silence_sec:
+        cut = end_samples_actual - target_samples
+        audio = audio[:max(0, len(audio) - cut)]
+    elif effective_end < target_silence_sec:
+        pad = target_samples - end_samples_actual
+        audio = np.concatenate([audio, np.zeros(pad, dtype=np.float32)])
+
+    return audio
 
 
 def search_silence_ranges(
-    wav,
-    sr,
-    sil_vol_threshold=0.003,
-    sil_len_threshold=0.08,
-):
-    def is_sil(seg):
-        return np.max(np.abs(seg)) < sil_vol_threshold
-
+    wav: np.ndarray, sr: int,
+    sil_vol_threshold: float = 0.003,
+    sil_len_threshold: float = 0.08,
+) -> list[list[int]]:
+    """Vectorised: find speech ranges by reshaping into 10ms frames."""
     wav_len = wav.shape[0]
-    step = int(sr * 0.01)  # 10ms
-    n_steps = int(np.ceil(wav_len / step))
+    step = int(sr * 0.01)
+    n_steps = max(0, wav_len // step)
+    if n_steps == 0:
+        return []
 
-    sil_labels = [True] * n_steps
-    for i in range(n_steps):
-        s = step * i
-        e = min(s + step, wav_len)
-        sil_labels[i] = is_sil(wav[s:e])
+    # Vectorised: reshape into [n_steps, step], compute max abs per step
+    frames = wav[:n_steps * step].reshape(n_steps, step)
+    sil_labels = np.max(np.abs(frames), axis=1) < sil_vol_threshold
 
     spk_ranges = []
     spk_start = None
@@ -155,17 +152,14 @@ def search_silence_ranges(
     for i in range(n_steps):
         if sil_labels[i]:
             if spk_start is not None and i - spk_start > min_spk_n:
-                s = max(0, spk_start - ext_n)
-                e = min(n_steps, i + ext_n)
-                spk_ranges.append([s, e])
+                spk_ranges.append([max(0, spk_start - ext_n), min(n_steps, i + ext_n)])
             spk_start = None
         else:
             if spk_start is None:
                 spk_start = i
 
     if spk_start is not None and n_steps - spk_start > 3:
-        s = max(0, spk_start - ext_n)
-        spk_ranges.append([s, n_steps])
+        spk_ranges.append([max(0, spk_start - ext_n), n_steps])
 
     sil_ranges = []
     if len(spk_ranges) == 0:
@@ -322,7 +316,8 @@ def main():
     ok = 0
     fail = 0
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+    from concurrent.futures import ProcessPoolExecutor as _PPE
+    with _PPE(max_workers=args.workers) as executor:
         futures = [
             executor.submit(
                 process_one_file,

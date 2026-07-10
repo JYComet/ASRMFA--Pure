@@ -142,6 +142,19 @@ def load_mfa_word_set(dict_path: Path | None) -> set[str] | None:
     return words
 
 
+def valid_mfa_word(token: str, mfa_words: set[str] | None = None) -> bool:
+    """Check if *token* should be kept in the MFA words tier."""
+    if is_nvv_token(token):
+        return token in mfa_words if mfa_words is not None else True
+    if is_pinyin_syllable(token):
+        return token in mfa_words if mfa_words is not None else True
+    if is_english_token(token):
+        return True
+    if token.isdigit():
+        return True
+    return False
+
+
 # ─── NVV 标签 → MFA 大写 token 映射 ───
 
 NVV_TO_MFA: dict[str, str] = {
@@ -190,11 +203,11 @@ def preprocess_asr_for_mfa(text: str) -> str:
     "[Breathing]" → "BREATHING"
     其他文本 (汉字/标点) 保持不变.
     """
-    return re.sub(
+    text = re.sub(
         r'\[([A-Za-z][^\]]*?)\]',
-        lambda m: nvv_to_mfa(m.group(0)),
-        text
-    )
+        lambda m: ' ' + nvv_to_mfa(m.group(0)) + ' ',
+        text)
+    return re.sub(r'\s+', ' ', text).strip()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -306,8 +319,14 @@ def make_patched_inference(ref_texts: dict[str, str],
             asr_text = tokenizer.decode(token_int)  # 仅用于显示/nvv标签
 
             # ── 后处理 (省略号标点去重等) ──
+            # Adjacent ellipsis+punct → punct only
             asr_text = re.sub(r'…([，。！？、；：,\.!\?;:])', r'\1', asr_text)
             asr_text = re.sub(r'([，。！？、；：,\.!\?;:])…', r'\1', asr_text)
+            # ，NVV… → ，NVV  (ellipsis redundant when punct already exists
+            # before the NVV token; the comma already marks the pause)
+            asr_text = re.sub(
+                r'([，。！？、；：,\.!\?;:])([A-Z][A-Z0-9-]*[A-Z0-9])…',
+                r'\1\2', asr_text)
             asr_text = re.sub(r'…{2,}', '…', asr_text)
             asr_text = re.sub(r'^((?:<\|[^|]+\|>|\[[^\]]+\])*)…+', r'\1', asr_text)
             asr_text = re.sub(
@@ -708,7 +727,23 @@ def main():
     # ── 批量推理 ──
     t0 = time.time()
     all_results = []
-    BATCH = 16  # 比 export_mfa_textgrid.py 稍小, 留 GPU 空间给 forced alignment
+
+    # Auto-select batch size based on GPU memory (if CUDA available)
+    def _detect_batch_size(device: str) -> int:
+        if device == "cpu" or not device.startswith("cuda"):
+            return 4
+        try:
+            mem_gb = torch.cuda.get_device_properties(device).total_mem / 1024**3
+            if mem_gb >= 40:   return 64   # A100, RTX 6000 Ada
+            if mem_gb >= 24:   return 32   # RTX 3090/4090
+            if mem_gb >= 16:   return 24   # RTX 3080/4080, A4000
+            if mem_gb >= 8:    return 16   # RTX 2070/3070
+            return 8
+        except Exception:
+            return 16
+
+    BATCH = _detect_batch_size(args.device)
+    print(f"  推理 batch size: {BATCH} (device: {args.device})")
     for bs in range(0, len(paths), BATCH):
         batch = paths[bs:bs + BATCH]
         res = model.generate(input=batch, language="zh", use_itn=True,
@@ -738,27 +773,6 @@ def main():
         stem = stems[i] if i < len(stems) else Path(r["key"]).stem
         words_aligned = r["words"]
         duration_s = r["duration_s"]
-
-        # 判断 token 类型并决定是否保留到 TextGrid
-        def valid_word(token: str) -> bool:
-            """token 在 MFA 词典中 → 保留; 标点/空白 → 剔除."""
-            # NVV 大写标签
-            if is_nvv_token(token):
-                if mfa_words is not None:
-                    return token in mfa_words
-                return True  # 无词典时也保留 NVV
-            # 拼音音节
-            if is_pinyin_syllable(token):
-                if mfa_words is not None:
-                    return token in mfa_words
-                return True
-            # 英文 token — self-referential, 自动加入 MFA 词典
-            if is_english_token(token):
-                return True
-            # 数字
-            if token.isdigit():
-                return True
-            return False
 
         # 将 CTC 对齐 token 映射到 MFA 词条
         # 策略: 遍历 words_aligned, 检测并合并 [NVV] 模式:
@@ -833,6 +847,39 @@ def main():
                     "end": w["end"],
                 })
 
+        # ── Merge consecutive single-ASCII-letter tokens ──
+        # The NVASR tokenizer splits OOV English words into individual
+        # letter tokens (e.g. "ria"→"R"+"I"+"A").  Merge them back so
+        # the token count stays aligned with reference-text word units.
+        if words_pinyin:
+            merged_pinyin = []
+            i = 0
+            while i < len(words_pinyin):
+                w = words_pinyin[i]
+                token = w["word"]
+                if (len(token) == 1 and token.isascii() and token.isalpha()
+                        and not is_nvv_token(token)):
+                    letters = [token]
+                    j = i + 1
+                    while j < len(words_pinyin):
+                        nt = words_pinyin[j]["word"]
+                        if (len(nt) == 1 and nt.isascii() and nt.isalpha()
+                                and not is_nvv_token(nt)):
+                            letters.append(nt)
+                            j += 1
+                        else:
+                            break
+                    merged_pinyin.append({
+                        "word": "".join(letters),
+                        "start": w["start"],
+                        "end": words_pinyin[j - 1]["end"],
+                    })
+                    i = j
+                else:
+                    merged_pinyin.append(w)
+                    i += 1
+            words_pinyin = merged_pinyin
+
         # 写 TextGrid — 含 pauses tier
         try:
             # 从 blank_runs 计算 ≥200ms 的停顿段
@@ -865,21 +912,27 @@ def main():
                 for p in punct_entries:
                     all_seq.append({"text": p["word"], "start": p["start"], "kind": "p"})
                 all_seq.sort(key=lambda x: x["start"])
-                # 最后标点: end = max(start, duration - 0.5s), 尾部留给静音
+                # 最後标点: end = max(start, duration - 0.5s), 尾部留给静音
                 last_punct = max(punct_entries, key=lambda x: x["start"]) if punct_entries else None
-                trailing_silence_s = max(0, duration_s - 0.5)
+                # Pre-extract sorted start times for O(P+T) monotonic lookup
+                seq_starts = [t["start"] for t in all_seq]
                 punct_data = []
+                next_idx = 0  # monotonic pointer
                 for p in punct_entries:
                     next_start = None
-                    for t in all_seq:
-                        if t["start"] > p["start"] + 0.001:
-                            next_start = t["start"]
-                            break
+                    while next_idx < len(seq_starts) and seq_starts[next_idx] <= p["start"] + 0.001:
+                        next_idx += 1
+                    if next_idx < len(seq_starts):
+                        next_start = seq_starts[next_idx]
                     if p is last_punct:
                         # 最后标点直接延续到音频结束
                         end_s = duration_s
                     else:
                         end_s = next_start if next_start is not None else p["end"]
+                    # Guard: CTC overlap (e.g. NVV inside word) can make
+                    # end_s < start_s, producing invalid intervals.
+                    if end_s <= p["start"]:
+                        end_s = p["start"] + 0.060  # min 1 frame width
                     punct_data.append({
                         "word": p["word"],
                         "start_ms": round(p["start"] * 1000, 1),
@@ -887,6 +940,22 @@ def main():
                         "start_s": p["start"],
                         "end_s": end_s,
                     })
+                # Dedup: remove … if it overlaps with a real punctuation mark
+                # (comma, period, etc.) — the punct mark already serves the
+                # pause-marking function.  NVV tokens must be preserved.
+                non_ellipsis = [p for p in punct_data if p["word"] != "…"]
+                ellipsis_only = [p for p in punct_data if p["word"] == "…"]
+                if non_ellipsis and ellipsis_only:
+                    kept_ellipsis = []
+                    for ep in ellipsis_only:
+                        overlap = any(
+                            nep["start_s"] < ep["end_s"]
+                            and nep["end_s"] > ep["start_s"]
+                            for nep in non_ellipsis)
+                        if not overlap:
+                            kept_ellipsis.append(ep)
+                    punct_data = non_ellipsis + kept_ellipsis
+
                 punct_path.write_text(json.dumps(punct_data, ensure_ascii=False),
                                      encoding="utf-8")
 
@@ -909,7 +978,15 @@ def main():
                                  text_cn)
             text_cn = re.sub(
                 r'\[([A-Za-z][^\]]*?)\]',
-                lambda m: nvv_to_mfa(m.group(0)), text_cn)
+                lambda m: ' ' + nvv_to_mfa(m.group(0)) + ' ', text_cn)
+            text_cn = re.sub(r'\s+', ' ', text_cn).strip()
+            # Same ellipsis-punct dedup as asr_text (lines 308-316)
+            text_cn = re.sub(r'…([，。！？、；：,\.!\?;:])', r'\1', text_cn)
+            text_cn = re.sub(r'([，。！？、；：,\.!\?;:])…', r'\1', text_cn)
+            text_cn = re.sub(
+                r'([，。！？、；：,\.!\?;:])([A-Z][A-Z0-9-]*[A-Z0-9])…',
+                r'\1\2', text_cn)
+            text_cn = re.sub(r'…{2,}', '…', text_cn)
             cn_path = args.output_dir / f"{stem}_text_cn.txt"
             cn_path.write_text(text_cn + "\n", encoding="utf-8")
 

@@ -3,8 +3,8 @@
 Complete Chinese MFA forced alignment pipeline.
 
 Full mode:  trim -> resample -> prealign -> normalize -> adjust -> validate -> align -> postprocess
-ctc_ready:  link -> resample -> adjust -> validate -> align -> postprocess
-            (skip trim/prealign/normalize — use pre-existing NVASR CTC output)
+ctc_ready:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+            (skip trim/prealign — use pre-existing NVASR CTC output)
 
 Usage:
   # Full pipeline
@@ -21,6 +21,7 @@ Usage:
 
 import argparse
 import os
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -33,6 +34,105 @@ except ModuleNotFoundError:
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = PROJECT_ROOT / "config.yaml"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Cross-platform path translation — Windows UNC ↔ Linux SMB mount
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Auto-detected mapping: Windows UNC → Linux mount point
+# Built at import time from /proc/mounts
+_WIN_UNC_MAP: dict[str, str] = {}
+
+def _detect_smb_mounts() -> dict[str, str]:
+    """Parse /proc/mounts for CIFS/SMB mounts; derive UNC→linux mapping."""
+    mapping: dict[str, str] = {}
+    if platform.system() == "Windows":
+        return mapping
+    try:
+        for line in Path("/proc/mounts").read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            dev, mnt, fstype = parts[0], parts[1], parts[2]
+            if fstype != "cifs":
+                continue
+            # dev = //server/share/path...
+            # Extract the share path
+            dev_path = dev.replace("//", "", 1)  # server/share/path...
+            if dev_path.startswith("192.168."):
+                # IP-based — match by network path convention
+                # Build possible UNC variants
+                server_share = dev_path
+                # e.g. "192.168.102.202/Research_TTS/Data/Raw" → map from multiple patterns
+                # Store as-is
+                unc = f"//{server_share}"
+                mapping[unc] = mnt
+                # Also store with backslash variant
+                mapping[unc.replace("/", "\\")] = mnt
+
+        # Build RS3621 mapping if we can find //192.168.102.202/Research_TTS
+        # This is the SMB server behind the DNS alias RS3621
+        for unc, mnt in list(mapping.items()):
+            clean = unc.replace("\\", "/")
+            if "192.168.102.202/Research_TTS" in clean:
+                # Map RS3621 aliases
+                parts_after = clean.split("Research_TTS", 1)
+                if len(parts_after) > 1:
+                    suffix = parts_after[1]
+                    mapping[f"//RS3621/Research_TTS{suffix}"] = mnt
+                    _win_suf = suffix.replace("/", "\\")
+                    mapping[f"\\\\RS3621\\Research_TTS{_win_suf}"] = mnt
+    except Exception:
+        pass
+    return mapping
+
+_WIN_UNC_MAP = _detect_smb_mounts()
+
+
+def translate_path(path_str: str) -> str:
+    """Convert Windows UNC paths to Linux mount paths.
+
+    On Windows, returns the path unchanged.
+    On Linux, translates ``\\\\RS3621\\...`` → ``/mnt/Raw/...`` etc.
+
+    Also handles mixed-separator paths from config files.
+    """
+    if not path_str or platform.system() == "Windows":
+        return path_str
+
+    # Normalise: backslash → forward slash for comparison
+    normalized = path_str.replace("\\", "/")
+
+    # Try exact match first, then longest-prefix match
+    for unc_raw, linux_mnt in sorted(_WIN_UNC_MAP.items(),
+                                     key=lambda x: -len(x[0])):
+        unc_norm = unc_raw.replace("\\", "/")
+        if normalized.startswith(unc_norm):
+            rest = normalized[len(unc_norm):]
+            # Remove leading slash if present (UNC path might have it)
+            rest = rest.lstrip("/")
+            result = f"{linux_mnt}/{rest}" if rest else linux_mnt
+            return result
+
+    return path_str
+
+
+def resolve_input_path(raw: str, base: Path = PROJECT_ROOT) -> Path:
+    """Resolve *raw* path with UNC→Linux translation + relative resolution.
+
+    - Empty / None → returns base
+    - Windows UNC → translated to Linux mount, then returned as Path
+    - Absolute path (already translated) → returned as-is
+    - Relative path → resolved against *base*
+    """
+    if not raw:
+        return base
+    translated = translate_path(raw)
+    p = Path(translated)
+    if p.is_absolute():
+        return p
+    return base / p
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +165,7 @@ DEFAULT_CFG: dict = {
         "require_all": True,       # skip stems missing any of the 6 CTC files
         "stem_range": None,        # optional [start, end] inclusive range filter
         "stems": None,             # optional explicit list of stems to process
+        "stem_prefix": "",         # prepended to numeric stems (e.g., "合成ria_")
     },
     "trim": {
         "max_silence_sec": 1.0,
@@ -88,11 +189,12 @@ DEFAULT_CFG: dict = {
     },
     "ctc_adjust": {"enabled": True, "limit": 0},
     "mfa": {
-        "num_jobs": 8,
+        "num_jobs": 0,               # 0 = auto (os.cpu_count())
         "single_speaker": True,
         "output_format": "long_textgrid",
-        "clean": True,
+        "clean": False,              # keep feature cache for faster re-runs
         "no_tokenization": True,
+        "skip_validate": True,       # MFA align internally validates; standalone validate is redundant
     },
     "postprocess": {
         "merge_silence": True,
@@ -119,6 +221,7 @@ DEFAULT_CFG: dict = {
         "filter_long_vowel_sec": 999.0,
         "enable_text_correction": True,
         "handle_unexpected_sil": True,
+        "workers": 0,            # 0 = auto (os.cpu_count())
     },
     "output_spec": {
         "trim": ["audio/**/*.wav"],
@@ -178,6 +281,14 @@ def resolve_path(base: Path, value: str | None) -> Path | None:
     return p if p.is_absolute() else base / p
 
 
+def resolve_num_jobs(cfg_val: int) -> int:
+    """Resolve *num_jobs* config value (0 = auto → os.cpu_count())."""
+    if cfg_val <= 0:
+        import multiprocessing as mp
+        return mp.cpu_count()
+    return cfg_val
+
+
 # ---------------------------------------------------------------------------
 # MFA environment
 # ---------------------------------------------------------------------------
@@ -207,7 +318,7 @@ def find_mfa_python(cfg_python: str = "") -> Path | None:
         Path("/opt/conda"),
         Path("/usr/local/anaconda3"),
     ]
-    env_names = ["mfa_chinese", "mfa_mandarin", "mfa"]
+    env_names = ["mfa_chinese", "mfa_mandarin", "mfa", "mfa-dev", "asr"]
     is_win = os.name == "nt"
 
     for conda_root in conda_roots:
@@ -241,7 +352,7 @@ def get_mfa_env(mfa_python: Path, models_dir: Path) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def run_python(script: Path, script_args: list[str], mfa_python: Path,
-               models_dir: Path, desc: str = "", timeout: int = 600) -> int:
+               models_dir: Path, desc: str = "", timeout: int = 86400) -> int:
     cmd = [str(mfa_python), str(script)] + script_args
     print(f"\n{'='*60}\n  {desc or script.name}\n  {' '.join(cmd)}\n{'='*60}\n")
     try:
@@ -304,6 +415,7 @@ def _resample_one(wav_path: Path, audio_dir: Path, out_dir: Path,
                   target_sr: int, overwrite: bool) -> tuple[str, bool, str]:
     """Worker for parallel resample (module-level, pickleable)."""
     import shutil
+    import struct
     import soundfile as sf
     sys.path.insert(0, str(SCRIPTS_DIR))
     from audio_utils import resample_audio
@@ -313,12 +425,24 @@ def _resample_one(wav_path: Path, audio_dir: Path, out_dir: Path,
     if out.exists() and not overwrite:
         return (str(rel), False, "skipped")
 
-    # Fast path: read only samplerate, hard-link if already at target
-    try:
-        info = sf.info(str(wav_path))
-        sr = info.samplerate
-    except Exception:
-        sr = 0
+    # Fast path: read sample rate from WAV header (44 bytes) instead of full
+    # sf.info() — saves ~5-15ms per file on SMB/CIFS mounts
+    def _read_sr_fast(p: Path) -> int:
+        """Read sample rate from WAV header only."""
+        try:
+            with open(str(p), 'rb') as fh:
+                header = fh.read(44)
+            if len(header) >= 40 and header[:4] == b'RIFF':
+                return struct.unpack_from('<I', header, 24)[0]
+        except Exception:
+            pass
+        # Fallback: soundfile (handles non-standard headers, FLAC, etc.)
+        try:
+            return sf.info(str(p)).samplerate
+        except Exception:
+            return 0
+
+    sr = _read_sr_fast(wav_path)
     if sr == target_sr:
         out.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -339,8 +463,14 @@ def _resample_one(wav_path: Path, audio_dir: Path, out_dir: Path,
 
 
 def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
-    """Resample trimmed audio to 16kHz for MFA (parallelised)."""
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    """Resample trimmed audio to 16kHz for MFA (parallelised).
+
+    Uses ThreadPoolExecutor because the work is I/O-bound (file read/write,
+    hard-link, copy) and any CPU work (scipy resample) releases the GIL.
+    This avoids ProcessPoolExecutor's per-worker spawn overhead on Windows
+    (each worker imports numpy/scipy/soundfile from scratch, ~2-5 s each).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     import multiprocessing as mp
 
     audio_dir = ctx["audio_dir"]
@@ -350,28 +480,63 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
 
     # Use scandir for fast flat-listing (common case)
     wavs: list[Path] = []
-    try:
-        with os.scandir(str(audio_dir)) as it:
-            for entry in it:
-                if entry.is_file() and entry.name.endswith(".wav"):
-                    wavs.append(Path(entry.path))
-    except OSError:
-        pass
+
+    # Fast path: read stems from ctc_ready manifest (no directory scan)
+    manifest_path = ctx.get("ctc_pretg", Path()) / "ctc_ready_manifest.json"
+    if manifest_path.exists():
+        import json as _json
+        try:
+            manifest = _json.loads(manifest_path.read_text())
+            stems = manifest.get("stems", [])
+            if stems:
+                wavs = []
+                missing = 0
+                for s in stems:
+                    w = _resolve_wav(audio_dir, s)
+                    if w:
+                        wavs.append(w)
+                    else:
+                        missing += 1
+                if missing:
+                    print(f"  Warning: {missing}/{len(stems)} WAVs not found"
+                          f" (mangled filenames)")
+                print(f"  Found {len(wavs)} WAVs from manifest"
+                      f" (skipping directory scan)")
+        except Exception:
+            pass
+
     if not wavs:
-        wavs = list(audio_dir.rglob("*.wav"))  # fallback to recursive
+        try:
+            with os.scandir(str(audio_dir)) as it:
+                for entry in it:
+                    if entry.is_file() and entry.name.endswith(".wav"):
+                        wavs.append(Path(entry.path))
+        except OSError:
+            pass
+        if not wavs:
+            wavs = list(audio_dir.rglob("*.wav"))  # fallback to recursive
 
     if not wavs:
         print("  No WAVs found in audio dir.")
         return 1
 
-    existing = list(mfa_audio_dir.rglob("*.wav")) if mfa_audio_dir.exists() else []
-    if len(existing) >= len(wavs) and not overwrite:
-        print(f"  {len(existing)} resampled WAVs already exist. Use --overwrite to redo.")
+    # Fast count via scandir (avoid rglob on SMB)
+    existing_count = 0
+    if mfa_audio_dir.exists():
+        try:
+            with os.scandir(str(mfa_audio_dir)) as it:
+                for entry in it:
+                    if entry.is_file() and entry.name.endswith(".wav"):
+                        existing_count += 1
+        except OSError:
+            pass
+    if existing_count >= len(wavs) and not overwrite:
+        print(f"  {existing_count} resampled WAVs already exist. Use --overwrite to redo.")
         return 0
 
     mfa_audio_dir.mkdir(parents=True, exist_ok=True)
 
-    n_workers = min(cfg.get("mfa", {}).get("num_jobs", mp.cpu_count()),
+    n_workers = min(resolve_num_jobs(cfg.get("mfa", {}).get("num_jobs", 0)),
                     len(wavs), mp.cpu_count())
     done = skipped = 0
     actions: dict[str, int] = {}
@@ -387,7 +552,7 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                 skipped += 1
             actions[action] = actions.get(action, 0) + 1
     else:
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
             futures = {
                 pool.submit(_resample_one, w, audio_dir, mfa_audio_dir,
                             target_sr, overwrite): w
@@ -418,12 +583,17 @@ def step_mfa_validate(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         if not list(corpus_dir.glob("*.txt")):
             print("ERROR: No .lab files in ctc_pretg/ or .txt files in pinyin_dir.")
             return 1
+    # Use pre-extracted directory if available — avoids MFA Archive.__init__
+    # deleting and re-extracting the zip (which races with parallel workers).
+    extracted = ctx["models_dir"] / "extracted_models" / "acoustic" / f"{cfg['acoustic_model']}_acoustic"
+    acoustic_model_arg = str(extracted) if extracted.is_dir() else cfg["acoustic_model"]
+
     mfa_args = [
         "validate", str(corpus_dir), str(ctx["mfa_dict"]),
-        "--acoustic_model_path", cfg["acoustic_model"],
+        "--acoustic_model_path", acoustic_model_arg,
         "--audio_directory", str(ctx["mfa_audio_dir"]),
         "--temporary_directory", str(ctx["temp_dir"]),
-        "--num_jobs", str(mc["num_jobs"]),
+        "--num_jobs", str(resolve_num_jobs(mc.get("num_jobs", 0))),
         "--overwrite",
     ]
     if mc.get("clean"):
@@ -479,6 +649,28 @@ def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                       timeout=pc.get("timeout", 3600))
 
 
+def step_normalize_punct(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
+    """Normalize ASCII punctuation to CJK equivalents in CTC output text."""
+    _punct_table = str.maketrans({
+        ",": "，",   # fullwidth comma  →
+        ".": "。",   # ideographic full stop  。
+        "?": "？",   # fullwidth question mark ？
+        "!": "！",   # fullwidth exclamation mark ！
+        ";": "；",   # fullwidth semicolon ；
+        ":": "：",   # fullwidth colon ：
+    })
+    ctc_dir = ctx["ctc_pretg"]
+    count = 0
+    for txt_file in sorted(ctc_dir.glob("*_text_cn.txt")):
+        text = txt_file.read_text(encoding="utf-8").strip()
+        normalized = text.translate(_punct_table)
+        if normalized != text:
+            txt_file.write_text(normalized + "\n", encoding="utf-8")
+            count += 1
+    print(f"  Normalized punctuation in {count} files")
+    return 0
+
+
 def step_normalize_text(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     """Normalize Arabic numerals to Chinese in CTC output text and .lab files."""
     try:
@@ -500,6 +692,24 @@ def step_normalize_text(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
             count += 1
     print(f"  Normalized numerals in {count} files")
     return 0
+
+
+def step_normalize_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
+    """Normalise English-word phonetic fragments in .lab and _tokens.jsonl.
+
+    NVASR tokenizer breaks OOV English words into pinyin approximations
+    (e.g. "ria"→"rui4"+"ya4").  This step merges them back into the
+    canonical spelling before MFA alignment.
+    """
+    ctc_dir = ctx["ctc_pretg"]
+    if not ctc_dir or not ctc_dir.exists():
+        return 0
+
+    script = SCRIPTS_DIR / "normalize_english_tokens.py"
+    return run_python(
+        script, ["--txt-dir", str(ctc_dir)],
+        mfa_python, ctx["models_dir"],
+        "Step 2b: Normalise English tokens")
 
 
 def step_adjust_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
@@ -548,11 +758,20 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     use_nvasr_corpus = ctc_dir.exists() and any(ctc_dir.glob("*.lab"))
     corpus_dir = ctc_dir if use_nvasr_corpus else ctx["pinyin_dir"]
 
-    # Clean temp dir when overwriting to avoid stale MFA cache
+    # Clean temp dir when overwriting — only remove alignment DB, keep feature cache
     import shutil
-    if args.overwrite and ctx["temp_dir"].exists():
-        shutil.rmtree(ctx["temp_dir"], ignore_errors=True)
-        ctx["temp_dir"].mkdir(parents=True, exist_ok=True)
+    if args.overwrite:
+        # Only clean alignment outputs, preserve MFCC feature cache in temp_dir
+        if ctx["aligned_dir"].exists():
+            shutil.rmtree(ctx["aligned_dir"], ignore_errors=True)
+            ctx["aligned_dir"].mkdir(parents=True, exist_ok=True)
+        # Remove stale MFA sqlite DBs (they reference old alignment state)
+        if ctx["temp_dir"].exists():
+            for db_file in ctx["temp_dir"].glob("*.db"):
+                try:
+                    db_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     if not list(corpus_dir.glob("*.lab" if use_nvasr_corpus else "*.txt")):
         print("ERROR: No corpus files found.")
@@ -567,13 +786,18 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         print(f"  CTC anchors:  {ctc_dir}")
         print(f"  Transcript and anchors from SAME source → 100% word match")
 
+    # Use pre-extracted directory if available — avoids MFA Archive.__init__
+    # deleting and re-extracting the zip (which races with parallel workers).
+    extracted_acoustic = ctx["models_dir"] / "extracted_models" / "acoustic" / f"{cfg['acoustic_model']}_acoustic"
+    acoustic_model_arg2 = str(extracted_acoustic) if extracted_acoustic.is_dir() else cfg["acoustic_model"]
+
     mfa_args = [
         "align", str(corpus_dir), str(ctx["mfa_dict"]),
-        cfg["acoustic_model"], str(ctx["aligned_dir"]),
+        acoustic_model_arg2, str(ctx["aligned_dir"]),
         "--audio_directory", str(ctx["mfa_audio_dir"]),
         "--temporary_directory", str(ctx["temp_dir"]),
         "--output_format", mc.get("output_format", "long_textgrid"),
-        "--num_jobs", str(mc["num_jobs"]),
+        "--num_jobs", str(resolve_num_jobs(mc.get("num_jobs", 0))),
         "--overwrite", "--no_textgrid_cleanup",
     ]
     if use_anchors:
@@ -650,6 +874,8 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         pp_args.append("--no-enable-text-correction")
     if not pc.get("handle_unexpected_sil", True):
         pp_args.append("--no-handle-unexpected-sil")
+    if pc.get("workers", 0) > 0:
+        pp_args += ["--workers", str(pc["workers"])]
     if args.overwrite:
         pp_args.append("--overwrite")
     return run_python(SCRIPTS_DIR / "postprocess_textgrids.py", pp_args, mfa_python,
@@ -685,7 +911,57 @@ SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 
 
 # ---------------------------------------------------------------------------
-# File-index helpers — O(1) stem lookups without recursive scanning
+# Scan cache -- persist directory scan results to skip re-scanning
+# ---------------------------------------------------------------------------
+
+CACHE_VERSION = 1
+
+
+def _get_cache_dir(config_path: Path, cache_dir_override: str | None = None) -> Path:
+    """Resolve the cache directory for *config_path*."""
+    if cache_dir_override:
+        p = Path(cache_dir_override)
+        return p if p.is_absolute() else PROJECT_ROOT / p
+    return PROJECT_ROOT / "cache"
+
+
+def _get_cache_path(config_path: Path, cache_dir: Path) -> Path:
+    """Cache file path for *config_path* (e.g. ``batch_all.cache.json``)."""
+    return cache_dir / f"{config_path.stem}.cache.json"
+
+
+def load_scan_cache(cache_path: Path) -> dict | None:
+    """Load scan cache if it exists and version matches.  Returns None on miss."""
+    if not cache_path.exists():
+        return None
+    try:
+        import json as _j
+        data = _j.loads(cache_path.read_text(encoding="utf-8"))
+        if data.get("version") != CACHE_VERSION:
+            print(f"  Cache version mismatch ({data.get('version')} != {CACHE_VERSION}), ignoring.")
+            return None
+        print(f"  Loaded scan cache: {cache_path}")
+        return data
+    except Exception as e:
+        print(f"  Failed to load cache {cache_path}: {e}")
+        return None
+
+
+def save_scan_cache(cache_path: Path, cache_data: dict) -> None:
+    """Persist scan cache to disk (creates parent directory if needed)."""
+    import json as _j
+    import datetime as _dt
+    cache_data.setdefault("version", CACHE_VERSION)
+    cache_data["scanned_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        _j.dumps(cache_data, ensure_ascii=False, indent=2),
+        encoding="utf-8")
+    print(f"  Scan cache saved: {cache_path}")
+
+
+# ---------------------------------------------------------------------------
+# File-index helpers -- O(1) stem lookups without recursive scanning
 # ---------------------------------------------------------------------------
 
 def _build_file_index(root: Path, suffix: str, recurse: bool = True) -> dict[str, Path]:
@@ -723,22 +999,138 @@ def _build_file_index(root: Path, suffix: str, recurse: bool = True) -> dict[str
     return index
 
 
+def _build_ctc_presence(ctc_dir: Path) -> "tuple[set[str], dict[str, set[str]]]":
+    """Build filename presence sets for O(1) CTC completeness validation.
+
+    One ``os.scandir`` pass over *ctc_dir* replaces thousands of per-stem
+    ``exists()`` calls -- each of which is an SMB round-trip on CIFS mounts.
+
+    Returns:
+        flat_names: filenames in the top-level directory
+        nested_names: ``{subdir_name: {filenames in that subdir}}``
+    """
+    flat_names: set[str] = set()
+    nested_names: dict[str, set[str]] = {}
+
+    def _collect_names(dirpath: str) -> set[str]:
+        names: set[str] = set()
+        try:
+            for entry in os.scandir(dirpath):
+                if entry.is_file():
+                    names.add(entry.name)
+        except OSError:
+            pass
+        return names
+
+    flat_names = _collect_names(str(ctc_dir))
+
+    # One level of subdirectories for nested layout: {ds}/{stem}/{stem}.{ext}
+    try:
+        for entry in os.scandir(str(ctc_dir)):
+            if entry.is_dir():
+                sub = _collect_names(entry.path)
+                if sub:
+                    nested_names[entry.name] = sub
+    except OSError:
+        pass
+
+    return flat_names, nested_names
+
+
+def _count_files_fast(dirpath: Path, suffix: str, max_count: int = 10000) -> int:
+    """Count files ending with *suffix*, stopping early at *max_count*.
+
+    Much faster than ``len(list(dirpath.glob(...)))`` on large SMB directories
+    because it bails out as soon as *max_count* is reached.
+    """
+    n = 0
+    try:
+        with os.scandir(str(dirpath)) as it:
+            for entry in it:
+                if entry.is_file() and entry.name.endswith(suffix):
+                    n += 1
+                    if n >= max_count:
+                        return n
+    except OSError:
+        pass
+    return n
+
+
 def _link_or_copy(src: Path, dst: Path) -> bool:
-    """Hard-link *src* → *dst*; fall back to copy if cross-device.
+    """Link *src* → *dst* with least-cost strategy.
+
+    Strategy (tried in order):
+      1. os.symlink  — works cross-device, near-zero I/O
+      2. os.link     — same-device hard link (instant, zero space)
+      3. shutil.copy2 — fallback when both fail
 
     Returns True on success, False if *src* does not exist.
     """
     if not src.exists():
         return False
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.exists():
+    if dst.exists() or dst.is_symlink():
         dst.unlink()
     try:
-        os.link(str(src), str(dst))
+        os.symlink(str(src), str(dst))
+        return True
     except OSError:
-        import shutil
-        shutil.copy2(str(src), str(dst))
+        pass
+    try:
+        os.link(str(src), str(dst))
+        return True
+    except OSError:
+        pass
+    import shutil, time as _t
+    for _i in range(3):
+        try:
+            shutil.copy2(str(src), str(dst))
+            return True
+        except (OSError, FileNotFoundError):
+            if _i < 2:
+                _t.sleep(0.3)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+    return False
     return True
+
+
+def _resolve_wav(audio_src: Path, stem: str) -> Path | None:
+    """Find ``{stem}.wav`` in *audio_src*.
+
+    Tries: flat (dir/{stem}.wav) → nested (dir/{stem}/{stem}.wav) →
+    zero-padded variants → glob fallback.
+    """
+    # Flat: dir/{stem}.wav
+    wav_path = audio_src / f"{stem}.wav"
+    if wav_path.exists():
+        return wav_path
+    # Nested: dir/{stem}/{stem}.wav
+    wav_path = audio_src / stem / f"{stem}.wav"
+    if wav_path.exists():
+        return wav_path
+    # Zero-padded variants (e.g., stem="35000" → "035000.wav")
+    if stem.isdigit():
+        for width in (5, 6, 7, 8):
+            wav_path = audio_src / f"{stem.zfill(width)}.wav"
+            if wav_path.exists():
+                return wav_path
+    # Glob fallback (deep subdirectories)
+    candidates = list(audio_src.glob(f"**/{stem}.wav"))
+    if candidates:
+        return candidates[0]
+    # Numeric-suffix fallback: filename may have mojibake Chinese chars
+    # but the numeric suffix is always ASCII.  e.g. stem="合成ria_35002"
+    # → search for "*35002.wav".
+    import re as _re
+    _m = _re.search(r'(\d+)$', stem)
+    if _m:
+        num = _m.group(1)
+        candidates = list(audio_src.glob(f"**/*{num}.wav"))
+        # Prefer exact numeric match in filename (avoid 35002 matching 135002)
+        candidates = [c for c in candidates
+                      if _re.search(rf'(?<!\d){num}(?!\d)', c.stem)]
+        return candidates[0] if candidates else None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -763,10 +1155,21 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
 
     cr = cfg.get("ctc_ready", {})
 
+    # -- Fast path: if manifest exists from a previous run, skip re-scanning --
+    ctc_out_early = ctx["ctc_pretg"]
+    manifest_early = ctc_out_early / "ctc_ready_manifest.json"
+    if manifest_early.exists() and not args.overwrite:
+        try:
+            prev = _json.loads(manifest_early.read_text())
+            n_stems = len(prev.get("stems", []))
+            print(f"  Link already done ({n_stems} stems in manifest)."
+                  f" Use --overwrite to re-link.")
+            return 0
+        except Exception:
+            pass  # corrupt manifest, proceed with scan
+
     # ── Resolve source directories ──
-    ctc_dir_src = Path(cr["ctc_dir"])
-    if not ctc_dir_src.is_absolute():
-        ctc_dir_src = PROJECT_ROOT / ctc_dir_src
+    ctc_dir_src = resolve_input_path(cr["ctc_dir"], PROJECT_ROOT)
     if not ctc_dir_src.exists():
         print(f"ERROR: CTC directory not found: {ctc_dir_src}")
         return 1
@@ -776,122 +1179,161 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         print(f"ERROR: Audio directory not found: {audio_src}")
         return 1
 
-    text_src = Path(cr.get("text_dir", "")) if cr.get("text_dir") else audio_src
-    if not text_src.is_absolute():
-        text_src = PROJECT_ROOT / text_src
+    text_src = resolve_input_path(cr.get("text_dir", ""), PROJECT_ROOT) if cr.get("text_dir") else audio_src
 
     print(f"  CTC dir:   {ctc_dir_src}")
     print(f"  Audio dir: {audio_src}")
     if text_src != audio_src:
         print(f"  Text dir:  {text_src}")
 
-    # ── 1. Scan CTC dir for .lab files (single-level, no recursion) ──
-    stems: list[str] = []
-    try:
-        with os.scandir(str(ctc_dir_src)) as it:
-            for entry in it:
-                if entry.is_file() and entry.name.endswith(".lab"):
-                    stems.append(entry.name[:-4])
-    except OSError as e:
-        print(f"ERROR: Cannot read CTC directory: {e}")
-        return 1
-
-    if not stems:
-        print("ERROR: No .lab files found in CTC directory.")
-        return 1
-    stems.sort()
-    print(f"  Found {len(stems)} stems via .lab scan")
-
-    # ── 1b. Filter stems by explicit list or range (if configured) ──
-    stem_filter = cr.get("stems", None)     # explicit list: ["35000", 35001, ...]
-    stem_range = cr.get("stem_range", None) # [start, end] inclusive
-
-    if stem_filter is not None:
-        allow = {str(s) for s in stem_filter}
-        stems = [s for s in stems if s in allow]
-        print(f"  Filtered to {len(stems)} stems (explicit list)")
-    elif stem_range is not None:
-        lo, hi = stem_range
-        if isinstance(lo, int) and isinstance(hi, int):
-            stems = [s for s in stems if lo <= int(s) <= hi]
-        else:
-            lo_s, hi_s = str(lo), str(hi)
-            stems = [s for s in stems if lo_s <= s <= hi_s]
-        print(f"  Filtered to {len(stems)} stems (range {lo}–{hi})")
-
-    if not stems:
-        print("ERROR: No stems match the filter criteria.")
-        return 1
-
-    # ── 2. Build audio index ──
-    # When filtered: direct lookup per stem (avoids scanning 100K+ files).
-    # Otherwise: single-level scan (fast for moderate directories).
-    audio_index: dict[str, Path] = {}
+    # ── 1. Resolve filters ──
+    stem_filter = cr.get("stems", None)      # explicit list
+    stem_range = cr.get("stem_range", None)  # [start, end] inclusive
+    stem_prefix = cr.get("stem_prefix", "")  # prepended to numeric stems
     is_filtered = stem_filter is not None or stem_range is not None
-    if is_filtered:
-        for stem in stems:
-            # Try exact match first
-            wav_path = audio_src / f"{stem}.wav"
-            if wav_path.exists():
-                audio_index[stem] = wav_path
-                continue
-            # Try zero-padded variants (e.g., stem="35000" → "035000.wav")
-            if stem.isdigit():
-                found = False
-                for width in (5, 6, 7, 8):
-                    wav_path = audio_src / f"{stem.zfill(width)}.wav"
-                    if wav_path.exists():
-                        audio_index[stem] = wav_path
-                        found = True
-                        break
-                if found:
-                    continue
-            # Fallback: glob search in subdirectories
-            candidates = list(audio_src.glob(f"**/{stem}.wav"))
-            if candidates:
-                audio_index[stem] = candidates[0]
-        print(f"  Audio check: {len(audio_index)}/{len(stems)} matched"
-              f"{' (direct)' if len(audio_index) == len(stems) else ''}")
-    else:
-        audio_index = _build_file_index(audio_src, ".wav")
-        print(f"  Audio index: {len(audio_index)} WAV files")
-
-    # ── 3. Build text index (single-level) ──
-    text_index: dict[str, Path] = {}
-    if text_src.exists():
-        if is_filtered:
-            for stem in stems:
-                txt_path = text_src / f"{stem}.txt"
-                if txt_path.exists():
-                    text_index[stem] = txt_path
-            if text_index:
-                print(f"  Text check:  {len(text_index)}/{len(stems)} matched")
-        else:
-            text_index = _build_file_index(text_src, ".txt")
-            print(f"  Text index:  {len(text_index)} TXT files")
-
-    # ── 4. Validate per stem ──
     require_all = cr.get("require_all", True)
+
+    # ── 2. Single-pass matching: discover stems + match audio/text + validate ──
+    # When filtered: generate candidates, probe directly — no directory scan.
+    # When unfiltered: scan CTC dir for .lab files, then match audio/text.
+    audio_index: dict[str, Path] = {}
+    text_index: dict[str, Path] = {}
     valid: list[str] = []
     missing_audio: list[str] = []
     incomplete_ctc: list[tuple[str, str]] = []
+    total_candidates = 0
+    _ctc_base_cache: dict[str, Path] = {}  # stem → resolved CTC base dir
 
-    for stem in stems:
-        if stem not in audio_index:
-            missing_audio.append(stem)
-            continue
-        # Check CTC completeness
-        if require_all:
-            for suffix in _CTC_SUFFIXES:
-                if not (ctc_dir_src / f"{stem}{suffix}").exists():
-                    incomplete_ctc.append((stem, suffix))
-                    break
-            if any(s == suffix for s, suffix in incomplete_ctc if s == stem):
+    if is_filtered:
+        # -- Filtered path -- direct probe (no directory scan) --
+        # Build CTC presence sets once for O(1) completeness checks
+        ctc_files_flat, ctc_files_nested = _build_ctc_presence(ctc_dir_src)
+        print(f"  CTC presence index: {len(ctc_files_flat)} flat + "
+              f"{sum(len(v) for v in ctc_files_nested.values())} nested files")
+        if stem_filter is not None:
+            candidates = [f"{stem_prefix}{s}" for s in stem_filter]
+        else:
+            lo, hi = stem_range
+            prefix = str(stem_prefix) if stem_prefix else ""
+            candidates = [f"{prefix}{i}" for i in range(int(lo), int(hi) + 1)]
+        total_candidates = len(candidates)
+        print(f"  Probing {total_candidates} candidates"
+              f" ({candidates[0]}–{candidates[-1]}) ...")
+
+        for stem in candidates:
+            # ── Resolve CTC base: flat (dir/{stem}.lab) or nested (dir/{stem}/{stem}.lab) ──
+            ctc_base = ctc_dir_src
+            lab_path = ctc_base / f"{stem}.lab"
+            if not lab_path.exists():
+                lab_path = ctc_base / stem / f"{stem}.lab"
+                if lab_path.exists():
+                    ctc_base = ctc_base / stem
+                else:
+                    continue
+
+            # ── Match audio (exact → nested → zero-padded → glob fallback) ──
+            wav_path = _resolve_wav(audio_src, stem)
+            if wav_path is None:
+                missing_audio.append(stem)
                 continue
-        valid.append(stem)
+            audio_index[stem] = wav_path
 
-    # ── 5. Report ──
-    print(f"\n  Valid stems:    {len(valid)}")
+            # ── Match text ──
+            txt_path = text_src / f"{stem}.txt"
+            if not txt_path.exists():
+                txt_path = text_src / stem / f"{stem}.txt"
+            if txt_path.exists():
+                text_index[stem] = txt_path
+
+            # -- Validate CTC completeness (O(1) set lookup, no per-file exists()) --
+            if require_all:
+                ctc_ok = all(
+                    f"{stem}{suffix}" in ctc_files_flat
+                    or (stem in ctc_files_nested
+                        and f"{stem}{suffix}" in ctc_files_nested[stem])
+                    for suffix in _CTC_SUFFIXES
+                )
+                if not ctc_ok:
+                    # Determine which suffix is missing for the report
+                    for suffix in _CTC_SUFFIXES:
+                        in_flat = f"{stem}{suffix}" in ctc_files_flat
+                        in_nested = (stem in ctc_files_nested
+                                      and f"{stem}{suffix}" in ctc_files_nested[stem])
+                        if not in_flat and not in_nested:
+                            incomplete_ctc.append((stem, suffix))
+                            break
+                    continue
+
+            # Store resolved ctc_base for linking step
+            valid.append(stem)
+            _ctc_base_cache[stem] = ctc_base
+
+    else:
+        # -- Unfiltered path -- scan CTC dir for .lab files --
+        # Handles both flat (dir/{stem}.lab) and nested (dir/{stem}/{stem}.lab)
+        print("  Scanning CTC directory for .lab files ...")
+
+        # Build CTC presence sets once for O(1) completeness checks
+        ctc_files_flat, ctc_files_nested = _build_ctc_presence(ctc_dir_src)
+        print(f"  CTC presence index: {len(ctc_files_flat)} flat files, "
+              f"{len(ctc_files_nested)} nested dirs")
+        stems_all: list[str] = []
+        layout_kind = "flat"
+        try:
+            with os.scandir(str(ctc_dir_src)) as it:
+                for entry in it:
+                    if entry.is_file() and entry.name.endswith(".lab"):
+                        stems_all.append(entry.name[:-4])
+                        _ctc_base_cache[entry.name[:-4]] = ctc_dir_src
+                    elif entry.is_dir():
+                        # Nested: {dir}/{stem}/{stem}.lab
+                        nested_lab = Path(entry.path) / f"{entry.name}.lab"
+                        if nested_lab.exists():
+                            stems_all.append(entry.name)
+                            _ctc_base_cache[entry.name] = Path(entry.path)
+                            layout_kind = "nested"
+        except OSError as e:
+            print(f"ERROR: Cannot read CTC directory: {e}")
+            return 1
+        stems_all.sort()
+        total_candidates = len(stems_all)
+        print(f"  Found {total_candidates} stems via .lab scan ({layout_kind})")
+
+        # Build audio/text indices (single-level scan, then match in memory)
+        audio_index = _build_file_index(audio_src, ".wav")
+        print(f"  Audio index: {len(audio_index)} WAV files")
+        if text_src.exists():
+            text_index = _build_file_index(text_src, ".txt")
+            print(f"  Text index:  {len(text_index)} TXT files")
+
+        for stem in stems_all:
+            if stem not in audio_index:
+                missing_audio.append(stem)
+                continue
+            if require_all:
+                ctc_ok = all(
+                    f"{stem}{suffix}" in ctc_files_flat
+                    or (stem in ctc_files_nested
+                        and f"{stem}{suffix}" in ctc_files_nested[stem])
+                    for suffix in _CTC_SUFFIXES
+                )
+                if not ctc_ok:
+                    for suffix in _CTC_SUFFIXES:
+                        in_flat = f"{stem}{suffix}" in ctc_files_flat
+                        in_nested = (stem in ctc_files_nested
+                                      and f"{stem}{suffix}" in ctc_files_nested[stem])
+                        if not in_flat and not in_nested:
+                            incomplete_ctc.append((stem, suffix))
+                            break
+                    continue
+            valid.append(stem)
+
+    # ── 3. Report ──
+    n_missing_lab = total_candidates - len(valid) - len(missing_audio) - len(incomplete_ctc)
+    print(f"\n  Candidates:     {total_candidates}")
+    print(f"  Valid stems:    {len(valid)}")
+    if n_missing_lab > 0:
+        print(f"  Missing .lab:   {n_missing_lab}")
     if missing_audio:
         print(f"  Missing audio:  {len(missing_audio)}")
         for s in missing_audio[:5]:
@@ -909,46 +1351,62 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         print("ERROR: No valid stems — nothing to process.")
         return 1
 
-    # ── 6. Link audio → workspace/audio/ ──
-    audio_out = ctx["audio_dir"]
-    audio_out.mkdir(parents=True, exist_ok=True)
-    linked = 0
-    for stem in valid:
-        if _link_or_copy(audio_index[stem], audio_out / f"{stem}.wav"):
-            linked += 1
-    print(f"\n  Audio linked: {linked} → {audio_out}")
+    # In scan-only mode, skip file linking — only validate + write manifest
+    scan_only = getattr(args, 'scan_only', False)
+    if scan_only:
+        print(f"\n  Scan-only: skipping file linking for {len(valid)} stems")
 
-    # ── 7. Link CTC files → workspace/ctc_pretg/ ──
+    # ── 4-6. File linking (skipped in scan-only mode) ──
     ctc_out = ctx["ctc_pretg"]
     ctc_out.mkdir(parents=True, exist_ok=True)
-    ctc_linked = 0
-    for stem in valid:
-        for suffix in _CTC_SUFFIXES:
-            src = ctc_dir_src / f"{stem}{suffix}"
-            if src.exists():
-                if _link_or_copy(src, ctc_out / f"{stem}{suffix}"):
-                    ctc_linked += 1
-    print(f"  CTC linked:  {ctc_linked} → {ctc_out}")
+    if not scan_only:
+        audio_out = ctx["audio_dir"]
+        if audio_out.resolve() == audio_src.resolve():
+            # Audio dir IS the source — no linking needed
+            # Verify all stems have audio accessible
+            n_present = sum(1 for stem in valid if stem in audio_index)
+            print(f"\n  Audio in-place: {n_present}/{len(valid)} stems indexed (audio at {audio_out})")
+            if n_present < len(valid):
+                print(f"  WARNING: {len(valid) - n_present} stems missing audio")
+        else:
+            audio_out.mkdir(parents=True, exist_ok=True)
+            linked = 0
+            for stem in valid:
+                if _link_or_copy(audio_index[stem], audio_out / f"{stem}.wav"):
+                    linked += 1
+            print(f"\n  Audio linked: {linked} → {audio_out}")
 
-    # ── 8. Copy/link reference text (.txt from text_dir) ──
-    if text_index:
-        txt_linked = 0
+        # ── 5. Link CTC files → workspace/ctc_pretg/ ──
+        ctc_out.mkdir(parents=True, exist_ok=True)
+        ctc_linked = 0
         for stem in valid:
-            if stem in text_index:
-                # Copy to ctc_pretg so postprocess can find it
-                dst = ctc_out / f"{stem}_ref.txt"
-                if not dst.exists() or args.overwrite:
-                    _link_or_copy(text_index[stem], dst)
-                    txt_linked += 1
-        if txt_linked:
-            print(f"  Text refs:   {txt_linked} → {ctc_out}")
+            ctc_base = _ctc_base_cache.get(stem, ctc_dir_src)
+            for suffix in _CTC_SUFFIXES:
+                src = ctc_base / f"{stem}{suffix}"
+                if src.exists():
+                    if _link_or_copy(src, ctc_out / f"{stem}{suffix}"):
+                        ctc_linked += 1
+        print(f"  CTC linked:  {ctc_linked} → {ctc_out}")
 
-    # ── 9. Save manifest for debugging ──
+        # ── 6. Copy/link reference text (.txt from text_dir) ──
+        if text_index:
+            txt_linked = 0
+            for stem in valid:
+                if stem in text_index:
+                    # Copy to ctc_pretg so postprocess can find it
+                    dst = ctc_out / f"{stem}_ref.txt"
+                    if not dst.exists() or args.overwrite:
+                        _link_or_copy(text_index[stem], dst)
+                        txt_linked += 1
+            if txt_linked:
+                print(f"  Text refs:   {txt_linked} → {ctc_out}")
+
+    # ── 7. Save manifest (always, even in scan-only mode) ──
     manifest = {
         "mode": "ctc_ready",
         "ctc_dir_src": str(ctc_dir_src),
         "audio_src": str(audio_src),
-        "n_stems": len(stems),
+        "n_candidates": total_candidates,
         "n_valid": len(valid),
         "n_missing_audio": len(missing_audio),
         "n_incomplete_ctc": len(incomplete_ctc),
@@ -970,7 +1428,9 @@ STEPS = {
     "trim": ("Audio preprocessing", step_trim_silence),
     "resample": ("Resample to 16kHz for MFA", step_resample_for_mfa),
     "prealign": ("CTC pre-alignment (NVASR → MFA anchors)", step_prealign),
+    "normalize_punct": ("Normalize punctuation (ASCII → CJK)", step_normalize_punct),
     "normalize": ("Normalize numerals (Arabic → Chinese)", step_normalize_text),
+    "normalize_en": ("Normalise English-word fragments in CTC output", step_normalize_en),
     "adjust": ("Adjust CTC boundaries (energy-based)", step_adjust_ctc),
     "validate": ("MFA validate", step_mfa_validate),
     "align": ("MFA align (NVASR corpus + CTC anchors)", step_mfa_align),
@@ -978,7 +1438,7 @@ STEPS = {
 }
 
 FULL_STEP_ORDER = list(STEPS.keys())
-CTC_READY_STEP_ORDER = ["link", "resample", "adjust", "validate", "align", "postprocess"]
+CTC_READY_STEP_ORDER = ["link", "normalize_punct", "normalize", "normalize_en", "resample", "adjust", "align", "postprocess"]
 
 
 def main():
@@ -996,15 +1456,25 @@ def main():
                         help="Override input directory from config.")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Override output directory from config.")
+    parser.add_argument("--workspace", type=str, default=None,
+                        help="Override workspace root (default: <project>/output/<workspace_name>).")
     parser.add_argument("--python", type=str, default=None,
                         help="Override Python path from config.")
     parser.add_argument("--validate", action="store_true",
                         help="Validate output structure after each step (uses output_spec in config).")
     parser.add_argument("--mode", type=str, default=None,
-                        choices=["full", "ctc_ready"],
+                        choices=["full", "ctc_ready", "batch_ctc_ready"],
                         help="Pipeline mode (default: from config, or 'full').")
     parser.add_argument("--ctc-ready", type=str, default=None, metavar="CTC_DIR",
                         help="Enable ctc_ready mode: path to pre-existing NVASR CTC output.")
+    parser.add_argument("--use-cache", action="store_true",
+                        help="Use pre-built scan cache (default: enabled, controlled by config 'use_cache').")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Force re-scan, ignore cache and config setting.")
+    parser.add_argument("--scan-only", action="store_true",
+                        help="Pre-scan only: discover + validate + write cache, then exit.")
+    parser.add_argument("--cache-dir", type=str, default=None,
+                        help="Custom cache directory (default: <project>/cache/).")
     args = parser.parse_args()
 
     if args.list_steps:
@@ -1016,6 +1486,21 @@ def main():
     cfg = load_config(Path(args.config))
     print(f"Config: {args.config}")
 
+    # Resolve cache paths (used by both batch and single modes)
+    config_path = Path(args.config)
+    cache_dir = _get_cache_dir(config_path, args.cache_dir)
+    cache_path = _get_cache_path(config_path, cache_dir)
+    # Cache default: enabled. Disable via config "use_cache: false" or CLI --no-cache.
+    # --use-cache forces it on even if config says false.
+    if args.no_cache:
+        use_cache = False
+    elif args.use_cache:
+        use_cache = True
+    else:
+        use_cache = cfg.get("use_cache", True)
+    if not use_cache:
+        print("  Scan cache: DISABLED (use_cache=false or --no-cache)")
+
     # ── Resolve pipeline mode ──
     mode = args.mode or cfg.get("mode", "full")
     if args.ctc_ready:
@@ -1023,33 +1508,12 @@ def main():
         cfg.setdefault("ctc_ready", {})["ctc_dir"] = args.ctc_ready
         print(f"ctc_ready mode: CTC dir = {args.ctc_ready}")
 
-    if mode not in ("full", "ctc_ready"):
+    if mode not in ("full", "ctc_ready", "batch_ctc_ready"):
         print(f"ERROR: Unknown mode: {mode}")
         sys.exit(1)
     print(f"Pipeline mode: {mode}")
 
-    # Resolve workspace and paths
-    # All pipeline output goes under output/<workspace>/ — never pollutes
-    # the project root or random external directories.
-    output_root = PROJECT_ROOT / "output"
-    output_root.mkdir(parents=True, exist_ok=True)
-    workspace_name = cfg.get("workspace", "default")
-    workspace = output_root / workspace_name
-    workspace.mkdir(parents=True, exist_ok=True)
-
-    # Input: relative to PROJECT_ROOT (or absolute / CLI override)
-    data_dir = Path(args.data_dir) if args.data_dir else resolve_path(PROJECT_ROOT, cfg.get("data_dir", "data_dir"))
-
-    # Outputs: relative to workspace
-    audio_dir = workspace / cfg.get("audio_dir", "audio")
-    pinyin_dir = workspace / cfg.get("pinyin_dir", "pinyin")
-    aligned_dir = workspace / cfg.get("aligned_dir", "aligned")
-    output_dir = Path(args.output_dir) if args.output_dir else workspace / cfg.get("output_dir", "output")
-    filtered_dir = workspace / cfg.get("filtered_dir", "filtered")
-    validate_dir = workspace / cfg.get("validate_dir", "validate")
-    temp_dir = workspace / cfg.get("temp_dir", "temp")
-
-    # Models & dicts: relative to PROJECT_ROOT
+    # Models & dicts: relative to PROJECT_ROOT (must be resolved before batch/single modes)
     models_dir = resolve_path(PROJECT_ROOT, cfg.get("models_dir", "models/mfa"))
     mfa_dict = resolve_path(PROJECT_ROOT, cfg.get("mfa_dict", "dict/mfa_ipa.dict"))
 
@@ -1064,7 +1528,235 @@ def main():
         sys.exit(1)
     print(f"Using Python: {mfa_python}")
 
-    # Check models
+    # ═══════════════════════════════════════════════════════════════════════════
+    # batch_ctc_ready: discover all datasets and process each one
+    # ═══════════════════════════════════════════════════════════════════════════
+    if mode == "batch_ctc_ready":
+        bc = cfg.get("batch", {})
+        ctc_root = resolve_input_path(bc.get("ctc_root", ""), PROJECT_ROOT)
+        audio_root = resolve_input_path(bc.get("audio_root", ""), PROJECT_ROOT)
+        output_root_path = resolve_input_path(bc.get("output_root", ""), PROJECT_ROOT)
+
+        if not ctc_root.exists():
+            print(f"ERROR: CTC root not found: {ctc_root}")
+            sys.exit(1)
+
+        # Discover datasets -- use cache if available
+        datasets: list[str] = []
+        batch_cache_data: dict | None = None
+        datasets_from_cache = False
+
+        if use_cache and not args.scan_only:
+            batch_cache_data = load_scan_cache(cache_path)
+            if batch_cache_data and batch_cache_data.get("datasets"):
+                datasets = [d["name"] for d in batch_cache_data["datasets"]]
+                datasets_from_cache = True
+                print(f"\nBatch: {len(datasets)} datasets (from cache)")
+
+        if not datasets_from_cache:
+            # Scan: directories under ctc_root that have wavs/
+            try:
+                for entry in os.scandir(str(ctc_root)):
+                    if entry.is_dir():
+                        ctc_wavs = Path(entry.path) / "wavs"
+                        if ctc_wavs.exists():
+                            datasets.append(entry.name)
+            except OSError:
+                pass
+            datasets.sort()
+            print(f"\nBatch: {len(datasets)} datasets discovered")
+
+        # Filter: optional include/exclude
+        include = bc.get("include", None)
+        exclude = bc.get("exclude", [])
+        if include:
+            datasets = [d for d in datasets if d in include]
+        if exclude:
+            datasets = [d for d in datasets if d not in exclude]
+
+        if datasets:
+            print(f"  First: {datasets[0]}")
+            print(f"  Last:  {datasets[-1]}")
+
+        if not datasets:
+            print("ERROR: No datasets found!")
+            sys.exit(1)
+
+        # Optional limit for testing
+        limit = bc.get("limit", 0)
+        if limit > 0:
+            datasets = datasets[:limit]
+            print(f"  Limited to first {limit}")
+
+        # Process each dataset
+        ok_count = 0
+        fail_list: list[str] = []
+        batch_cache_entries: list[dict] = []  # accumulate cache info per dataset
+        for i, ds_name in enumerate(datasets):
+            audiodir = audio_root / ds_name / "wavs"
+            if not audiodir.exists():
+                print(f"\n[{i+1}/{len(datasets)}] {ds_name} — SKIP (no audio)")
+                continue
+
+            n_files = _count_files_fast(audiodir, ".wav")
+            print(f"\n{'='*60}")
+            print(f"  [{i+1}/{len(datasets)}] {ds_name} ({n_files} files)")
+            print(f"{'='*60}")
+
+            # Build sub-config for this dataset
+            sub_cfg = dict(cfg)  # shallow copy of top-level keys
+            sub_cfg["workspace"] = ds_name
+            sub_cfg["data_dir"] = str(audiodir)
+            sub_cfg.setdefault("ctc_ready", {})["ctc_dir"] = str(ctc_root / ds_name / "wavs")
+            sub_cfg["output_dir"] = str(output_root_path / ds_name)
+
+            # Resolve workspace
+            sub_output_root = PROJECT_ROOT / "output"
+            sub_output_root.mkdir(parents=True, exist_ok=True)
+            sub_ws_name = ds_name
+            if not sub_ws_name.isascii():
+                sub_ws_name = __import__('re').sub(r'[^\x00-\x7F]+', '_', sub_ws_name).strip('_') or "workspace"
+            sub_workspace = sub_output_root / sub_ws_name
+            sub_workspace.mkdir(parents=True, exist_ok=True)
+
+            # Resolve paths for this dataset
+            sub_data_dir = resolve_input_path(sub_cfg["data_dir"], PROJECT_ROOT)
+            sub_audio_dir = sub_data_dir  # ctc_ready: in-place audio
+            sub_output_dir = resolve_input_path(sub_cfg.get("output_dir", "output"), sub_workspace)
+            if not sub_output_dir.is_absolute():
+                sub_output_dir = sub_workspace / sub_cfg.get("output_dir", "output")
+            sub_aligned_dir = sub_workspace / sub_cfg.get("aligned_dir", "aligned")
+            sub_filtered_dir = sub_workspace / sub_cfg.get("filtered_dir", "filtered")
+            sub_validate_dir = sub_workspace / sub_cfg.get("validate_dir", "validate")
+            sub_temp_dir = sub_workspace / sub_cfg.get("temp_dir", "temp")
+            sub_ctc_pretg = sub_workspace / sub_cfg.get("ctc_pretg", "ctc_pretg")
+            sub_ctc_pretg_adj = sub_workspace / sub_cfg.get("ctc_pretg_adj", "ctc_pretg_adj")
+
+            for d in [sub_output_dir, sub_aligned_dir, sub_filtered_dir,
+                       sub_validate_dir, sub_temp_dir, sub_ctc_pretg,
+                       sub_ctc_pretg_adj, sub_workspace]:
+                d.mkdir(parents=True, exist_ok=True)
+
+            sub_ctx = {
+                "data_dir": sub_data_dir,
+                "audio_dir": sub_audio_dir,
+                "pinyin_dir": sub_workspace / sub_cfg.get("pinyin_dir", "pinyin"),
+                "aligned_dir": sub_aligned_dir,
+                "output_dir": sub_output_dir,
+                "filtered_dir": sub_filtered_dir,
+                "validate_dir": sub_validate_dir,
+                "models_dir": models_dir,
+                "temp_dir": sub_temp_dir,
+                "mfa_dict": mfa_dict,
+                "mfa_audio_dir": sub_workspace / "audio_16k",
+                "ctc_pretg": sub_ctc_pretg,
+                "ctc_pretg_adj": sub_ctc_pretg_adj,
+            }
+
+            # Run all ctc_ready steps
+            sub_args = argparse.Namespace(
+                force=args.force, overwrite=args.overwrite,
+                scan_only=args.scan_only, validate=False,
+                **( {k: getattr(args, k, False)
+                    for k in [f"skip_{s}" for s in STEPS]} )
+            )
+            for skip_s in ("trim", "prealign"):
+                setattr(sub_args, f"skip_{skip_s}", True)
+
+            sub_failed = []
+            # In --scan-only mode, only run the link step
+            scan_only_steps = ["link"] if args.scan_only else CTC_READY_STEP_ORDER
+            for step_name in scan_only_steps:
+                if getattr(sub_args, f"skip_{step_name}", False):
+                    continue
+                desc, func = STEPS[step_name]
+                print(f"\n  [{step_name}] {desc}")
+                rc = func(sub_args, sub_cfg, mfa_python, sub_ctx)
+                if rc != 0:
+                    sub_failed.append(step_name)
+                    if not sub_args.force:
+                        break
+
+            if not sub_failed:
+                print(f"  [{i+1}/{len(datasets)}] {ds_name} -- DONE")
+                ok_count += 1
+                # Record cache entry for this dataset
+                batch_cache_entries.append({
+                    "name": ds_name,
+                    "audio_dir": str(audiodir),
+                    "ctc_dir": str(ctc_root / ds_name / "wavs"),
+                })
+            else:
+                print(f"  [{i+1}/{len(datasets)}] {ds_name} -- FAILED: {sub_failed}")
+                fail_list.append(ds_name)
+        # Save batch-level scan cache for future --use-cache runs
+        if not datasets_from_cache or args.scan_only:
+            batch_cache = {
+                "config_file": str(config_path),
+                "mode": "batch_ctc_ready",
+                "ctc_root": str(ctc_root),
+                "audio_root": str(audio_root),
+                "output_root": str(output_root_path),
+                "datasets": batch_cache_entries,
+            }
+            save_scan_cache(cache_path, batch_cache)
+
+        print(f"\n{'#'*60}")
+        print(f"  BATCH COMPLETE: {ok_count}/{len(datasets)} OK")
+        if fail_list:
+            print(f"  Failed: {', '.join(fail_list)}")
+        print(f"{'#'*60}")
+        return 0 if not fail_list else 1
+
+    # Resolve workspace and paths
+    # --workspace override: point ALL intermediate output to a custom root
+    # (e.g., local SSD).  When not set, defaults to <project>/output/<workspace>/.
+    if args.workspace:
+        workspace = Path(args.workspace)
+        if not workspace.is_absolute():
+            workspace = PROJECT_ROOT / workspace
+        workspace.mkdir(parents=True, exist_ok=True)
+    else:
+        output_root = PROJECT_ROOT / "output"
+        output_root.mkdir(parents=True, exist_ok=True)
+        workspace_name = cfg.get("workspace", "default")
+        # MFA's C++ backend (pywrapfst) does not support non-ASCII paths on
+        # Windows.  Warn and fall back to a safe ASCII name if needed.
+        if not workspace_name.isascii():
+            import re as _re
+            safe = _re.sub(r'[^\x00-\x7F]+', '_', workspace_name).strip('_') or "workspace"
+            print(f"WARNING: workspace name '{workspace_name}' contains non-ASCII chars.")
+            print(f"  MFA cannot handle Unicode paths. Using '{safe}' instead.")
+            workspace_name = safe
+        workspace = output_root / workspace_name
+        workspace.mkdir(parents=True, exist_ok=True)
+
+    # Input: apply UNC→Linux translation, then resolve relative to PROJECT_ROOT
+    data_dir = resolve_input_path(args.data_dir) if args.data_dir else resolve_input_path(cfg.get("data_dir", "data_dir"), PROJECT_ROOT)
+
+    # In ctc_ready mode, audio_dir points to the source data_dir (already trimmed)
+    # to avoid copying 100k+ files across SMB mounts
+    # Resample reads from here and writes 16k audio locally
+    if mode == "ctc_ready":
+        audio_dir = data_dir  # use source audio in-place, no copy
+    else:
+        audio_dir = workspace / cfg.get("audio_dir", "audio")
+    pinyin_dir = workspace / cfg.get("pinyin_dir", "pinyin")
+    aligned_dir = workspace / cfg.get("aligned_dir", "aligned")
+    if args.output_dir:
+        output_dir = resolve_input_path(args.output_dir, workspace)
+    else:
+        raw_out = cfg.get("output_dir", "output")
+        out_p = resolve_input_path(raw_out, workspace)
+        # If resolve_input_path returned a non-absolute path (relative), make it relative to workspace
+        if not out_p.is_absolute():
+            out_p = workspace / raw_out
+        output_dir = out_p
+    filtered_dir = workspace / cfg.get("filtered_dir", "filtered")
+    validate_dir = workspace / cfg.get("validate_dir", "validate")
+    temp_dir = workspace / cfg.get("temp_dir", "temp")
+
+    # Check models (already resolved above)
     if not mfa_dict.exists():
         print(f"ERROR: MFA dictionary not found at {mfa_dict}")
         sys.exit(1)
@@ -1075,10 +1767,16 @@ def main():
     else:
         step_order = FULL_STEP_ORDER
 
-    # ctc_ready mode: skip trim/prealign/normalize unconditionally
+    # ctc_ready mode: skip trim/prealign unconditionally
     if mode == "ctc_ready":
-        for skip_s in ("trim", "prealign", "normalize"):
+        for skip_s in ("trim", "prealign"):
             setattr(args, f"skip_{skip_s}", True)
+
+    # Skip standalone MFA validate when configured (align validates internally)
+    if cfg.get("mfa", {}).get("skip_validate", True):
+        setattr(args, "skip_validate", True)
+        if "validate" in step_order:
+            step_order.remove("validate")
 
     if args.step:
         if args.step not in STEPS:
@@ -1094,6 +1792,15 @@ def main():
         run_list = step_order[step_order.index(args.skip_to):]
     else:
         run_list = list(step_order)
+
+    # --scan-only: only run the link step (single-dataset mode)
+    if args.scan_only and mode in ("full", "ctc_ready"):
+        if "link" in run_list:
+            run_list = ["link"]
+        else:
+            run_list = run_list[:1]  # keep the first step
+        print(f"  Scan-only mode: running only {run_list}")
+
     run_list = [s for s in run_list if not getattr(args, f"skip_{s}", False)]
 
     if not run_list:
@@ -1168,6 +1875,32 @@ def main():
             print(f"  Cleaned temp: {mfa_audio}")
         elif mfa_audio.exists():
             print(f"  Kept 16kHz audio: {mfa_audio}")
+
+    # Save scan cache for future --use-cache runs (single-dataset mode).
+    # Skip when running as a subprocess of streaming_pipeline (config mode
+    # is batch_ctc_ready but --mode ctc_ready was passed on command line).
+    _config_mode = cfg.get("mode", "")
+    if mode in ("ctc_ready", "full") and not failed and _config_mode != "batch_ctc_ready":
+        import json as _json
+        manifest_path = workspace / cfg.get("ctc_pretg", "ctc_pretg") / "ctc_ready_manifest.json"
+        n_stems = 0
+        if manifest_path.exists():
+            try:
+                n_stems = len(_json.loads(manifest_path.read_text()).get("stems", []))
+            except Exception:
+                pass
+        single_cache = {
+            "config_file": str(config_path),
+            "mode": mode,
+            "workspace": cfg.get("workspace", "default"),
+            "data_dir": str(data_dir),
+            "output_dir": str(output_dir),
+            "n_stems": n_stems,
+            "manifest_path": str(manifest_path),
+        }
+        if mode == "ctc_ready":
+            single_cache["ctc_dir"] = cfg.get("ctc_ready", {}).get("ctc_dir", "")
+        save_scan_cache(cache_path, single_cache)
 
     print(f"\n{'#'*60}")
     print(f"  {'FAILED' if failed else 'DONE'}: {', '.join(failed) if failed else 'Success'}")

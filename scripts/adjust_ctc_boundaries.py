@@ -16,6 +16,7 @@ Pre-MFA CTC anchor boundary adjustment using audio energy analysis.
 import argparse
 import json
 import math
+import os
 import re
 import shutil
 import sys
@@ -284,7 +285,19 @@ def rebuild_textgrid(orig_tg: Path, out_tg: Path,
 
 
 def process_one(stem: str, ctc_dir: Path, audio_dir: Path,
-                out_dir: Path) -> dict:
+                out_dir: Path, blas_num_threads: int = 1) -> dict:
+    """Process a single stem — safe for parallel execution.
+
+    Each worker limits its own BLAS threads to *blas_num_threads* so
+    that N concurrent processes don't create N × M BLAS threads and
+    thrash the CPU caches.  The work is CPU-bound NumPy RMS + energy
+    search; with ``OMP_NUM_THREADS=1``, N workers ≈ N× throughput.
+    """
+    # Pin BLAS threads inside this worker (inherited by child process)
+    for env_var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                     "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[env_var] = str(blas_num_threads)
+
     tokens_path = ctc_dir / f"{stem}_tokens.jsonl"
     punct_path = ctc_dir / f"{stem}_punct.json"
     wav_path = audio_dir / f"{stem}.wav"
@@ -299,6 +312,27 @@ def process_one(stem: str, ctc_dir: Path, audio_dir: Path,
 
     adj_tokens, adj_punct, stats = adjust_boundaries(tokens, punct, audio, sr)
 
+    # Guard: fix invalid intervals from CTC token overlap (e.g. NVV
+    # overlapping adjacent word causes punct end_s < start_s).
+    for p in adj_punct:
+        if p["end_s"] <= p["start_s"]:
+            p["end_s"] = p["start_s"] + 0.060
+
+    # Dedup: remove ellipsis that overlaps with real punctuation (comma,
+    # period, etc.).  Boundary adjustment can shift punct times and create
+    # new overlaps that didn't exist in the raw CTC output.
+    non_ellipsis = [p for p in adj_punct if p["word"] != "…"]
+    ellipsis_only = [p for p in adj_punct if p["word"] == "…"]
+    if non_ellipsis and ellipsis_only:
+        kept_ellipsis = []
+        for ep in ellipsis_only:
+            overlap = any(
+                nep["start_s"] < ep["end_s"] and nep["end_s"] > ep["start_s"]
+                for nep in non_ellipsis)
+            if not overlap:
+                kept_ellipsis.append(ep)
+        adj_punct = non_ellipsis + kept_ellipsis
+
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / f"{stem}_tokens.jsonl", "w", encoding="utf-8") as f:
         for t in adj_tokens:
@@ -308,7 +342,7 @@ def process_one(stem: str, ctc_dir: Path, audio_dir: Path,
 
     orig_tg = ctc_dir / f"{stem}.TextGrid"
     if orig_tg.exists():
-        rebuild_textgrid(orig_tg, out_tg / f"{stem}.TextGrid",
+        rebuild_textgrid(orig_tg, out_dir / f"{stem}.TextGrid",
                         adj_tokens, adj_punct)
 
     for suffix in [".lab", "_text_cn.txt"]:
@@ -329,6 +363,8 @@ def main():
     parser.add_argument("--audio-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print per-stem adjustment details.")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -339,22 +375,85 @@ def main():
     if args.limit > 0:
         stems = stems[:args.limit]
 
+    import multiprocessing as mp
+    import platform as _plat
+
+    # ── Executor selection ──
+    # Linux/macOS: ProcessPoolExecutor with fork — fast COW, true CPU parallelism.
+    # Windows:      ThreadPoolExecutor — avoids per-worker spawn overhead
+    #               (each worker would re-import numpy/scipy/soundfile, ~2-5 s).
+    #               NumPy energy analysis releases the GIL, so threads are fine.
+    if _plat.system() == "Windows":
+        from concurrent.futures import ThreadPoolExecutor as _Pool, as_completed
+        _use_initializer = False
+        _exec_label = "ThreadPool"
+    else:
+        from concurrent.futures import ProcessPoolExecutor as _Pool, as_completed
+        _use_initializer = True
+        _exec_label = "ProcessPool"
+
+    # Resource analysis for parallel processing:
+    #   CPU  — frame_rms() + energy search are vectorized NumPy (no GIL).
+    #          Each worker pins BLAS to 1 thread → N workers = N× throughput.
+    #   I/O  — each worker reads a different {stem}.wav + .jsonl; no overlap.
+    #   Mem  — each WAV is ~0.3-1 MB float32; N workers × 1 MB is negligible.
+    #   Disk — on SMB/CIFS, concurrent reads may saturate network; use
+    #          n_workers = min(cpu-1, 8) as a safe upper bound for SMB.
+    n_cpu = mp.cpu_count() or 4
+    n_workers = min(max(1, n_cpu - 1), len(stems))
+    # Cap at 8 for SMB mounts to avoid network saturation
+    n_workers = min(n_workers, 8)
     totals = {"start_adj": 0, "end_extend": 0, "end_shorten": 0,
               "punct_adj": 0, "files": 0}
 
-    for stem in stems:
-        s = process_one(stem, args.ctc_dir, args.audio_dir, args.output_dir)
-        totals["files"] += 1
-        parts = []
-        if s.get("start_adj", 0) > 0:
-            parts.append(f"startx{s['start_adj']}")
-        if s.get("end_extend", 0) > 0:
-            parts.append(f"extendx{s['end_extend']}")
-        if s.get("end_shorten", 0) > 0:
-            parts.append(f"shortenx{s['end_shorten']}")
-        for k in ["start_adj", "end_extend", "end_shorten", "punct_adj"]:
-            totals[k] += s.get(k, 0)
-        print(f"  {stem}: {', '.join(parts) if parts else 'no changes'}")
+    if n_workers <= 1 or len(stems) <= 2:
+        # Sequential for tiny jobs — avoid process overhead
+        for stem in stems:
+            s = process_one(stem, args.ctc_dir, args.audio_dir, args.output_dir)
+            totals["files"] += 1
+            parts = []
+            if s.get("start_adj", 0) > 0:
+                parts.append(f"startx{s['start_adj']}")
+            if s.get("end_extend", 0) > 0:
+                parts.append(f"extendx{s['end_extend']}")
+            if s.get("end_shorten", 0) > 0:
+                parts.append(f"shortenx{s['end_shorten']}")
+            for k in ["start_adj", "end_extend", "end_shorten", "punct_adj"]:
+                totals[k] += s.get(k, 0)
+            if args.verbose:
+                print(f"  {stem}: {', '.join(parts) if parts else 'no changes'}")
+            elif totals["files"] % 100 == 0:
+                print(f"  ... {totals['files']}/{len(stems)} files adjusted", flush=True)
+    else:
+        print(f"  Parallel mode: {n_workers} workers for {len(stems)} files ({_exec_label}, BLAS=1 per worker)")
+        with _Pool(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(process_one, stem, args.ctc_dir, args.audio_dir,
+                            args.output_dir, 1): stem
+                for stem in stems
+            }
+            for fut in as_completed(futures):
+                stem = futures[fut]
+                try:
+                    s = fut.result()
+                except Exception as e:
+                    print(f"  FAIL {stem}: {e}")
+                    continue
+                totals["files"] += 1
+                parts = []
+                if s.get("start_adj", 0) > 0:
+                    parts.append(f"startx{s['start_adj']}")
+                if s.get("end_extend", 0) > 0:
+                    parts.append(f"extendx{s['end_extend']}")
+                if s.get("end_shorten", 0) > 0:
+                    parts.append(f"shortenx{s['end_shorten']}")
+                for k in ["start_adj", "end_extend", "end_shorten", "punct_adj"]:
+                    totals[k] += s.get(k, 0)
+                if args.verbose:
+                    print(f"  {stem}: {', '.join(parts) if parts else 'no changes'}")
+            # Progress heartbeat — one dot per 100 files
+            if totals["files"] % 100 == 0:
+                print(f"  ... {totals['files']}/{len(stems)} files adjusted", flush=True)
 
     print(f"\n{'='*50}")
     print(f"Total: {totals['files']} files")

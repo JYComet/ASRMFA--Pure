@@ -59,11 +59,12 @@
 
 # ── MFA ─────────────────────────────────────────────────────────────────
 # mfa:
-#   num_jobs: 8
+#   num_jobs: 0             # 0 = auto (os.cpu_count())
 #   single_speaker: true
 #   output_format: long_textgrid
-#   clean: true
+#   clean: false            # keep feature cache for faster re-runs
 #   no_tokenization: true
+#   skip_validate: true     # MFA align validates internally
 
 # ── 后处理 ──────────────────────────────────────────────────────────────
 # postprocess:
@@ -91,3 +92,4 @@
 #   filter_long_vowel_sec: 999.0
 #   enable_text_correction: true
 #   handle_unexpected_sil: true
+#   workers: 0              # 0 = auto (os.cpu_count())
