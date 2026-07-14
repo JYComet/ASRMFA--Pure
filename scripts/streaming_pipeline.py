@@ -46,8 +46,238 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 from pipeline_utils import (
     translate_path, resolve_input_path, find_mfa_python, get_mfa_env,
     find_wav, link_or_copy_file, sync_tree_back,
-    discover_stems, CTC_SUFFIXES,
+    discover_stems, discover_stems_separated, build_ctc_presence, build_file_index,
+    CTC_SUFFIXES,
 )
+
+
+# ═══════════════════════════════════════════════════════════════
+# Batch-level processing — single batch (2000 stems), no threading
+# ═══════════════════════════════════════════════════════════════
+
+def _persist_ctc_adj_cache(local_workspace: Path, nas_speaker: Path) -> None:
+    """Upload ctc_pretg_adj to NAS if it exists — preserves expensive adjust output."""
+    local_adj = local_workspace / "ctc_pretg_adj"
+    if not local_adj.exists() or not any(local_adj.iterdir()):
+        return
+    nas_adj = nas_speaker / "ctc_pretg_adj"
+    nas_adj.mkdir(parents=True, exist_ok=True)
+    rsync = shutil.which("rsync")
+    if rsync:
+        subprocess.run(
+            [rsync, "-a", "--no-inc-recursive",
+             str(local_adj) + "/", str(nas_adj) + "/"],
+            capture_output=True, text=True, timeout=600)
+    else:
+        for f in local_adj.rglob("*"):
+            if f.is_file():
+                rel = f.relative_to(local_adj)
+                tgt = nas_adj / rel
+                tgt.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(f), str(tgt))
+
+
+def _restore_ctc_adj_cache(local_workspace: Path, nas_speaker: Path) -> bool:
+    """Download ctc_pretg_adj from NAS if cached — skip expensive adjust step."""
+    nas_adj = nas_speaker / "ctc_pretg_adj"
+    if not nas_adj.exists() or not any(nas_adj.iterdir()):
+        return False
+    local_adj = local_workspace / "ctc_pretg_adj"
+    local_adj.mkdir(parents=True, exist_ok=True)
+    rsync = shutil.which("rsync")
+    if rsync:
+        rc = subprocess.run(
+            [rsync, "-a", "--no-inc-recursive",
+             str(nas_adj) + "/", str(local_adj) + "/"],
+            capture_output=True, text=True, timeout=600).returncode
+        return rc == 0
+    else:
+        for f in nas_adj.rglob("*"):
+            if f.is_file():
+                rel = f.relative_to(nas_adj)
+                tgt = local_adj / rel
+                tgt.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(f), str(tgt))
+        return True
+
+
+def run_single_batch(
+    ds: dict, batch_idx: int, batch_stems: list[str],
+    layout_map: dict, wav_index: dict,
+    local_base: Path, config: Path,
+    mfa_python: Path, models_dir: Path,
+    nas_output_root: Path,
+    batch_size: int, python_path: str | None = None,
+    mode: str = "ctc_ready",
+    text_index: dict[str, Path] | None = None,
+) -> bool:
+    """Process a single batch (one set of stems) end-to-end.
+
+    Prefetch → run_pipeline → upload → cleanup.  Synchronous; designed
+    to be called from a ThreadPoolExecutor worker for batch-level parallelism.
+
+    Args:
+        mode: "ctc_ready" (pre-existing CTC, fast) or "nvrasr_fallback"
+              (no/incomplete CTC, runs NVASR from scratch).
+        text_index: {stem: txt_path} for NVASR reference text (fallback only).
+    """
+    local_dir = local_base / f"batch_{batch_idx:04d}"
+    local_audio = local_dir / "audio"
+    local_ctc = local_dir / "ctc"
+    local_output = local_dir / "output"
+    local_workspace = local_dir / "workspace"
+
+    nas_ctc_dir = resolve_input_path(ds.get("ctc_dir", ""))
+    nas_audio_dir = resolve_input_path(ds.get("audio_dir", ""))
+    nas_output = nas_output_root / ds["name"]
+
+    is_fallback = (mode == "nvrasr_fallback")
+
+    # ── 1. Prefetch: NAS → local NVMe ──
+    t0 = time.time()
+    local_audio.mkdir(parents=True, exist_ok=True)
+
+    import concurrent.futures as _cf2
+    copy_tasks: list[tuple[Path, Path]] = []
+    for stem in batch_stems:
+        src_wav = wav_index.get(stem)
+        if src_wav is None:
+            src_wav = find_wav(nas_audio_dir, stem)
+        if src_wav:
+            copy_tasks.append((src_wav, local_audio / f"{stem}.wav"))
+        if is_fallback:
+            # Copy .txt reference text alongside audio for NVASR
+            txt_src = None
+            if text_index and stem in text_index:
+                txt_src = text_index[stem]
+            else:
+                # Try flat, then nested layout
+                for txt_path in (nas_audio_dir / f"{stem}.txt",
+                                 nas_audio_dir / stem / f"{stem}.txt"):
+                    if txt_path.exists():
+                        txt_src = txt_path
+                        break
+            if txt_src:
+                copy_tasks.append((txt_src, local_audio / f"{stem}.txt"))
+        else:
+            # ctc_ready: copy CTC files
+            if not is_fallback:
+                local_ctc.mkdir(parents=True, exist_ok=True)
+            layout = layout_map.get(stem, "flat")
+            ctc_base = nas_ctc_dir / stem if layout == "nested" else nas_ctc_dir
+            for suffix in CTC_SUFFIXES:
+                copy_tasks.append(
+                    (ctc_base / f"{stem}{suffix}",
+                     local_ctc / f"{stem}{suffix}")
+                )
+
+    n_workers = min(8, max(1, len(copy_tasks) // 100))
+    failed_copies = 0
+    with _cf2.ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = [pool.submit(link_or_copy_file, s, d) for s, d in copy_tasks]
+        for f in _cf2.as_completed(futures):
+            try:
+                if not f.result():
+                    failed_copies += 1
+            except Exception:
+                failed_copies += 1
+    if failed_copies:
+        print(f"  [BATCH {batch_idx:04d}] WARNING: {failed_copies}/{len(copy_tasks)} "
+              f"prefetch copies failed (source files missing on NAS?)")
+
+    # Write manifest for run_pipeline.py (ctc_ready only)
+    if not is_fallback:
+        manifest = {"stems": batch_stems, "n_stems": len(batch_stems)}
+        (local_ctc / "ctc_ready_manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False))
+
+    prefetch_elapsed = time.time() - t0
+
+    # ── 1.5 Restore cached adjust output (skip expensive adjust_ctc step) ──
+    adj_cached = _restore_ctc_adj_cache(local_workspace, nas_output)
+    if adj_cached:
+        print(f"  [BATCH {batch_idx:04d}] Restored ctc_pretg_adj from NAS cache")
+
+    # ── 2. Process: run_pipeline.py ──
+    cmd = [
+        str(mfa_python),
+        str(PROJECT_ROOT / "scripts" / "run_pipeline.py"),
+        "--config", str(config),
+        "--mode", mode,
+        "--data-dir", str(local_audio),
+        "--output-dir", str(local_output),
+        "--workspace", str(local_workspace),
+        "--python", str(mfa_python),
+        "--overwrite", "--force",
+    ]
+    if is_fallback:
+        # nvrasr_fallback: no --ctc-ready, NVASR generates CTC from scratch
+        pass
+    else:
+        cmd += ["--ctc-ready", str(local_ctc)]
+    t1 = time.time()
+    try:
+        rc = subprocess.run(
+            cmd, env=get_mfa_env(mfa_python, models_dir),
+            timeout=7200, capture_output=False,
+        ).returncode
+    except subprocess.TimeoutExpired:
+        rc = 1
+    process_elapsed = time.time() - t1
+
+    if rc != 0:
+        print(f"  [BATCH {batch_idx:04d}] {ds['name']} FAIL (rc={rc}) "
+              f"(prefetch={prefetch_elapsed:.0f}s process={process_elapsed:.0f}s)")
+        # Even on failure, preserve ctc_pretg_adj (expensive adjust output) to NAS
+        _persist_ctc_adj_cache(local_workspace, nas_output)
+        shutil.rmtree(local_dir, ignore_errors=True)
+        return False
+
+    # ── 3. Upload: local NVMe → NAS ──
+    t2 = time.time()
+    upload_ok = True
+    for local_src, nas_rel in [
+        (local_output, nas_output / "output"),
+        (local_workspace / "filtered", nas_output / "filtered"),
+        (local_workspace / "ctc_pretg_adj", nas_output / "ctc_pretg_adj"),
+    ]:
+        if not local_src.exists() or not any(local_src.iterdir()):
+            continue
+        nas_rel.mkdir(parents=True, exist_ok=True)
+        rsync = shutil.which("rsync")
+        if rsync:
+            try:
+                rc_up = subprocess.run(
+                    [rsync, "-a", "--no-inc-recursive",
+                     str(local_src) + "/", str(nas_rel) + "/"],
+                    capture_output=True, text=True, timeout=600).returncode
+                if rc_up != 0:
+                    print(f"    rsync warning: rc={rc_up} for {local_src}")
+            except subprocess.TimeoutExpired:
+                print(f"    rsync TIMEOUT for {local_src}, falling back to copy")
+                rsync = None  # fall through to manual copy
+        if not rsync:
+            try:
+                for f in local_src.rglob("*"):
+                    if f.is_file():
+                        rel = f.relative_to(local_src)
+                        target = nas_rel / rel
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(str(f), str(target))
+            except Exception as e:
+                print(f"    Upload copy error: {e}")
+                upload_ok = False
+
+    upload_elapsed = time.time() - t2
+
+    # ── 4. Cleanup ──
+    shutil.rmtree(local_dir, ignore_errors=True)
+
+    total = time.time() - t0
+    print(f"  [BATCH {batch_idx:04d}] {ds['name']} OK "
+          f"(prefetch={prefetch_elapsed:.0f}s process={process_elapsed:.0f}s "
+          f"upload={upload_elapsed:.0f}s total={total:.0f}s)")
+    return True
 
 
 def _merge_to_nas(src: Path, dst: Path) -> bool:
@@ -60,12 +290,15 @@ def _merge_to_nas(src: Path, dst: Path) -> bool:
     dst.mkdir(parents=True, exist_ok=True)
     rsync = shutil.which("rsync")
     if rsync:
-        rc = subprocess.run(
-            [rsync, "-a", "--no-inc-recursive",
-             str(src) + "/", str(dst) + "/"],
-            capture_output=True, text=True, timeout=300).returncode
-        if rc == 0:
-            return True
+        try:
+            rc = subprocess.run(
+                [rsync, "-a", "--no-inc-recursive",
+                 str(src) + "/", str(dst) + "/"],
+                capture_output=True, text=True, timeout=300).returncode
+            if rc == 0:
+                return True
+        except subprocess.TimeoutExpired:
+            print(f"  rsync timed out after 300s — falling back to file-by-file copy")
     # Fallback: copy file-by-file
     try:
         for f in src.rglob("*"):
@@ -220,13 +453,15 @@ class BatchManager:
     def __init__(self, stems: list[str], batch_size: int,
                  nas_ctc_dir: Path, nas_audio_dir: Path,
                  local_base: Path,
-                 layout_map: dict[str, str] | None = None):
+                 layout_map: dict[str, str] | None = None,
+                 wav_index: dict[str, Path] | None = None):
         self.stems = stems
         self.batch_size = batch_size
         self.nas_ctc_dir = nas_ctc_dir
         self.nas_audio_dir = nas_audio_dir
         self.local_base = local_base
         self.layout_map = layout_map or {}  # {stem: "flat"|"nested"}
+        self.wav_index = wav_index or {}    # {stem: resolved_wav_path}
         self.batches: list[list[str]] = [
             stems[i:i + batch_size]
             for i in range(0, len(stems), batch_size)
@@ -282,7 +517,9 @@ class StreamingPipeline:
     # ── 预取线程 ─────────────────────────────────────────────
 
     def _prefetch_worker(self):
-        """后台: NAS → 本地 SSD。"""
+        """后台: NAS → 本地 SSD (并行文件拷贝)。"""
+        import concurrent.futures as _cf
+
         for batch_idx in range(len(self.bm)):
             if self._stop_event.is_set():
                 break
@@ -295,42 +532,63 @@ class StreamingPipeline:
             print(f"\n  [PREFETCH] batch {batch_idx+1}/{len(self.bm)} "
                   f"({len(stems)} stems) NAS → local ...")
 
-            ok = True
-            missing_audio = 0
             local_audio.mkdir(parents=True, exist_ok=True)
             local_ctc.mkdir(parents=True, exist_ok=True)
 
-            # 复制音频
+            # ── 并行拷贝: 音频 + CTC 文件 ──
+            # 构建拷贝任务列表 (src, dst)，然后用线程池并发执行
+            copy_tasks: list[tuple[Path, Path]] = []
+            missing_audio = 0
+
+            wav_index = self.bm.wav_index
+            nas_audio_dir = self.bm.nas_audio_dir
+            nas_ctc_dir = self.bm.nas_ctc_dir
+            layout_map = self.bm.layout_map
+
             for stem in stems:
-                src_wav = find_wav(self.bm.nas_audio_dir, stem)
+                # Audio: use pre-built wav_index (O(1), no CIFS)
+                src_wav = wav_index.get(stem) if wav_index else None
+                if src_wav is None:
+                    src_wav = find_wav(nas_audio_dir, stem)
                 if src_wav:
-                    link_or_copy_file(src_wav, local_audio / f"{stem}.wav")
+                    copy_tasks.append((src_wav, local_audio / f"{stem}.wav"))
                 else:
                     missing_audio += 1
-                    ok = False
+
+                # CTC files: use layout_map from discover_stems
+                layout = layout_map.get(stem, "flat")
+                ctc_src_base = nas_ctc_dir / stem if layout == "nested" else nas_ctc_dir
+                for suffix in CTC_SUFFIXES:
+                    copy_tasks.append(
+                        (ctc_src_base / f"{stem}{suffix}",
+                         local_ctc / f"{stem}{suffix}")
+                    )
 
             if missing_audio:
                 print(f"    WARNING: audio not found for {missing_audio}/{len(stems)} stems")
 
-            # 复制 CTC 文件 — use layout_map from discover_stems (no per-stem exists())
-            missing_ctc = 0
-            for stem in stems:
-                layout = self.bm.layout_map.get(stem, "flat")
-                if layout == "nested":
-                    ctc_src_base = self.bm.nas_ctc_dir / stem
-                else:
-                    ctc_src_base = self.bm.nas_ctc_dir
-                found_any = False
-                for suffix in CTC_SUFFIXES:
-                    src = ctc_src_base / f"{stem}{suffix}"
-                    if src.exists():
-                        link_or_copy_file(src, local_ctc / f"{stem}{suffix}")
-                        found_any = True
-                if not found_any:
-                    missing_ctc += 1
+            # ── 并行执行拷贝 (I/O-bound, 8 线程足够饱和 CIFS) ──
+            n_workers = min(8, len(copy_tasks))
+            copied = 0
+            failed = 0
+            with _cf.ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = [
+                    pool.submit(link_or_copy_file, src, dst)
+                    for src, dst in copy_tasks
+                ]
+                for fut in _cf.as_completed(futures):
+                    try:
+                        if fut.result():
+                            copied += 1
+                        else:
+                            failed += 1
+                    except Exception:
+                        failed += 1
 
-            if missing_ctc:
-                print(f"    WARNING: CTC files not found for {missing_ctc}/{len(stems)} stems")
+            if failed:
+                print(f"    WARNING: {failed}/{len(copy_tasks)} file copies failed")
+
+            ok = (missing_audio == 0)
 
             # 写 manifest
             manifest = {"stems": stems, "n_stems": len(stems)}
@@ -372,12 +630,16 @@ class StreamingPipeline:
             t0 = time.time()
             ok = True
 
-            if local_output.exists() and any(local_output.iterdir()):
-                if not _merge_to_nas(local_output, nas_output):
-                    ok = False
-            if local_filtered.exists() and any(local_filtered.iterdir()):
-                if not _merge_to_nas(local_filtered, nas_filtered):
-                    ok = False
+            try:
+                if local_output.exists() and any(local_output.iterdir()):
+                    if not _merge_to_nas(local_output, nas_output):
+                        ok = False
+                if local_filtered.exists() and any(local_filtered.iterdir()):
+                    if not _merge_to_nas(local_filtered, nas_filtered):
+                        ok = False
+            except Exception as e:
+                print(f"  [UPLOAD] batch {batch_idx+1} exception: {e}")
+                ok = False
 
             if local_dir.exists():
                 shutil.rmtree(local_dir, ignore_errors=True)
@@ -606,12 +868,29 @@ Examples:
     args._config = cfg  # stash for reuse by run_batch
 
     # --local-work: CLI > config > error
+    # Supports single path (str) or list of paths for multi-NVMe setups
     if args.local_work is None:
         cfg_val = streaming_cfg.get("local_work", "")
         if cfg_val:
-            args.local_work = Path(cfg_val)
+            if isinstance(cfg_val, list):
+                # Multi-drive: resolve each path
+                args.local_work = tuple(
+                    Path(p) if Path(p).is_absolute() else PROJECT_ROOT / p
+                    for p in cfg_val
+                )
+            else:
+                p = Path(cfg_val)
+                args.local_work = p if p.is_absolute() else PROJECT_ROOT / p
         else:
             parser.error("--local-work is required (or set 'streaming.local_work' in config)")
+
+    # Normalize to tuple for uniform handling
+    _lw = args.local_work
+    if isinstance(_lw, (str, Path)):
+        _lw = (_lw if isinstance(_lw, Path) else Path(_lw),)
+    args._local_work_drives = tuple(
+        p if p.is_absolute() else PROJECT_ROOT / p for p in _lw
+    )
 
     # --batch-size: CLI > config > default 500
     if args.batch_size is None:
@@ -623,7 +902,8 @@ Examples:
     if args.batch_cache is None:
         cfg_val = streaming_cfg.get("batch_cache", "")
         if cfg_val:
-            args.batch_cache = Path(cfg_val)
+            p = Path(cfg_val)
+            args.batch_cache = p if p.is_absolute() else PROJECT_ROOT / p
         elif not (args.data_dir or args.ctc_ready or args.nas_ctc or args.nas_audio):
             derived = PROJECT_ROOT / "cache" / f"{args.config.stem}.cache.json"
             if derived.exists():
@@ -687,6 +967,7 @@ def run_single_dataset(
     config: Path, local_work: Path,
     batch_size: int = 500, limit: int = 0,
     python_path: str | None = None,
+    stems_override: list[str] | None = None,
 ) -> bool:
     """Run streaming pipeline for a single dataset.  Returns True on success."""
     # ── Ensure MFA model is pre-extracted before subprocess starts ──
@@ -712,7 +993,18 @@ def run_single_dataset(
 
     # ── Discover stems (single scandir, O(1) set validation) ──
     print("\nDiscovering stems ...")
-    stems, layout_map = discover_stems(nas_ctc_dir, nas_audio_dir, require_all=True)
+    if stems_override is not None:
+        stems = list(stems_override)
+        layout_map = {s: "nested" for s in stems}
+        wav_index = {}
+        for s in stems:
+            w = find_wav(nas_audio_dir, s)
+            if w:
+                wav_index[s] = w
+        stems = [s for s in stems if s in wav_index]
+        print(f"  Using {len(stems)} stems (override)")
+    else:
+        stems, layout_map, wav_index = discover_stems(nas_ctc_dir, nas_audio_dir, require_all=True)
     if limit > 0:
         stems = stems[:limit]
     print(f"  Found {len(stems)} valid stems"
@@ -744,6 +1036,7 @@ def run_single_dataset(
         nas_audio_dir=nas_audio_dir,
         local_base=local_work,
         layout_map=layout_map,
+        wav_index=wav_index,
     )
 
     # ── Run ──
@@ -823,16 +1116,54 @@ def run_batch(args) -> None:
 
     # Resolve parallelism: CLI > config > default 1
     parallel = args.parallel_datasets
+    _cfg = getattr(args, '_config', {})
     if parallel is None:
-        _cfg = getattr(args, '_config', {})
         parallel = _cfg.get("streaming", {}).get("parallel", 1) if _cfg else 1
-    parallel = max(1, min(parallel, len(datasets)))
+    parallel = max(1, parallel)  # Keep user-specified value for batch-level scheduling
+
+    # ── Resolve local work drives ──
+    _drives = getattr(args, '_local_work_drives', (args.local_work,))
+    # Validate at least one drive is usable
+    usable_drives = []
+    for d in _drives:
+        d.parent.mkdir(parents=True, exist_ok=True) if not d.exists() else None
+        d.mkdir(parents=True, exist_ok=True)
+        usable_drives.append(d)
+    if not usable_drives:
+        print("ERROR: No usable local work drives!")
+        sys.exit(1)
+
+    # Auto-adjust MFA num_jobs per dataset when running parallel:
+    # Each dataset's MFA align spawns num_jobs processes internally.
+    # With N parallel datasets, total MFA workers = N * num_jobs.
+    # IMPORTANT: num_jobs > 1 causes a race condition inside MFA's
+    # setup_acoustic_model() (os.rename without locking on phones.txt /
+    # graphemes.txt).  We cap at 1 — batch-level parallelism already
+    # provides enough throughput and avoids the race entirely.
+    import os as _os
+    cpu_count = _os.cpu_count() or 32
+    _mfa_jobs = _cfg.get("mfa", {}).get("num_jobs", 32) if _cfg else 32
+    if _mfa_jobs <= 0:
+        _mfa_jobs = cpu_count
+    # Force num_jobs=1: MFA's setup_acoustic_model() has a TOCTOU race
+    # on phones.txt/graphemes.txt rename when multiple workers share a
+    # temp directory. Batch-level parallelism (12 workers) already gives
+    # enough throughput.
+    _effective_mfa_jobs = 1
+    if _effective_mfa_jobs < _mfa_jobs:
+        print(f"  Note: Reducing MFA num_jobs from {_mfa_jobs} to {_effective_mfa_jobs} "
+              f"(parallel={parallel}, CPUs={cpu_count})")
+    # Update config for child processes
+    if _cfg:
+        _cfg.setdefault("mfa", {})["num_jobs"] = _effective_mfa_jobs
+    args._effective_mfa_jobs = _effective_mfa_jobs
 
     print(f"\n{'#'*60}")
     print(f"  BATCH MODE: {len(datasets)} datasets from {cache_path}")
     print(f"  Checkpoint:  {ckpt_path}")
     print(f"  Parallel:    {parallel} concurrent workers")
-    print(f"  Local work:  {args.local_work}")
+    print(f"  Local work:  {len(usable_drives)} drive(s): {', '.join(str(d) for d in usable_drives)}")
+    print(f"  MFA jobs/ds: {_effective_mfa_jobs}")
     print(f"  Batch size:  {args.batch_size}")
     print(f"{'#'*60}")
 
@@ -842,60 +1173,238 @@ def run_batch(args) -> None:
     #   - MFA subprocess extracting into double-nested path → FileNotFoundError
     _ensure_mfa_model_extracted()
 
+    # ── Resolve MFA Python and models dir (needed by run_single_batch) ──
+    if args.python:
+        mfa_python = Path(args.python)
+    else:
+        mfa_python = find_mfa_python()
+    if not mfa_python or not mfa_python.exists():
+        print("ERROR: Cannot find MFA Python. Use --python PATH.")
+        sys.exit(1)
+    models_dir = PROJECT_ROOT / "models" / "mfa"
+    print(f"MFA Python: {mfa_python}")
+
     if parallel <= 1:
         _run_batch_sequential(args, datasets, cache, ckpt_path, completed_set, failed_set)
         return
 
-    # ── Parallel mode ──
+    # ── Batch-level parallel mode ──
+    # Pre-discover stems for ALL datasets, split into batches, put ALL
+    # individual batches into a shared queue.  Every worker processes
+    # whatever batch is available — including batches from the same
+    # dataset.  A 100k-stem dataset with 50 batches gets distributed
+    # across all 8 workers instead of being stuck on 1 worker.
+    import queue as _queue
+
+    # Phase 1: pre-scan all datasets → build batch task list
+    print(f"\n  Pre-scanning {len(datasets)} datasets ...")
+
+    # Load scan cache to avoid re-scanning on restart (expensive SMB find_wav calls)
+    scan_cache_path = cache_path.with_name(cache_path.stem + ".scan.json")
+    scan_cache: dict[str, dict] = {}
+    if not getattr(args, 'no_resume', False) and scan_cache_path.exists():
+        try:
+            scan_cache = json.loads(scan_cache_path.read_text(encoding='utf-8'))
+            hits = sum(1 for ds in datasets if ds["name"] in scan_cache)
+            print(f"  Scan cache: {hits}/{len(datasets)} datasets cached")
+        except Exception:
+            scan_cache = {}
+    scan_updated = False
+
+    all_batches: list[tuple] = []  # (mode, ds, batch_idx, batch_stems, layout_map, wav_index, text_index)
+    total_stems = 0
+    total_incomplete = 0
+    for ds_idx, ds in enumerate(datasets):
+        ds_name = ds["name"]
+        nas_ctc = resolve_input_path(ds.get("ctc_dir", ""))
+        nas_audio = resolve_input_path(ds.get("audio_dir", ""))
+        if not nas_ctc.exists() or not nas_audio.exists():
+            print(f"  SKIP {ds_name}: CTC or audio dir not found")
+            continue
+
+        complete_stems: list[str] = []
+        incomplete_stems: list[str] = []
+        layout_map: dict[str, str] = {}
+        wav_index: dict[str, Path] = {}
+        incomplete_wav_index: dict[str, Path] = {}
+        text_index: dict[str, Path] = {}
+
+        # Support per-dataset stems override (for missing-files reprocessing)
+        if "stems" in ds:
+            all_stems = list(ds["stems"])
+            layout_map = {s: "nested" for s in all_stems}  # assume nested layout
+
+            # Check scan cache for pre-computed wav_index (avoids 38k SMB find_wav calls)
+            cached = scan_cache.get(ds_name, {})
+            if cached.get("stems") == all_stems:
+                wav_index = {s: Path(p) for s, p in cached["wav_paths"].items()}
+                # Cache also includes incomplete info if present
+                if "incomplete_stems" in cached:
+                    incomplete_stems = cached["incomplete_stems"]
+                    incomplete_wav_index = {s: Path(p) for s, p
+                                            in cached.get("incomplete_wav_paths", {}).items()}
+                complete_stems = [s for s in all_stems if s in wav_index]
+                print(f"  {ds_name}: {len(complete_stems)} stems (scan cache)"
+                      + (f" + {len(incomplete_stems)} fallback" if incomplete_stems else ""))
+            else:
+                missing_ctc = 0
+                ctc_files_flat, ctc_files_nested = build_ctc_presence(nas_ctc)
+                for s in all_stems:
+                    w = find_wav(nas_audio, s)
+                    if not w:
+                        continue
+                    ctc_ok = all(f"{s}{suffix}" in ctc_files_flat
+                                 or (s in ctc_files_nested
+                                     and f"{s}{suffix}" in ctc_files_nested[s])
+                                 for suffix in CTC_SUFFIXES)
+                    if ctc_ok:
+                        wav_index[s] = w
+                        complete_stems.append(s)
+                    else:
+                        incomplete_wav_index[s] = w
+                        incomplete_stems.append(s)
+                        missing_ctc += 1
+                # Save to scan cache
+                scan_cache[ds_name] = {
+                    "stems": all_stems,
+                    "wav_paths": {s: str(p) for s, p in wav_index.items()},
+                    "incomplete_stems": incomplete_stems,
+                    "incomplete_wav_paths": {s: str(p) for s, p in incomplete_wav_index.items()},
+                }
+                scan_updated = True
+                info = f"  {ds_name}: {len(complete_stems)} stems (scanned)"
+                if missing_ctc:
+                    info += f", {missing_ctc} incomplete → fallback"
+                print(info)
+        else:
+            complete_stems, incomplete_stems, layout_map, wav_index = \
+                discover_stems_separated(nas_ctc, nas_audio, require_all=True)
+            # Build incomplete wav_index from wav_index (same stems)
+            for s in incomplete_stems:
+                if s in wav_index:
+                    incomplete_wav_index[s] = wav_index[s]
+
+        batch_size_eff = args.batch_size
+
+        # ── Enqueue ctc_ready batches (complete stems) ──
+        if complete_stems:
+            batches_ctc = [complete_stems[i:i + batch_size_eff]
+                           for i in range(0, len(complete_stems), batch_size_eff)]
+            for batch_idx, batch_stems in enumerate(batches_ctc):
+                all_batches.append(
+                    ("ctc_ready", ds, batch_idx, batch_stems, layout_map, wav_index, None))
+            total_stems += len(complete_stems)
+            print(f"  {ds_name}: {len(complete_stems)} stems → {len(batches_ctc)} ctc_ready batches")
+
+        # ── Enqueue nvrasr_fallback batches (incomplete stems) ──
+        if incomplete_stems:
+            # Build text index for NVASR reference text
+            text_index = build_file_index(nas_audio, ".txt")
+            if not text_index:
+                print(f"  {ds_name}: WARNING: {len(incomplete_stems)} fallback stems "
+                      f"have no reference .txt — NVASR will use ASR-only")
+            batches_fb = [incomplete_stems[i:i + batch_size_eff]
+                          for i in range(0, len(incomplete_stems), batch_size_eff)]
+            for batch_idx, batch_stems in enumerate(batches_fb):
+                all_batches.append(
+                    ("nvrasr_fallback", ds, batch_idx, batch_stems,
+                     layout_map, incomplete_wav_index, text_index))
+            total_incomplete += len(incomplete_stems)
+            print(f"  {ds_name}: {len(incomplete_stems)} stems → {len(batches_fb)} nvrasr_fallback batches")
+
+        if not complete_stems and not incomplete_stems:
+            print(f"  SKIP {ds_name}: no valid stems")
+            continue
+
+    # Persist scan cache for faster restart
+    if scan_updated:
+        try:
+            scan_cache_path.write_text(
+                json.dumps(scan_cache, ensure_ascii=False, indent=2), encoding='utf-8')
+            print(f"  Scan cache saved: {scan_cache_path}")
+        except Exception as e:
+            print(f"  WARNING: Could not save scan cache: {e}")
+
+    print(f"\n  Total: {len(all_batches)} batches ({total_stems} ctc_ready + {total_incomplete} fallback stems)")
+
+    if not all_batches:
+        print("ERROR: No batches to process!")
+        sys.exit(1)
+
+    # Phase 2: put all batches into shared queue
+    batch_queue: _queue.Queue = _queue.Queue()
+    global_batch_idx = 0
+    for item in all_batches:
+        batch_queue.put((global_batch_idx, item))
+        global_batch_idx += 1
+    total_batches = global_batch_idx
+
+    # Track per-dataset completion: all batches of a dataset must
+    # succeed before marking the dataset as DONE in checkpoint.
+    ds_batch_tracker: dict[str, dict] = {}  # {ds_name: {"total": N, "done": n, "fail": n}}
+    for ds_item in all_batches:
+        # ds_item format: (mode, ds, batch_idx, batch_stems, layout_map, wav_index, text_index)
+        ds_name = ds_item[1]["name"]
+        if ds_name not in ds_batch_tracker:
+            ds_batch_tracker[ds_name] = {"total": 0, "done": 0, "fail": 0}
+        ds_batch_tracker[ds_name]["total"] += 1
+
     ok_count = 0
     fail_list: list[str] = []
-
-    groups = [[] for _ in range(parallel)]
-    for i, ds in enumerate(datasets):
-        groups[i % parallel].append((i, ds))
-
     ckpt_lock = threading.Lock()
 
-    def worker(worker_id: int, group: list) -> tuple[int, list[str]]:
-        """Process one group of datasets sequentially."""
+    def worker(worker_id: int) -> tuple[int, list[str]]:
+        """Pull individual batches from shared queue."""
         w_ok = 0
         w_fails: list[str] = []
-        local_base = args.local_work / f"worker_{worker_id}"
-        for global_idx, ds in group:
+        drive = usable_drives[worker_id % len(usable_drives)]
+        local_base = drive / f"worker_{worker_id}"
+        while True:
+            try:
+                batch_global_idx, (batch_mode, ds, batch_idx, batch_stems,
+                                   layout_map, wav_index, text_index) = batch_queue.get_nowait()
+            except _queue.Empty:
+                break
+
             ds_name = ds["name"]
-            nas_ctc = ds.get("ctc_dir", "")
-            nas_audio = ds.get("audio_dir", "")
-            nas_output = cache.get("output_root", "").rstrip("/") + "/" + ds_name
-            ds_local = local_base / ds_name
+            nas_output_root = resolve_input_path(
+                cache.get("output_root", "").rstrip("/"), PROJECT_ROOT)
+            batch_label = f"{ds_name}/{batch_idx:04d}"
+            remaining = batch_queue.qsize()
 
-            with ckpt_lock:
-                print(f"\n{'='*60}")
-                print(f"  [W{worker_id}] [{global_idx+1}/{len(datasets)}] {ds_name}")
-                print(f"  Local:   {ds_local}")
-                print(f"{'='*60}")
+            mode_tag = f" [{batch_mode}]" if batch_mode != "ctc_ready" else ""
+            print(f"\n  [W{worker_id}] [{batch_global_idx+1}/{total_batches}]"
+                  f" {batch_label} ({len(batch_stems)} stems){mode_tag}"
+                  f" [{remaining} left]")
 
-            result = run_single_dataset(
-                nas_ctc=nas_ctc, nas_audio=nas_audio,
-                nas_output=nas_output, config=args.config,
-                local_work=ds_local, batch_size=args.batch_size,
-                limit=args.limit, python_path=args.python,
+            ok = run_single_batch(
+                ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
+                layout_map=layout_map, wav_index=wav_index,
+                local_base=local_base, config=args.config,
+                mfa_python=mfa_python, models_dir=models_dir,
+                nas_output_root=nas_output_root,
+                batch_size=args.batch_size, python_path=args.python,
+                mode=batch_mode, text_index=text_index,
             )
 
             with ckpt_lock:
-                if result:
-                    w_ok += 1
+                tracker = ds_batch_tracker[ds_name]
+                if ok:
+                    tracker["done"] += 1
                 else:
-                    w_fails.append(ds_name)
-                if ds_local.exists():
-                    shutil.rmtree(ds_local, ignore_errors=True)
-                # Update checkpoint
-                if result:
-                    completed_set.add(ds_name)
-                else:
-                    failed_set.add(ds_name)
-                _save_checkpoint(ckpt_path, completed_set, failed_set)
-                print(f"  [W{worker_id}] [{global_idx+1}/{len(datasets)}] {ds_name} — "
-                      f"{'DONE' if result else 'FAILED'}")
+                    tracker["fail"] += 1
+                # Dataset complete when all batches done
+                if tracker["done"] + tracker["fail"] >= tracker["total"]:
+                    if tracker["fail"] == 0:
+                        w_ok += 1
+                        completed_set.add(ds_name)
+                    else:
+                        w_fails.append(ds_name)
+                        failed_set.add(ds_name)
+                    _save_checkpoint(ckpt_path, completed_set, failed_set)
+                    status = "DONE" if tracker["fail"] == 0 else "FAIL"
+                    print(f"  [W{worker_id}] {ds_name} — {status} "
+                          f"({tracker['done']}/{tracker['total']} batches)")
 
         # Cleanup worker dir
         if local_base.exists():
@@ -903,7 +1412,7 @@ def run_batch(args) -> None:
         return w_ok, w_fails
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as pool:
-        futures = [pool.submit(worker, wid, group) for wid, group in enumerate(groups)]
+        futures = [pool.submit(worker, wid) for wid in range(parallel)]
         for fut in concurrent.futures.as_completed(futures):
             w_ok, w_fails = fut.result()
             ok_count += w_ok
@@ -935,12 +1444,15 @@ def _run_batch_sequential(args, datasets: list, cache: dict,
     """Sequential dataset loop with checkpoint after each dataset (used when parallel=1)."""
     ok_count = 0
     fail_list: list[str] = []
+    # Use first available local drive
+    _drives = getattr(args, '_local_work_drives', (args.local_work,))
+    _first_drive = _drives[0] if _drives else args.local_work
     for i, ds in enumerate(datasets):
         ds_name = ds["name"]
         nas_ctc = ds.get("ctc_dir", "")
         nas_audio = ds.get("audio_dir", "")
         nas_output = cache.get("output_root", "").rstrip("/") + "/" + ds_name
-        ds_local = args.local_work / ds_name
+        ds_local = _first_drive / ds_name
 
         print(f"\n{'='*60}")
         print(f"  [{i+1}/{len(datasets)}] {ds_name}")
@@ -949,11 +1461,13 @@ def _run_batch_sequential(args, datasets: list, cache: dict,
         print(f"  Output: {nas_output}")
         print(f"{'='*60}")
 
+        stems_ov = ds.get("stems", None)
         ok = run_single_dataset(
             nas_ctc=nas_ctc, nas_audio=nas_audio,
             nas_output=nas_output, config=args.config,
             local_work=ds_local, batch_size=args.batch_size,
             limit=args.limit, python_path=args.python,
+            stems_override=stems_ov,
         )
 
         if ok:

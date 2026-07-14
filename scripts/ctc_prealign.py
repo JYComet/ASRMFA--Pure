@@ -25,6 +25,7 @@ import json
 import os
 import re
 import time
+from collections import Counter
 from itertools import groupby
 from pathlib import Path
 
@@ -82,51 +83,12 @@ def chars_and_pinyin(text: str):
     return chars, pinyins
 
 
-# ── NVV known names (shared with postprocess_textgrids.py) ──
-NVV_NAMES: set[str] = {
-    "BREATHING", "LAUGHTER", "BURP", "COUGH", "CRYING", "GROAN",
-    "HISS", "HUM", "SHH", "SIGH", "SNEEZE", "SNIFF", "SNORE",
-    "TSK", "UHM", "WHISTLE", "YAWN",
-    "QUESTION-YI", "QUESTION-EN", "QUESTION-OH", "QUESTION-AH",
-    "QUESTION-EI", "QUESTION-HUH",
-    "SURPRISE-OH", "SURPRISE-AH", "SURPRISE-WA", "SURPRISE-YO",
-    "CONFIRMATION-EN", "DISSATISFACTION-HNN",
-}
-
-_NVV_NAMES_UPPER = {n.upper() for n in NVV_NAMES}
-
-
-def is_pinyin_syllable(token: str) -> bool:
-    """检查 token 是否为有效的拼音音节 (可被 MFA 词典识别).
-
-    拼音音节: 小写字母序列 + 可选声调数字 1-5.
-    例如: kuai4, ni3, hao3, e2, a1, nv3, lve4
-    不匹配: , . ? ! ... (标点), hello (英文), 123 (数字)
-    """
-    import re
-    return bool(re.match(r'^[a-z]+[1-5]$', token))
-
-
-def is_nvv_token(token: str) -> bool:
-    """检查 token 是否为 NVV 标签 (BREATHING, QUESTION-YI 等)."""
-    return token.upper() in _NVV_NAMES_UPPER
-
-
-def is_english_token(token: str) -> bool:
-    """Token is English alpha: not CJK, not NVV, not pinyin syllable with tone.
-
-    English tokens (like "li", "ve", "A", "I", "AI", "live") are treated
-    as self-referential MFA dict entries and use CTC-only boundaries.
-    """
-    if not token or not token.isalpha():
-        return False
-    if not token.isascii():
-        return False  # CJK chars are alpha in Python but not English
-    if is_nvv_token(token):
-        return False
-    if is_pinyin_syllable(token):
-        return False
-    return True
+# ── Import shared constants from pipeline_utils ──
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+from pipeline_utils import (
+    NVV_NAMES, NVV_TO_MFA,
+    is_nvv_token, is_english_token, is_pinyin_syllable,
+)
 
 
 def load_mfa_word_set(dict_path: Path | None) -> set[str] | None:
@@ -153,41 +115,6 @@ def valid_mfa_word(token: str, mfa_words: set[str] | None = None) -> bool:
     if token.isdigit():
         return True
     return False
-
-
-# ─── NVV 标签 → MFA 大写 token 映射 ───
-
-NVV_TO_MFA: dict[str, str] = {
-    "Breathing": "BREATHING",
-    "Laughter": "LAUGHTER",
-    "Burp": "BURP",
-    "Cough": "COUGH",
-    "Crying": "CRYING",
-    "Groan": "GROAN",
-    "Hiss": "HISS",
-    "Hum": "HUM",
-    "Shh": "SHH",
-    "Sigh": "SIGH",
-    "Sneeze": "SNEEZE",
-    "Sniff": "SNIFF",
-    "Snore": "SNORE",
-    "Tsk": "TSK",
-    "Uhm": "UHM",
-    "Whistle": "WHISTLE",
-    "Yawn": "YAWN",
-    "Question-yi": "QUESTION-YI",
-    "Question-en": "QUESTION-EN",
-    "Question-oh": "QUESTION-OH",
-    "Question-ah": "QUESTION-AH",
-    "Question-ei": "QUESTION-EI",
-    "Question-huh": "QUESTION-HUH",
-    "Surprise-oh": "SURPRISE-OH",
-    "Surprise-ah": "SURPRISE-AH",
-    "Surprise-wa": "SURPRISE-WA",
-    "Surprise-yo": "SURPRISE-YO",
-    "Confirmation-en": "CONFIRMATION-EN",
-    "Dissatisfaction-hnn": "DISSATISFACTION-HNN",
-}
 
 
 def nvv_to_mfa(label: str) -> str:
@@ -227,6 +154,10 @@ def make_patched_inference(ref_texts: dict[str, str],
 
     ref_texts: {stem: chinese_text}  — 键为音频文件 stem (无扩展名)
     """
+    try:
+        import cn2an as _cn2an
+    except ImportError:
+        _cn2an = None
 
     def patched(self, data_in, data_lengths=None,
                 key=["wav_file_tmp_name"], tokenizer=None,
@@ -350,19 +281,16 @@ def make_patched_inference(ref_texts: dict[str, str],
                 align_text = asr_clean
 
             # cn2an 数字正则化 (参考文本和 ASR 文本都可能含阿拉伯数字)
-            try:
-                import cn2an
+            if _cn2an is not None:
                 parts = re.split(r'(\[[^\]]+\]|[A-Z][A-Z0-9-]*[A-Z0-9])', align_text)
                 for k, part in enumerate(parts):
                     if re.match(r'^(\[[^\]]+\]|[A-Z][A-Z0-9-]*[A-Z0-9])$', part):
                         continue
                     try:
-                        parts[k] = cn2an.transform(part, 'an2cn')
+                        parts[k] = _cn2an.transform(part, 'an2cn')
                     except Exception:
                         pass
                 align_text = ''.join(parts)
-            except ImportError:
-                pass
 
             words_aligned = []  # token 级别时间戳
             if align_text:
@@ -416,6 +344,27 @@ def make_patched_inference(ref_texts: dict[str, str],
                             tid += 1
                         _s = _e
 
+            # ── Check English token completeness ──
+            # CTC forced alignment can drop tokens that get 0 frames
+            # (e.g. "live"→"li"+"ve" but only "li" survives).  Detect
+            # this by comparing tokenizer output against aligned tokens.
+            expected_eng: list[str] = []
+            for t in speech_tokens:
+                t_clean = str(t).lstrip('▁')
+                if is_english_token(t_clean):
+                    expected_eng.append(t_clean)
+            actual_eng = [w['word'].lstrip('▁') for w in words_aligned
+                          if is_english_token(w['word'].lstrip('▁'))]
+            exp_counts = Counter(expected_eng)
+            act_counts = Counter(actual_eng)
+            english_complete = True
+            missing_english: list[str] = []
+            for tok, count in exp_counts.items():
+                if act_counts.get(tok, 0) < count:
+                    english_complete = False
+                    missing_english.append(
+                        f"{tok}(expected {count}, got {act_counts.get(tok, 0)})")
+
             results.append({
                 "key": key[i],
                 "text_asr": asr_final,
@@ -423,6 +372,8 @@ def make_patched_inference(ref_texts: dict[str, str],
                 "duration_s": round(duration_s, 3),
                 "words": words_aligned,
                 "blank_runs": blank_runs,
+                "english_complete": english_complete,
+                "missing_english": missing_english,
             })
 
         return results, meta
@@ -655,7 +606,7 @@ def main():
     parser.add_argument("--data-dir", type=Path, required=True,
                         help="原始数据目录 (含 wav + 中文 txt)")
     parser.add_argument("--pinyin-dir", type=Path, required=True,
-                        help="拼音语料目录 (prepare_corpus 输出, 用于 fallback)")
+                        help="拼音语料目录 (用于 fallback)")
     parser.add_argument("--audio-dir", type=Path, default=None,
                         help="处理后的音频目录 (trim 输出), 默认同 data-dir")
     parser.add_argument("--output-dir", type=Path,
@@ -773,6 +724,16 @@ def main():
         stem = stems[i] if i < len(stems) else Path(r["key"]).stem
         words_aligned = r["words"]
         duration_s = r["duration_s"]
+
+        # ── Skip stems with incomplete English fragments ──
+        # CTC forced alignment can drop OOV English fragments (e.g.
+        # "live"→"li"+"ve" but only "li" gets frames).  These stems
+        # would produce incomplete transcriptions — filter them out.
+        if not r.get("english_complete", True):
+            missing = r.get("missing_english", [])
+            print(f"  SKIP {stem}: incomplete English fragments - {', '.join(missing)}")
+            fail += 1
+            continue
 
         # 将 CTC 对齐 token 映射到 MFA 词条
         # 策略: 遍历 words_aligned, 检测并合并 [NVV] 模式:

@@ -33,7 +33,16 @@ except ModuleNotFoundError:
     sys.exit(1)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 DEFAULT_CONFIG = PROJECT_ROOT / "config.yaml"
+
+# ── Shared pipeline utilities (canonical implementations in pipeline_utils.py) ──
+sys.path.insert(0, str(SCRIPTS_DIR))
+from pipeline_utils import (
+    find_mfa_python, get_mfa_env,
+    build_ctc_presence, build_file_index, count_files_fast, find_wav,
+    is_punct, is_word_like,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -214,6 +223,7 @@ DEFAULT_CFG: dict = {
         "filter_min_word_sec": 0.15,
         "filter_min_word_dur_sec": 0.02,
         "filter_word_energy_ratio": 2.0,
+        "enable_word_in_silence_filter": False,  # 默认关闭 word_in_silence 过滤
         "filter_min_phone_coverage": 0.35,
         "filter_edge_gap_sec": 0.25,
         "filter_flank_silence_sec": 0.4,
@@ -290,61 +300,8 @@ def resolve_num_jobs(cfg_val: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# MFA environment
+# MFA environment — imported from pipeline_utils (find_mfa_python, get_mfa_env)
 # ---------------------------------------------------------------------------
-
-def find_mfa_python(cfg_python: str = "") -> Path | None:
-    import shutil as _shutil
-    if cfg_python:
-        p = Path(cfg_python)
-        if p.exists():
-            return p
-
-    # Try config/env-sourced Python (mfa on PATH)
-    mfa_on_path = _shutil.which("mfa")
-    if mfa_on_path:
-        parent = Path(mfa_on_path).parent
-        py = parent / ("python.exe" if os.name == "nt" else "python3")
-        if py.exists():
-            return py
-
-    # Search common conda envs
-    home = Path.home()
-    conda_roots = [
-        home / "miniconda3",
-        home / "anaconda3",
-        home / "opt" / "miniconda3",
-        home / "opt" / "anaconda3",
-        Path("/opt/conda"),
-        Path("/usr/local/anaconda3"),
-    ]
-    env_names = ["mfa_chinese", "mfa_mandarin", "mfa", "mfa-dev", "asr"]
-    is_win = os.name == "nt"
-
-    for conda_root in conda_roots:
-        for env_name in env_names:
-            env_dir = conda_root / "envs" / env_name
-            py_bin = env_dir / ("python.exe" if is_win else "bin/python3")
-            if py_bin.exists():
-                return py_bin
-            py_bin = env_dir / ("python.exe" if is_win else "bin/python")
-            if py_bin.exists():
-                return py_bin
-
-    return None
-
-
-def get_mfa_env(mfa_python: Path, models_dir: Path) -> dict[str, str]:
-    env = os.environ.copy()
-    env["MFA_ROOT_DIR"] = str(models_dir)
-    lib_bin = mfa_python.parent / "Library" / "bin"
-    paths = [str(mfa_python.parent)]
-    if lib_bin.exists():
-        paths.append(str(lib_bin))
-    if "PATH" in env:
-        paths.append(env["PATH"])
-    env["PATH"] = os.pathsep.join(paths)
-    return env
 
 
 # ---------------------------------------------------------------------------
@@ -492,7 +449,7 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                 wavs = []
                 missing = 0
                 for s in stems:
-                    w = _resolve_wav(audio_dir, s)
+                    w = find_wav(audio_dir, s)
                     if w:
                         wavs.append(w)
                     else:
@@ -650,23 +607,139 @@ def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
 
 
 def step_normalize_punct(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
-    """Normalize ASCII punctuation to CJK equivalents in CTC output text."""
-    _punct_table = str.maketrans({
-        ",": "，",   # fullwidth comma  →
-        ".": "。",   # ideographic full stop  。
-        "?": "？",   # fullwidth question mark ？
-        "!": "！",   # fullwidth exclamation mark ！
-        ";": "；",   # fullwidth semicolon ；
-        ":": "：",   # fullwidth colon ：
-    })
+    """Normalize punctuation in CTC output text and sync with punct.json anchors.
+
+    1. ASCII → CJK equivalents (existing)
+    2. Non-whitelist punctuation → ，(fullwidth comma)
+    3. Merge adjacent punctuation — no two puncts side by side;
+       timestamps in _punct.json are merged to span the combined range.
+    """
+    import json
+
+    ALLOWED_PUNCT = frozenset("，。！？、；：…")
+    ASCII_MAP = {
+        ",": "，", ".": "。", "?": "？", "!": "！", ";": "；", ":": "：",
+    }
     ctc_dir = ctx["ctc_pretg"]
     count = 0
+    missing = 0
+
     for txt_file in sorted(ctc_dir.glob("*_text_cn.txt")):
-        text = txt_file.read_text(encoding="utf-8").strip()
-        normalized = text.translate(_punct_table)
-        if normalized != text:
-            txt_file.write_text(normalized + "\n", encoding="utf-8")
+        stem = txt_file.stem.replace("_text_cn", "")
+
+        try:
+            text = txt_file.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            missing += 1
+            print(f"  WARNING: Skipping {txt_file.name} — file missing "
+                  f"(symlink target gone?)")
+            continue
+
+        # --- load CTC punctuation anchors (time-aligned) ---
+        punct_file = ctc_dir / f"{stem}_punct.json"
+        punct_entries: list[dict] = []
+        if punct_file.exists():
+            try:
+                punct_entries = json.loads(punct_file.read_text())
+            except Exception:
+                pass
+
+        # === Phase 1 — ASCII → CJK ===
+        text = text.translate(str.maketrans(ASCII_MAP))
+        for p in punct_entries:
+            w = p.get("word", "")
+            if w in ASCII_MAP:
+                p["word"] = ASCII_MAP[w]
+
+        # === Phase 2 — classify each character ===
+        # char_info[i] = ("punct"|"other", is_allowed | None, char)
+        char_info: list[tuple[str, bool | None, str]] = []
+        for ch in text:
+            if is_punct(ch):
+                char_info.append(("punct", ch in ALLOWED_PUNCT, ch))
+            else:
+                char_info.append(("other", None, ch))
+
+        # Build map from punct ordinal → punct_entries index
+        pidx_map: dict[int, int] = {}
+        pi = 0
+        for ci, (kind, _, _) in enumerate(char_info):
+            if kind == "punct":
+                pidx_map[ci] = pi
+                pi += 1
+
+        # Mark entries that will be deleted (merged away)
+        for p in punct_entries:
+            p["_merge_del"] = False
+
+        # === Phase 3 — replace abnormal + merge adjacent ===
+        new_chars: list[str] = []
+        i = 0
+        punct_seq = 0  # ordinal among punct characters so far
+
+        while i < len(char_info):
+            kind, is_allowed, ch = char_info[i]
+            if kind != "punct":
+                new_chars.append(ch)
+                i += 1
+                continue
+
+            # Collect consecutive punctuation characters
+            group: list[tuple[int, bool, str]] = []  # (char_index, is_allowed, char)
+            j = i
+            while j < len(char_info) and char_info[j][0] == "punct":
+                group.append((j, char_info[j][1], char_info[j][2]))
+                j += 1
+
+            # ---- single punctuation ----
+            if len(group) == 1:
+                _, ia, ch = group[0]
+                if ia:
+                    new_chars.append(ch)
+                else:
+                    new_chars.append("，")
+                    if punct_seq < len(punct_entries):
+                        punct_entries[punct_seq]["word"] = "，"
+                punct_seq += 1
+                i = j
+                continue
+
+            # ---- N adjacent punctuation → merge into one ， ----
+            new_chars.append("，")
+
+            first_seq = punct_seq
+            last_seq = punct_seq + len(group) - 1
+
+            if first_seq < len(punct_entries) and last_seq < len(punct_entries):
+                first = punct_entries[first_seq]
+                last = punct_entries[last_seq]
+
+                first["word"] = "，"
+                first["end_ms"] = last["end_ms"]
+                first["end_s"] = last["end_s"]
+
+                for k in range(first_seq + 1, last_seq + 1):
+                    if k < len(punct_entries):
+                        punct_entries[k]["_merge_del"] = True
+
+            punct_seq += len(group)
+            i = j
+
+        # === Phase 4 — write back ===
+        new_text = "".join(new_chars)
+        new_punct = [p for p in punct_entries if not p.pop("_merge_del", False)]
+
+        changed = new_text != text or len(new_punct) != len(punct_entries)
+
+        if changed:
+            txt_file.write_text(new_text + "\n", encoding="utf-8")
+            if punct_file.exists() or new_punct:
+                punct_file.write_text(
+                    json.dumps(new_punct, ensure_ascii=False), encoding="utf-8")
             count += 1
+
+    if missing:
+        print(f"  WARNING: {missing} _text_cn.txt file(s) not found, skipped")
     print(f"  Normalized punctuation in {count} files")
     return 0
 
@@ -680,16 +753,27 @@ def step_normalize_text(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         return 0
     ctc_dir = ctx["ctc_pretg"]
     count = 0
+    missing = 0
     for txt_file in sorted(ctc_dir.glob("*_text_cn.txt")):
-        text = txt_file.read_text(encoding="utf-8").strip()
+        try:
+            text = txt_file.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            missing += 1
+            print(f"  WARNING: Skipping {txt_file.name} — file missing (symlink target gone?)")
+            continue
         normalized = cn2an.transform(text, "an2cn")
         if normalized != text:
             txt_file.write_text(normalized + "\n", encoding="utf-8")
             lab_file = ctc_dir / txt_file.name.replace("_text_cn.txt", ".lab")
             if lab_file.exists():
-                lab_text = lab_file.read_text(encoding="utf-8").strip()
-                lab_file.write_text(cn2an.transform(lab_text, "an2cn") + "\n", encoding="utf-8")
+                try:
+                    lab_text = lab_file.read_text(encoding="utf-8").strip()
+                    lab_file.write_text(cn2an.transform(lab_text, "an2cn") + "\n", encoding="utf-8")
+                except FileNotFoundError:
+                    pass  # lab file disappeared, non-critical
             count += 1
+    if missing:
+        print(f"  WARNING: {missing} _text_cn.txt file(s) not found, skipped")
     print(f"  Normalized numerals in {count} files")
     return 0
 
@@ -706,8 +790,11 @@ def step_normalize_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         return 0
 
     script = SCRIPTS_DIR / "normalize_english_tokens.py"
+    norm_en_args = ["--txt-dir", str(ctc_dir)]
+    if ctx.get("mfa_dict"):
+        norm_en_args += ["--dict-path", str(ctx["mfa_dict"])]
     return run_python(
-        script, ["--txt-dir", str(ctc_dir)],
+        script, norm_en_args,
         mfa_python, ctx["models_dir"],
         "Step 2b: Normalise English tokens")
 
@@ -808,6 +895,27 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         mfa_args.append("--single_speaker")
     if mc.get("no_tokenization"):
         mfa_args.append("--no_tokenization")
+
+    # ── Kaldi alignment parameters ──
+    # beam: Viterbi beam width (default 10). Wider = more paths explored, fewer failures.
+    mfa_args += ["--beam", str(mc.get("beam", 20))]
+    # retry_beam: beam width for retry on failure (default 40). Wider = more rescue attempts.
+    mfa_args += ["--retry_beam", str(mc.get("retry_beam", 80))]
+    # boost_silence: silence probability multiplier in HMM (default 1.0). >1 → prefer silence.
+    mfa_args += ["--boost_silence", str(mc.get("boost_silence", 1.0))]
+    # acoustic_scale: weight of acoustic vs transition scores (default 0.1). Lower = looser constraints.
+    if mc.get("acoustic_scale") is not None:
+        mfa_args += ["--acoustic_scale", str(mc["acoustic_scale"])]
+    # transition_scale: weight of transition probabilities (default 1.0).
+    if mc.get("transition_scale") is not None:
+        mfa_args += ["--transition_scale", str(mc["transition_scale"])]
+
+    # ── Fine-tune: allows CTC anchor boundaries to float during a refinement pass ──
+    if mc.get("fine_tune", True):
+        mfa_args.append("--fine_tune")
+    fine_tune_tolerance = mc.get("fine_tune_boundary_tolerance", 0.1)
+    if fine_tune_tolerance is not None and fine_tune_tolerance > 0:
+        mfa_args += ["--fine_tune_boundary_tolerance", str(fine_tune_tolerance)]
     return run_mfa(mfa_args, mfa_python, ctx["models_dir"],
                    "Step 6: MFA Align" + (" (NVASR corpus + CTC anchors)" if use_nvasr_corpus and use_anchors else ""))
 
@@ -861,7 +969,10 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         pp_args += ["--filter-long-word-sec", str(pc.get("filter_long_word_sec", 1.0))]
         pp_args += ["--filter-min-word-sec", str(pc.get("filter_min_word_sec", 0.15))]
         pp_args += ["--filter-min-word-dur-sec", str(pc.get("filter_min_word_dur_sec", 0.02))]
-        pp_args += ["--filter-word-energy-ratio", str(pc.get("filter_word_energy_ratio", 2.0))]
+        if pc.get("enable_word_in_silence_filter", False):
+            pp_args += ["--filter-word-energy-ratio", str(pc.get("filter_word_energy_ratio", 2.0))]
+        else:
+            pp_args += ["--filter-word-energy-ratio", "0"]
         pp_args += ["--filter-min-phone-coverage", str(pc.get("filter_min_phone_coverage", 0.35))]
         pp_args += ["--filter-edge-gap-sec", str(pc.get("filter_edge_gap_sec", 0.25))]
         pp_args += ["--filter-flank-silence-sec", str(pc.get("filter_flank_silence_sec", 0.4))]
@@ -906,8 +1017,6 @@ def validate_step_output(step_name: str, workspace: Path, spec: dict) -> list[st
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
-SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 
 
 # ---------------------------------------------------------------------------
@@ -961,99 +1070,9 @@ def save_scan_cache(cache_path: Path, cache_data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# File-index helpers -- O(1) stem lookups without recursive scanning
+# File-index helpers — imported from pipeline_utils
+#   build_file_index, build_ctc_presence, count_files_fast, find_wav
 # ---------------------------------------------------------------------------
-
-def _build_file_index(root: Path, suffix: str, recurse: bool = True) -> dict[str, Path]:
-    """Build ``{stem: path}`` index for files ending with *suffix*.
-
-    Uses ``os.scandir`` for fast single-level listing; only recurses into
-    subdirectories when *recurse* is True and the top-level scan yields nothing.
-    """
-    index: dict[str, Path] = {}
-
-    def _scan(dirpath: Path) -> int:
-        n = 0
-        try:
-            for entry in os.scandir(str(dirpath)):
-                if entry.is_file() and entry.name.endswith(suffix):
-                    stem = entry.name[:-len(suffix)]
-                    if stem not in index:
-                        index[stem] = Path(entry.path)
-                        n += 1
-        except OSError:
-            pass
-        return n
-
-    n = _scan(root)
-
-    if recurse and n == 0:
-        # Top-level empty — try one level of subdirectories
-        try:
-            for entry in os.scandir(str(root)):
-                if entry.is_dir():
-                    _scan(Path(entry.path))
-        except OSError:
-            pass
-
-    return index
-
-
-def _build_ctc_presence(ctc_dir: Path) -> "tuple[set[str], dict[str, set[str]]]":
-    """Build filename presence sets for O(1) CTC completeness validation.
-
-    One ``os.scandir`` pass over *ctc_dir* replaces thousands of per-stem
-    ``exists()`` calls -- each of which is an SMB round-trip on CIFS mounts.
-
-    Returns:
-        flat_names: filenames in the top-level directory
-        nested_names: ``{subdir_name: {filenames in that subdir}}``
-    """
-    flat_names: set[str] = set()
-    nested_names: dict[str, set[str]] = {}
-
-    def _collect_names(dirpath: str) -> set[str]:
-        names: set[str] = set()
-        try:
-            for entry in os.scandir(dirpath):
-                if entry.is_file():
-                    names.add(entry.name)
-        except OSError:
-            pass
-        return names
-
-    flat_names = _collect_names(str(ctc_dir))
-
-    # One level of subdirectories for nested layout: {ds}/{stem}/{stem}.{ext}
-    try:
-        for entry in os.scandir(str(ctc_dir)):
-            if entry.is_dir():
-                sub = _collect_names(entry.path)
-                if sub:
-                    nested_names[entry.name] = sub
-    except OSError:
-        pass
-
-    return flat_names, nested_names
-
-
-def _count_files_fast(dirpath: Path, suffix: str, max_count: int = 10000) -> int:
-    """Count files ending with *suffix*, stopping early at *max_count*.
-
-    Much faster than ``len(list(dirpath.glob(...)))`` on large SMB directories
-    because it bails out as soon as *max_count* is reached.
-    """
-    n = 0
-    try:
-        with os.scandir(str(dirpath)) as it:
-            for entry in it:
-                if entry.is_file() and entry.name.endswith(suffix):
-                    n += 1
-                    if n >= max_count:
-                        return n
-    except OSError:
-        pass
-    return n
 
 
 def _link_or_copy(src: Path, dst: Path) -> bool:
@@ -1091,46 +1110,6 @@ def _link_or_copy(src: Path, dst: Path) -> bool:
                 _t.sleep(0.3)
                 dst.parent.mkdir(parents=True, exist_ok=True)
     return False
-    return True
-
-
-def _resolve_wav(audio_src: Path, stem: str) -> Path | None:
-    """Find ``{stem}.wav`` in *audio_src*.
-
-    Tries: flat (dir/{stem}.wav) → nested (dir/{stem}/{stem}.wav) →
-    zero-padded variants → glob fallback.
-    """
-    # Flat: dir/{stem}.wav
-    wav_path = audio_src / f"{stem}.wav"
-    if wav_path.exists():
-        return wav_path
-    # Nested: dir/{stem}/{stem}.wav
-    wav_path = audio_src / stem / f"{stem}.wav"
-    if wav_path.exists():
-        return wav_path
-    # Zero-padded variants (e.g., stem="35000" → "035000.wav")
-    if stem.isdigit():
-        for width in (5, 6, 7, 8):
-            wav_path = audio_src / f"{stem.zfill(width)}.wav"
-            if wav_path.exists():
-                return wav_path
-    # Glob fallback (deep subdirectories)
-    candidates = list(audio_src.glob(f"**/{stem}.wav"))
-    if candidates:
-        return candidates[0]
-    # Numeric-suffix fallback: filename may have mojibake Chinese chars
-    # but the numeric suffix is always ASCII.  e.g. stem="合成ria_35002"
-    # → search for "*35002.wav".
-    import re as _re
-    _m = _re.search(r'(\d+)$', stem)
-    if _m:
-        num = _m.group(1)
-        candidates = list(audio_src.glob(f"**/*{num}.wav"))
-        # Prefer exact numeric match in filename (avoid 35002 matching 135002)
-        candidates = [c for c in candidates
-                      if _re.search(rf'(?<!\d){num}(?!\d)', c.stem)]
-        return candidates[0] if candidates else None
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1207,7 +1186,7 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     if is_filtered:
         # -- Filtered path -- direct probe (no directory scan) --
         # Build CTC presence sets once for O(1) completeness checks
-        ctc_files_flat, ctc_files_nested = _build_ctc_presence(ctc_dir_src)
+        ctc_files_flat, ctc_files_nested = build_ctc_presence(ctc_dir_src)
         print(f"  CTC presence index: {len(ctc_files_flat)} flat + "
               f"{sum(len(v) for v in ctc_files_nested.values())} nested files")
         if stem_filter is not None:
@@ -1232,7 +1211,7 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                     continue
 
             # ── Match audio (exact → nested → zero-padded → glob fallback) ──
-            wav_path = _resolve_wav(audio_src, stem)
+            wav_path = find_wav(audio_src, stem)
             if wav_path is None:
                 missing_audio.append(stem)
                 continue
@@ -1274,7 +1253,7 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         print("  Scanning CTC directory for .lab files ...")
 
         # Build CTC presence sets once for O(1) completeness checks
-        ctc_files_flat, ctc_files_nested = _build_ctc_presence(ctc_dir_src)
+        ctc_files_flat, ctc_files_nested = build_ctc_presence(ctc_dir_src)
         print(f"  CTC presence index: {len(ctc_files_flat)} flat files, "
               f"{len(ctc_files_nested)} nested dirs")
         stems_all: list[str] = []
@@ -1300,10 +1279,10 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         print(f"  Found {total_candidates} stems via .lab scan ({layout_kind})")
 
         # Build audio/text indices (single-level scan, then match in memory)
-        audio_index = _build_file_index(audio_src, ".wav")
+        audio_index = build_file_index(audio_src, ".wav")
         print(f"  Audio index: {len(audio_index)} WAV files")
         if text_src.exists():
-            text_index = _build_file_index(text_src, ".txt")
+            text_index = build_file_index(text_src, ".txt")
             print(f"  Text index:  {len(text_index)} TXT files")
 
         for stem in stems_all:
@@ -1379,6 +1358,7 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         # ── 5. Link CTC files → workspace/ctc_pretg/ ──
         ctc_out.mkdir(parents=True, exist_ok=True)
         ctc_linked = 0
+        ctc_missing: list[str] = []
         for stem in valid:
             ctc_base = _ctc_base_cache.get(stem, ctc_dir_src)
             for suffix in _CTC_SUFFIXES:
@@ -1386,6 +1366,17 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                 if src.exists():
                     if _link_or_copy(src, ctc_out / f"{stem}{suffix}"):
                         ctc_linked += 1
+                    else:
+                        ctc_missing.append(f"{stem}{suffix}")
+                else:
+                    ctc_missing.append(f"{stem}{suffix} (source gone)")
+        if ctc_missing:
+            print(f"  WARNING: {len(ctc_missing)} CTC file(s) missing at link time "
+                  f"(previously passed validation):")
+            for f in ctc_missing[:10]:
+                print(f"    - {f}")
+            if len(ctc_missing) > 10:
+                print(f"    ... and {len(ctc_missing) - 10} more")
         print(f"  CTC linked:  {ctc_linked} → {ctc_out}")
 
         # ── 6. Copy/link reference text (.txt from text_dir) ──
@@ -1439,6 +1430,7 @@ STEPS = {
 
 FULL_STEP_ORDER = list(STEPS.keys())
 CTC_READY_STEP_ORDER = ["link", "normalize_punct", "normalize", "normalize_en", "resample", "adjust", "align", "postprocess"]
+NVASR_FALLBACK_STEP_ORDER = ["prealign", "normalize_punct", "normalize", "normalize_en", "resample", "adjust", "align", "postprocess"]
 
 
 def main():
@@ -1463,7 +1455,7 @@ def main():
     parser.add_argument("--validate", action="store_true",
                         help="Validate output structure after each step (uses output_spec in config).")
     parser.add_argument("--mode", type=str, default=None,
-                        choices=["full", "ctc_ready", "batch_ctc_ready"],
+                        choices=["full", "ctc_ready", "batch_ctc_ready", "nvrasr_fallback"],
                         help="Pipeline mode (default: from config, or 'full').")
     parser.add_argument("--ctc-ready", type=str, default=None, metavar="CTC_DIR",
                         help="Enable ctc_ready mode: path to pre-existing NVASR CTC output.")
@@ -1508,7 +1500,7 @@ def main():
         cfg.setdefault("ctc_ready", {})["ctc_dir"] = args.ctc_ready
         print(f"ctc_ready mode: CTC dir = {args.ctc_ready}")
 
-    if mode not in ("full", "ctc_ready", "batch_ctc_ready"):
+    if mode not in ("full", "ctc_ready", "batch_ctc_ready", "nvrasr_fallback"):
         print(f"ERROR: Unknown mode: {mode}")
         sys.exit(1)
     print(f"Pipeline mode: {mode}")
@@ -1598,7 +1590,7 @@ def main():
                 print(f"\n[{i+1}/{len(datasets)}] {ds_name} — SKIP (no audio)")
                 continue
 
-            n_files = _count_files_fast(audiodir, ".wav")
+            n_files = count_files_fast(audiodir, ".wav")
             print(f"\n{'='*60}")
             print(f"  [{i+1}/{len(datasets)}] {ds_name} ({n_files} files)")
             print(f"{'='*60}")
@@ -1737,7 +1729,7 @@ def main():
     # In ctc_ready mode, audio_dir points to the source data_dir (already trimmed)
     # to avoid copying 100k+ files across SMB mounts
     # Resample reads from here and writes 16k audio locally
-    if mode == "ctc_ready":
+    if mode in ("ctc_ready", "nvrasr_fallback"):
         audio_dir = data_dir  # use source audio in-place, no copy
     else:
         audio_dir = workspace / cfg.get("audio_dir", "audio")
@@ -1764,13 +1756,19 @@ def main():
     # Resolve steps — order depends on pipeline mode
     if mode == "ctc_ready":
         step_order = CTC_READY_STEP_ORDER
+    elif mode == "nvrasr_fallback":
+        step_order = NVASR_FALLBACK_STEP_ORDER
     else:
         step_order = FULL_STEP_ORDER
 
-    # ctc_ready mode: skip trim/prealign unconditionally
+    # ctc_ready mode: skip trim/prealign unconditionally (CTC already exists)
     if mode == "ctc_ready":
         for skip_s in ("trim", "prealign"):
             setattr(args, f"skip_{skip_s}", True)
+
+    # nvrasr_fallback mode: skip trim (audio is pre-trimmed), keep prealign
+    if mode == "nvrasr_fallback":
+        setattr(args, "skip_trim", True)
 
     # Skip standalone MFA validate when configured (align validates internally)
     if cfg.get("mfa", {}).get("skip_validate", True):
@@ -1800,6 +1798,9 @@ def main():
         else:
             run_list = run_list[:1]  # keep the first step
         print(f"  Scan-only mode: running only {run_list}")
+    elif args.scan_only and mode == "nvrasr_fallback":
+        print("  Scan-only mode: nvrasr_fallback has no link step, nothing to scan.")
+        return
 
     run_list = [s for s in run_list if not getattr(args, f"skip_{s}", False)]
 

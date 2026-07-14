@@ -15,7 +15,14 @@ use_cache: true
 
 # 流式管线默认值 (命令行可覆盖)
 streaming:
-  local_work: /mnt/nvme0/mfa_work  # 本地 NVMe 工作目录 (7TB)
+  # 本地 NVMe 工作目录 — 单盘模式
+  local_work: /mnt/nvme0/mfa_work
+  # 多盘模式 (取消注释下面以使用所有 4 块 NVMe，每盘承载 parallel/4 个 worker):
+  # local_work:
+  #   - /mnt/nvme0/mfa_work
+  #   - /mnt/nvme1/mfa_work
+  #   - /mnt/nvme2/mfa_work
+  #   - /mnt/nvme3/mfa_work
   batch_size: 2000              # 每批 stem 数量 (减少进程启动开销)
   parallel: 4                   # 并行数据集数 (每数据集独立 NVMe 子目录)
   batch_cache: cache/batch_all.cache.json  # 批量缓存 (不写则自动从 config 名推导)

@@ -85,6 +85,7 @@
 #   filter_min_word_sec: 0.15
 #   filter_min_word_dur_sec: 0.02
 #   filter_word_energy_ratio: 2.0
+#   enable_word_in_silence_filter: false   # 默认关闭；设为 true 开启
 #   filter_min_phone_coverage: 0.35
 #   filter_edge_gap_sec: 0.25
 #   filter_flank_silence_sec: 0.4

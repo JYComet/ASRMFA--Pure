@@ -1,0 +1,12 @@
+{
+  "config_file": "configs\\合成ria_35000-35100.yaml",
+  "mode": "ctc_ready",
+  "workspace": "hechengria_35000-35100",
+  "data_dir": "\\\\RS3621\\Research_TTS\\Data\\Raw\\v5_0707\\合成ria\\wavs",
+  "output_dir": "E:\\Audio Event Detection\\chinese_mfa_pipeline\\output\\hechengria_35000-35100\\output",
+  "n_stems": 101,
+  "manifest_path": "E:\\Audio Event Detection\\chinese_mfa_pipeline\\output\\hechengria_35000-35100\\ctc_pretg\\ctc_ready_manifest.json",
+  "ctc_dir": "\\\\RS3621\\Research_TTS\\Data\\Raw\\ASRNEW\\合成ria\\wavs",
+  "version": 1,
+  "scanned_at": "2026-07-10T20:26:08"
+}

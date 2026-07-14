@@ -22,36 +22,26 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
+from pipeline_utils import (
+    NVV_NAMES,
+    is_cjk, is_nvv_token, is_english_token, is_pinyin_syllable,
+    is_word_like, is_punct, extract_word_chars,
+)
+
 try:
     from pypinyin import lazy_pinyin, Style
 except ModuleNotFoundError:
     raise SystemExit("pypinyin is not installed. Run: pip install pypinyin")
-
-NVV_NAMES: set[str] = {
-    "BREATHING", "LAUGHTER", "BURP", "COUGH", "CRYING", "GROAN",
-    "HISS", "HUM", "SHH", "SIGH", "SNEEZE", "SNIFF", "SNORE",
-    "TSK", "UHM", "WHISTLE", "YAWN",
-    "QUESTION-YI", "QUESTION-EN", "QUESTION-OH", "QUESTION-AH",
-    "QUESTION-EI", "QUESTION-HUH",
-    "SURPRISE-OH", "SURPRISE-AH", "SURPRISE-WA", "SURPRISE-YO",
-    "CONFIRMATION-EN", "DISSATISFACTION-HNN",
-}
 
 
 # ---------------------------------------------------------------------------
 # Character classification (same as postprocess_textgrids)
 # ---------------------------------------------------------------------------
 
-def _is_cjk(ch: str) -> bool:
-    return '一' <= ch <= '鿿'
-
 
 def _is_alpha_group(s: str) -> bool:
     return s.isascii() and bool(s) and all(c.isalpha() or c == '-' for c in s)
 
-
-def is_nvv_token(s: str) -> bool:
-    return s.strip().strip('<>').upper() in NVV_NAMES
 
 
 # ── Words to keep as single units ──────────────────────────────────────
@@ -80,54 +70,9 @@ def _load_merge_words() -> set[str]:
 MERGE_WORDS = _load_merge_words()
 
 
-def is_english_token(token: str) -> bool:
-    if not token or not token.isalpha():
-        return False
-    if not token.isascii():
-        return False
-    if is_nvv_token(token):
-        return False
-    if re.match(r'^[a-z]+[1-5]$', token):
-        return False
-    return True
 
 
-def _is_word_like(s: str) -> bool:
-    if not s:
-        return False
-    return _is_cjk(s) or s[0].isalpha() or s.isdigit() or is_nvv_token(s)
 
-
-def _is_punct(s: str) -> bool:
-    return bool(s.strip()) and not _is_word_like(s)
-
-
-def _is_pinyin_token(tok: str) -> bool:
-    return bool(re.match(r'^[a-z]+[1-5]$', tok))
-
-
-def _extract_word_chars(text: str) -> list[str]:
-    result = []
-    buf = ""
-    for c in text:
-        if _is_cjk(c):
-            if buf:
-                result.append(buf)
-                buf = ""
-            result.append(c)
-        elif c.isalpha() or c == '-':
-            buf += c
-        elif c.isdigit():
-            buf += c
-        else:
-            if buf:
-                result.append(buf)
-                buf = ""
-            if not c.isspace():
-                result.append(c)
-    if buf:
-        result.append(buf)
-    return result
 
 
 def _pinyin_for_cjk(ch: str) -> str | None:
@@ -149,7 +94,7 @@ def _token_matches_ref(tok: str, ref: str) -> bool:
     t = tok.strip().lower()
     r = ref.lower()
 
-    if _is_cjk(ref):
+    if is_cjk(ref):
         try:
             py = lazy_pinyin(ref, style=Style.TONE3,
                             neutral_tone_with_five=True, errors="default")
@@ -219,12 +164,12 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
         return False
 
     ref_text = cn_path.read_text(encoding="utf-8").strip()
-    char_units = _extract_word_chars(ref_text)
+    char_units = extract_word_chars(ref_text)
 
     # Reference word units (punct filtered)
     ref_units: list[tuple[int, str]] = []
     for i, u in enumerate(char_units):
-        if _is_word_like(u):
+        if is_word_like(u):
             ref_units.append((i, u))
 
     # English words in reference — only normalise those in MERGE_WORDS.
@@ -307,7 +252,7 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
             if len(t) == 1 and t.isascii() and t.isalpha():
                 if t.lower() not in en_lower:
                     all_fragments = False; break
-            elif _is_pinyin_token(t):
+            elif is_pinyin_syllable(t):
                 base = t[:-1]  # strip tone digit
                 if not any(c in en_lower for c in base):
                     all_fragments = False; break
@@ -371,10 +316,53 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
 # Main
 # ---------------------------------------------------------------------------
 
+def _auto_add_english_to_dict(txt_dir: Path, dict_path: Path) -> int:
+    """Scan all .lab files for English tokens and add missing ones to MFA dict.
+
+    English tokens (like "li", "ve", "A", "play") need self-referential
+    entries in the MFA dictionary so MFA can treat them as CTC-only tokens
+    (no acoustic model).  This mirrors the auto-add logic in ctc_prealign.py.
+    """
+    if not dict_path or not dict_path.exists():
+        return 0
+
+    # Collect English tokens from all .lab files
+    english_tokens_found: set[str] = set()
+    for lab_path in sorted(txt_dir.glob("*.lab")):
+        tokens = lab_path.read_text(encoding="utf-8").strip().split()
+        for t in tokens:
+            if is_english_token(t):
+                english_tokens_found.add(t)
+
+    if not english_tokens_found:
+        return 0
+
+    # Load existing dict keys
+    existing: set[str] = set()
+    with open(dict_path, encoding='utf-8-sig') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                existing.add(line.split()[0])
+
+    new_tokens = sorted(t for t in english_tokens_found if t not in existing)
+    if new_tokens:
+        with open(dict_path, 'a', encoding='utf-8') as f:
+            for t in new_tokens:
+                f.write(f"{t} {t}\n")
+        print(f"  Added {len(new_tokens)} English tokens to MFA dict: {', '.join(new_tokens)}")
+    else:
+        print(f"  All {len(english_tokens_found)} English tokens already in MFA dict")
+
+    return len(new_tokens)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Normalise English-word tokens in NVASR CTC output")
     parser.add_argument("--txt-dir", type=Path, required=True)
+    parser.add_argument("--dict-path", type=Path, default=None,
+                        help="MFA dictionary path (for auto-adding missing English tokens)")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -399,6 +387,10 @@ def main():
         print(f"\nWould normalise {changed}/{len(stems)} stems")
     else:
         print(f"\nNormalised {changed}/{len(stems)} stems")
+
+    # Auto-add English tokens to MFA dictionary (safety net for ctc_ready mode)
+    if args.dict_path and not args.dry_run:
+        _auto_add_english_to_dict(txt_dir, args.dict_path)
 
 
 if __name__ == "__main__":

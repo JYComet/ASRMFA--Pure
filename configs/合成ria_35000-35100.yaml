@@ -1,26 +1,88 @@
 # 合成ria — ctc_ready 模式 (音频已预补静音, NVASR CTC 已跑完)
 # 处理编号 35000–35100 (共 101 条)
+# 运行: python scripts/run_pipeline.py --config configs/合成ria_35000-35100.yaml
 
 mode: ctc_ready
 workspace: hechengria_35000-35100
 
+# 扫描缓存
+use_cache: true
+
 # 预处理后的音频目录 (已补全静音)
 data_dir: \\RS3621\Research_TTS\Data\Raw\v5_0707\合成ria\wavs
+
+# 完成后是否保留 16kHz 重采样音频
+keep_16k_audio: true
 
 ctc_ready:
   # NVASR CTC 输出目录 (.lab .TextGrid _tokens.jsonl _punct.json _text_cn.txt _text_raw.txt)
   ctc_dir: \\RS3621\Research_TTS\Data\Raw\ASRNEW\合成ria\wavs
+  # 可选：参考文本 .txt 目录 (默认同 data_dir)
+  text_dir: ""
   require_all: true
   stem_prefix: "合成ria_"
   stem_range: [35000, 35100]
+
+# CTC 边界调整
+ctc_adjust:
+  enabled: true
+  limit: 0
 
 # MFA 对齐参数
 mfa:
   num_jobs: 8
   single_speaker: true
+  output_format: "long_textgrid"
+  clean: false
+  no_tokenization: true
+  skip_validate: true
 
 # 后处理参数
 postprocess:
+  merge_silence: true
+  min_sil_merge_sec: 0.2
+  fix_short_word: true
+  short_word_max_sec: 0.25
+  flank_silence_sec: 0.4
+  short_word_search_window: 0.5
+  detect_bgm: true
+  bgm_noise_floor_ratio: 2.0
+  bgm_min_sil_dur: 0.3
+  bgm_speech_ratio: 1.0
+  bgm_min_energy: 0.01
   filter_suspicious: true
+  filter_short_phone_sec: 0.015
+  filter_long_word_sec: 1.0
+  filter_min_word_sec: 0.15
+  filter_min_word_dur_sec: 0.02
+  filter_word_energy_ratio: 2.0
+  filter_min_phone_coverage: 0.35
+  filter_edge_gap_sec: 0.25
+  filter_flank_silence_sec: 0.4
+  filter_long_consonant_sec: 999.0
+  filter_long_vowel_sec: 999.0
   enable_text_correction: true
   handle_unexpected_sil: true
+  workers: 0
+
+# 各步骤输出校验 (供 validate 步骤使用)
+output_spec:
+  trim: ["audio/**/*.wav"]
+  prealign:
+    - "ctc_pretg/*.TextGrid"
+    - "ctc_pretg/*.lab"
+    - "ctc_pretg/*_tokens.jsonl"
+    - "ctc_pretg/*_text_cn.txt"
+    - "ctc_pretg/manifest.json"
+    - "ctc_pretg/summary.txt"
+  adjust:
+    - "ctc_pretg_adj/*.TextGrid"
+    - "ctc_pretg_adj/*.lab"
+    - "ctc_pretg_adj/*_tokens.jsonl"
+    - "ctc_pretg_adj/*_text_cn.txt"
+  align: ["aligned/*.TextGrid"]
+  postprocess:
+    - "output/*.TextGrid"
+    - "output/tone_mapping.json"
+    - "output/postprocess_report.jsonl"
+    - "filtered/*.TextGrid"

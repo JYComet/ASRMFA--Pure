@@ -24,20 +24,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from postprocess_textgrids import parse_textgrid, write_textgrid
-
-NVV_NAMES: set[str] = {
-    "BREATHING", "LAUGHTER", "BURP", "COUGH", "CRYING", "GROAN",
-    "HISS", "HUM", "SHH", "SIGH", "SNEEZE", "SNIFF", "SNORE",
-    "TSK", "UHM", "WHISTLE", "YAWN",
-    "QUESTION-YI", "QUESTION-EN", "QUESTION-OH", "QUESTION-AH",
-    "QUESTION-EI", "QUESTION-HUH",
-    "SURPRISE-OH", "SURPRISE-AH", "SURPRISE-WA", "SURPRISE-YO",
-    "CONFIRMATION-EN", "DISSATISFACTION-HNN",
-}
+from pipeline_utils import NVV_NAMES, is_nvv_token
 
 
 def is_nvv(text: str) -> bool:
-    return text in NVV_NAMES
+    return is_nvv_token(text)
 
 
 def is_silence(text: str) -> bool:

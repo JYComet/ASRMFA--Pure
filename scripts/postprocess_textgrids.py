@@ -21,6 +21,7 @@ import json
 import math
 import re
 import shutil
+import sys
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,17 +35,20 @@ except ModuleNotFoundError:
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-SILENCE_LABELS = {"<eps>", "<sil>", "sil", "<sp0>", "<sp1>", "<sp2>", "<sp3>"}
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+from pipeline_utils import (
+    SILENCE_LABELS, NVV_NAMES, CHINESE_INITIALS_SET,
+    IPA_CONSONANT_MAP, IPA_TONE_TO_DIGIT, IPA_VOWEL_BASE_MAP,
+    TONE_MARK_CHARS, FINAL_DECOMPOSE, FINAL_TONE_INDEX,
+    CHINESE_SHORT_WORDS,
+    is_cjk, is_nvv_token, is_english_token, is_pinyin_syllable,
+    is_word_like, is_punct, extract_word_chars,
+)
+
 SHORT_PAUSE_PUNCT = set("，、：；,")
 LONG_PAUSE_PUNCT = set("。？！…!?.")
 SHORT_PAUSE_TOKEN = "[PAUSE]"
 LONG_PAUSE_TOKEN = "<PAUSE>"
-
-CHINESE_SHORT_WORDS = {
-    "的", "了", "着", "呢", "吗", "吧", "啊", "嘛", "呀", "哦",
-    "是", "在", "个", "和", "就", "也", "都", "不", "没",
-    "de5", "le5", "zhe5", "ne5", "ma5", "ba5", "a5", "ya5",
-}
 
 @dataclass
 class Interval:
@@ -75,16 +79,6 @@ class TextGrid:
 # ---------------------------------------------------------------------------
 # NVV bracket + sp1 normalization (runs BEFORE QC filtering)
 # ---------------------------------------------------------------------------
-
-NVV_NAMES: set[str] = {
-    "BREATHING", "LAUGHTER", "BURP", "COUGH", "CRYING", "GROAN",
-    "HISS", "HUM", "SHH", "SIGH", "SNEEZE", "SNIFF", "SNORE",
-    "TSK", "UHM", "WHISTLE", "YAWN",
-    "QUESTION-YI", "QUESTION-EN", "QUESTION-OH", "QUESTION-AH",
-    "QUESTION-EI", "QUESTION-HUH",
-    "SURPRISE-OH", "SURPRISE-AH", "SURPRISE-WA", "SURPRISE-YO",
-    "CONFIRMATION-EN", "DISSATISFACTION-HNN",
-}
 
 _NVV_PATTERN = re.compile(
     r"(?<![A-Z-])("
@@ -252,101 +246,6 @@ def load_dict(path: Path) -> tuple[dict[str, list[str]], dict[str, str]]:
                 if lower not in case_map:
                     case_map[lower] = token
     return d, case_map
-
-
-# ---------------------------------------------------------------------------
-# Static IPA → Pinyin phone mapping table
-# Covers all phones in the MFA mandarin_mfa acoustic model and our dicts.
-# ---------------------------------------------------------------------------
-
-# Consonant mapping: IPA → pinyin
-IPA_CONSONANT_MAP = {
-    # Stops & affricates
-    'p': 'b', 'pʰ': 'p',
-    't': 'd', 'tʰ': 't',
-    'k': 'g', 'kʰ': 'k',
-    'tɕ': 'j', 'tɕʰ': 'q',
-    'ʈʂ': 'zh', 'ʈʂʰ': 'ch',
-    'ts': 'z', 'tsʰ': 'c',
-    # Fricatives
-    'f': 'f', 's': 's', 'ɕ': 'x', 'ʂ': 'sh', 'x': 'h',
-    # Sonorants
-    'm': 'm', 'n': 'n', 'l': 'l', 'ɻ': 'r',
-    # Glides
-    'j': 'i', 'w': 'u', 'ɥ': 'v',
-    # Nasal finals
-    'ŋ': 'ng',
-    # Special
-    'ʔ': '',  # glottal stop (unwritten in pinyin)
-    'z̩': 'i0', 'ʐ̩': 'ir',
-}
-
-# Vowel tone mapping: base IPA vowel → (tone_marks_pattern → pinyin_tone_digit)
-# Tones are applied to the vowel by replacing tone marks with the digit.
-IPA_TONE_TO_DIGIT = {
-    '˥˥': '1', '˥': '1',   # high level (also single ˥)
-    '˧˥': '2',              # rising
-    '˨˩˦': '3',             # dipping
-    '˥˩': '4',              # falling
-    '˩': '5',               # neutral
-}
-
-# Base vowel mapping: IPA (without tone) → pinyin vowel base
-IPA_VOWEL_BASE_MAP = {
-    'a': 'a', 'o': 'o', 'ə': 'e', 'e': 'e',
-    'i': 'i', 'u': 'u', 'y': 'v',
-    'z̩': 'i0', 'ʐ̩': 'ir',
-}
-
-TONE_MARK_CHARS = set('˥˧˨˩˦')
-
-# Decompose pinyin finals into individual phone components for 1:1 IPA alignment.
-# Derived from FINAL_SEGMENTS in convert_dict_to_ipa.py.
-FINAL_DECOMPOSE = {
-    'a': ['a'], 'o': ['o'], 'e': ['e'], 'e2': ['e'],
-    'i': ['i'], 'u': ['u'], 'v': ['v'],
-    'i0': ['i0'], 'u0': ['u0'], 'v0': ['v0'], 'ir': ['ir'],
-    'ai': ['a', 'i'], 'ei': ['e', 'i'], 'ao': ['a', 'u'], 'ou': ['o', 'u'],
-    'an': ['a', 'n'], 'en': ['e', 'n'], 'in': ['i', 'n'],
-    'ang': ['a', 'ng'], 'eng': ['e', 'ng'], 'ing': ['i', 'ng'], 'ong': ['u', 'ng'],
-    'ia': ['i', 'a'], 'ie': ['i', 'e'],
-    'iao': ['i', 'a', 'u'], 'iu': ['i', 'o', 'u'], 'iou': ['i', 'o', 'u'],
-    'ian': ['i', 'e', 'n'], 'iang': ['i', 'a', 'ng'], 'iong': ['i', 'u', 'ng'],
-    'ua': ['u', 'a'], 'uo': ['u', 'o'],
-    'uai': ['u', 'a', 'i'], 'ui': ['u', 'e', 'i'], 'uei': ['u', 'e', 'i'],
-    'uan': ['u', 'a', 'n'], 'un': ['u', 'e', 'n'], 'uen': ['u', 'e', 'n'],
-    'uang': ['u', 'a', 'ng'], 'ueng': ['u', 'e', 'ng'],
-    've': ['v', 'e'], 'vn': ['v', 'n'], 'van': ['v', 'e', 'n'],
-    'er': ['e', 'r'], 'io': ['i', 'o'],
-    'n': ['n'], 'm': ['m'],
-}
-
-# Which component carries the tone (0-based index into FINAL_DECOMPOSE list).
-FINAL_TONE_INDEX = {
-    'a': 0, 'o': 0, 'e': 0, 'e2': 0, 'i': 0, 'u': 0, 'v': 0,
-    'i0': 0, 'u0': 0, 'v0': 0, 'ir': 0,
-    'ai': 0, 'ei': 0, 'ao': 0, 'ou': 0,
-    'an': 0, 'en': 0, 'in': 0,
-    'ang': 0, 'eng': 0, 'ing': 0, 'ong': 0,
-    'ia': 1, 'ie': 1, 'iao': 1, 'iu': 1, 'iou': 1,
-    'ian': 1, 'iang': 1, 'iong': 1,
-    'ua': 1, 'uo': 1, 'uai': 1, 'ui': 1, 'uei': 1,
-    'uan': 1, 'un': 1, 'uen': 1,
-    'uang': 1, 'ueng': 1,
-    've': 1, 'vn': 0, 'van': 1,
-    'er': 0, 'io': 1,
-    'n': 0, 'm': 0,
-}
-
-# Chinese initials (consonant phones without tone numbers)
-CHINESE_INITIALS_SET = {
-    "p", "pʰ", "t", "tʰ", "k", "kʰ",
-    "tɕ", "tɕʰ", "ʈʂ", "ʈʂʰ", "ts", "tsʰ",
-    "f", "s", "ɕ", "ʂ", "x",
-    "m", "n", "l", "ɻ",
-    "j", "w", "ɥ",
-    "ŋ", "ʔ",
-}
 
 
 def decompose_pinyin_phone(phone: str) -> list[str]:
@@ -541,7 +440,7 @@ def build_pinyin_phones_tier(phones_tier: Tier,
                 break
 
         # Punctuation: pass through as-is
-        if _is_punct(w_iv.text):
+        if is_punct(w_iv.text):
             new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, w_iv.text))
             continue
 
@@ -622,8 +521,8 @@ def handle_unexpected_silences(textgrid: TextGrid, pinyin_text: str) -> list[str
     pinyin_tokens = pinyin_text.split()
     word_items = [(iv.text.strip(), is_silence(iv.text)) for iv in words_tier.intervals]
     tg_word_idx = [i for i, (text, is_sil) in enumerate(word_items)
-                   if not is_sil and not _is_punct(text)]
-    py_word_idx = [i for i, t in enumerate(pinyin_tokens) if _is_word_like(t)]
+                   if not is_sil and not is_punct(text)]
+    py_word_idx = [i for i, t in enumerate(pinyin_tokens) if is_word_like(t)]
 
     if len(tg_word_idx) != len(py_word_idx) or len(tg_word_idx) == 0:
         return []
@@ -645,7 +544,7 @@ def handle_unexpected_silences(textgrid: TextGrid, pinyin_text: str) -> list[str
     for k in range(1, n):
         lo = py_word_idx[k - 1] + 1
         hi = py_word_idx[k]
-        gap_punct[k] = any(_is_punct(pinyin_tokens[i]) for i in range(lo, hi))
+        gap_punct[k] = any(is_punct(pinyin_tokens[i]) for i in range(lo, hi))
 
     filter_reasons = []
 
@@ -790,17 +689,17 @@ def _sync_pinyin_punctuation(pinyin_text: str, raw_text: str, final_text: str) -
     the final Chinese text has it (between the same word positions).  Punctuation
     that was deleted in the final text is dropped.
     """
-    py_words = [t for t in pinyin_text.split() if _is_word_like(t)]
+    py_words = [t for t in pinyin_text.split() if is_word_like(t)]
     # Build final_text character sequence: word chars vs punct
     final_chars = list(final_text.replace('<sp1>', ''))
     result = []
     word_idx = 0
     for ch in final_chars:
-        if _is_word_like(ch):
+        if is_word_like(ch):
             if word_idx < len(py_words):
                 result.append(py_words[word_idx])
                 word_idx += 1
-        elif _is_punct(ch):
+        elif is_punct(ch):
             result.append(ch)
         else:
             result.append(ch)
@@ -814,7 +713,7 @@ def _extract_word_chars(text: str) -> list[str]:
     result = []
     buf = ""
     for c in text:
-        if _is_cjk(c):
+        if is_cjk(c):
             if buf:
                 result.append(buf)
                 buf = ""
@@ -849,7 +748,7 @@ def _word_matches(ctc_token: str, ref_unit: str) -> bool:
     c = ctc_token.strip().lower()
     r = ref_unit.lower()
 
-    if _is_cjk(ref_unit):
+    if is_cjk(ref_unit):
         try:
             py = lazy_pinyin(ref_unit, style=Style.TONE3,
                             neutral_tone_with_five=True, errors="default")
@@ -957,7 +856,7 @@ def _build_hanzi_tier(words_tier: Tier, raw_text: str) -> Tier:
     # ── Build reference word-unit sequence (punct filtered out) ──
     ref_units: list[tuple[int, str]] = []   # (char_units_index, unit_text)
     for i, u in enumerate(char_units):
-        if _is_word_like(u):
+        if is_word_like(u):
             ref_units.append((i, u))
 
     # ── Build CTC word-token sequence (silence & punct filtered out) ──
@@ -965,7 +864,7 @@ def _build_hanzi_tier(words_tier: Tier, raw_text: str) -> Tier:
     for i, iv in enumerate(words_tier.intervals):
         if is_silence(iv.text) or not iv.text.strip():
             continue
-        if _is_punct(iv.text):
+        if is_punct(iv.text):
             continue
         ctc_pool.append((i, iv.text.strip()))
 
@@ -989,7 +888,7 @@ def _build_hanzi_tier(words_tier: Tier, raw_text: str) -> Tier:
             # spelling (e.g. "li"→"live", "b"→"BGM"), keep the fragment's
             # own text so track 3 shows the actual split tokens.
             if (ref_label.lower() != "ria"
-                    and ref_label.isascii() and not _is_cjk(ref_label)
+                    and ref_label.isascii() and not is_cjk(ref_label)
                     and ctc_text != ref_label):
                 ctc_map[ctc_i] = (ref_ci, ctc_text)
             else:
@@ -1004,7 +903,7 @@ def _build_hanzi_tier(words_tier: Tier, raw_text: str) -> Tier:
             intervals.append(Interval(iv.xmin, iv.xmax, silence_label(iv.duration)))
             continue
 
-        if _is_punct(iv.text):
+        if is_punct(iv.text):
             intervals.append(Interval(iv.xmin, iv.xmax, iv.text))
             continue
 
@@ -1043,7 +942,7 @@ def _normalize_word_spellings(words_tier: Tier, raw_text: str) -> None:
     # Reference word units (punct filtered)
     ref_units: list[tuple[int, str]] = []
     for i, u in enumerate(char_units):
-        if _is_word_like(u):
+        if is_word_like(u):
             ref_units.append((i, u))
 
     # Word-tier tokens (silence & punct filtered)
@@ -1051,7 +950,7 @@ def _normalize_word_spellings(words_tier: Tier, raw_text: str) -> None:
     for i, iv in enumerate(words_tier.intervals):
         if is_silence(iv.text) or not iv.text.strip():
             continue
-        if _is_punct(iv.text):
+        if is_punct(iv.text):
             continue
         word_entries.append((i, iv.text.strip()))
 
@@ -1137,53 +1036,9 @@ def _noise_floor(audio, sr: int, bottom_pct: float = 0.10) -> float:
     return float(_np.partition(rms, k)[k])
 
 
-def _is_cjk(ch: str) -> bool:
-    return '一' <= ch <= '鿿'
-
-
 def _is_alpha_group(s: str) -> bool:
     """True for ASCII strings whose characters are all alpha or hyphen (NVV tokens)."""
     return s.isascii() and bool(s) and all(c.isalpha() or c == '-' for c in s)
-
-
-def is_nvv_token(s: str) -> bool:
-    """Check if token is an NVV label (BREATHING, QUESTION-YI, etc.)."""
-    return s.strip().strip('<>').upper() in NVV_NAMES
-
-
-def is_english_token(token: str) -> bool:
-    """Token is English alpha: not NVV, not CJK, not pinyin syllable with tone.
-
-    English tokens are self-referential in MFA dict (like NVV) and use
-    CTC-only boundaries.  E.g. "li", "ve", "A", "I", "AI", "live".
-    """
-    import re as _re
-    if not token or not token.isalpha():
-        return False
-    if not token.isascii():
-        return False  # CJK chars are alpha in Python but not English
-    if is_nvv_token(token):
-        return False
-    if _re.match(r'^[a-z]+[1-5]$', token):
-        return False
-    return True
-
-
-def _is_word_like(s: str) -> bool:
-    """True for CJK characters, pinyin syllables (ni3), English words, digits, NVV labels."""
-    if not s:
-        return False
-    return _is_cjk(s) or s[0].isalpha() or s.isdigit() or is_nvv_token(s)
-
-
-def _is_punct(s: str) -> bool:
-    return bool(s.strip()) and not _is_word_like(s)
-
-
-def _is_pinyin_token(tok: str) -> bool:
-    """True for Chinese pinyin syllable with tone digit (e.g. jin1, ya4)."""
-    import re as _re
-    return bool(_re.match(r'^[a-z]+[1-5]$', tok))
 
 
 # ── Merge-words dictionary ────────────────────────────────────────────
@@ -1236,9 +1091,9 @@ def build_corrected_text(words_tier: Tier, raw_text: str, pinyin_text: str) -> s
 
     # word indices: exclude NVV tokens (transparent — not in raw Chinese text)
     py_word_idx = [i for i, t in enumerate(pinyin_tokens)
-                   if _is_word_like(t) and not is_nvv_token(t)]
+                   if is_word_like(t) and not is_nvv_token(t)]
     tg_word_idx = [i for i, (text, is_sil) in enumerate(word_items)
-                   if not is_sil and not is_nvv_token(text) and not _is_punct(text)]
+                   if not is_sil and not is_nvv_token(text) and not is_punct(text)]
 
     n_py = len(py_word_idx)
     n_tg = len(tg_word_idx)
@@ -1270,17 +1125,17 @@ def build_corrected_text(words_tier: Tier, raw_text: str, pinyin_text: str) -> s
 
     # leading punct
     if py_word_idx[0] > 0:
-        gap_punct[0] = any(_is_punct(pinyin_tokens[i]) for i in range(0, py_word_idx[0]))
+        gap_punct[0] = any(is_punct(pinyin_tokens[i]) for i in range(0, py_word_idx[0]))
 
     # between-word punct
     for k in range(n - 1):
         lo = py_word_idx[k] + 1
         hi = py_word_idx[k + 1]
-        gap_punct[k + 1] = any(_is_punct(pinyin_tokens[i]) for i in range(lo, hi))
+        gap_punct[k + 1] = any(is_punct(pinyin_tokens[i]) for i in range(lo, hi))
 
     # trailing punct
     if py_word_idx[-1] < len(pinyin_tokens) - 1:
-        gap_punct[n] = any(_is_punct(pinyin_tokens[i])
+        gap_punct[n] = any(is_punct(pinyin_tokens[i])
                            for i in range(py_word_idx[-1] + 1, len(pinyin_tokens)))
 
     # ---- walk raw Chinese text and produce corrected version ----
@@ -1296,16 +1151,16 @@ def build_corrected_text(words_tier: Tier, raw_text: str, pinyin_text: str) -> s
     # each char_unit consumes.  We need this because English word groups (e.g.
     # "live") are one char_unit but may map to one or more pinyin Word tokens.
     py_words = [t for t in pinyin_tokens
-                if _is_word_like(t) and not is_nvv_token(t)]
+                if is_word_like(t) and not is_nvv_token(t)]
     py_cursor = 0
 
     result = []
     word_idx = 0  # word position (aligned with py_words / tg_word_idx)
 
     for unit in char_units:
-        if _is_word_like(unit):
+        if is_word_like(unit):
             # How many pinyin-word slots does this unit consume?
-            if _is_cjk(unit):
+            if is_cjk(unit):
                 consume = 1
             else:
                 # English / alpha group: consume consecutive pinyin tokens that
@@ -1330,7 +1185,7 @@ def build_corrected_text(words_tier: Tier, raw_text: str, pinyin_text: str) -> s
 
             result.append(unit)
             word_idx += consume
-        elif _is_punct(unit):
+        elif is_punct(unit):
             gap_pos = word_idx  # gap after the last word
             if gap_pos < len(gap_sil):
                 if gap_sil[gap_pos]:
@@ -2131,11 +1986,11 @@ def _extend_word_into_ellipsis(words_tier: Tier, pp_tier: Tier | None,
         iv_curr = intervals[i]
         iv_next = intervals[i + 1]
 
-        if is_nvv_token(iv_curr.text) or _is_punct(iv_curr.text):
+        if is_nvv_token(iv_curr.text) or is_punct(iv_curr.text):
             continue
         if iv_curr.text.strip() in SILENCE_LABELS:
             continue
-        if not _is_word_like(iv_curr.text):
+        if not is_word_like(iv_curr.text):
             continue
         if iv_next.text.strip() != '…':
             continue
@@ -2195,7 +2050,7 @@ def _extend_word_into_ellipsis(words_tier: Tier, pp_tier: Tier | None,
             pp_next = pp_ivs[i + 1]
             if pp_next.text.strip() != '…':
                 continue
-            if is_nvv_token(pp_cur.text) or _is_punct(pp_cur.text):
+            if is_nvv_token(pp_cur.text) or is_punct(pp_cur.text):
                 continue
             if pp_cur.text.strip() in SILENCE_LABELS:
                 continue
@@ -2307,10 +2162,11 @@ def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
         return words_tier
     k = max(1, int(len(all_rms) * 0.15))
     nf = float(_np.partition(all_rms, k)[k])
-    threshold = max(nf * 3.0, 0.005)
 
     intervals = list(words_tier.intervals)
     n = len(intervals)
+
+    threshold = max(nf * 3.0, 0.001)
 
     # 从右往左处理: 后面的词先移, 给前面的词腾空间
     for i in range(n - 1, -1, -1):
@@ -2383,6 +2239,67 @@ def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
                                         intervals[i + 1].text)
         intervals[i] = Interval(new_start, new_end, iv.text)
 
+    # ── End trimming: word tails that decay into silence ──
+    # Sentence-final words often have their tail silence absorbed
+    # into the word boundary (e.g. 630ms for single-syllable 远).
+    # Trim the end to the last frame above threshold, convert tail
+    # to a new silence gap so _inject_punctuation can mark it as ….
+    for i in range(n - 1, -1, -1):
+        iv = intervals[i]
+        if is_silence(iv.text) or not iv.text.strip():
+            continue
+        if is_english_token(iv.text) or is_nvv_token(iv.text):
+            continue
+        if is_punct(iv.text):
+            continue  # punctuation has no acoustic energy to trim
+        dur = iv.xmax - iv.xmin
+        if dur < 0.15:
+            continue  # already short, don't trim further
+
+        # Check tail region: last 30% of the word (min 80ms)
+        tail_start_s = max(iv.xmin + dur * 0.7, iv.xmax - 0.300)
+        tail_start = int(tail_start_s * sr)
+        tail_end = int(iv.xmax * sr)
+        if tail_end - tail_start < int(0.040 * sr):
+            continue  # tail too short to analyze
+
+        tail_seg = audio[tail_start:tail_end]
+        tail_rms = float(_np.mean(_np.abs(tail_seg)))
+        if tail_rms >= threshold * 0.8:
+            continue  # tail has meaningful energy, keep boundary
+
+        # Search backward from word end to find last frame above threshold
+        w_start_s = int(iv.xmin * sr)
+        w_end_s = int(iv.xmax * sr)
+        frame_s = max(1, int(0.010 * sr))
+        n_frames = (w_end_s - w_start_s) // frame_s
+        if n_frames <= 0:
+            continue
+        frames = audio[w_start_s:w_start_s + n_frames * frame_s].reshape(n_frames, frame_s)
+        frame_rms_arr = _np.mean(_np.abs(frames), axis=1)
+        last_above = -1
+        for fi in range(n_frames - 1, -1, -1):
+            if frame_rms_arr[fi] > threshold:
+                last_above = fi
+                break
+        if last_above < 0:
+            continue  # entire word below threshold, leave as-is
+
+        new_end_s = (w_start_s + (last_above + 1) * frame_s) / sr
+        trimmed = iv.xmax - new_end_s
+        if trimmed < 0.030:
+            continue  # trim too small, not worth creating a gap
+
+        # Trim: word ends at new_end_s, remainder becomes silence gap
+        intervals[i] = Interval(iv.xmin, min(new_end_s, iv.xmax), iv.text)
+        gap_label = silence_label(trimmed)
+        if i + 1 < len(intervals) and is_silence(intervals[i + 1].text):
+            # Merge into existing trailing silence gap
+            next_iv = intervals[i + 1]
+            intervals[i + 1] = Interval(new_end_s, next_iv.xmax, next_iv.text)
+        else:
+            intervals.insert(i + 1, Interval(new_end_s, iv.xmax, gap_label))
+
     intervals = [iv for iv in intervals if iv.xmax > iv.xmin + 0.001]
     return Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals)
 
@@ -2401,7 +2318,7 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
     """
     mfa_words = [(i, iv) for i, iv in enumerate(words_tier.intervals)
                  if not is_silence(iv.text) and iv.text.strip() not in ("", "<eps>")
-                 and not _is_punct(iv.text)]
+                 and not is_punct(iv.text)]
 
     if len(mfa_words) != len(ctc_tokens):
         import sys
@@ -3335,7 +3252,7 @@ def main():
     parser.add_argument("--filter-min-word-dur-sec", type=float, default=0.02,
                         help="Absolute minimum word duration (below = misaligned).")
     parser.add_argument("--filter-word-energy-ratio", type=float, default=2.0,
-                        help="Flag word if energy < noise_floor * N (0 = disabled).")
+                        help="Flag word if energy < noise_floor * N.")
     parser.add_argument("--filter-min-phone-coverage", type=float, default=0.35)
     parser.add_argument("--filter-edge-gap-sec", type=float, default=0.25)
     parser.add_argument("--copy-errors", action="store_true")
@@ -3382,7 +3299,7 @@ def main():
     import platform as _plat
     n_workers = args.workers
     if n_workers <= 0:
-        n_workers = min(mp.cpu_count() or 4, len(tg_paths))
+        n_workers = min(32, len(tg_paths))  # cap at 32 — 384 forks on EPYC is wasteful
     n_workers = min(n_workers, len(tg_paths))
 
     reports = []
@@ -3416,7 +3333,10 @@ def main():
 
         print(f"  Postprocess parallel: {n_workers} workers for {len(tg_paths)} files ({_exec_label})")
         if _is_win:
-            # ThreadPool: simple submit, dicts shared in-process
+            # ThreadPool: set globals once, then all threads see them
+            _worker_init(ipa_to_pinyin, pinyin_dict, pinyin_case,
+                         args, args.txt_dir, args.wav_dir,
+                         args.output_dir, args.filtered_dir)
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
                 futures = {pool.submit(_worker_fn, tgp): tgp for tgp in tg_paths}
                 for fut in as_completed(futures):

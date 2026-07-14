@@ -85,28 +85,47 @@ def resolve_input_path(raw: str, base: Path = PROJECT_ROOT) -> Path:
 # ═══════════════════════════════════════════════════════════════
 
 def find_mfa_python(cfg_python: str = "") -> Optional[Path]:
-    """Auto-detect Python with MFA installed."""
+    """Auto-detect Python with MFA installed.
+
+    Checks (in order): explicit config path → ``mfa`` on PATH →
+    common conda environments (Linux & Windows).
+    """
     if cfg_python:
         p = Path(cfg_python)
         if p.exists():
             return p
+
+    # Try config/env-sourced Python (mfa on PATH)
     mfa_on_path = shutil.which("mfa")
     if mfa_on_path:
         parent = Path(mfa_on_path).parent
-        for name in ("python3", "python"):
-            py = parent / name
-            if py.exists():
-                return py
+        py = parent / ("python.exe" if os.name == "nt" else "python3")
+        if py.exists():
+            return py
+
+    # Search common conda envs
     home = Path.home()
-    for conda_root in [
-        home / "miniconda3", home / "anaconda3",
-        home / "opt" / "miniconda3", Path("/opt/conda"),
-    ]:
-        for env_name in ["mfa_chinese", "mfa_mandarin", "mfa", "mfa-dev"]:
-            for py_name in ("bin/python3", "bin/python"):
-                py = conda_root / "envs" / env_name / py_name
-                if py.exists():
-                    return py
+    is_win = os.name == "nt"
+    conda_roots = [
+        home / "miniconda3",
+        home / "anaconda3",
+        home / "opt" / "miniconda3",
+        home / "opt" / "anaconda3",
+        Path("/opt/conda"),
+        Path("/usr/local/anaconda3"),
+    ]
+    env_names = ["mfa_chinese", "mfa_mandarin", "mfa", "mfa-dev", "asr"]
+
+    for conda_root in conda_roots:
+        for env_name in env_names:
+            env_dir = conda_root / "envs" / env_name
+            py_bin = env_dir / ("python.exe" if is_win else "bin/python3")
+            if py_bin.exists():
+                return py_bin
+            py_bin = env_dir / ("python.exe" if is_win else "bin/python")
+            if py_bin.exists():
+                return py_bin
+
     return None
 
 
@@ -331,6 +350,100 @@ def discover_stems(ctc_dir: Path, audio_dir: Path,
     return valid, layout_map
 
 
+def discover_stems_separated(ctc_dir: Path, audio_dir: Path,
+                             require_all: bool = True) -> "tuple[list[str], list[str], dict[str, str], dict[str, Path]]":
+    """Like discover_stems() but returns (complete, incomplete) separately.
+
+    Incomplete stems are those with audio + a .lab file but missing ≥1 CTC suffix.
+    Stems without any .lab file are excluded entirely (never processed by NVASR).
+
+    Returns:
+        complete_stems:   sorted list of stems with all CTC files + audio
+        incomplete_stems: sorted list of stems with audio + .lab but missing ≥1 CTC suffix
+        layout_map:       {stem: "flat"|"nested"}
+        wav_index:        {stem: resolved_wav_path}
+    """
+    flat_names, nested_names = build_ctc_presence(ctc_dir)
+
+    # Build audio index (single scandir)
+    audio_index: set[str] = set()
+    try:
+        with os.scandir(str(audio_dir)) as it:
+            for entry in it:
+                if entry.is_file() and entry.name.endswith(".wav"):
+                    audio_index.add(entry.name[:-4])
+        if not audio_index:
+            try:
+                with os.scandir(str(audio_dir)) as it:
+                    for entry in it:
+                        if entry.is_dir():
+                            try:
+                                with os.scandir(entry.path) as it2:
+                                    for e2 in it2:
+                                        if e2.is_file() and e2.name.endswith(".wav"):
+                                            audio_index.add(e2.name[:-4])
+                            except OSError:
+                                pass
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+    # Collect candidates
+    candidate_stems: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for fname in flat_names:
+        if fname.endswith(".lab"):
+            stem = fname[:-4]
+            if stem not in seen:
+                candidate_stems.append((stem, "flat"))
+                seen.add(stem)
+    for dirname, sub_files in nested_names.items():
+        if f"{dirname}.lab" in sub_files:
+            if dirname not in seen:
+                candidate_stems.append((dirname, "nested"))
+                seen.add(dirname)
+
+    # Validate — split into complete and incomplete
+    complete_stems: list[str] = []
+    incomplete_stems: list[str] = []
+    layout_map: dict[str, str] = {}
+    wav_index: dict[str, Path] = {}
+    for stem, layout in candidate_stems:
+        # Must have audio
+        if stem not in audio_index:
+            wav_path = find_wav(audio_dir, stem)
+            if wav_path is None:
+                continue
+            wav_index[stem] = wav_path
+        else:
+            # We only know the stem exists, resolve the full path
+            wav_path = find_wav(audio_dir, stem)
+            if wav_path is None:
+                continue
+            wav_index[stem] = wav_path
+
+        if require_all:
+            if layout == "flat":
+                all_ok = all(f"{stem}{suffix}" in flat_names
+                             for suffix in CTC_SUFFIXES)
+            else:
+                all_ok = all(f"{stem}{suffix}" in nested_names.get(stem, set())
+                             for suffix in CTC_SUFFIXES)
+            if all_ok:
+                complete_stems.append(stem)
+            else:
+                incomplete_stems.append(stem)
+        else:
+            complete_stems.append(stem)
+
+        layout_map[stem] = layout
+
+    complete_stems.sort()
+    incomplete_stems.sort()
+    return complete_stems, incomplete_stems, layout_map, wav_index
+
+
 # ═══════════════════════════════════════════════════════════════
 # 数据传输 (rsync/cp)
 # ═══════════════════════════════════════════════════════════════
@@ -388,3 +501,185 @@ def sync_tree_back(src: Path, dst: Path) -> bool:
         import time
         time.sleep(2 ** attempt)
     return False
+
+
+# ═══════════════════════════════════════════════════════════════
+# Shared constants — canonical definitions used across the pipeline.
+# Edit HERE when adding/changing NVV names, IPA mappings, etc.
+# ═══════════════════════════════════════════════════════════════
+
+import re as _re
+
+# ── Silence / pause tokens ──────────────────────────────────────
+SILENCE_LABELS: set[str] = {"<eps>", "<sil>", "sil", "<sp0>", "<sp1>", "<sp2>", "<sp3>"}
+
+# ── NVV (Non-Verbal Vocalisation) names ─────────────────────────
+NVV_NAMES: set[str] = {
+    "BREATHING", "LAUGHTER", "BURP", "COUGH", "CRYING", "GROAN",
+    "HISS", "HUM", "SHH", "SIGH", "SNEEZE", "SNIFF", "SNORE",
+    "TSK", "UHM", "WHISTLE", "YAWN",
+    "QUESTION-YI", "QUESTION-EN", "QUESTION-OH", "QUESTION-AH",
+    "QUESTION-EI", "QUESTION-HUH",
+    "SURPRISE-OH", "SURPRISE-AH", "SURPRISE-WA", "SURPRISE-YO",
+    "CONFIRMATION-EN", "DISSATISFACTION-HNN",
+}
+
+NVV_TO_MFA: dict[str, str] = {
+    "Breathing": "BREATHING", "Laughter": "LAUGHTER", "Burp": "BURP",
+    "Cough": "COUGH", "Crying": "CRYING", "Groan": "GROAN", "Hiss": "HISS",
+    "Hum": "HUM", "Shh": "SHH", "Sigh": "SIGH", "Sneeze": "SNEEZE",
+    "Sniff": "SNIFF", "Snore": "SNORE", "Tsk": "TSK", "Uhm": "UHM",
+    "Whistle": "WHISTLE", "Yawn": "YAWN",
+    "Question-yi": "QUESTION-YI", "Question-en": "QUESTION-EN",
+    "Question-oh": "QUESTION-OH", "Question-ah": "QUESTION-AH",
+    "Question-ei": "QUESTION-EI", "Question-huh": "QUESTION-HUH",
+    "Surprise-oh": "SURPRISE-OH", "Surprise-ah": "SURPRISE-AH",
+    "Surprise-wa": "SURPRISE-WA", "Surprise-yo": "SURPRISE-YO",
+    "Confirmation-en": "CONFIRMATION-EN",
+    "Dissatisfaction-hnn": "DISSATISFACTION-HNN",
+    "Pause": "PAUSE",
+}
+
+# ── Chinese initials (consonant phones without tone) ────────────
+CHINESE_INITIALS_SET: set[str] = {
+    "p", "pʰ", "t", "tʰ", "k", "kʰ",
+    "tɕ", "tɕʰ", "ʈʂ", "ʈʂʰ", "ts", "tsʰ",
+    "f", "s", "ɕ", "ʂ", "x",
+    "m", "n", "l", "ɻ",
+    "j", "w", "ɥ",
+    "ŋ", "ʔ",
+}
+
+# ── IPA → pinyin mapping tables ─────────────────────────────────
+IPA_CONSONANT_MAP: dict[str, str] = {
+    'p': 'b', 'pʰ': 'p', 't': 'd', 'tʰ': 't', 'k': 'g', 'kʰ': 'k',
+    'tɕ': 'j', 'tɕʰ': 'q', 'ʈʂ': 'zh', 'ʈʂʰ': 'ch', 'ts': 'z', 'tsʰ': 'c',
+    'f': 'f', 's': 's', 'ɕ': 'x', 'ʂ': 'sh', 'x': 'h',
+    'm': 'm', 'n': 'n', 'l': 'l', 'ɻ': 'r',
+    'j': 'i', 'w': 'u', 'ɥ': 'v',
+    'ŋ': 'ng', 'ʔ': '',
+    'z̩': 'i0', 'ʐ̩': 'ir',
+}
+
+IPA_TONE_TO_DIGIT: dict[str, str] = {
+    '˥˥': '1', '˥': '1', '˧˥': '2', '˨˩˦': '3', '˥˩': '4', '˩': '5',
+}
+
+IPA_VOWEL_BASE_MAP: dict[str, str] = {
+    'a': 'a', 'o': 'o', 'ə': 'e', 'e': 'e',
+    'i': 'i', 'u': 'u', 'y': 'v',
+    'z̩': 'i0', 'ʐ̩': 'ir',
+}
+
+TONE_MARK_CHARS: set[str] = set('˥˧˨˩˦')
+
+FINAL_DECOMPOSE: dict[str, list[str]] = {
+    'a': ['a'], 'o': ['o'], 'e': ['e'], 'e2': ['e'],
+    'i': ['i'], 'u': ['u'], 'v': ['v'],
+    'i0': ['i0'], 'u0': ['u0'], 'v0': ['v0'], 'ir': ['ir'],
+    'ai': ['a', 'i'], 'ei': ['e', 'i'], 'ao': ['a', 'u'], 'ou': ['o', 'u'],
+    'an': ['a', 'n'], 'en': ['e', 'n'], 'in': ['i', 'n'],
+    'ang': ['a', 'ng'], 'eng': ['e', 'ng'], 'ing': ['i', 'ng'], 'ong': ['u', 'ng'],
+    'ia': ['i', 'a'], 'ie': ['i', 'e'],
+    'iao': ['i', 'a', 'u'], 'iu': ['i', 'o', 'u'], 'iou': ['i', 'o', 'u'],
+    'ian': ['i', 'e', 'n'], 'iang': ['i', 'a', 'ng'], 'iong': ['i', 'u', 'ng'],
+    'ua': ['u', 'a'], 'uo': ['u', 'o'],
+    'uai': ['u', 'a', 'i'], 'ui': ['u', 'e', 'i'], 'uei': ['u', 'e', 'i'],
+    'uan': ['u', 'a', 'n'], 'un': ['u', 'e', 'n'], 'uen': ['u', 'e', 'n'],
+    'uang': ['u', 'a', 'ng'], 'ueng': ['u', 'e', 'ng'],
+    've': ['v', 'e'], 'vn': ['v', 'n'], 'van': ['v', 'e', 'n'],
+    'er': ['e', 'r'], 'io': ['i', 'o'],
+    'n': ['n'], 'm': ['m'],
+}
+
+FINAL_TONE_INDEX: dict[str, int] = {
+    'a': 0, 'o': 0, 'e': 0, 'e2': 0, 'i': 0, 'u': 0, 'v': 0,
+    'i0': 0, 'u0': 0, 'v0': 0, 'ir': 0,
+    'ai': 0, 'ei': 0, 'ao': 0, 'ou': 0,
+    'an': 0, 'en': 0, 'in': 0,
+    'ang': 0, 'eng': 0, 'ing': 0, 'ong': 0,
+    'ia': 1, 'ie': 1, 'iao': 1, 'iu': 1, 'iou': 1,
+    'ian': 1, 'iang': 1, 'iong': 1,
+    'ua': 1, 'uo': 1, 'uai': 1, 'ui': 1, 'uei': 1,
+    'uan': 1, 'un': 1, 'uen': 1,
+    'uang': 1, 'ueng': 1,
+    've': 1, 'vn': 0, 'van': 1,
+    'er': 0, 'io': 1,
+    'n': 0, 'm': 0,
+}
+
+# ── CJK short function words (often compressed by MFA) ─────────
+CHINESE_SHORT_WORDS: set[str] = {
+    "的", "了", "着", "呢", "吗", "吧", "啊", "嘛", "呀", "哦",
+    "是", "在", "个", "和", "就", "也", "都", "不", "没",
+    "de5", "le5", "zhe5", "ne5", "ma5", "ba5", "a5", "ya5",
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Character / token classification helpers
+# ═══════════════════════════════════════════════════════════════
+
+def is_cjk(ch: str) -> bool:
+    """True if *ch* is a single CJK Unified Ideograph character."""
+    return '一' <= ch <= '鿿'
+
+
+def is_nvv_token(token: str) -> bool:
+    """Check if *token* is an NVV label (BREATHING, QUESTION-YI, etc.)."""
+    return token.strip().strip('<>').upper() in NVV_NAMES
+
+
+def is_english_token(token: str) -> bool:
+    """Token is English alpha: not NVV, not CJK, not pinyin syllable with tone."""
+    if not token or not token.isalpha():
+        return False
+    if not token.isascii():
+        return False
+    if is_nvv_token(token):
+        return False
+    if _re.match(r'^[a-z]+[1-5]$', token):
+        return False
+    return True
+
+
+def is_pinyin_syllable(token: str) -> bool:
+    """True for Chinese pinyin syllable with tone digit (e.g. jin1, ya4)."""
+    return bool(_re.match(r'^[a-z]+[1-5]$', token))
+
+
+def is_word_like(s: str) -> bool:
+    """True for CJK chars, pinyin syllables, English words, digits, NVV labels."""
+    if not s:
+        return False
+    return is_cjk(s) or s[0].isalpha() or s.isdigit() or is_nvv_token(s)
+
+
+def is_punct(s: str) -> bool:
+    """True if *s* is a non-word token (punctuation / symbol)."""
+    return bool(s.strip()) and not is_word_like(s)
+
+
+def extract_word_chars(text: str) -> list[str]:
+    """Split *text* into word-like units (CJK chars, alpha groups, punct)."""
+    result: list[str] = []
+    buf: str = ""
+    for c in text:
+        if is_cjk(c):
+            if buf:
+                result.append(buf)
+                buf = ""
+            result.append(c)
+        elif c.isalpha() or c == '-':
+            buf += c
+        elif c.isdigit():
+            buf += c
+        else:
+            if buf:
+                result.append(buf)
+                buf = ""
+            if not c.isspace():
+                result.append(c)
+    if buf:
+        result.append(buf)
+    return result

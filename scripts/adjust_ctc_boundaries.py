@@ -375,6 +375,19 @@ def main():
     if args.limit > 0:
         stems = stems[:args.limit]
 
+    # Skip stems that already have adjusted output (NAS cache from previous run)
+    existing = {p.stem for p in args.output_dir.glob("*.TextGrid")}
+    if existing:
+        new_stems = [s for s in stems if s not in existing]
+        skipped = len(stems) - len(new_stems)
+        if skipped:
+            print(f"  Skipping {skipped}/{len(stems)} stems (already cached in output dir)")
+        stems = new_stems
+
+    if not stems:
+        print("  All stems already have adjusted output. Nothing to do.")
+        return 0
+
     import multiprocessing as mp
     import platform as _plat
 
@@ -401,8 +414,15 @@ def main():
     #          n_workers = min(cpu-1, 8) as a safe upper bound for SMB.
     n_cpu = mp.cpu_count() or 4
     n_workers = min(max(1, n_cpu - 1), len(stems))
-    # Cap at 8 for SMB mounts to avoid network saturation
-    n_workers = min(n_workers, 8)
+    # Auto-detect local vs network filesystem for worker count
+    # NVMe paths (pipeline local work dirs) → higher parallelism
+    # SMB/CIFS/NFS paths → conservative cap to avoid network saturation
+    _audio_path = str(args.audio_dir)
+    _on_local = _audio_path.startswith("/mnt/nvme") or _audio_path.startswith("/dev/nvme")
+    if _on_local:
+        n_workers = min(n_workers, 32)   # local NVMe → up to 32 workers per batch
+    else:
+        n_workers = min(n_workers, 8)    # network FS → safe cap
     totals = {"start_adj": 0, "end_extend": 0, "end_shorten": 0,
               "punct_adj": 0, "files": 0}
 
@@ -451,9 +471,9 @@ def main():
                     totals[k] += s.get(k, 0)
                 if args.verbose:
                     print(f"  {stem}: {', '.join(parts) if parts else 'no changes'}")
-            # Progress heartbeat — one dot per 100 files
-            if totals["files"] % 100 == 0:
-                print(f"  ... {totals['files']}/{len(stems)} files adjusted", flush=True)
+                # Progress heartbeat — every 100 files
+                if totals["files"] % 100 == 0:
+                    print(f"  ... {totals['files']}/{len(stems)} files adjusted", flush=True)
 
     print(f"\n{'='*50}")
     print(f"Total: {totals['files']} files")

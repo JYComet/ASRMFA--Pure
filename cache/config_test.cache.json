@@ -1,0 +1,11 @@
+{
+  "config_file": "config_test.yaml",
+  "mode": "full",
+  "workspace": "ws_test",
+  "data_dir": "E:\\Audio Event Detection\\chinese_mfa_pipeline\\data_dir\\test",
+  "output_dir": "E:\\Audio Event Detection\\chinese_mfa_pipeline\\output\\ws_test\\output",
+  "n_stems": 0,
+  "manifest_path": "E:\\Audio Event Detection\\chinese_mfa_pipeline\\output\\ws_test\\ctc_pretg\\ctc_ready_manifest.json",
+  "version": 1,
+  "scanned_at": "2026-07-10T18:01:42"
+}
