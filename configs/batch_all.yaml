@@ -1,0 +1,48 @@
+# 批量处理 ASRNEW 下全部数据集
+# 运行: python scripts/run_pipeline.py --config configs/batch_all.yaml
+#
+# 自动发现 ASRNEW/{数据集}/wavs/ 下有CTC的所有数据集
+# 对应音频在 v5_0707/{数据集}/wavs/
+# 输出到 ASR_MFA/{数据集}/
+#
+# 预扫描缓存: python scripts/run_pipeline.py --config configs/batch_all.yaml --scan-only
+# 使用缓存:   默认自动启用（use_cache: true），--no-cache 强制重扫
+
+mode: batch_ctc_ready
+
+# 扫描缓存 (默认 true，缓存文件在 cache/ 目录)
+use_cache: true
+
+# 流式管线默认值 (命令行可覆盖)
+streaming:
+  # 本地 NVMe 工作目录 — 单盘模式
+  local_work: /mnt/nvme0/mfa_work
+  # 多盘模式 (取消注释下面以使用所有 4 块 NVMe，每盘承载 parallel/4 个 worker):
+  # local_work:
+  #   - /mnt/nvme0/mfa_work
+  #   - /mnt/nvme1/mfa_work
+  #   - /mnt/nvme2/mfa_work
+  #   - /mnt/nvme3/mfa_work
+  batch_size: 2000              # 每批 stem 数量 (减少进程启动开销)
+  parallel: 4                   # 并行数据集数 (每数据集独立 NVMe 子目录)
+  batch_cache: cache/batch_all.cache.json  # 批量缓存 (不写则自动从 config 名推导)
+
+batch:
+  ctc_root: \\RS3621\Research_TTS\Data\Raw\ASRNEW
+  audio_root: \\RS3621\Research_TTS\Data\Raw\v5_0707
+  output_root: \\RS3621\Research_TTS\Data\Raw\ASR_MFA
+  # include: [合成ria, BCNbanma]  # 可选：只处理指定数据集
+  # exclude: [test]                # 可选：排除指定数据集
+  # limit: 5                       # 可选：只处理前N个（测试用）
+
+ctc_ready:
+  require_all: true
+
+mfa:
+  num_jobs: 32                   # MFA 对齐并行数 (384 核 CPU)
+  single_speaker: true
+
+postprocess:
+  filter_suspicious: true
+  enable_text_correction: true
+  handle_unexpected_sil: true

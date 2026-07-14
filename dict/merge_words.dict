@@ -1,0 +1,10 @@
+# Words to be kept as single units (not split by NVASR tokenizer).
+# Self-referential format: word word (same as NVV entries in mfa_ipa.dict).
+# The tokenizer's phonetic approximations (pinyin fragments, single
+# letters) at the word's position will be merged into the canonical form.
+#
+# Add new words below — one per line:
+# ria ria
+# call call
+ria ria
+call call

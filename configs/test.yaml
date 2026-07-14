@@ -1,0 +1,9 @@
+# test — 2 条音频
+workspace: ws_test
+data_dir: data_dir/test
+
+ctc_prealign:
+  python: "C:/Users/MSI/miniconda3/python.exe"
+
+postprocess:
+  handle_unexpected_sil: true

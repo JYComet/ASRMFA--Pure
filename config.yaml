@@ -1,100 +1,96 @@
-# Chinese MFA Pipeline Configuration
-# ====================================
-# All paths are relative to the project root (chinese_mfa_pipeline/).
-# Absolute paths also work if you prefer to keep data elsewhere.
-# CLI arguments (--data-dir, --output-dir, --python) override these values.
+# ═══════════════════════════════════════════════════════════════════════════
+# Chinese MFA Pipeline — 参考配置 / 内置默认值
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 任务配置文件只需写与默认值不同的字段 (通常只需要 workspace + data_dir).
+# 运行: python scripts/run_pipeline.py --config config.yaml
+#       python scripts/run_pipeline.py --config configs/xiaoyuan5.yaml
+#
+# 所有字段都有内置默认值 (见 run_pipeline.py::DEFAULT_CFG).
+# 以下列出的是默认值, 注释掉表示使用默认即可.
 
-# ---- Workspace (all generated data goes here) ----
-workspace: workspace
+# ── 必填 (无默认值) ──────────────────────────────────────────────────────
+# workspace: my_task           # 工作区名 (相对路径 = 相对于当前目录)
+# data_dir: data_dir/my_task   # 输入目录, 含 wav + txt
 
-# ---- Input ----
-data_dir: data_dir                  # Source directory (wav + txt in subdirs)
-txt_suffix:                         # Only match txt files with this suffix (e.g. qwen3-api)
+# ── 输出子目录 (相对于 workspace) ────────────────────────────────────────
+# audio_dir: audio
+# pinyin_dir: pinyin
+# aligned_dir: aligned
+# output_dir: output
+# filtered_dir: filtered
+# validate_dir: validate
+# temp_dir: temp
+# ctc_pretg: ctc_pretg
+# ctc_pretg_adj: ctc_pretg_adj
 
-# ---- Output directories (relative to workspace) ----
-audio_dir: audio                    # Trimmed WAV
-pinyin_dir: pinyin                  # Chinese text converted to pinyin
-aligned_dir: aligned                # Raw MFA alignment TextGrids
-output_dir: output                  # Final TextGrids (passed QC)
-filtered_dir: filtered              # TextGrids that failed QC
-validate_dir: validate              # MFA validation output
-temp_dir: temp                      # MFA temporary files
+# ── 模型 & 词典 (相对于项目根) ──────────────────────────────────────────
+# models_dir: models/mfa
+# acoustic_model: mandarin_mfa
+# mfa_dict: dict/mfa_ipa.dict
+# pinyin_dict: dict/fullpinyin_enword.dict
+# python_path: ""              # 空 = 自动检测 conda env
 
-# ---- Model & Dictionary (relative to project root) ----
-models_dir: models/mfa              # MFA model root
-acoustic_model: mandarin_mfa        # MFA acoustic model name
-mfa_dict: dict/mfa_ipa.dict         # Pronunciation dictionary
-pinyin_dict: dict/fullpinyin_enword.dict  # Source pinyin dictionary
+# ── 音频预处理 ──────────────────────────────────────────────────────────
+# trim:
+#   max_silence_sec: 1.0
+#   sil_vol_threshold: 0.005
+#   sil_len_threshold: 0.08
+#   normalize_edges: true
+#   target_edge_silence_sec: 0.5
+#   edge_silence_threshold: 0.001
+#   edge_frame_length: 1024
+#   target_sr: null
+#   workers: 8
 
-# ---- Python environment (auto-detect if empty) ----
-python_path: ""                     # Path to Python with MFA installed. Empty = auto-detect from conda envs.
+# ── CTC 预对齐 ──────────────────────────────────────────────────────────
+# ctc_prealign:
+#   enabled: true
+#   model_path: "models/Multilingual-NVASR"
+#   device: cuda:0
+#   python: ""
+#   limit: 0
+#   timeout: 3600
 
-# ---- Step 1: Trim Silence ----
-trim:
-  max_silence_sec: 1.0
-  sil_vol_threshold: 0.005
-  sil_len_threshold: 0.08
-  normalize_edges: true
-  target_edge_silence_sec: 0.5
-  edge_silence_threshold: 0.001
-  edge_frame_length: 1024
-  target_sr: null
-  workers: 8
+# ── CTC 边界能量修正 ────────────────────────────────────────────────────
+# ctc_adjust:
+#   enabled: true
+#   limit: 0
 
-# ---- Step 2: Prepare Corpus ----
-prepare:
-  copy_wav: false
-  keep_punctuation: true
+# ── MFA ─────────────────────────────────────────────────────────────────
+# mfa:
+#   num_jobs: 0             # 0 = auto (os.cpu_count())
+#   single_speaker: true
+#   output_format: long_textgrid
+#   clean: false            # keep feature cache for faster re-runs
+#   no_tokenization: true
+#   skip_validate: true     # MFA align validates internally
 
-# ---- CTC directories (relative to workspace) ----
-ctc_pretg: ctc_pretg
-ctc_pretg_adj: ctc_pretg_adj
-
-# ---- Step 4: CTC Pre-alignment (NVASR -> MFA anchors) ----
-ctc_prealign:
-  enabled: true
-  model_path: "models/Multilingual-NVASR"   # relative to project root
-  device: cuda:0
-  python: ""                                # Python with funasr+torch. Empty = use current Python.
-  limit: 0
-  timeout: 3600
-
-# ---- Step 5: Energy-based CTC boundary adjustment ----
-ctc_adjust:
-  enabled: true
-  limit: 0
-
-# ---- Step 6 & 7: MFA ----
-mfa:
-  num_jobs: 8
-  single_speaker: true
-  output_format: long_textgrid
-  clean: true
-  no_tokenization: true
-
-# ---- Step 8: Postprocess ----
-postprocess:
-  merge_silence: true
-  min_sil_merge_sec: 0.2
-  fix_short_word: true
-  short_word_max_sec: 0.25
-  flank_silence_sec: 0.4
-  short_word_search_window: 0.5
-  detect_bgm: true
-  bgm_noise_floor_ratio: 2.0
-  bgm_min_sil_dur: 0.3
-  bgm_speech_ratio: 1.0
-  bgm_min_energy: 0.01
-  filter_suspicious: true
-  filter_short_phone_sec: 0.005
-  filter_long_word_sec: 1.5
-  filter_min_word_sec: 0.15
-  filter_min_word_dur_sec: 0.02
-  filter_word_energy_ratio: 2.0
-  filter_min_phone_coverage: 0.25
-  filter_edge_gap_sec: 0.35
-  filter_flank_silence_sec: 0.4
-  filter_long_consonant_sec: 999.0
-  filter_long_vowel_sec: 999.0
-  enable_text_correction: true
-  handle_unexpected_sil: false
+# ── 后处理 ──────────────────────────────────────────────────────────────
+# postprocess:
+#   merge_silence: true
+#   min_sil_merge_sec: 0.2
+#   fix_short_word: true
+#   short_word_max_sec: 0.25
+#   flank_silence_sec: 0.4
+#   short_word_search_window: 0.5
+#   detect_bgm: true
+#   bgm_noise_floor_ratio: 2.0
+#   bgm_min_sil_dur: 0.3
+#   bgm_speech_ratio: 1.0
+#   bgm_min_energy: 0.01
+#   filter_suspicious: true
+#   filter_short_phone_sec: 0.015
+#   filter_long_word_sec: 1.0
+#   filter_min_word_sec: 0.15
+#   filter_min_word_dur_sec: 0.02
+#   filter_word_energy_ratio: 2.0
+#   enable_word_in_silence_filter: false   # 默认关闭；设为 true 开启
+#   filter_min_phone_coverage: 0.35
+#   filter_edge_gap_sec: 0.25
+#   filter_flank_silence_sec: 0.4
+#   filter_long_consonant_sec: 999.0
+#   filter_long_vowel_sec: 999.0
+#   enable_text_correction: true
+#   handle_unexpected_sil: true
+#   workers: 0              # 0 = auto (os.cpu_count())

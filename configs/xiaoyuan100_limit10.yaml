@@ -1,6 +1,12 @@
-# xiaoyuan5 — 5 条音频测试
-workspace: xiaoyuan5
-data_dir: ../video/xiaoyuan5
+# xiaoyuan100 前 10 条 (测试/调参)
+workspace: xiaoyuan100_limit10
+data_dir: data_dir/xiaoyuan100
+
+ctc_prealign:
+  limit: 10
+
+ctc_adjust:
+  limit: 10
 
 postprocess:
   handle_unexpected_sil: false

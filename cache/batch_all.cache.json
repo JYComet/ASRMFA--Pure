@@ -1,0 +1,851 @@
+{
+  "config_file": "configs/batch_all.yaml",
+  "mode": "batch_ctc_ready",
+  "ctc_root": "/mnt/Raw/ASRNEW",
+  "audio_root": "/mnt/Raw/v5_0707",
+  "output_root": "/mnt/Raw/ASR_MFA",
+  "datasets": [
+    {
+      "name": "BCNbanma",
+      "audio_dir": "/mnt/Raw/v5_0707/BCNbanma/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/BCNbanma/wavs"
+    },
+    {
+      "name": "BCNchenniningxi",
+      "audio_dir": "/mnt/Raw/v5_0707/BCNchenniningxi/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/BCNchenniningxi/wavs"
+    },
+    {
+      "name": "BCNdaodao",
+      "audio_dir": "/mnt/Raw/v5_0707/BCNdaodao/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/BCNdaodao/wavs"
+    },
+    {
+      "name": "BCNgaoqifana",
+      "audio_dir": "/mnt/Raw/v5_0707/BCNgaoqifana/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/BCNgaoqifana/wavs"
+    },
+    {
+      "name": "BCNgaoqifanb",
+      "audio_dir": "/mnt/Raw/v5_0707/BCNgaoqifanb/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/BCNgaoqifanb/wavs"
+    },
+    {
+      "name": "BCNgaoqifanc",
+      "audio_dir": "/mnt/Raw/v5_0707/BCNgaoqifanc/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/BCNgaoqifanc/wavs"
+    },
+    {
+      "name": "BCNgaoqifand",
+      "audio_dir": "/mnt/Raw/v5_0707/BCNgaoqifand/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/BCNgaoqifand/wavs"
+    },
+    {
+      "name": "BCNgaoqifane",
+      "audio_dir": "/mnt/Raw/v5_0707/BCNgaoqifane/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/BCNgaoqifane/wavs"
+    },
+    {
+      "name": "BCNgaoqifanf",
+      "audio_dir": "/mnt/Raw/v5_0707/BCNgaoqifanf/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/BCNgaoqifanf/wavs"
+    },
+    {
+      "name": "BCNgaoqifanv",
+      "audio_dir": "/mnt/Raw/v5_0707/BCNgaoqifanv/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/BCNgaoqifanv/wavs"
+    },
+    {
+      "name": "BCNqiaoba",
+      "audio_dir": "/mnt/Raw/v5_0707/BCNqiaoba/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/BCNqiaoba/wavs"
+    },
+    {
+      "name": "BCNqiaofeifei",
+      "audio_dir": "/mnt/Raw/v5_0707/BCNqiaofeifei/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/BCNqiaofeifei/wavs"
+    },
+    {
+      "name": "BCNqinwenjing",
+      "audio_dir": "/mnt/Raw/v5_0707/BCNqinwenjing/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/BCNqinwenjing/wavs"
+    },
+    {
+      "name": "BCNxiaomi",
+      "audio_dir": "/mnt/Raw/v5_0707/BCNxiaomi/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/BCNxiaomi/wavs"
+    },
+    {
+      "name": "BCNxieying0001",
+      "audio_dir": "/mnt/Raw/v5_0707/BCNxieying0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/BCNxieying0001/wavs"
+    },
+    {
+      "name": "BCNzhangxinfang",
+      "audio_dir": "/mnt/Raw/v5_0707/BCNzhangxinfang/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/BCNzhangxinfang/wavs"
+    },
+    {
+      "name": "BCNzhaoxi",
+      "audio_dir": "/mnt/Raw/v5_0707/BCNzhaoxi/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/BCNzhaoxi/wavs"
+    },
+    {
+      "name": "GSabaidu0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSabaidu0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSabaidu0001/wavs"
+    },
+    {
+      "name": "GSaierhaisen0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSaierhaisen0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSaierhaisen0001/wavs"
+    },
+    {
+      "name": "GSbabala0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSbabala0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSbabala0001/wavs"
+    },
+    {
+      "name": "GSbazyshenzi0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSbazyshenzi0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSbazyshenzi0001/wavs"
+    },
+    {
+      "name": "GSbeidou0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSbeidou0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSbeidou0001/wavs"
+    },
+    {
+      "name": "GSdadaliya",
+      "audio_dir": "/mnt/Raw/v5_0707/GSdadaliya/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSdadaliya/wavs"
+    },
+    {
+      "name": "GSdiona0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSdiona0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSdiona0001/wavs"
+    },
+    {
+      "name": "GSdixiya0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSdixiya0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSdixiya0001/wavs"
+    },
+    {
+      "name": "GSfalushan0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSfalushan0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSfalushan0001/wavs"
+    },
+    {
+      "name": "GSfengyuanwanye0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSfengyuanwanye0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSfengyuanwanye0001/wavs"
+    },
+    {
+      "name": "GSfuningna0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSfuningna0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSfuningna0001/wavs"
+    },
+    {
+      "name": "GShuanglongyidou0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GShuanglongyidou0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GShuanglongyidou0001/wavs"
+    },
+    {
+      "name": "GShutao0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GShutao0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GShutao0001/wavs"
+    },
+    {
+      "name": "GSkaiya0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSkaiya0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSkaiya0001/wavs"
+    },
+    {
+      "name": "GSkaqina0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSkaqina0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSkaqina0001/wavs"
+    },
+    {
+      "name": "GSkawei",
+      "audio_dir": "/mnt/Raw/v5_0707/GSkawei/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSkawei/wavs"
+    },
+    {
+      "name": "GSkelailei",
+      "audio_dir": "/mnt/Raw/v5_0707/GSkelailei/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSkelailei/wavs"
+    },
+    {
+      "name": "GSkeli0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSkeli0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSkeli0001/wavs"
+    },
+    {
+      "name": "GSkeqing0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSkeqing0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSkeqing0001/wavs"
+    },
+    {
+      "name": "GSkong0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSkong0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSkong0001/wavs"
+    },
+    {
+      "name": "GSlaila0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSlaila0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSlaila0001/wavs"
+    },
+    {
+      "name": "GSlaiousili0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSlaiousili0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSlaiousili0001/wavs"
+    },
+    {
+      "name": "GSleidianjiangjun0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSleidianjiangjun0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSleidianjiangjun0001/wavs"
+    },
+    {
+      "name": "GSlinni0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSlinni0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSlinni0001/wavs"
+    },
+    {
+      "name": "GSlisha",
+      "audio_dir": "/mnt/Raw/v5_0707/GSlisha/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSlisha/wavs"
+    },
+    {
+      "name": "GSluyeyuanpingcang0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSluyeyuanpingcang0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSluyeyuanpingcang0001/wavs"
+    },
+    {
+      "name": "GSmalani0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSmalani0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSmalani0001/wavs"
+    },
+    {
+      "name": "GSmaweika0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSmaweika0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSmaweika0001/wavs"
+    },
+    {
+      "name": "GSmengjianyueruixi0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSmengjianyueruixi0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSmengjianyueruixi0001/wavs"
+    },
+    {
+      "name": "GSmuna",
+      "audio_dir": "/mnt/Raw/v5_0707/GSmuna/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSmuna/wavs"
+    },
+    {
+      "name": "GSnaweilaite0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSnaweilaite0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSnaweilaite0001/wavs"
+    },
+    {
+      "name": "GSnaweiya0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSnaweiya0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSnaweiya0001/wavs"
+    },
+    {
+      "name": "GSnaxida0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSnaxida0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSnaxida0001/wavs"
+    },
+    {
+      "name": "GSnilu0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSnilu0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSnilu0001/wavs"
+    },
+    {
+      "name": "GSningguang",
+      "audio_dir": "/mnt/Raw/v5_0707/GSningguang/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSningguang/wavs"
+    },
+    {
+      "name": "GSnuoaier0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSnuoaier0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSnuoaier0001/wavs"
+    },
+    {
+      "name": "GSpaimeng",
+      "audio_dir": "/mnt/Raw/v5_0707/GSpaimeng/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSpaimeng/wavs"
+    },
+    {
+      "name": "GSsainuo0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSsainuo0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSsainuo0001/wavs"
+    },
+    {
+      "name": "GSshanhaigongxinhai",
+      "audio_dir": "/mnt/Raw/v5_0707/GSshanhaigongxinhai/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSshanhaigongxinhai/wavs"
+    },
+    {
+      "name": "GSshenlilinghua0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSshenlilinghua0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSshenlilinghua0001/wavs"
+    },
+    {
+      "name": "GStinab0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GStinab0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GStinab0001/wavs"
+    },
+    {
+      "name": "GStuomab0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GStuomab0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GStuomab0001/wavs"
+    },
+    {
+      "name": "GSwendidi",
+      "audio_dir": "/mnt/Raw/v5_0707/GSwendidi/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSwendidi/wavs"
+    },
+    {
+      "name": "GSxiangling0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSxiangling0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSxiangling0001/wavs"
+    },
+    {
+      "name": "GSxiaogong0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSxiaogong0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSxiaogong0001/wavs"
+    },
+    {
+      "name": "GSxinuoning0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSxinuoning0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSxinuoning0001/wavs"
+    },
+    {
+      "name": "GSxiterali",
+      "audio_dir": "/mnt/Raw/v5_0707/GSxiterali/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSxiterali/wavs"
+    },
+    {
+      "name": "GSyanfei0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSyanfei0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSyanfei0001/wavs"
+    },
+    {
+      "name": "GSyelan0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSyelan0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSyelan0001/wavs"
+    },
+    {
+      "name": "GSying0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSying0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSying0001/wavs"
+    },
+    {
+      "name": "GSzaoyou0001",
+      "audio_dir": "/mnt/Raw/v5_0707/GSzaoyou0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSzaoyou0001/wavs"
+    },
+    {
+      "name": "GSzhongli",
+      "audio_dir": "/mnt/Raw/v5_0707/GSzhongli/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/GSzhongli/wavs"
+    },
+    {
+      "name": "HKailixiya",
+      "audio_dir": "/mnt/Raw/v5_0707/HKailixiya/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKailixiya/wavs"
+    },
+    {
+      "name": "HKaiyinsitan",
+      "audio_dir": "/mnt/Raw/v5_0707/HKaiyinsitan/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKaiyinsitan/wavs"
+    },
+    {
+      "name": "HKaotuo",
+      "audio_dir": "/mnt/Raw/v5_0707/HKaotuo/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKaotuo/wavs"
+    },
+    {
+      "name": "HKbazy",
+      "audio_dir": "/mnt/Raw/v5_0707/HKbazy/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKbazy/wavs"
+    },
+    {
+      "name": "HKbulangni",
+      "audio_dir": "/mnt/Raw/v5_0707/HKbulangni/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKbulangni/wavs"
+    },
+    {
+      "name": "HKdibaliuzhe",
+      "audio_dir": "/mnt/Raw/v5_0707/HKdibaliuzhe/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKdibaliuzhe/wavs"
+    },
+    {
+      "name": "HKduya",
+      "audio_dir": "/mnt/Raw/v5_0707/HKduya/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKduya/wavs"
+    },
+    {
+      "name": "HKfuhua",
+      "audio_dir": "/mnt/Raw/v5_0707/HKfuhua/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKfuhua/wavs"
+    },
+    {
+      "name": "HKjizi",
+      "audio_dir": "/mnt/Raw/v5_0707/HKjizi/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKjizi/wavs"
+    },
+    {
+      "name": "HKkaiwen",
+      "audio_dir": "/mnt/Raw/v5_0707/HKkaiwen/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKkaiwen/wavs"
+    },
+    {
+      "name": "HKkalian",
+      "audio_dir": "/mnt/Raw/v5_0707/HKkalian/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKkalian/wavs"
+    },
+    {
+      "name": "HKkaluoer",
+      "audio_dir": "/mnt/Raw/v5_0707/HKkaluoer/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKkaluoer/wavs"
+    },
+    {
+      "name": "HKliliya",
+      "audio_dir": "/mnt/Raw/v5_0707/HKliliya/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKliliya/wavs"
+    },
+    {
+      "name": "HKlita",
+      "audio_dir": "/mnt/Raw/v5_0707/HKlita/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKlita/wavs"
+    },
+    {
+      "name": "HKtesila",
+      "audio_dir": "/mnt/Raw/v5_0707/HKtesila/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKtesila/wavs"
+    },
+    {
+      "name": "HKwaerte",
+      "audio_dir": "/mnt/Raw/v5_0707/HKwaerte/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKwaerte/wavs"
+    },
+    {
+      "name": "HKxier0001",
+      "audio_dir": "/mnt/Raw/v5_0707/HKxier0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKxier0001/wavs"
+    },
+    {
+      "name": "HKxier0002",
+      "audio_dir": "/mnt/Raw/v5_0707/HKxier0002/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKxier0002/wavs"
+    },
+    {
+      "name": "HKyiyi",
+      "audio_dir": "/mnt/Raw/v5_0707/HKyiyi/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKyiyi/wavs"
+    },
+    {
+      "name": "HKyoulandaier",
+      "audio_dir": "/mnt/Raw/v5_0707/HKyoulandaier/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/HKyoulandaier/wavs"
+    },
+    {
+      "name": "LAria",
+      "audio_dir": "/mnt/Raw/v5_0707/LAria/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/LAria/wavs"
+    },
+    {
+      "name": "Mieli",
+      "audio_dir": "/mnt/Raw/v5_0707/Mieli/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/Mieli/wavs"
+    },
+    {
+      "name": "SRageleya0001",
+      "audio_dir": "/mnt/Raw/v5_0707/SRageleya0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRageleya0001/wavs"
+    },
+    {
+      "name": "SRbaie",
+      "audio_dir": "/mnt/Raw/v5_0707/SRbaie/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRbaie/wavs"
+    },
+    {
+      "name": "SRbuluoniya",
+      "audio_dir": "/mnt/Raw/v5_0707/SRbuluoniya/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRbuluoniya/wavs"
+    },
+    {
+      "name": "SRdanhen",
+      "audio_dir": "/mnt/Raw/v5_0707/SRdanhen/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRdanhen/wavs"
+    },
+    {
+      "name": "SRfengjin0001",
+      "audio_dir": "/mnt/Raw/v5_0707/SRfengjin0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRfengjin0001/wavs"
+    },
+    {
+      "name": "SRfuxuan0001",
+      "audio_dir": "/mnt/Raw/v5_0707/SRfuxuan0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRfuxuan0001/wavs"
+    },
+    {
+      "name": "SRheitiane",
+      "audio_dir": "/mnt/Raw/v5_0707/SRheitiane/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRheitiane/wavs"
+    },
+    {
+      "name": "SRhuangquan0001",
+      "audio_dir": "/mnt/Raw/v5_0707/SRhuangquan0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRhuangquan0001/wavs"
+    },
+    {
+      "name": "SRjingyuan",
+      "audio_dir": "/mnt/Raw/v5_0707/SRjingyuan/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRjingyuan/wavs"
+    },
+    {
+      "name": "SRjizi0001",
+      "audio_dir": "/mnt/Raw/v5_0707/SRjizi0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRjizi0001/wavs"
+    },
+    {
+      "name": "SRkaitezhenv",
+      "audio_dir": "/mnt/Raw/v5_0707/SRkaitezhenv/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRkaitezhenv/wavs"
+    },
+    {
+      "name": "SRkaituozhe0001",
+      "audio_dir": "/mnt/Raw/v5_0707/SRkaituozhe0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRkaituozhe0001/wavs"
+    },
+    {
+      "name": "SRkelala0001",
+      "audio_dir": "/mnt/Raw/v5_0707/SRkelala0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRkelala0001/wavs"
+    },
+    {
+      "name": "SRliuying",
+      "audio_dir": "/mnt/Raw/v5_0707/SRliuying/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRliuying/wavs"
+    },
+    {
+      "name": "SRluke",
+      "audio_dir": "/mnt/Raw/v5_0707/SRluke/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRluke/wavs"
+    },
+    {
+      "name": "SRnakexia",
+      "audio_dir": "/mnt/Raw/v5_0707/SRnakexia/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRnakexia/wavs"
+    },
+    {
+      "name": "SRnatasha0001",
+      "audio_dir": "/mnt/Raw/v5_0707/SRnatasha0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRnatasha0001/wavs"
+    },
+    {
+      "name": "SRpeila",
+      "audio_dir": "/mnt/Raw/v5_0707/SRpeila/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRpeila/wavs"
+    },
+    {
+      "name": "SRsaifeier0001",
+      "audio_dir": "/mnt/Raw/v5_0707/SRsaifeier0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRsaifeier0001/wavs"
+    },
+    {
+      "name": "SRsanyueqi",
+      "audio_dir": "/mnt/Raw/v5_0707/SRsanyueqi/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRsanyueqi/wavs"
+    },
+    {
+      "name": "SRshajin",
+      "audio_dir": "/mnt/Raw/v5_0707/SRshajin/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRshajin/wavs"
+    },
+    {
+      "name": "SRwaerte",
+      "audio_dir": "/mnt/Raw/v5_0707/SRwaerte/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRwaerte/wavs"
+    },
+    {
+      "name": "SRwand",
+      "audio_dir": "/mnt/Raw/v5_0707/SRwand/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRwand/wavs"
+    },
+    {
+      "name": "SRxiadie0001",
+      "audio_dir": "/mnt/Raw/v5_0707/SRxiadie0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRxiadie0001/wavs"
+    },
+    {
+      "name": "SRxier",
+      "audio_dir": "/mnt/Raw/v5_0707/SRxier/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRxier/wavs"
+    },
+    {
+      "name": "SRxiluowa",
+      "audio_dir": "/mnt/Raw/v5_0707/SRxiluowa/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRxiluowa/wavs"
+    },
+    {
+      "name": "SRxingqiri0001",
+      "audio_dir": "/mnt/Raw/v5_0707/SRxingqiri0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRxingqiri0001/wavs"
+    },
+    {
+      "name": "SRyanqing0001",
+      "audio_dir": "/mnt/Raw/v5_0707/SRyanqing0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRyanqing0001/wavs"
+    },
+    {
+      "name": "SRyunli0001",
+      "audio_dir": "/mnt/Raw/v5_0707/SRyunli0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/SRyunli0001/wavs"
+    },
+    {
+      "name": "TTlujinghe",
+      "audio_dir": "/mnt/Raw/v5_0707/TTlujinghe/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/TTlujinghe/wavs"
+    },
+    {
+      "name": "TTmoyi",
+      "audio_dir": "/mnt/Raw/v5_0707/TTmoyi/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/TTmoyi/wavs"
+    },
+    {
+      "name": "TTxiayan",
+      "audio_dir": "/mnt/Raw/v5_0707/TTxiayan/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/TTxiayan/wavs"
+    },
+    {
+      "name": "TTxuyin",
+      "audio_dir": "/mnt/Raw/v5_0707/TTxuyin/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/TTxuyin/wavs"
+    },
+    {
+      "name": "TTzuoran",
+      "audio_dir": "/mnt/Raw/v5_0707/TTzuoran/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/TTzuoran/wavs"
+    },
+    {
+      "name": "WWanke0001",
+      "audio_dir": "/mnt/Raw/v5_0707/WWanke0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWanke0001/wavs"
+    },
+    {
+      "name": "WWbulante",
+      "audio_dir": "/mnt/Raw/v5_0707/WWbulante/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWbulante/wavs"
+    },
+    {
+      "name": "WWchangli",
+      "audio_dir": "/mnt/Raw/v5_0707/WWchangli/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWchangli/wavs"
+    },
+    {
+      "name": "WWchixia",
+      "audio_dir": "/mnt/Raw/v5_0707/WWchixia/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWchixia/wavs"
+    },
+    {
+      "name": "WWchun",
+      "audio_dir": "/mnt/Raw/v5_0707/WWchun/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWchun/wavs"
+    },
+    {
+      "name": "WWfeibi0001",
+      "audio_dir": "/mnt/Raw/v5_0707/WWfeibi0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWfeibi0001/wavs"
+    },
+    {
+      "name": "WWjinx0001",
+      "audio_dir": "/mnt/Raw/v5_0707/WWjinx0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWjinx0001/wavs"
+    },
+    {
+      "name": "WWjiyan",
+      "audio_dir": "/mnt/Raw/v5_0707/WWjiyan/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWjiyan/wavs"
+    },
+    {
+      "name": "WWkantelaila",
+      "audio_dir": "/mnt/Raw/v5_0707/WWkantelaila/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWkantelaila/wavs"
+    },
+    {
+      "name": "WWkelaite0001",
+      "audio_dir": "/mnt/Raw/v5_0707/WWkelaite0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWkelaite0001/wavs"
+    },
+    {
+      "name": "WWlingyang0001",
+      "audio_dir": "/mnt/Raw/v5_0707/WWlingyang0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWlingyang0001/wavs"
+    },
+    {
+      "name": "WWluokke",
+      "audio_dir": "/mnt/Raw/v5_0707/WWluokke/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWluokke/wavs"
+    },
+    {
+      "name": "WWpiaobozhenan",
+      "audio_dir": "/mnt/Raw/v5_0707/WWpiaobozhenan/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWpiaobozhenan/wavs"
+    },
+    {
+      "name": "WWpiaobozi",
+      "audio_dir": "/mnt/Raw/v5_0707/WWpiaobozi/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWpiaobozi/wavs"
+    },
+    {
+      "name": "WWqiushui",
+      "audio_dir": "/mnt/Raw/v5_0707/WWqiushui/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWqiushui/wavs"
+    },
+    {
+      "name": "WWshouanren0001",
+      "audio_dir": "/mnt/Raw/v5_0707/WWshouanren0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWshouanren0001/wavs"
+    },
+    {
+      "name": "WWxiangliyao",
+      "audio_dir": "/mnt/Raw/v5_0707/WWxiangliyao/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWxiangliyao/wavs"
+    },
+    {
+      "name": "WWyangyang",
+      "audio_dir": "/mnt/Raw/v5_0707/WWyangyang/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWyangyang/wavs"
+    },
+    {
+      "name": "WWyinlin",
+      "audio_dir": "/mnt/Raw/v5_0707/WWyinlin/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWyinlin/wavs"
+    },
+    {
+      "name": "WWzanini0001",
+      "audio_dir": "/mnt/Raw/v5_0707/WWzanini0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWzanini0001/wavs"
+    },
+    {
+      "name": "WWzhezhi0001",
+      "audio_dir": "/mnt/Raw/v5_0707/WWzhezhi0001/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/WWzhezhi0001/wavs"
+    },
+    {
+      "name": "Wumi",
+      "audio_dir": "/mnt/Raw/v5_0707/Wumi/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/Wumi/wavs"
+    },
+    {
+      "name": "Xiaoyuan",
+      "audio_dir": "/mnt/Raw/v5_0707/Xiaoyuan/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/Xiaoyuan/wavs"
+    },
+    {
+      "name": "Xuehusang",
+      "audio_dir": "/mnt/Raw/v5_0707/Xuehusang/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/Xuehusang/wavs"
+    },
+    {
+      "name": "乃琳",
+      "audio_dir": "/mnt/Raw/v5_0707/乃琳/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/乃琳/wavs"
+    },
+    {
+      "name": "云崎早_haya",
+      "audio_dir": "/mnt/Raw/v5_0707/云崎早_haya/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/云崎早_haya/wavs"
+    },
+    {
+      "name": "冥冥",
+      "audio_dir": "/mnt/Raw/v5_0707/冥冥/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/冥冥/wavs"
+    },
+    {
+      "name": "十六萤Izayoi",
+      "audio_dir": "/mnt/Raw/v5_0707/十六萤Izayoi/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/十六萤Izayoi/wavs"
+    },
+    {
+      "name": "叶绯页",
+      "audio_dir": "/mnt/Raw/v5_0707/叶绯页/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/叶绯页/wavs"
+    },
+    {
+      "name": "合成ria",
+      "audio_dir": "/mnt/Raw/v5_0707/合成ria/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/合成ria/wavs"
+    },
+    {
+      "name": "喵铃Neko",
+      "audio_dir": "/mnt/Raw/v5_0707/喵铃Neko/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/喵铃Neko/wavs"
+    },
+    {
+      "name": "嘉然",
+      "audio_dir": "/mnt/Raw/v5_0707/嘉然/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/嘉然/wavs"
+    },
+    {
+      "name": "塔神",
+      "audio_dir": "/mnt/Raw/v5_0707/塔神/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/塔神/wavs"
+    },
+    {
+      "name": "奈奈莉娅",
+      "audio_dir": "/mnt/Raw/v5_0707/奈奈莉娅/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/奈奈莉娅/wavs"
+    },
+    {
+      "name": "宣小纸不怕火",
+      "audio_dir": "/mnt/Raw/v5_0707/宣小纸不怕火/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/宣小纸不怕火/wavs"
+    },
+    {
+      "name": "晚晚sumi",
+      "audio_dir": "/mnt/Raw/v5_0707/晚晚sumi/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/晚晚sumi/wavs"
+    },
+    {
+      "name": "王宝煲",
+      "audio_dir": "/mnt/Raw/v5_0707/王宝煲/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/王宝煲/wavs"
+    },
+    {
+      "name": "皮皮",
+      "audio_dir": "/mnt/Raw/v5_0707/皮皮/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/皮皮/wavs"
+    },
+    {
+      "name": "礼墨",
+      "audio_dir": "/mnt/Raw/v5_0707/礼墨/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/礼墨/wavs"
+    },
+    {
+      "name": "花礼",
+      "audio_dir": "/mnt/Raw/v5_0707/花礼/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/花礼/wavs"
+    },
+    {
+      "name": "鸣海派",
+      "audio_dir": "/mnt/Raw/v5_0707/鸣海派/wavs",
+      "ctc_dir": "/mnt/Raw/ASRNEW/鸣海派/wavs"
+    }
+  ],
+  "version": 1,
+  "scanned_at": "2026-07-10T06:07:55",
+  "completed_datasets": [
+    "BCNbanma",
+    "BCNchenniningxi",
+    "BCNdaodao",
+    "BCNgaoqifana",
+    "BCNgaoqifanb",
+    "BCNgaoqifane",
+    "BCNgaoqifanc",
+    "BCNgaoqifand"
+  ]
+}

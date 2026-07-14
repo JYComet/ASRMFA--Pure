@@ -7,61 +7,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Copy of the reverse mapping logic from postprocess_textgrids.py
-IPA_CONSONANT_MAP = {
-    'p': 'b', 'pʰ': 'p', 't': 'd', 'tʰ': 't', 'k': 'g', 'kʰ': 'k',
-    'tɕ': 'j', 'tɕʰ': 'q', 'ʈʂ': 'zh', 'ʈʂʰ': 'ch', 'ts': 'z', 'tsʰ': 'c',
-    'f': 'f', 's': 's', 'ɕ': 'x', 'ʂ': 'sh', 'x': 'h',
-    'm': 'm', 'n': 'n', 'l': 'l', 'ɻ': 'r',
-    'j': 'i', 'w': 'u', 'ɥ': 'v',
-    'ŋ': 'ng', 'ʔ': '',
-    'z̩': 'i0', 'ʐ̩': 'ir',
-}
-
-IPA_TONE_TO_DIGIT = {
-    '˥˥': '1', '˥': '1', '˧˥': '2', '˨˩˦': '3', '˥˩': '4', '˩': '5',
-}
-
-IPA_VOWEL_BASE_MAP = {
-    'a': 'a', 'o': 'o', 'ə': 'e', 'e': 'e',
-    'i': 'i', 'u': 'u', 'y': 'v',
-    'z̩': 'i0', 'ʐ̩': 'ir',
-}
-
-FINAL_DECOMPOSE = {
-    'a': ['a'], 'o': ['o'], 'e': ['e'], 'e2': ['e'],
-    'i': ['i'], 'u': ['u'], 'v': ['v'],
-    'i0': ['i0'], 'u0': ['u0'], 'v0': ['v0'], 'ir': ['ir'],
-    'ai': ['a', 'i'], 'ei': ['e', 'i'], 'ao': ['a', 'u'], 'ou': ['o', 'u'],
-    'an': ['a', 'n'], 'en': ['e', 'n'], 'in': ['i', 'n'],
-    'ang': ['a', 'ng'], 'eng': ['e', 'ng'], 'ing': ['i', 'ng'], 'ong': ['u', 'ng'],
-    'ia': ['i', 'a'], 'ie': ['i', 'e'],
-    'iao': ['i', 'a', 'u'], 'iu': ['i', 'o', 'u'], 'iou': ['i', 'o', 'u'],
-    'ian': ['i', 'e', 'n'], 'iang': ['i', 'a', 'ng'], 'iong': ['i', 'u', 'ng'],
-    'ua': ['u', 'a'], 'uo': ['u', 'o'],
-    'uai': ['u', 'a', 'i'], 'ui': ['u', 'e', 'i'], 'uei': ['u', 'e', 'i'],
-    'uan': ['u', 'a', 'n'], 'un': ['u', 'e', 'n'], 'uen': ['u', 'e', 'n'],
-    'uang': ['u', 'a', 'ng'], 'ueng': ['u', 'e', 'ng'],
-    've': ['v', 'e'], 'vn': ['v', 'n'], 'van': ['v', 'e', 'n'],
-    'er': ['e', 'r'], 'io': ['i', 'o'],
-    'n': ['n'], 'm': ['m'],
-}
-
-FINAL_TONE_INDEX = {
-    'a': 0, 'o': 0, 'e': 0, 'e2': 0, 'i': 0, 'u': 0, 'v': 0,
-    'i0': 0, 'u0': 0, 'v0': 0, 'ir': 0,
-    'ai': 0, 'ei': 0, 'ao': 0, 'ou': 0,
-    'an': 0, 'en': 0, 'in': 0,
-    'ang': 0, 'eng': 0, 'ing': 0, 'ong': 0,
-    'ia': 1, 'ie': 1, 'iao': 1, 'iu': 1, 'iou': 1,
-    'ian': 1, 'iang': 1, 'iong': 1,
-    'ua': 1, 'uo': 1, 'uai': 1, 'ui': 1, 'uei': 1,
-    'uan': 1, 'un': 1, 'uen': 1,
-    'uang': 1, 'ueng': 1,
-    've': 1, 'vn': 0, 'van': 1,
-    'er': 0, 'io': 1,
-    'n': 0, 'm': 0,
-}
+from pipeline_utils import IPA_CONSONANT_MAP, IPA_TONE_TO_DIGIT, IPA_VOWEL_BASE_MAP, FINAL_DECOMPOSE, FINAL_TONE_INDEX
 
 
 def decompose_pinyin_phone(phone: str) -> list[str]:

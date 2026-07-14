@@ -1,0 +1,2758 @@
+
+  Resume: 153 already completed, 13 remaining
+
+############################################################
+  BATCH MODE: 13 datasets from /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/cache/batch_all.cache.json
+  Checkpoint:  /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/cache/batch_all.cache.checkpoint.json
+  Parallel:    8 concurrent workers
+  Local work:  1 drive(s): /mnt/nvme0/mfa_work
+  MFA jobs/ds: 32
+  Batch size:  2000
+############################################################
+
+============================================================
+  [W0] [1/13] Mieli
+  Local:   /mnt/nvme0/mfa_work/worker_0/Mieli
+============================================================
+
+============================================================
+  [W1] [2/13] SRwaerte
+  Local:   /mnt/nvme0/mfa_work/worker_1/SRwaerte
+============================================================
+
+============================================================
+  [W2] [3/13] WWchixia
+  Local:   /mnt/nvme0/mfa_work/worker_2/WWchixia
+============================================================
+
+============================================================
+  [W3] [4/13] WWzanini0001
+  Local:   /mnt/nvme0/mfa_work/worker_3/WWzanini0001
+============================================================
+
+============================================================
+  [W4] [5/13] Wumi
+  Local:   /mnt/nvme0/mfa_work/worker_4/Wumi
+============================================================
+
+============================================================
+  [W5] [6/13] Xuehusang
+  Local:   /mnt/nvme0/mfa_work/worker_5/Xuehusang
+============================================================
+
+============================================================
+  [W6] [7/13] 十六萤Izayoi
+  Local:   /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi
+============================================================
+
+============================================================
+  [W7] [8/13] 合成ria
+  Local:   /mnt/nvme0/mfa_work/worker_7/合成ria
+============================================================
+
+NAS CTC:    /mnt/Raw/ASRNEW/Wumi/wavs
+NAS audio:  /mnt/Raw/v5_0707/Wumi/wavs
+NAS output: /mnt/Raw/ASR_MFA/Wumi
+
+Discovering stems ...
+
+NAS CTC:    /mnt/Raw/ASRNEW/Mieli/wavs
+NAS audio:  /mnt/Raw/v5_0707/Mieli/wavs
+NAS output: /mnt/Raw/ASR_MFA/Mieli
+
+Discovering stems ...
+
+NAS CTC:    /mnt/Raw/ASRNEW/SRwaerte/wavs
+NAS audio:  /mnt/Raw/v5_0707/SRwaerte/wavs
+
+NAS CTC:    /mnt/Raw/ASRNEW/WWchixia/wavsNAS output: /mnt/Raw/ASR_MFA/SRwaerte
+
+Discovering stems ...
+
+
+NAS CTC:    /mnt/Raw/ASRNEW/Xuehusang/wavs
+NAS CTC:    /mnt/Raw/ASRNEW/WWzanini0001/wavsNAS audio:  /mnt/Raw/v5_0707/WWchixia/wavs
+NAS audio:  /mnt/Raw/v5_0707/WWzanini0001/wavs
+NAS CTC:    /mnt/Raw/ASRNEW/合成ria/wavs
+NAS output: /mnt/Raw/ASR_MFA/WWchixia
+
+NAS CTC:    /mnt/Raw/ASRNEW/十六萤Izayoi/wavs
+NAS audio:  /mnt/Raw/v5_0707/十六萤Izayoi/wavs
+NAS output: /mnt/Raw/ASR_MFA/十六萤Izayoi
+
+
+Discovering stems ...
+NAS audio:  /mnt/Raw/v5_0707/合成ria/wavs
+NAS output: /mnt/Raw/ASR_MFA/合成ria
+
+Discovering stems ...
+NAS audio:  /mnt/Raw/v5_0707/Xuehusang/wavs
+
+Discovering stems ...
+
+
+NAS output: /mnt/Raw/ASR_MFA/WWzanini0001
+
+Discovering stems ...
+NAS output: /mnt/Raw/ASR_MFA/Xuehusang
+
+Discovering stems ...
+  Found 94 valid stems
+MFA Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Streaming Pipeline
+  Batches: 1 × ~2000 stems
+  Local work: /mnt/nvme0/mfa_work/worker_2/WWchixia
+  NAS output: /mnt/Raw/ASR_MFA/WWchixia
+############################################################
+
+  [PREFETCH] batch 1/1 (94 stems) NAS → local ...
+  [PREFETCH] batch 1 done (33.4s, 94 stems)
+
+============================================================
+  PROCESS batch 1/1 (94 stems)
+  Workspace: /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/workspace
+============================================================
+
+Normalised 0/94 stems
+  Parallel mode: 32 workers for 94 files (ProcessPool, BLAS=1 per worker)
+
+==================================================
+Total: 94 files
+  Start adjustments:   94
+  End extended:        89
+  End shortened:       46
+  Punct adjustments:   193
+Output: /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/workspace/ctc_pretg_adj
+<frozen runpy>:128: RuntimeWarning: 'montreal_forced_aligner.command_line.mfa' found in sys.modules after import of package 'montreal_forced_aligner.command_line', but prior to execution of 'montreal_forced_aligner.command_line.mfa'; this may result in unpredictable behaviour
+ INFO     Setting up corpus information...                                      
+ INFO     Loading corpus from source files...                                   
+  94% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸   94/100  [ 0:00:02 < -:--:-- , ? it/s ]
+ INFO     Found 1 speaker across 94 files, average number of utterances per     
+          speaker: 94.0                                                         
+ INFO     Initializing multiprocessing jobs...                                  
+ INFO     Normalizing text...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 94/94  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Generating MFCCs...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 94/94  [ 0:00:05 < 0:00:00 , ? it/s ]
+ INFO     Calculating CMVN...                                                   
+ INFO     Generating final features...                                          
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 94/94  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Creating corpus split...                                              
+  Found 314 valid stems
+MFA Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Streaming Pipeline
+  Batches: 1 × ~2000 stems
+  Local work: /mnt/nvme0/mfa_work/worker_3/WWzanini0001
+  NAS output: /mnt/Raw/ASR_MFA/WWzanini0001
+############################################################
+
+  [PREFETCH] batch 1/1 (314 stems) NAS → local ...
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 94/94  [ 0:00:01 < 0:00:00 , ? it/s ]
+ WARNING  There were 37 pronunciations in the dictionary that were ignored for  
+          containing one of 37 phones not present in the trained acoustic model.
+          Please run `mfa validate` to get more details.                        
+ INFO     Compiling training graphs...                                          
+ INFO     Performing first-pass alignment...                                    
+ INFO     Generating alignments...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 94/94  [ 0:00:03 < 0:00:00 , ? it/s ]
+ INFO     Collecting phone and word alignments from alignment lattices...       
+  97% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸  91/94  [ 0:00:02 < -:--:-- , ? it/s ]
+ INFO     Analyzing alignment quality...                                        
+  97% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸  91/94  [ 0:00:02 < -:--:-- , ? it/s ]
+ INFO     Exporting alignment TextGrids to                                      
+          /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/workspace/aligned... 
+  97% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸  91/94  [ 0:00:02 < 0:00:01 , 90 it/s ]
+ INFO     Finished exporting TextGrids to                                       
+          /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/workspace/aligned!   
+ INFO     Done! Everything took 25.627 seconds                                  
+Loading dictionaries...
+  Pinyin dict: 2210 entries
+  IPA dict: 2207 entries
+  IPA→Pinyin phone mappings: 119
+  Tone reference table: /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/output/tone_mapping.json
+  Tone marks: ˥->1, ˥˥->1, ˧˥->2, ˨˩˦->3, ˥˩->4, ˩->5
+  Postprocess parallel: 32 workers for 91 files (ProcessPool)
+Done. {'ok': 91}. report=/mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/output/postprocess_report.jsonl
+Config: configs/batch_all.yaml
+ctc_ready mode: CTC dir = /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/ctc
+Pipeline mode: ctc_ready
+Using Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Chinese MFA Pipeline  [ctc_ready]
+  Input:  /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/audio
+  Output: /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/output
+  Steps:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+############################################################
+
+  >>> [link] Link pre-existing CTC output (ctc_ready mode)
+  CTC dir:   /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/ctc
+  Audio dir: /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/audio
+  Scanning CTC directory for .lab files ...
+  CTC presence index: 565 flat files, 0 nested dirs
+  Found 94 stems via .lab scan (flat)
+  Audio index: 94 WAV files
+  Text index:  0 TXT files
+
+  Candidates:     94
+  Valid stems:    94
+
+  Audio in-place: 94/94 stems indexed (audio at /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/audio)
+  CTC linked:  564 → /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/workspace/ctc_pretg
+  Ready for MFA pipeline (94 stems)
+
+  >>> [normalize_punct] Normalize punctuation (ASCII → CJK)
+  Normalized punctuation in 0 files
+
+  >>> [normalize] Normalize numerals (Arabic → Chinese)
+  Normalized numerals in 0 files
+
+  >>> [normalize_en] Normalise English-word fragments in CTC output
+
+============================================================
+  Step 2b: Normalise English tokens
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/normalize_english_tokens.py --txt-dir /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/workspace/ctc_pretg
+============================================================
+
+
+  >>> [resample] Resample to 16kHz for MFA
+  Found 94 WAVs from manifest (skipping directory scan)
+  Resampled to 16000Hz → /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/workspace/audio_16k  (94 done, 94 resampled)
+
+  >>> [adjust] Adjust CTC boundaries (energy-based)
+
+============================================================
+  Step 5: Adjust CTC boundaries (energy-based)
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/adjust_ctc_boundaries.py --ctc-dir /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/workspace/ctc_pretg --audio-dir /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/audio --output-dir /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/workspace/ctc_pretg_adj
+============================================================
+
+
+  >>> [align] MFA align (NVASR corpus + CTC anchors)
+  NVASR corpus: /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/workspace/ctc_pretg_adj (.lab files from ASR text)
+  CTC anchors:  /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/workspace/ctc_pretg_adj
+  Transcript and anchors from SAME source → 100% word match
+
+============================================================
+  Step 6: MFA Align (NVASR corpus + CTC anchors)
+============================================================
+
+
+  >>> [postprocess] Post-processing (includes NVV brackets + sp1 normalization)
+
+============================================================
+  Step 7: Post-processing
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/postprocess_textgrids.py --txt-dir /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/workspace/ctc_pretg_adj --textgrid-dir /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/workspace/aligned --output-dir /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/output --filtered-dir /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/workspace/filtered --wav-dir /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/audio --raw-text-dir /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/workspace/ctc_pretg_adj --pinyin-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/fullpinyin_enword.dict --ipa-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/mfa_ipa.dict --merge-max-sil-sec 0.2 --fix-short-word-sec 0.25 --fix-min-silence-sec 0.4 --fix-search-sec 0.5 --bgm-noise-floor-ratio 2.0 --bgm-min-sil-dur 0.3 --bgm-speech-ratio 1.0 --bgm-min-energy 0.01 --filter-short-phone-sec 0.015 --filter-long-word-sec 1.0 --filter-min-word-sec 0.15 --filter-min-word-dur-sec 0.02 --filter-word-energy-ratio 2.0 --filter-min-phone-coverage 0.35 --filter-edge-gap-sec 0.25 --filter-flank-silence-sec 0.4 --filter-long-consonant-sec 999.0 --filter-long-vowel-sec 999.0 --overwrite
+============================================================
+
+  Kept 16kHz audio: /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/workspace/audio_16k
+
+############################################################
+  DONE: Success
+  Output: /mnt/nvme0/mfa_work/worker_2/WWchixia/batch_0000/output
+############################################################
+
+
+  PROCESS batch 1: OK (31.5s)
+
+  [UPLOAD] batch 1/1 → /mnt/Raw/ASR_MFA/WWchixia ...
+  [UPLOAD] batch 1 done (46.6s)
+
+############################################################
+  PIPELINE COMPLETE
+  Prefetched: 1/1
+  Processed:  1/1
+  Uploaded:   1/1
+############################################################
+  [W2] [3/13] WWchixia — DONE (5 left)
+
+============================================================
+  [W2] [9/13] 嘉然
+  Local:   /mnt/nvme0/mfa_work/worker_2/嘉然
+============================================================
+
+NAS CTC:    /mnt/Raw/ASRNEW/嘉然/wavs
+NAS audio:  /mnt/Raw/v5_0707/嘉然/wavs
+NAS output: /mnt/Raw/ASR_MFA/嘉然
+
+Discovering stems ...
+  Found 616 valid stems
+MFA Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Streaming Pipeline
+  Batches: 1 × ~2000 stems
+  Local work: /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi
+  NAS output: /mnt/Raw/ASR_MFA/十六萤Izayoi
+############################################################
+
+  [PREFETCH] batch 1/1 (616 stems) NAS → local ...
+  [PREFETCH] batch 1 done (72.7s, 314 stems)
+
+============================================================
+  PROCESS batch 1/1 (314 stems)
+  Workspace: /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/workspace
+============================================================
+
+Normalised 0/314 stems
+  Parallel mode: 32 workers for 314 files (ProcessPool, BLAS=1 per worker)
+
+==================================================
+Total: 314 files
+  Start adjustments:   613
+  End extended:        174
+  End shortened:       327
+  Punct adjustments:   895
+Output: /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/workspace/ctc_pretg_adj
+<frozen runpy>:128: RuntimeWarning: 'montreal_forced_aligner.command_line.mfa' found in sys.modules after import of package 'montreal_forced_aligner.command_line', but prior to execution of 'montreal_forced_aligner.command_line.mfa'; this may result in unpredictable behaviour
+ INFO     Setting up corpus information...                                      
+ INFO     Loading corpus from source files...                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 314/100  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Found 1 speaker across 314 files, average number of utterances per    
+          speaker: 314.0                                                        
+ INFO     Initializing multiprocessing jobs...                                  
+ INFO     Normalizing text...                                                   
+  Found 903 valid stems
+MFA Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Streaming Pipeline
+  Batches: 1 × ~2000 stems
+  Local work: /mnt/nvme0/mfa_work/worker_1/SRwaerte
+  NAS output: /mnt/Raw/ASR_MFA/SRwaerte
+############################################################
+
+  [PREFETCH] batch 1/1 (903 stems) NAS → local ...
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 314/314  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Generating MFCCs...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 314/314  [ 0:00:12 < 0:00:00 , 21 it/s ]
+ INFO     Calculating CMVN...                                                   
+ INFO     Generating final features...                                          
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 314/314  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Creating corpus split...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 314/314  [ 0:00:01 < 0:00:00 , ? it/s ]
+ WARNING  There were 37 pronunciations in the dictionary that were ignored for  
+          containing one of 37 phones not present in the trained acoustic model.
+          Please run `mfa validate` to get more details.                        
+ INFO     Compiling training graphs...                                          
+ INFO     Performing first-pass alignment...                                    
+ INFO     Generating alignments...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 314/314  [ 0:00:02 < 0:00:00 , ? it/s ]
+ INFO     Collecting phone and word alignments from alignment lattices...       
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸ 313/314  [ 0:00:03 < -:--:-- , ? it/s ]
+ INFO     Analyzing alignment quality...                                        
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸ 313/314  [ 0:00:04 < -:--:-- , ? it/s ]
+ INFO     Exporting alignment TextGrids to                                      
+          /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/workspace/aligned
+          ...                                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸ 313/314  [ 0:00:02 < 0:00:01 , 311 it/s ]
+ INFO     Finished exporting TextGrids to                                       
+          /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/workspace/aligned
+          !                                                                     
+ INFO     Done! Everything took 35.924 seconds                                  
+Loading dictionaries...
+  Pinyin dict: 2210 entries
+  IPA dict: 2207 entries
+  IPA→Pinyin phone mappings: 119
+  Tone reference table: /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/output/tone_mapping.json
+  Tone marks: ˥->1, ˥˥->1, ˧˥->2, ˨˩˦->3, ˥˩->4, ˩->5
+  Postprocess parallel: 32 workers for 313 files (ProcessPool)
+Done. {'ok': 307, 'filtered_word_in_silence': 6}. report=/mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/output/postprocess_report.jsonl
+Config: configs/batch_all.yaml
+ctc_ready mode: CTC dir = /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/ctc
+Pipeline mode: ctc_ready
+Using Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Chinese MFA Pipeline  [ctc_ready]
+  Input:  /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/audio
+  Output: /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/output
+  Steps:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+############################################################
+
+  >>> [link] Link pre-existing CTC output (ctc_ready mode)
+  CTC dir:   /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/ctc
+  Audio dir: /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/audio
+  Scanning CTC directory for .lab files ...
+  CTC presence index: 1885 flat files, 0 nested dirs
+  Found 314 stems via .lab scan (flat)
+  Audio index: 314 WAV files
+  Text index:  0 TXT files
+
+  Candidates:     314
+  Valid stems:    314
+
+  Audio in-place: 314/314 stems indexed (audio at /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/audio)
+  CTC linked:  1884 → /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/workspace/ctc_pretg
+  Ready for MFA pipeline (314 stems)
+
+  >>> [normalize_punct] Normalize punctuation (ASCII → CJK)
+  Normalized punctuation in 0 files
+
+  >>> [normalize] Normalize numerals (Arabic → Chinese)
+  Normalized numerals in 0 files
+
+  >>> [normalize_en] Normalise English-word fragments in CTC output
+
+============================================================
+  Step 2b: Normalise English tokens
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/normalize_english_tokens.py --txt-dir /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/workspace/ctc_pretg
+============================================================
+
+
+  >>> [resample] Resample to 16kHz for MFA
+  Found 314 WAVs from manifest (skipping directory scan)
+  Resampled to 16000Hz → /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/workspace/audio_16k  (314 done, 314 resampled)
+
+  >>> [adjust] Adjust CTC boundaries (energy-based)
+
+============================================================
+  Step 5: Adjust CTC boundaries (energy-based)
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/adjust_ctc_boundaries.py --ctc-dir /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/workspace/ctc_pretg --audio-dir /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/audio --output-dir /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/workspace/ctc_pretg_adj
+============================================================
+
+
+  >>> [align] MFA align (NVASR corpus + CTC anchors)
+  NVASR corpus: /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/workspace/ctc_pretg_adj (.lab files from ASR text)
+  CTC anchors:  /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/workspace/ctc_pretg_adj
+  Transcript and anchors from SAME source → 100% word match
+
+============================================================
+  Step 6: MFA Align (NVASR corpus + CTC anchors)
+============================================================
+
+
+  >>> [postprocess] Post-processing (includes NVV brackets + sp1 normalization)
+
+============================================================
+  Step 7: Post-processing
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/postprocess_textgrids.py --txt-dir /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/workspace/ctc_pretg_adj --textgrid-dir /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/workspace/aligned --output-dir /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/output --filtered-dir /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/workspace/filtered --wav-dir /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/audio --raw-text-dir /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/workspace/ctc_pretg_adj --pinyin-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/fullpinyin_enword.dict --ipa-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/mfa_ipa.dict --merge-max-sil-sec 0.2 --fix-short-word-sec 0.25 --fix-min-silence-sec 0.4 --fix-search-sec 0.5 --bgm-noise-floor-ratio 2.0 --bgm-min-sil-dur 0.3 --bgm-speech-ratio 1.0 --bgm-min-energy 0.01 --filter-short-phone-sec 0.015 --filter-long-word-sec 1.0 --filter-min-word-sec 0.15 --filter-min-word-dur-sec 0.02 --filter-word-energy-ratio 2.0 --filter-min-phone-coverage 0.35 --filter-edge-gap-sec 0.25 --filter-flank-silence-sec 0.4 --filter-long-consonant-sec 999.0 --filter-long-vowel-sec 999.0 --overwrite
+============================================================
+
+  Kept 16kHz audio: /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/workspace/audio_16k
+
+############################################################
+  DONE: Success
+  Output: /mnt/nvme0/mfa_work/worker_3/WWzanini0001/batch_0000/output
+############################################################
+
+
+  PROCESS batch 1: OK (44.1s)
+
+  [UPLOAD] batch 1/1 → /mnt/Raw/ASR_MFA/WWzanini0001 ...
+  [PREFETCH] batch 1 done (70.0s, 616 stems)
+
+============================================================
+  PROCESS batch 1/1 (616 stems)
+  Workspace: /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/workspace
+============================================================
+
+Normalised 0/616 stems
+  Parallel mode: 32 workers for 616 files (ProcessPool, BLAS=1 per worker)
+
+==================================================
+Total: 616 files
+  Start adjustments:   1188
+  End extended:        1257
+  End shortened:       484
+  Punct adjustments:   2678
+Output: /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/workspace/ctc_pretg_adj
+<frozen runpy>:128: RuntimeWarning: 'montreal_forced_aligner.command_line.mfa' found in sys.modules after import of package 'montreal_forced_aligner.command_line', but prior to execution of 'montreal_forced_aligner.command_line.mfa'; this may result in unpredictable behaviour
+ INFO     Setting up corpus information...                                      
+ INFO     Loading corpus from source files...                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 616/100  [ 0:00:00 < 0:00:00 , 274 it/s ]
+ INFO     Found 1 speaker across 616 files, average number of utterances per    
+          speaker: 616.0                                                        
+ INFO     Initializing multiprocessing jobs...                                  
+ INFO     Normalizing text...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 616/616  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Generating MFCCs...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 616/616  [ 0:00:36 < 0:00:00 , 18 it/s ]
+ INFO     Calculating CMVN...                                                   
+ INFO     Generating final features...                                          
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 616/616  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Creating corpus split...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 616/616  [ 0:00:01 < 0:00:00 , ? it/s ]
+ WARNING  There were 37 pronunciations in the dictionary that were ignored for  
+          containing one of 37 phones not present in the trained acoustic model.
+          Please run `mfa validate` to get more details.                        
+ INFO     Compiling training graphs...                                          
+ INFO     Performing first-pass alignment...                                    
+ INFO     Generating alignments...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 616/616  [ 0:00:04 < 0:00:00 , ? it/s ]
+ INFO     Collecting phone and word alignments from alignment lattices...       
+  93% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸   573/616  [ 0:00:05 < -:--:-- , ? it/s ]
+ INFO     Analyzing alignment quality...                                        
+  [UPLOAD] batch 1 done (87.2s)
+
+############################################################
+  PIPELINE COMPLETE
+  Prefetched: 1/1
+  Processed:  1/1
+  Uploaded:   1/1
+############################################################
+  [W3] [4/13] WWzanini0001 — DONE (4 left)
+
+============================================================
+  [W3] [10/13] 宣小纸不怕火
+  Local:   /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火
+============================================================
+
+NAS CTC:    /mnt/Raw/ASRNEW/宣小纸不怕火/wavs
+NAS audio:  /mnt/Raw/v5_0707/宣小纸不怕火/wavs
+NAS output: /mnt/Raw/ASR_MFA/宣小纸不怕火
+
+Discovering stems ...
+  93% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸   573/616  [ 0:00:09 < -:--:-- , ? it/s ]
+ INFO     Exporting alignment TextGrids to                                      
+          /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/workspace/aligned
+          ...                                                                   
+  93% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸   573/616  [ 0:00:02 < 0:00:01 , 568 it/s ]
+ INFO     Finished exporting TextGrids to                                       
+          /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/workspace/aligned
+          !                                                                     
+ INFO     Done! Everything took 69.548 seconds                                  
+Loading dictionaries...
+  Pinyin dict: 2210 entries
+  IPA dict: 2207 entries
+  IPA→Pinyin phone mappings: 119
+  Tone reference table: /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/output/tone_mapping.json
+  Tone marks: ˥->1, ˥˥->1, ˧˥->2, ˨˩˦->3, ˥˩->4, ˩->5
+  Postprocess parallel: 32 workers for 573 files (ProcessPool)
+Done. {'ok': 527, 'filtered_word_in_silence': 46}. report=/mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/output/postprocess_report.jsonl
+Config: configs/batch_all.yaml
+ctc_ready mode: CTC dir = /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/ctc
+Pipeline mode: ctc_ready
+Using Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Chinese MFA Pipeline  [ctc_ready]
+  Input:  /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/audio
+  Output: /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/output
+  Steps:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+############################################################
+
+  >>> [link] Link pre-existing CTC output (ctc_ready mode)
+  CTC dir:   /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/ctc
+  Audio dir: /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/audio
+  Scanning CTC directory for .lab files ...
+  CTC presence index: 3697 flat files, 0 nested dirs
+  Found 616 stems via .lab scan (flat)
+  Audio index: 616 WAV files
+  Text index:  0 TXT files
+
+  Candidates:     616
+  Valid stems:    616
+
+  Audio in-place: 616/616 stems indexed (audio at /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/audio)
+  CTC linked:  3696 → /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/workspace/ctc_pretg
+  Ready for MFA pipeline (616 stems)
+
+  >>> [normalize_punct] Normalize punctuation (ASCII → CJK)
+  Normalized punctuation in 0 files
+
+  >>> [normalize] Normalize numerals (Arabic → Chinese)
+  Normalized numerals in 0 files
+
+  >>> [normalize_en] Normalise English-word fragments in CTC output
+
+============================================================
+  Step 2b: Normalise English tokens
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/normalize_english_tokens.py --txt-dir /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/workspace/ctc_pretg
+============================================================
+
+
+  >>> [resample] Resample to 16kHz for MFA
+  Found 616 WAVs from manifest (skipping directory scan)
+  Resampled to 16000Hz → /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/workspace/audio_16k  (616 done, 616 resampled)
+
+  >>> [adjust] Adjust CTC boundaries (energy-based)
+
+============================================================
+  Step 5: Adjust CTC boundaries (energy-based)
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/adjust_ctc_boundaries.py --ctc-dir /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/workspace/ctc_pretg --audio-dir /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/audio --output-dir /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/workspace/ctc_pretg_adj
+============================================================
+
+
+  >>> [align] MFA align (NVASR corpus + CTC anchors)
+  NVASR corpus: /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/workspace/ctc_pretg_adj (.lab files from ASR text)
+  CTC anchors:  /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/workspace/ctc_pretg_adj
+  Transcript and anchors from SAME source → 100% word match
+
+============================================================
+  Step 6: MFA Align (NVASR corpus + CTC anchors)
+============================================================
+
+
+  >>> [postprocess] Post-processing (includes NVV brackets + sp1 normalization)
+
+============================================================
+  Step 7: Post-processing
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/postprocess_textgrids.py --txt-dir /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/workspace/ctc_pretg_adj --textgrid-dir /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/workspace/aligned --output-dir /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/output --filtered-dir /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/workspace/filtered --wav-dir /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/audio --raw-text-dir /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/workspace/ctc_pretg_adj --pinyin-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/fullpinyin_enword.dict --ipa-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/mfa_ipa.dict --merge-max-sil-sec 0.2 --fix-short-word-sec 0.25 --fix-min-silence-sec 0.4 --fix-search-sec 0.5 --bgm-noise-floor-ratio 2.0 --bgm-min-sil-dur 0.3 --bgm-speech-ratio 1.0 --bgm-min-energy 0.01 --filter-short-phone-sec 0.015 --filter-long-word-sec 1.0 --filter-min-word-sec 0.15 --filter-min-word-dur-sec 0.02 --filter-word-energy-ratio 2.0 --filter-min-phone-coverage 0.35 --filter-edge-gap-sec 0.25 --filter-flank-silence-sec 0.4 --filter-long-consonant-sec 999.0 --filter-long-vowel-sec 999.0 --overwrite
+============================================================
+
+  Kept 16kHz audio: /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/workspace/audio_16k
+
+############################################################
+  DONE: Success
+  Output: /mnt/nvme0/mfa_work/worker_6/十六萤Izayoi/batch_0000/output
+############################################################
+
+
+  PROCESS batch 1: OK (78.3s)
+
+  [UPLOAD] batch 1/1 → /mnt/Raw/ASR_MFA/十六萤Izayoi ...
+  [PREFETCH] batch 1 done (131.7s, 903 stems)
+
+============================================================
+  PROCESS batch 1/1 (903 stems)
+  Workspace: /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/workspace
+============================================================
+
+Normalised 0/903 stems
+  Found 173 valid stems
+MFA Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Streaming Pipeline
+  Batches: 1 × ~2000 stems
+  Local work: /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火
+  NAS output: /mnt/Raw/ASR_MFA/宣小纸不怕火
+############################################################
+
+  [PREFETCH] batch 1/1 (173 stems) NAS → local ...
+  Parallel mode: 32 workers for 903 files (ProcessPool, BLAS=1 per worker)
+
+==================================================
+Total: 903 files
+  Start adjustments:   1692
+  End extended:        662
+  End shortened:       1020
+  Punct adjustments:   2762
+Output: /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/workspace/ctc_pretg_adj
+<frozen runpy>:128: RuntimeWarning: 'montreal_forced_aligner.command_line.mfa' found in sys.modules after import of package 'montreal_forced_aligner.command_line', but prior to execution of 'montreal_forced_aligner.command_line.mfa'; this may result in unpredictable behaviour
+ INFO     Setting up corpus information...                                      
+ INFO     Loading corpus from source files...                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 903/100  [ 0:00:00 < 0:00:00 , 435 it/s ]
+ INFO     Found 1 speaker across 903 files, average number of utterances per    
+          speaker: 903.0                                                        
+ INFO     Initializing multiprocessing jobs...                                  
+ INFO     Normalizing text...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 903/903  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Generating MFCCs...                                                   
+  [PREFETCH] batch 1 done (20.1s, 173 stems)
+
+============================================================
+  PROCESS batch 1/1 (173 stems)
+  Workspace: /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/workspace
+============================================================
+
+Normalised 0/173 stems
+  Parallel mode: 32 workers for 173 files (ProcessPool, BLAS=1 per worker)
+
+==================================================
+Total: 173 files
+  Start adjustments:   455
+  End extended:        434
+  End shortened:       125
+  Punct adjustments:   906
+Output: /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/workspace/ctc_pretg_adj
+<frozen runpy>:128: RuntimeWarning: 'montreal_forced_aligner.command_line.mfa' found in sys.modules after import of package 'montreal_forced_aligner.command_line', but prior to execution of 'montreal_forced_aligner.command_line.mfa'; this may result in unpredictable behaviour
+ INFO     Setting up corpus information...                                      
+ INFO     Loading corpus from source files...                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 173/100  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Found 1 speaker across 173 files, average number of utterances per    
+          speaker: 173.0                                                        
+ INFO     Initializing multiprocessing jobs...                                  
+ INFO     Normalizing text...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 173/173  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Generating MFCCs...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 903/903  [ 0:00:29 < 0:00:00 , 32 it/s ]
+ INFO     Calculating CMVN...                                                   
+ INFO     Generating final features...                                          
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 173/173  [ 0:00:10 < 0:00:00 , ? it/s ]
+ INFO     Calculating CMVN...                                                   
+ INFO     Generating final features...                                          
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 173/173  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Creating corpus split...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 903/903  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Creating corpus split...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 173/173  [ 0:00:01 < 0:00:00 , ? it/s ]
+ WARNING  There were 37 pronunciations in the dictionary that were ignored for  
+          containing one of 37 phones not present in the trained acoustic model.
+          Please run `mfa validate` to get more details.                        
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 903/903  [ 0:00:01 < 0:00:00 , ? it/s ]
+ WARNING  There were 37 pronunciations in the dictionary that were ignored for  
+          containing one of 37 phones not present in the trained acoustic model.
+          Please run `mfa validate` to get more details.                        
+ INFO     Compiling training graphs...                                          
+ INFO     Compiling training graphs...                                          
+ INFO     Performing first-pass alignment...                                    
+ INFO     Generating alignments...                                              
+ INFO     Performing first-pass alignment...                                    
+ INFO     Generating alignments...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 903/903  [ 0:00:02 < 0:00:00 , ? it/s ]
+ INFO     Collecting phone and word alignments from alignment lattices...       
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 173/173  [ 0:00:02 < 0:00:00 , ? it/s ]
+ INFO     Collecting phone and word alignments from alignment lattices...       
+  [UPLOAD] batch 1 done (51.5s)
+
+############################################################
+  PIPELINE COMPLETE
+  Prefetched: 1/1
+  Processed:  1/1
+  Uploaded:   1/1
+############################################################
+  [W6] [7/13] 十六萤Izayoi — DONE (3 left)
+
+============================================================
+  [W6] [11/13] 晚晚sumi
+  Local:   /mnt/nvme0/mfa_work/worker_6/晚晚sumi
+============================================================
+
+NAS CTC:    /mnt/Raw/ASRNEW/晚晚sumi/wavs
+NAS audio:  /mnt/Raw/v5_0707/晚晚sumi/wavs
+NAS output: /mnt/Raw/ASR_MFA/晚晚sumi
+
+Discovering stems ...
+  99% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸ 171/173  [ 0:00:02 < -:--:-- , ? it/s ]
+ INFO     Analyzing alignment quality...                                        
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 903/903  [ 0:00:05 < 0:00:00 , ? it/s ]
+ INFO     Analyzing alignment quality...                                        
+  99% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸ 171/173  [ 0:00:03 < -:--:-- , ? it/s ]
+ INFO     Exporting alignment TextGrids to                                      
+          /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/workspace/aligned
+          ...                                                                   
+  99% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸ 171/173  [ 0:00:02 < 0:00:01 , 163 it/s ]
+ INFO     Finished exporting TextGrids to                                       
+          /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/workspace/aligned
+          !                                                                     
+ INFO     Done! Everything took 32.021 seconds                                  
+Loading dictionaries...
+  Pinyin dict: 2210 entries
+  IPA dict: 2207 entries
+  IPA→Pinyin phone mappings: 119
+  Tone reference table: /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/output/tone_mapping.json
+  Tone marks: ˥˥->1, ˥->1, ˧˥->2, ˨˩˦->3, ˥˩->4, ˩->5
+  Postprocess parallel: 32 workers for 171 files (ProcessPool)
+Done. {'ok': 154, 'filtered_word_in_silence': 17}. report=/mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/output/postprocess_report.jsonl
+Config: configs/batch_all.yaml
+ctc_ready mode: CTC dir = /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/ctc
+Pipeline mode: ctc_ready
+Using Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Chinese MFA Pipeline  [ctc_ready]
+  Input:  /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/audio
+  Output: /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/output
+  Steps:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+############################################################
+
+  >>> [link] Link pre-existing CTC output (ctc_ready mode)
+  CTC dir:   /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/ctc
+  Audio dir: /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/audio
+  Scanning CTC directory for .lab files ...
+  CTC presence index: 1039 flat files, 0 nested dirs
+  Found 173 stems via .lab scan (flat)
+  Audio index: 173 WAV files
+  Text index:  0 TXT files
+
+  Candidates:     173
+  Valid stems:    173
+
+  Audio in-place: 173/173 stems indexed (audio at /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/audio)
+  CTC linked:  1038 → /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/workspace/ctc_pretg
+  Ready for MFA pipeline (173 stems)
+
+  >>> [normalize_punct] Normalize punctuation (ASCII → CJK)
+  Normalized punctuation in 0 files
+
+  >>> [normalize] Normalize numerals (Arabic → Chinese)
+  Normalized numerals in 0 files
+
+  >>> [normalize_en] Normalise English-word fragments in CTC output
+
+============================================================
+  Step 2b: Normalise English tokens
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/normalize_english_tokens.py --txt-dir /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/workspace/ctc_pretg
+============================================================
+
+
+  >>> [resample] Resample to 16kHz for MFA
+  Found 173 WAVs from manifest (skipping directory scan)
+  Resampled to 16000Hz → /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/workspace/audio_16k  (173 done, 173 resampled)
+
+  >>> [adjust] Adjust CTC boundaries (energy-based)
+
+============================================================
+  Step 5: Adjust CTC boundaries (energy-based)
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/adjust_ctc_boundaries.py --ctc-dir /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/workspace/ctc_pretg --audio-dir /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/audio --output-dir /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/workspace/ctc_pretg_adj
+============================================================
+
+
+  >>> [align] MFA align (NVASR corpus + CTC anchors)
+  NVASR corpus: /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/workspace/ctc_pretg_adj (.lab files from ASR text)
+  CTC anchors:  /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/workspace/ctc_pretg_adj
+  Transcript and anchors from SAME source → 100% word match
+
+============================================================
+  Step 6: MFA Align (NVASR corpus + CTC anchors)
+============================================================
+
+
+  >>> [postprocess] Post-processing (includes NVV brackets + sp1 normalization)
+
+============================================================
+  Step 7: Post-processing
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/postprocess_textgrids.py --txt-dir /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/workspace/ctc_pretg_adj --textgrid-dir /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/workspace/aligned --output-dir /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/output --filtered-dir /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/workspace/filtered --wav-dir /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/audio --raw-text-dir /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/workspace/ctc_pretg_adj --pinyin-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/fullpinyin_enword.dict --ipa-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/mfa_ipa.dict --merge-max-sil-sec 0.2 --fix-short-word-sec 0.25 --fix-min-silence-sec 0.4 --fix-search-sec 0.5 --bgm-noise-floor-ratio 2.0 --bgm-min-sil-dur 0.3 --bgm-speech-ratio 1.0 --bgm-min-energy 0.01 --filter-short-phone-sec 0.015 --filter-long-word-sec 1.0 --filter-min-word-sec 0.15 --filter-min-word-dur-sec 0.02 --filter-word-energy-ratio 2.0 --filter-min-phone-coverage 0.35 --filter-edge-gap-sec 0.25 --filter-flank-silence-sec 0.4 --filter-long-consonant-sec 999.0 --filter-long-vowel-sec 999.0 --overwrite
+============================================================
+
+  Kept 16kHz audio: /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/workspace/audio_16k
+
+############################################################
+  DONE: Success
+  Output: /mnt/nvme0/mfa_work/worker_3/宣小纸不怕火/batch_0000/output
+############################################################
+
+
+  PROCESS batch 1: OK (38.0s)
+
+  [UPLOAD] batch 1/1 → /mnt/Raw/ASR_MFA/宣小纸不怕火 ...
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 903/903  [ 0:00:08 < 0:00:00 , ? it/s ]
+ INFO     Exporting alignment TextGrids to                                      
+          /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/workspace/aligned... 
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 903/903  [ 0:00:02 < 0:00:00 , 894 it/s ]
+ INFO     Finished exporting TextGrids to                                       
+          /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/workspace/aligned!   
+ INFO     Done! Everything took 60.506 seconds                                  
+Loading dictionaries...
+  Pinyin dict: 2210 entries
+  IPA dict: 2207 entries
+  IPA→Pinyin phone mappings: 119
+  Tone reference table: /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/output/tone_mapping.json
+  Tone marks: ˥->1, ˥˥->1, ˧˥->2, ˨˩˦->3, ˥˩->4, ˩->5
+  Postprocess parallel: 32 workers for 903 files (ProcessPool)
+Done. {'ok': 885, 'filtered_word_in_silence': 17, 'filtered_mid_sp_unexpected_silence': 1}. report=/mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/output/postprocess_report.jsonl
+Config: configs/batch_all.yaml
+ctc_ready mode: CTC dir = /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/ctc
+Pipeline mode: ctc_ready
+Using Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Chinese MFA Pipeline  [ctc_ready]
+  Input:  /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/audio
+  Output: /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/output
+  Steps:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+############################################################
+
+  >>> [link] Link pre-existing CTC output (ctc_ready mode)
+  CTC dir:   /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/ctc
+  Audio dir: /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/audio
+  Scanning CTC directory for .lab files ...
+  CTC presence index: 5419 flat files, 0 nested dirs
+  Found 903 stems via .lab scan (flat)
+  Audio index: 903 WAV files
+  Text index:  0 TXT files
+
+  Candidates:     903
+  Valid stems:    903
+
+  Audio in-place: 903/903 stems indexed (audio at /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/audio)
+  CTC linked:  5418 → /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/workspace/ctc_pretg
+  Ready for MFA pipeline (903 stems)
+
+  >>> [normalize_punct] Normalize punctuation (ASCII → CJK)
+  Normalized punctuation in 0 files
+
+  >>> [normalize] Normalize numerals (Arabic → Chinese)
+  Normalized numerals in 0 files
+
+  >>> [normalize_en] Normalise English-word fragments in CTC output
+
+============================================================
+  Step 2b: Normalise English tokens
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/normalize_english_tokens.py --txt-dir /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/workspace/ctc_pretg
+============================================================
+
+
+  >>> [resample] Resample to 16kHz for MFA
+  Found 903 WAVs from manifest (skipping directory scan)
+  Resampled to 16000Hz → /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/workspace/audio_16k  (903 done, 903 resampled)
+
+  >>> [adjust] Adjust CTC boundaries (energy-based)
+
+============================================================
+  Step 5: Adjust CTC boundaries (energy-based)
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/adjust_ctc_boundaries.py --ctc-dir /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/workspace/ctc_pretg --audio-dir /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/audio --output-dir /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/workspace/ctc_pretg_adj
+============================================================
+
+
+  >>> [align] MFA align (NVASR corpus + CTC anchors)
+  NVASR corpus: /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/workspace/ctc_pretg_adj (.lab files from ASR text)
+  CTC anchors:  /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/workspace/ctc_pretg_adj
+  Transcript and anchors from SAME source → 100% word match
+
+============================================================
+  Step 6: MFA Align (NVASR corpus + CTC anchors)
+============================================================
+
+
+  >>> [postprocess] Post-processing (includes NVV brackets + sp1 normalization)
+
+============================================================
+  Step 7: Post-processing
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/postprocess_textgrids.py --txt-dir /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/workspace/ctc_pretg_adj --textgrid-dir /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/workspace/aligned --output-dir /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/output --filtered-dir /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/workspace/filtered --wav-dir /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/audio --raw-text-dir /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/workspace/ctc_pretg_adj --pinyin-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/fullpinyin_enword.dict --ipa-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/mfa_ipa.dict --merge-max-sil-sec 0.2 --fix-short-word-sec 0.25 --fix-min-silence-sec 0.4 --fix-search-sec 0.5 --bgm-noise-floor-ratio 2.0 --bgm-min-sil-dur 0.3 --bgm-speech-ratio 1.0 --bgm-min-energy 0.01 --filter-short-phone-sec 0.015 --filter-long-word-sec 1.0 --filter-min-word-sec 0.15 --filter-min-word-dur-sec 0.02 --filter-word-energy-ratio 2.0 --filter-min-phone-coverage 0.35 --filter-edge-gap-sec 0.25 --filter-flank-silence-sec 0.4 --filter-long-consonant-sec 999.0 --filter-long-vowel-sec 999.0 --overwrite
+============================================================
+
+  Kept 16kHz audio: /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/workspace/audio_16k
+
+############################################################
+  DONE: Success
+  Output: /mnt/nvme0/mfa_work/worker_1/SRwaerte/batch_0000/output
+############################################################
+
+
+  PROCESS batch 1: OK (68.7s)
+
+  [UPLOAD] batch 1/1 → /mnt/Raw/ASR_MFA/SRwaerte ...
+  [UPLOAD] batch 1 done (15.1s)
+
+############################################################
+  PIPELINE COMPLETE
+  Prefetched: 1/1
+  Processed:  1/1
+  Uploaded:   1/1
+############################################################
+  [W3] [10/13] 宣小纸不怕火 — DONE (2 left)
+
+============================================================
+  [W3] [12/13] 皮皮
+  Local:   /mnt/nvme0/mfa_work/worker_3/皮皮
+============================================================
+
+NAS CTC:    /mnt/Raw/ASRNEW/皮皮/wavs
+NAS audio:  /mnt/Raw/v5_0707/皮皮/wavs
+NAS output: /mnt/Raw/ASR_MFA/皮皮
+
+Discovering stems ...
+  Found 221 valid stems
+MFA Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Streaming Pipeline
+  Batches: 1 × ~2000 stems
+  Local work: /mnt/nvme0/mfa_work/worker_3/皮皮
+  NAS output: /mnt/Raw/ASR_MFA/皮皮
+############################################################
+
+  [PREFETCH] batch 1/1 (221 stems) NAS → local ...
+  Found 1244 valid stems
+MFA Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Streaming Pipeline
+  Batches: 1 × ~2000 stems
+  Local work: /mnt/nvme0/mfa_work/worker_6/晚晚sumi
+  NAS output: /mnt/Raw/ASR_MFA/晚晚sumi
+############################################################
+
+  [PREFETCH] batch 1/1 (1244 stems) NAS → local ...
+  [PREFETCH] batch 1 done (59.9s, 221 stems)
+
+============================================================
+  PROCESS batch 1/1 (221 stems)
+  Workspace: /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/workspace
+============================================================
+
+Normalised 0/221 stems
+  Parallel mode: 32 workers for 221 files (ProcessPool, BLAS=1 per worker)
+
+==================================================
+Total: 221 files
+  Start adjustments:   617
+  End extended:        585
+  End shortened:       170
+  Punct adjustments:   1233
+Output: /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/workspace/ctc_pretg_adj
+<frozen runpy>:128: RuntimeWarning: 'montreal_forced_aligner.command_line.mfa' found in sys.modules after import of package 'montreal_forced_aligner.command_line', but prior to execution of 'montreal_forced_aligner.command_line.mfa'; this may result in unpredictable behaviour
+ INFO     Setting up corpus information...                                      
+ INFO     Loading corpus from source files...                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 221/100  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Found 1 speaker across 221 files, average number of utterances per    
+          speaker: 221.0                                                        
+ INFO     Initializing multiprocessing jobs...                                  
+ INFO     Normalizing text...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 221/221  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Generating MFCCs...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 221/221  [ 0:00:14 < 0:00:00 , 16 it/s ]
+ INFO     Calculating CMVN...                                                   
+ INFO     Generating final features...                                          
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 221/221  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Creating corpus split...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 221/221  [ 0:00:01 < 0:00:00 , ? it/s ]
+ WARNING  There were 37 pronunciations in the dictionary that were ignored for  
+          containing one of 37 phones not present in the trained acoustic model.
+          Please run `mfa validate` to get more details.                        
+ INFO     Compiling training graphs...                                          
+ INFO     Performing first-pass alignment...                                    
+ INFO     Generating alignments...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 221/221  [ 0:00:03 < 0:00:00 , ? it/s ]
+ INFO     Collecting phone and word alignments from alignment lattices...       
+  97% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  215/221  [ 0:00:02 < -:--:-- , ? it/s ]
+ INFO     Analyzing alignment quality...                                        
+  97% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  215/221  [ 0:00:04 < -:--:-- , ? it/s ]
+ INFO     Exporting alignment TextGrids to                                      
+          /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/workspace/aligned...     
+  97% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  215/221  [ 0:00:02 < 0:00:01 , 213 it/s ]
+ INFO     Finished exporting TextGrids to                                       
+          /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/workspace/aligned!       
+ INFO     Done! Everything took 35.729 seconds                                  
+Loading dictionaries...
+  Pinyin dict: 2210 entries
+  IPA dict: 2207 entries
+  IPA→Pinyin phone mappings: 119
+  Tone reference table: /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/output/tone_mapping.json
+  Tone marks: ˥˥->1, ˥->1, ˧˥->2, ˨˩˦->3, ˥˩->4, ˩->5
+  Postprocess parallel: 32 workers for 215 files (ProcessPool)
+Done. {'ok': 206, 'filtered_word_in_silence': 8, 'filtered_sp3_word_in_silence': 1}. report=/mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/output/postprocess_report.jsonl
+Config: configs/batch_all.yaml
+ctc_ready mode: CTC dir = /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/ctc
+Pipeline mode: ctc_ready
+Using Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Chinese MFA Pipeline  [ctc_ready]
+  Input:  /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/audio
+  Output: /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/output
+  Steps:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+############################################################
+
+  >>> [link] Link pre-existing CTC output (ctc_ready mode)
+  CTC dir:   /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/ctc
+  Audio dir: /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/audio
+  Scanning CTC directory for .lab files ...
+  CTC presence index: 1327 flat files, 0 nested dirs
+  Found 221 stems via .lab scan (flat)
+  Audio index: 221 WAV files
+  Text index:  0 TXT files
+
+  Candidates:     221
+  Valid stems:    221
+
+  Audio in-place: 221/221 stems indexed (audio at /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/audio)
+  CTC linked:  1326 → /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/workspace/ctc_pretg
+  Ready for MFA pipeline (221 stems)
+
+  >>> [normalize_punct] Normalize punctuation (ASCII → CJK)
+  Normalized punctuation in 1 files
+
+  >>> [normalize] Normalize numerals (Arabic → Chinese)
+  Normalized numerals in 0 files
+
+  >>> [normalize_en] Normalise English-word fragments in CTC output
+
+============================================================
+  Step 2b: Normalise English tokens
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/normalize_english_tokens.py --txt-dir /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/workspace/ctc_pretg
+============================================================
+
+
+  >>> [resample] Resample to 16kHz for MFA
+  Found 221 WAVs from manifest (skipping directory scan)
+  Resampled to 16000Hz → /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/workspace/audio_16k  (221 done, 221 resampled)
+
+  >>> [adjust] Adjust CTC boundaries (energy-based)
+
+============================================================
+  Step 5: Adjust CTC boundaries (energy-based)
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/adjust_ctc_boundaries.py --ctc-dir /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/workspace/ctc_pretg --audio-dir /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/audio --output-dir /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/workspace/ctc_pretg_adj
+============================================================
+
+
+  >>> [align] MFA align (NVASR corpus + CTC anchors)
+  NVASR corpus: /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/workspace/ctc_pretg_adj (.lab files from ASR text)
+  CTC anchors:  /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/workspace/ctc_pretg_adj
+  Transcript and anchors from SAME source → 100% word match
+
+============================================================
+  Step 6: MFA Align (NVASR corpus + CTC anchors)
+============================================================
+
+
+  >>> [postprocess] Post-processing (includes NVV brackets + sp1 normalization)
+
+============================================================
+  Step 7: Post-processing
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/postprocess_textgrids.py --txt-dir /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/workspace/ctc_pretg_adj --textgrid-dir /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/workspace/aligned --output-dir /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/output --filtered-dir /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/workspace/filtered --wav-dir /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/audio --raw-text-dir /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/workspace/ctc_pretg_adj --pinyin-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/fullpinyin_enword.dict --ipa-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/mfa_ipa.dict --merge-max-sil-sec 0.2 --fix-short-word-sec 0.25 --fix-min-silence-sec 0.4 --fix-search-sec 0.5 --bgm-noise-floor-ratio 2.0 --bgm-min-sil-dur 0.3 --bgm-speech-ratio 1.0 --bgm-min-energy 0.01 --filter-short-phone-sec 0.015 --filter-long-word-sec 1.0 --filter-min-word-sec 0.15 --filter-min-word-dur-sec 0.02 --filter-word-energy-ratio 2.0 --filter-min-phone-coverage 0.35 --filter-edge-gap-sec 0.25 --filter-flank-silence-sec 0.4 --filter-long-consonant-sec 999.0 --filter-long-vowel-sec 999.0 --overwrite
+============================================================
+
+  Kept 16kHz audio: /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/workspace/audio_16k
+
+############################################################
+  DONE: Success
+  Output: /mnt/nvme0/mfa_work/worker_3/皮皮/batch_0000/output
+############################################################
+
+
+  PROCESS batch 1: OK (43.9s)
+
+  [UPLOAD] batch 1/1 → /mnt/Raw/ASR_MFA/皮皮 ...
+  [UPLOAD] batch 1 done (33.7s)
+
+############################################################
+  PIPELINE COMPLETE
+  Prefetched: 1/1
+  Processed:  1/1
+  Uploaded:   1/1
+############################################################
+  [W3] [12/13] 皮皮 — DONE (1 left)
+
+============================================================
+  [W3] [13/13] 花礼
+  Local:   /mnt/nvme0/mfa_work/worker_3/花礼
+============================================================
+
+NAS CTC:    /mnt/Raw/ASRNEW/花礼/wavs
+NAS audio:  /mnt/Raw/v5_0707/花礼/wavs
+NAS output: /mnt/Raw/ASR_MFA/花礼
+
+Discovering stems ...
+  [UPLOAD] batch 1 done (161.5s)
+
+############################################################
+  PIPELINE COMPLETE
+  Prefetched: 1/1
+  Processed:  1/1
+  Uploaded:   1/1
+############################################################
+  [W1] [2/13] SRwaerte — DONE (0 left)
+  Found 5665 valid stems
+MFA Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Streaming Pipeline
+  Batches: 3 × ~2000 stems
+  Local work: /mnt/nvme0/mfa_work/worker_2/嘉然
+  NAS output: /mnt/Raw/ASR_MFA/嘉然
+############################################################
+
+  [PREFETCH] batch 1/3 (2000 stems) NAS → local ...
+  [PREFETCH] batch 1 done (143.1s, 1244 stems)
+
+============================================================
+  PROCESS batch 1/1 (1244 stems)
+  Workspace: /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/workspace
+============================================================
+
+Normalised 0/1244 stems
+  Parallel mode: 32 workers for 1244 files (ProcessPool, BLAS=1 per worker)
+
+==================================================
+Total: 1244 files
+  Start adjustments:   2362
+  End extended:        2830
+  End shortened:       851
+  Punct adjustments:   5494
+Output: /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/workspace/ctc_pretg_adj
+<frozen runpy>:128: RuntimeWarning: 'montreal_forced_aligner.command_line.mfa' found in sys.modules after import of package 'montreal_forced_aligner.command_line', but prior to execution of 'montreal_forced_aligner.command_line.mfa'; this may result in unpredictable behaviour
+ INFO     Setting up corpus information...                                      
+ INFO     Loading corpus from source files...                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,244/100  [ 0:00:00 < 0:00:00 , 684 it/s ]
+ INFO     Found 1 speaker across 1244 files, average number of utterances per   
+          speaker: 1244.0                                                       
+ INFO     Initializing multiprocessing jobs...                                  
+ INFO     Normalizing text...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,244/1,244  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Generating MFCCs...                                                   
+  Found 1657 valid stems
+MFA Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Streaming Pipeline
+  Batches: 1 × ~2000 stems
+  Local work: /mnt/nvme0/mfa_work/worker_3/花礼
+  NAS output: /mnt/Raw/ASR_MFA/花礼
+############################################################
+
+  [PREFETCH] batch 1/1 (1657 stems) NAS → local ...
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,244/1,244  [ 0:01:09 < 0:00:00 , 18 it/s ]
+ INFO     Calculating CMVN...                                                   
+ INFO     Generating final features...                                          
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,244/1,244  [ 0:00:02 < 0:00:00 , ? it/s ]
+ INFO     Creating corpus split...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,244/1,244  [ 0:00:01 < 0:00:00 , ? it/s ]
+ WARNING  There were 37 pronunciations in the dictionary that were ignored for  
+          containing one of 37 phones not present in the trained acoustic model.
+          Please run `mfa validate` to get more details.                        
+ INFO     Compiling training graphs...                                          
+ INFO     Performing first-pass alignment...                                    
+ INFO     Generating alignments...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,244/1,244  [ 0:00:08 < 0:00:00 , ? it/s ]
+ INFO     Collecting phone and word alignments from alignment lattices...       
+  95% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸  1,184/1,244  [ 0:00:09 < -:--:-- , ? it/s ]
+ INFO     Analyzing alignment quality...                                        
+  95% ━━━━━━━━━━━━━━━━━━━━━━━━━━━╸  1,184/1,244  [ 0:00:17 < 0:00:01 , 69 it/s ]
+ INFO     Exporting alignment TextGrids to                                      
+          /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/workspace/aligned... 
+  95% ━━━━━━━━━━━━━━━━━━━━━━━━╸  1,184/1,244  [ 0:00:02 < 0:00:01 , 1,170 it/s ]
+ INFO     Finished exporting TextGrids to                                       
+          /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/workspace/aligned!   
+ INFO     Done! Everything took 120.865 seconds                                 
+Loading dictionaries...
+  Pinyin dict: 2210 entries
+  IPA dict: 2207 entries
+  IPA→Pinyin phone mappings: 119
+  Tone reference table: /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/output/tone_mapping.json
+  Tone marks: ˥->1, ˥˥->1, ˧˥->2, ˨˩˦->3, ˥˩->4, ˩->5
+  Postprocess parallel: 32 workers for 1184 files (ProcessPool)
+Done. {'ok': 1138, 'filtered_word_in_silence': 45, 'filtered_sp3': 1}. report=/mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/output/postprocess_report.jsonl
+Config: configs/batch_all.yaml
+ctc_ready mode: CTC dir = /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/ctc
+Pipeline mode: ctc_ready
+Using Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Chinese MFA Pipeline  [ctc_ready]
+  Input:  /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/audio
+  Output: /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/output
+  Steps:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+############################################################
+
+  >>> [link] Link pre-existing CTC output (ctc_ready mode)
+  CTC dir:   /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/ctc
+  Audio dir: /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/audio
+  Scanning CTC directory for .lab files ...
+  CTC presence index: 7465 flat files, 0 nested dirs
+  Found 1244 stems via .lab scan (flat)
+  Audio index: 1244 WAV files
+  Text index:  0 TXT files
+
+  Candidates:     1244
+  Valid stems:    1244
+
+  Audio in-place: 1244/1244 stems indexed (audio at /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/audio)
+  CTC linked:  7464 → /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/workspace/ctc_pretg
+  Ready for MFA pipeline (1244 stems)
+
+  >>> [normalize_punct] Normalize punctuation (ASCII → CJK)
+  Normalized punctuation in 0 files
+
+  >>> [normalize] Normalize numerals (Arabic → Chinese)
+  Normalized numerals in 0 files
+
+  >>> [normalize_en] Normalise English-word fragments in CTC output
+
+============================================================
+  Step 2b: Normalise English tokens
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/normalize_english_tokens.py --txt-dir /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/workspace/ctc_pretg
+============================================================
+
+
+  >>> [resample] Resample to 16kHz for MFA
+  Found 1244 WAVs from manifest (skipping directory scan)
+  Resampled to 16000Hz → /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/workspace/audio_16k  (1244 done, 1244 resampled)
+
+  >>> [adjust] Adjust CTC boundaries (energy-based)
+
+============================================================
+  Step 5: Adjust CTC boundaries (energy-based)
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/adjust_ctc_boundaries.py --ctc-dir /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/workspace/ctc_pretg --audio-dir /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/audio --output-dir /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/workspace/ctc_pretg_adj
+============================================================
+
+
+  >>> [align] MFA align (NVASR corpus + CTC anchors)
+  NVASR corpus: /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/workspace/ctc_pretg_adj (.lab files from ASR text)
+  CTC anchors:  /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/workspace/ctc_pretg_adj
+  Transcript and anchors from SAME source → 100% word match
+
+============================================================
+  Step 6: MFA Align (NVASR corpus + CTC anchors)
+============================================================
+
+
+  >>> [postprocess] Post-processing (includes NVV brackets + sp1 normalization)
+
+============================================================
+  Step 7: Post-processing
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/postprocess_textgrids.py --txt-dir /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/workspace/ctc_pretg_adj --textgrid-dir /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/workspace/aligned --output-dir /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/output --filtered-dir /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/workspace/filtered --wav-dir /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/audio --raw-text-dir /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/workspace/ctc_pretg_adj --pinyin-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/fullpinyin_enword.dict --ipa-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/mfa_ipa.dict --merge-max-sil-sec 0.2 --fix-short-word-sec 0.25 --fix-min-silence-sec 0.4 --fix-search-sec 0.5 --bgm-noise-floor-ratio 2.0 --bgm-min-sil-dur 0.3 --bgm-speech-ratio 1.0 --bgm-min-energy 0.01 --filter-short-phone-sec 0.015 --filter-long-word-sec 1.0 --filter-min-word-sec 0.15 --filter-min-word-dur-sec 0.02 --filter-word-energy-ratio 2.0 --filter-min-phone-coverage 0.35 --filter-edge-gap-sec 0.25 --filter-flank-silence-sec 0.4 --filter-long-consonant-sec 999.0 --filter-long-vowel-sec 999.0 --overwrite
+============================================================
+
+  Kept 16kHz audio: /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/workspace/audio_16k
+
+############################################################
+  DONE: Success
+  Output: /mnt/nvme0/mfa_work/worker_6/晚晚sumi/batch_0000/output
+############################################################
+
+
+  PROCESS batch 1: OK (130.5s)
+
+  [UPLOAD] batch 1/1 → /mnt/Raw/ASR_MFA/晚晚sumi ...
+  [PREFETCH] batch 1 done (320.6s, 2000 stems)
+
+  [PREFETCH] batch 2/3 (2000 stems) NAS → local ...
+============================================================
+
+  PROCESS batch 1/3 (2000 stems)
+  Workspace: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/workspace
+============================================================
+
+Normalised 0/2000 stems
+  Parallel mode: 32 workers for 2000 files (ProcessPool, BLAS=1 per worker)
+  ... 2000/2000 files adjusted
+
+==================================================
+Total: 2000 files
+  Start adjustments:   5732
+  End extended:        4026
+  End shortened:       2191
+  Punct adjustments:   10761
+Output: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/workspace/ctc_pretg_adj
+<frozen runpy>:128: RuntimeWarning: 'montreal_forced_aligner.command_line.mfa' found in sys.modules after import of package 'montreal_forced_aligner.command_line', but prior to execution of 'montreal_forced_aligner.command_line.mfa'; this may result in unpredictable behaviour
+ INFO     Setting up corpus information...                                      
+ INFO     Loading corpus from source files...                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/100  [ 0:00:00 < 0:00:00 , 1,016 it/s ]
+ INFO     Found 1 speaker across 2000 files, average number of utterances per   
+          speaker: 2000.0                                                       
+ INFO     Initializing multiprocessing jobs...                                  
+ INFO     Normalizing text...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Generating MFCCs...                                                   
+  rsync timed out after 300s — falling back to file-by-file copy
+  [PREFETCH] batch 1 done (367.7s, 1657 stems)
+
+============================================================
+  PROCESS batch 1/1 (1657 stems)
+  Workspace: /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/workspace
+============================================================
+
+Normalised 0/1657 stems
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:01:52 < 0:00:00 , 18 it/s ]
+ INFO     Calculating CMVN...                                                   
+ INFO     Generating final features...                                          
+  Parallel mode: 32 workers for 1657 files (ProcessPool, BLAS=1 per worker)
+
+==================================================
+Total: 1657 files
+  Start adjustments:   5703
+  End extended:        4350
+  End shortened:       1307
+  Punct adjustments:   10294
+Output: /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/workspace/ctc_pretg_adj
+<frozen runpy>:128: RuntimeWarning: 'montreal_forced_aligner.command_line.mfa' found in sys.modules after import of package 'montreal_forced_aligner.command_line', but prior to execution of 'montreal_forced_aligner.command_line.mfa'; this may result in unpredictable behaviour
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:02 < 0:00:00 , ? it/s ]
+ INFO     Creating corpus split...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:01 < 0:00:00 , ? it/s ]
+ WARNING  There were 37 pronunciations in the dictionary that were ignored for  
+          containing one of 37 phones not present in the trained acoustic model.
+          Please run `mfa validate` to get more details.                        
+ INFO     Setting up corpus information...                                      
+ INFO     Loading corpus from source files...                                   
+ INFO     Compiling training graphs...                                          
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,657/100  [ 0:00:00 < 0:00:00 , 907 it/s ]
+ INFO     Found 1 speaker across 1657 files, average number of utterances per   
+          speaker: 1657.0                                                       
+ INFO     Initializing multiprocessing jobs...                                  
+ INFO     Normalizing text...                                                   
+ INFO     Performing first-pass alignment...                                    
+ INFO     Generating alignments...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,657/1,657  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Generating MFCCs...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:09 < 0:00:00 , ? it/s ]
+ INFO     Collecting phone and word alignments from alignment lattices...       
+  96% ━━━━━━━━━━━━━━━━━━━━━━━━━━╸  1,920/2,000  [ 0:00:14 < 0:00:01 , 367 it/s ]
+ INFO     Analyzing alignment quality...                                        
+  96% ━━━━━━━━━━━━━━━━━━━━━━━━━━━╸  1,920/2,000  [ 0:00:28 < 0:00:02 , 70 it/s ]
+ INFO     Exporting alignment TextGrids to                                      
+          /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/workspace/aligned...     
+  96% ━━━━━━━━━━━━━━━━━━━━━━━━╸  1,920/2,000  [ 0:00:02 < 0:00:01 , 1,890 it/s ]
+ INFO     Finished exporting TextGrids to                                       
+          /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/workspace/aligned!       
+ INFO     Done! Everything took 182.751 seconds                                 
+Loading dictionaries...
+  Pinyin dict: 2210 entries
+  IPA dict: 2207 entries
+  IPA→Pinyin phone mappings: 119
+  Tone reference table: /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/output/tone_mapping.json
+  Tone marks: ˥->1, ˥˥->1, ˧˥->2, ˨˩˦->3, ˥˩->4, ˩->5
+  Postprocess parallel: 32 workers for 1920 files (ProcessPool)
+Done. {'ok': 1512, 'filtered_word_in_silence': 403, 'filtered_mid_sp_unexpected_silence': 3, 'filtered_mid_sp_word_in_silence': 1, 'error': 1}. report=/mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/output/postprocess_report.jsonl
+Config: configs/batch_all.yaml
+ctc_ready mode: CTC dir = /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/ctc
+Pipeline mode: ctc_ready
+Using Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Chinese MFA Pipeline  [ctc_ready]
+  Input:  /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/audio
+  Output: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/output
+  Steps:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+############################################################
+
+  >>> [link] Link pre-existing CTC output (ctc_ready mode)
+  CTC dir:   /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/ctc
+  Audio dir: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/audio
+  Scanning CTC directory for .lab files ...
+  CTC presence index: 12001 flat files, 0 nested dirs
+  Found 2000 stems via .lab scan (flat)
+  Audio index: 2000 WAV files
+  Text index:  0 TXT files
+
+  Candidates:     2000
+  Valid stems:    2000
+
+  Audio in-place: 2000/2000 stems indexed (audio at /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/audio)
+  CTC linked:  12000 → /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/workspace/ctc_pretg
+  Ready for MFA pipeline (2000 stems)
+
+  >>> [normalize_punct] Normalize punctuation (ASCII → CJK)
+  Normalized punctuation in 3 files
+
+  >>> [normalize] Normalize numerals (Arabic → Chinese)
+  Normalized numerals in 0 files
+
+  >>> [normalize_en] Normalise English-word fragments in CTC output
+
+============================================================
+  Step 2b: Normalise English tokens
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/normalize_english_tokens.py --txt-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/workspace/ctc_pretg
+============================================================
+
+
+  >>> [resample] Resample to 16kHz for MFA
+  Found 2000 WAVs from manifest (skipping directory scan)
+  Resampled to 16000Hz → /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/workspace/audio_16k  (2000 done, 2000 resampled)
+
+  >>> [adjust] Adjust CTC boundaries (energy-based)
+
+============================================================
+  Step 5: Adjust CTC boundaries (energy-based)
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/adjust_ctc_boundaries.py --ctc-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/workspace/ctc_pretg --audio-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/audio --output-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/workspace/ctc_pretg_adj
+============================================================
+
+
+  >>> [align] MFA align (NVASR corpus + CTC anchors)
+  NVASR corpus: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/workspace/ctc_pretg_adj (.lab files from ASR text)
+  CTC anchors:  /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/workspace/ctc_pretg_adj
+  Transcript and anchors from SAME source → 100% word match
+
+============================================================
+  Step 6: MFA Align (NVASR corpus + CTC anchors)
+============================================================
+
+
+  >>> [postprocess] Post-processing (includes NVV brackets + sp1 normalization)
+
+============================================================
+  Step 7: Post-processing
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/postprocess_textgrids.py --txt-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/workspace/ctc_pretg_adj --textgrid-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/workspace/aligned --output-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/output --filtered-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/workspace/filtered --wav-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/audio --raw-text-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/workspace/ctc_pretg_adj --pinyin-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/fullpinyin_enword.dict --ipa-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/mfa_ipa.dict --merge-max-sil-sec 0.2 --fix-short-word-sec 0.25 --fix-min-silence-sec 0.4 --fix-search-sec 0.5 --bgm-noise-floor-ratio 2.0 --bgm-min-sil-dur 0.3 --bgm-speech-ratio 1.0 --bgm-min-energy 0.01 --filter-short-phone-sec 0.015 --filter-long-word-sec 1.0 --filter-min-word-sec 0.15 --filter-min-word-dur-sec 0.02 --filter-word-energy-ratio 2.0 --filter-min-phone-coverage 0.35 --filter-edge-gap-sec 0.25 --filter-flank-silence-sec 0.4 --filter-long-consonant-sec 999.0 --filter-long-vowel-sec 999.0 --overwrite
+============================================================
+
+  Kept 16kHz audio: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/workspace/audio_16k
+
+############################################################
+  DONE: Success
+  Output: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0000/output
+############################################################
+
+
+  PROCESS batch 1: OK (196.6s)
+
+  [UPLOAD] batch 1/3 → /mnt/Raw/ASR_MFA/嘉然 ...
+  [PREFETCH] batch 2 done (197.6s, 2000 stems)
+
+  [PREFETCH] batch 3/3 (1665 stems) NAS → local ...
+
+============================================================
+  PROCESS batch 2/3 (2000 stems)
+  Workspace: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/workspace
+============================================================
+
+Normalised 0/2000 stems
+  Parallel mode: 32 workers for 2000 files (ProcessPool, BLAS=1 per worker)
+  ... 2000/2000 files adjusted
+
+==================================================
+Total: 2000 files
+  Start adjustments:   5130
+  End extended:        4054
+  End shortened:       2126
+  Punct adjustments:   10237
+Output: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/workspace/ctc_pretg_adj
+<frozen runpy>:128: RuntimeWarning: 'montreal_forced_aligner.command_line.mfa' found in sys.modules after import of package 'montreal_forced_aligner.command_line', but prior to execution of 'montreal_forced_aligner.command_line.mfa'; this may result in unpredictable behaviour
+ INFO     Setting up corpus information...                                      
+ INFO     Loading corpus from source files...                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/100  [ 0:00:00 < 0:00:00 , 1,037 it/s ]
+ INFO     Found 1 speaker across 2000 files, average number of utterances per   
+          speaker: 2000.0                                                       
+ INFO     Initializing multiprocessing jobs...                                  
+ INFO     Normalizing text...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Generating MFCCs...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,657/1,657  [ 0:01:30 < 0:00:00 , 18 it/s ]
+ INFO     Calculating CMVN...                                                   
+ INFO     Generating final features...                                          
+  [UPLOAD] batch 1 done (409.1s)
+
+############################################################
+  PIPELINE COMPLETE
+  Prefetched: 1/1
+  Processed:  1/1
+  Uploaded:   1/1
+############################################################
+  [W6] [11/13] 晚晚sumi — DONE (0 left)
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,657/1,657  [ 0:00:03 < 0:00:00 , ? it/s ]
+ INFO     Creating corpus split...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,657/1,657  [ 0:00:01 < 0:00:00 , ? it/s ]
+ WARNING  There were 37 pronunciations in the dictionary that were ignored for  
+          containing one of 37 phones not present in the trained acoustic model.
+          Please run `mfa validate` to get more details.                        
+ INFO     Compiling training graphs...                                          
+ INFO     Performing first-pass alignment...                                    
+ INFO     Generating alignments...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,657/1,657  [ 0:00:06 < 0:00:00 , ? it/s ]
+ INFO     Collecting phone and word alignments from alignment lattices...       
+  97% ━━━━━━━━━━━━━━━━━━━━━━━━━━━  1,614/1,657  [ 0:00:12 < 0:00:01 , 428 it/s ]
+ INFO     Analyzing alignment quality...                                        
+  97% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━  1,614/1,657  [ 0:00:25 < 0:00:01 , 64 it/s ]
+ INFO     Exporting alignment TextGrids to                                      
+          /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/workspace/aligned...     
+  97% ━━━━━━━━━━━━━━━━━━━━━━━━━  1,614/1,657  [ 0:00:02 < 0:00:01 , 1,591 it/s ]
+ INFO     Finished exporting TextGrids to                                       
+          /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/workspace/aligned!       
+ INFO     Done! Everything took 154.165 seconds                                 
+Loading dictionaries...
+  Pinyin dict: 2210 entries
+  IPA dict: 2207 entries
+  IPA→Pinyin phone mappings: 119
+  Tone reference table: /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/output/tone_mapping.json
+  Tone marks: ˥->1, ˥˥->1, ˧˥->2, ˨˩˦->3, ˥˩->4, ˩->5
+  Postprocess parallel: 32 workers for 1614 files (ProcessPool)
+Done. {'ok': 1457, 'filtered_word_in_silence': 151, 'error': 2, 'filtered_mid_sp_unexpected_silence': 2, 'filtered_mid_sp_word_in_silence': 1, 'filtered_sp3': 1}. report=/mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/output/postprocess_report.jsonl
+Config: configs/batch_all.yaml
+ctc_ready mode: CTC dir = /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/ctc
+Pipeline mode: ctc_ready
+Using Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Chinese MFA Pipeline  [ctc_ready]
+  Input:  /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/audio
+  Output: /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/output
+  Steps:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+############################################################
+
+  >>> [link] Link pre-existing CTC output (ctc_ready mode)
+  CTC dir:   /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/ctc
+  Audio dir: /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/audio
+  Scanning CTC directory for .lab files ...
+  CTC presence index: 9943 flat files, 0 nested dirs
+  Found 1657 stems via .lab scan (flat)
+  Audio index: 1657 WAV files
+  Text index:  0 TXT files
+
+  Candidates:     1657
+  Valid stems:    1657
+
+  Audio in-place: 1657/1657 stems indexed (audio at /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/audio)
+  CTC linked:  9942 → /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/workspace/ctc_pretg
+  Ready for MFA pipeline (1657 stems)
+
+  >>> [normalize_punct] Normalize punctuation (ASCII → CJK)
+  Normalized punctuation in 3 files
+
+  >>> [normalize] Normalize numerals (Arabic → Chinese)
+  Normalized numerals in 0 files
+
+  >>> [normalize_en] Normalise English-word fragments in CTC output
+
+============================================================
+  Step 2b: Normalise English tokens
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/normalize_english_tokens.py --txt-dir /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/workspace/ctc_pretg
+============================================================
+
+
+  >>> [resample] Resample to 16kHz for MFA
+  Found 1657 WAVs from manifest (skipping directory scan)
+  Resampled to 16000Hz → /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/workspace/audio_16k  (1657 done, 1657 resampled)
+
+  >>> [adjust] Adjust CTC boundaries (energy-based)
+
+============================================================
+  Step 5: Adjust CTC boundaries (energy-based)
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/adjust_ctc_boundaries.py --ctc-dir /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/workspace/ctc_pretg --audio-dir /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/audio --output-dir /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/workspace/ctc_pretg_adj
+============================================================
+
+
+  >>> [align] MFA align (NVASR corpus + CTC anchors)
+  NVASR corpus: /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/workspace/ctc_pretg_adj (.lab files from ASR text)
+  CTC anchors:  /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/workspace/ctc_pretg_adj
+  Transcript and anchors from SAME source → 100% word match
+
+============================================================
+  Step 6: MFA Align (NVASR corpus + CTC anchors)
+============================================================
+
+
+  >>> [postprocess] Post-processing (includes NVV brackets + sp1 normalization)
+
+============================================================
+  Step 7: Post-processing
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/postprocess_textgrids.py --txt-dir /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/workspace/ctc_pretg_adj --textgrid-dir /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/workspace/aligned --output-dir /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/output --filtered-dir /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/workspace/filtered --wav-dir /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/audio --raw-text-dir /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/workspace/ctc_pretg_adj --pinyin-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/fullpinyin_enword.dict --ipa-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/mfa_ipa.dict --merge-max-sil-sec 0.2 --fix-short-word-sec 0.25 --fix-min-silence-sec 0.4 --fix-search-sec 0.5 --bgm-noise-floor-ratio 2.0 --bgm-min-sil-dur 0.3 --bgm-speech-ratio 1.0 --bgm-min-energy 0.01 --filter-short-phone-sec 0.015 --filter-long-word-sec 1.0 --filter-min-word-sec 0.15 --filter-min-word-dur-sec 0.02 --filter-word-energy-ratio 2.0 --filter-min-phone-coverage 0.35 --filter-edge-gap-sec 0.25 --filter-flank-silence-sec 0.4 --filter-long-consonant-sec 999.0 --filter-long-vowel-sec 999.0 --overwrite
+============================================================
+
+  Kept 16kHz audio: /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/workspace/audio_16k
+
+############################################################
+  DONE: Success
+  Output: /mnt/nvme0/mfa_work/worker_3/花礼/batch_0000/output
+############################################################
+
+
+  PROCESS batch 1: OK (167.4s)
+
+  [UPLOAD] batch 1/1 → /mnt/Raw/ASR_MFA/花礼 ...
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:01:49 < 0:00:00 , 18 it/s ]
+ INFO     Calculating CMVN...                                                   
+ INFO     Generating final features...                                          
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:03 < 0:00:00 , ? it/s ]
+ INFO     Creating corpus split...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:01 < 0:00:00 , ? it/s ]
+ WARNING  There were 37 pronunciations in the dictionary that were ignored for  
+          containing one of 37 phones not present in the trained acoustic model.
+          Please run `mfa validate` to get more details.                        
+ INFO     Compiling training graphs...                                          
+ INFO     Performing first-pass alignment...                                    
+ INFO     Generating alignments...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:07 < 0:00:00 , ? it/s ]
+ INFO     Collecting phone and word alignments from alignment lattices...       
+  95% ━━━━━━━━━━━━━━━━━━━━━━━━━━╸  1,906/2,000  [ 0:00:14 < 0:00:01 , 323 it/s ]
+ INFO     Analyzing alignment quality...                                        
+  95% ━━━━━━━━━━━━━━━━━━━━━━━━━━━╸  1,906/2,000  [ 0:00:29 < 0:00:02 , 68 it/s ]
+ INFO     Exporting alignment TextGrids to                                      
+          /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/workspace/aligned...     
+  [PREFETCH] batch 3 done (187.1s, 1665 stems)
+  95% ━━━━━━━━━━━━━━━━━━━━━━━━╸  1,906/2,000  [ 0:00:02 < 0:00:01 , 1,874 it/s ]
+ INFO     Finished exporting TextGrids to                                       
+          /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/workspace/aligned!       
+ INFO     Done! Everything took 180.648 seconds                                 
+Loading dictionaries...
+  Pinyin dict: 2210 entries
+  IPA dict: 2207 entries
+  IPA→Pinyin phone mappings: 119
+  Tone reference table: /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/output/tone_mapping.json
+  Tone marks: ˥˥->1, ˥->1, ˧˥->2, ˨˩˦->3, ˥˩->4, ˩->5
+  Postprocess parallel: 32 workers for 1906 files (ProcessPool)
+Done. {'ok': 1734, 'filtered_word_in_silence': 168, 'filtered_bgm_suspect_word_in_silence': 1, 'filtered_mid_sp': 1, 'filtered_mid_sp_unexpected_silence': 1, 'filtered_mid_sp_unexpected_silence_word_in_silence': 1}. report=/mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/output/postprocess_report.jsonl
+Config: configs/batch_all.yaml
+ctc_ready mode: CTC dir = /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/ctc
+Pipeline mode: ctc_ready
+Using Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Chinese MFA Pipeline  [ctc_ready]
+  Input:  /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/audio
+  Output: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/output
+  Steps:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+############################################################
+
+  >>> [link] Link pre-existing CTC output (ctc_ready mode)
+  CTC dir:   /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/ctc
+  Audio dir: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/audio
+  Scanning CTC directory for .lab files ...
+  CTC presence index: 12001 flat files, 0 nested dirs
+  Found 2000 stems via .lab scan (flat)
+  Audio index: 2000 WAV files
+  Text index:  0 TXT files
+
+  Candidates:     2000
+  Valid stems:    2000
+
+  Audio in-place: 2000/2000 stems indexed (audio at /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/audio)
+  CTC linked:  12000 → /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/workspace/ctc_pretg
+  Ready for MFA pipeline (2000 stems)
+
+  >>> [normalize_punct] Normalize punctuation (ASCII → CJK)
+  Normalized punctuation in 2 files
+
+  >>> [normalize] Normalize numerals (Arabic → Chinese)
+  Normalized numerals in 0 files
+
+  >>> [normalize_en] Normalise English-word fragments in CTC output
+
+============================================================
+  Step 2b: Normalise English tokens
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/normalize_english_tokens.py --txt-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/workspace/ctc_pretg
+============================================================
+
+
+  >>> [resample] Resample to 16kHz for MFA
+  Found 2000 WAVs from manifest (skipping directory scan)
+  Resampled to 16000Hz → /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/workspace/audio_16k  (2000 done, 2000 resampled)
+
+  >>> [adjust] Adjust CTC boundaries (energy-based)
+
+============================================================
+  Step 5: Adjust CTC boundaries (energy-based)
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/adjust_ctc_boundaries.py --ctc-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/workspace/ctc_pretg --audio-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/audio --output-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/workspace/ctc_pretg_adj
+============================================================
+
+
+  >>> [align] MFA align (NVASR corpus + CTC anchors)
+  NVASR corpus: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/workspace/ctc_pretg_adj (.lab files from ASR text)
+  CTC anchors:  /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/workspace/ctc_pretg_adj
+  Transcript and anchors from SAME source → 100% word match
+
+============================================================
+  Step 6: MFA Align (NVASR corpus + CTC anchors)
+============================================================
+
+
+  >>> [postprocess] Post-processing (includes NVV brackets + sp1 normalization)
+
+============================================================
+  Step 7: Post-processing
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/postprocess_textgrids.py --txt-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/workspace/ctc_pretg_adj --textgrid-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/workspace/aligned --output-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/output --filtered-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/workspace/filtered --wav-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/audio --raw-text-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/workspace/ctc_pretg_adj --pinyin-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/fullpinyin_enword.dict --ipa-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/mfa_ipa.dict --merge-max-sil-sec 0.2 --fix-short-word-sec 0.25 --fix-min-silence-sec 0.4 --fix-search-sec 0.5 --bgm-noise-floor-ratio 2.0 --bgm-min-sil-dur 0.3 --bgm-speech-ratio 1.0 --bgm-min-energy 0.01 --filter-short-phone-sec 0.015 --filter-long-word-sec 1.0 --filter-min-word-sec 0.15 --filter-min-word-dur-sec 0.02 --filter-word-energy-ratio 2.0 --filter-min-phone-coverage 0.35 --filter-edge-gap-sec 0.25 --filter-flank-silence-sec 0.4 --filter-long-consonant-sec 999.0 --filter-long-vowel-sec 999.0 --overwrite
+============================================================
+
+  Kept 16kHz audio: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/workspace/audio_16k
+
+############################################################
+  DONE: Success
+  Output: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0001/output
+############################################################
+
+
+  PROCESS batch 2: OK (194.7s)
+
+============================================================
+  PROCESS batch 3/3 (1665 stems)
+  Workspace: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/workspace
+============================================================
+
+Normalised 0/1665 stems
+  Parallel mode: 32 workers for 1665 files (ProcessPool, BLAS=1 per worker)
+
+==================================================
+Total: 1665 files
+  Start adjustments:   4030
+  End extended:        3366
+  End shortened:       1676
+  Punct adjustments:   8197
+Output: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/workspace/ctc_pretg_adj
+<frozen runpy>:128: RuntimeWarning: 'montreal_forced_aligner.command_line.mfa' found in sys.modules after import of package 'montreal_forced_aligner.command_line', but prior to execution of 'montreal_forced_aligner.command_line.mfa'; this may result in unpredictable behaviour
+ INFO     Setting up corpus information...                                      
+ INFO     Loading corpus from source files...                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,665/100  [ 0:00:00 < 0:00:00 , 898 it/s ]
+ INFO     Found 1 speaker across 1665 files, average number of utterances per   
+          speaker: 1665.0                                                       
+ INFO     Initializing multiprocessing jobs...                                  
+ INFO     Normalizing text...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,665/1,665  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Generating MFCCs...                                                   
+  [UPLOAD] batch 1 done (209.5s)
+
+  [UPLOAD] batch 2/3 → /mnt/Raw/ASR_MFA/嘉然 ...
+  [UPLOAD] batch 1 done (133.1s)
+
+############################################################
+  PIPELINE COMPLETE
+  Prefetched: 1/1
+  Processed:  1/1
+  Uploaded:   1/1
+############################################################
+  [W3] [13/13] 花礼 — DONE (0 left)
+  [UPLOAD] batch 2 done (68.9s)
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,665/1,665  [ 0:01:34 < 0:00:00 , 17 it/s ]
+ INFO     Calculating CMVN...                                                   
+ INFO     Generating final features...                                          
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,665/1,665  [ 0:00:03 < 0:00:00 , ? it/s ]
+ INFO     Creating corpus split...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,665/1,665  [ 0:00:01 < 0:00:00 , ? it/s ]
+ WARNING  There were 37 pronunciations in the dictionary that were ignored for  
+          containing one of 37 phones not present in the trained acoustic model.
+          Please run `mfa validate` to get more details.                        
+  Found 26224 valid stems
+MFA Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Streaming Pipeline
+  Batches: 14 × ~2000 stems
+  Local work: /mnt/nvme0/mfa_work/worker_5/Xuehusang
+  NAS output: /mnt/Raw/ASR_MFA/Xuehusang
+############################################################
+
+  [PREFETCH] batch 1/14 (2000 stems) NAS → local ...
+ INFO     Compiling training graphs...                                          
+ INFO     Performing first-pass alignment...                                    
+ INFO     Generating alignments...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1,665/1,665  [ 0:00:06 < 0:00:00 , ? it/s ]
+ INFO     Collecting phone and word alignments from alignment lattices...       
+  97% ━━━━━━━━━━━━━━━━━━━━━━━━━━━  1,608/1,665  [ 0:00:12 < 0:00:01 , 463 it/s ]
+ INFO     Analyzing alignment quality...                                        
+  97% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━  1,608/1,665  [ 0:00:24 < 0:00:01 , 67 it/s ]
+ INFO     Exporting alignment TextGrids to                                      
+          /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/workspace/aligned...     
+  97% ━━━━━━━━━━━━━━━━━━━━━━━━━  1,608/1,665  [ 0:00:02 < 0:00:01 , 1,585 it/s ]
+ INFO     Finished exporting TextGrids to                                       
+          /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/workspace/aligned!       
+ INFO     Done! Everything took 156.863 seconds                                 
+Loading dictionaries...
+  Pinyin dict: 2210 entries
+  IPA dict: 2207 entries
+  IPA→Pinyin phone mappings: 119
+  Tone reference table: /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/output/tone_mapping.json
+  Tone marks: ˥˥->1, ˥->1, ˧˥->2, ˨˩˦->3, ˥˩->4, ˩->5
+  Postprocess parallel: 32 workers for 1608 files (ProcessPool)
+Done. {'ok': 1435, 'filtered_word_in_silence': 167, 'filtered_mid_sp_unexpected_silence_word_in_silence': 1, 'error': 3, 'filtered_mid_sp': 2}. report=/mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/output/postprocess_report.jsonl
+Config: configs/batch_all.yaml
+ctc_ready mode: CTC dir = /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/ctc
+Pipeline mode: ctc_ready
+Using Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Chinese MFA Pipeline  [ctc_ready]
+  Input:  /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/audio
+  Output: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/output
+  Steps:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+############################################################
+
+  >>> [link] Link pre-existing CTC output (ctc_ready mode)
+  CTC dir:   /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/ctc
+  Audio dir: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/audio
+  Scanning CTC directory for .lab files ...
+  CTC presence index: 9991 flat files, 0 nested dirs
+  Found 1665 stems via .lab scan (flat)
+  Audio index: 1665 WAV files
+  Text index:  0 TXT files
+
+  Candidates:     1665
+  Valid stems:    1665
+
+  Audio in-place: 1665/1665 stems indexed (audio at /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/audio)
+  CTC linked:  9990 → /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/workspace/ctc_pretg
+  Ready for MFA pipeline (1665 stems)
+
+  >>> [normalize_punct] Normalize punctuation (ASCII → CJK)
+  Normalized punctuation in 0 files
+
+  >>> [normalize] Normalize numerals (Arabic → Chinese)
+  Normalized numerals in 0 files
+
+  >>> [normalize_en] Normalise English-word fragments in CTC output
+
+============================================================
+  Step 2b: Normalise English tokens
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/normalize_english_tokens.py --txt-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/workspace/ctc_pretg
+============================================================
+
+
+  >>> [resample] Resample to 16kHz for MFA
+  Found 1665 WAVs from manifest (skipping directory scan)
+  Resampled to 16000Hz → /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/workspace/audio_16k  (1665 done, 1665 resampled)
+
+  >>> [adjust] Adjust CTC boundaries (energy-based)
+
+============================================================
+  Step 5: Adjust CTC boundaries (energy-based)
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/adjust_ctc_boundaries.py --ctc-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/workspace/ctc_pretg --audio-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/audio --output-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/workspace/ctc_pretg_adj
+============================================================
+
+
+  >>> [align] MFA align (NVASR corpus + CTC anchors)
+  NVASR corpus: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/workspace/ctc_pretg_adj (.lab files from ASR text)
+  CTC anchors:  /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/workspace/ctc_pretg_adj
+  Transcript and anchors from SAME source → 100% word match
+
+============================================================
+  Step 6: MFA Align (NVASR corpus + CTC anchors)
+============================================================
+
+
+  >>> [postprocess] Post-processing (includes NVV brackets + sp1 normalization)
+
+============================================================
+  Step 7: Post-processing
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/postprocess_textgrids.py --txt-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/workspace/ctc_pretg_adj --textgrid-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/workspace/aligned --output-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/output --filtered-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/workspace/filtered --wav-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/audio --raw-text-dir /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/workspace/ctc_pretg_adj --pinyin-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/fullpinyin_enword.dict --ipa-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/mfa_ipa.dict --merge-max-sil-sec 0.2 --fix-short-word-sec 0.25 --fix-min-silence-sec 0.4 --fix-search-sec 0.5 --bgm-noise-floor-ratio 2.0 --bgm-min-sil-dur 0.3 --bgm-speech-ratio 1.0 --bgm-min-energy 0.01 --filter-short-phone-sec 0.015 --filter-long-word-sec 1.0 --filter-min-word-sec 0.15 --filter-min-word-dur-sec 0.02 --filter-word-energy-ratio 2.0 --filter-min-phone-coverage 0.35 --filter-edge-gap-sec 0.25 --filter-flank-silence-sec 0.4 --filter-long-consonant-sec 999.0 --filter-long-vowel-sec 999.0 --overwrite
+============================================================
+
+  Kept 16kHz audio: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/workspace/audio_16k
+
+############################################################
+  DONE: Success
+  Output: /mnt/nvme0/mfa_work/worker_2/嘉然/batch_0002/output
+############################################################
+
+
+  PROCESS batch 3: OK (168.7s)
+
+  [UPLOAD] batch 3/3 → /mnt/Raw/ASR_MFA/嘉然 ...
+  [PREFETCH] batch 1 done (109.4s, 2000 stems)
+
+  [PREFETCH] batch 2/14 (2000 stems) NAS → local ...
+
+============================================================
+  PROCESS batch 1/14 (2000 stems)
+  Workspace: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/workspace
+============================================================
+
+Normalised 0/2000 stems
+  Parallel mode: 32 workers for 2000 files (ProcessPool, BLAS=1 per worker)
+  ... 2000/2000 files adjusted
+
+==================================================
+Total: 2000 files
+  Start adjustments:   2083
+  End extended:        892
+  End shortened:       157
+  Punct adjustments:   1802
+Output: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/workspace/ctc_pretg_adj
+<frozen runpy>:128: RuntimeWarning: 'montreal_forced_aligner.command_line.mfa' found in sys.modules after import of package 'montreal_forced_aligner.command_line', but prior to execution of 'montreal_forced_aligner.command_line.mfa'; this may result in unpredictable behaviour
+ INFO     Setting up corpus information...                                      
+ INFO     Loading corpus from source files...                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/100  [ 0:00:00 < 0:00:00 , 1,067 it/s ]
+ INFO     Found 1 speaker across 2000 files, average number of utterances per   
+          speaker: 2000.0                                                       
+ INFO     Initializing multiprocessing jobs...                                  
+ INFO     Normalizing text...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Generating MFCCs...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:55 < 0:00:00 , 37 it/s ]
+ INFO     Calculating CMVN...                                                   
+ INFO     Generating final features...                                          
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:02 < 0:00:00 , ? it/s ]
+ INFO     Creating corpus split...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:01 < 0:00:00 , ? it/s ]
+ WARNING  There were 37 pronunciations in the dictionary that were ignored for  
+          containing one of 37 phones not present in the trained acoustic model.
+          Please run `mfa validate` to get more details.                        
+ INFO     Compiling training graphs...                                          
+ INFO     Performing first-pass alignment...                                    
+ INFO     Generating alignments...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:03 < 0:00:00 , ? it/s ]
+ INFO     Collecting phone and word alignments from alignment lattices...       
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:08 < 0:00:00 , ? it/s ]
+ INFO     Analyzing alignment quality...                                        
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:16 < 0:00:00 , 121 it/s ]
+ INFO     Exporting alignment TextGrids to                                      
+          /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/workspace/aligned...
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:02 < 0:00:00 , 1,966 it/s ]
+ INFO     Finished exporting TextGrids to                                       
+          /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/workspace/aligned!  
+ INFO     Done! Everything took 99.625 seconds                                  
+Loading dictionaries...
+  Pinyin dict: 2210 entries
+  IPA dict: 2207 entries
+  IPA→Pinyin phone mappings: 119
+  Tone reference table: /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/output/tone_mapping.json
+  Tone marks: ˥˥->1, ˥->1, ˧˥->2, ˨˩˦->3, ˥˩->4, ˩->5
+  Postprocess parallel: 32 workers for 2000 files (ProcessPool)
+Done. {'ok': 1957, 'filtered_bgm_suspect': 9, 'filtered_word_in_silence': 32, 'filtered_mid_sp_unexpected_silence': 2}. report=/mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/output/postprocess_report.jsonl
+Config: configs/batch_all.yaml
+ctc_ready mode: CTC dir = /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/ctc
+Pipeline mode: ctc_ready
+Using Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Chinese MFA Pipeline  [ctc_ready]
+  Input:  /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/audio
+  Output: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/output
+  Steps:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+############################################################
+
+  >>> [link] Link pre-existing CTC output (ctc_ready mode)
+  CTC dir:   /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/ctc
+  Audio dir: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/audio
+  Scanning CTC directory for .lab files ...
+  CTC presence index: 12001 flat files, 0 nested dirs
+  Found 2000 stems via .lab scan (flat)
+  Audio index: 2000 WAV files
+  Text index:  0 TXT files
+
+  Candidates:     2000
+  Valid stems:    2000
+
+  Audio in-place: 2000/2000 stems indexed (audio at /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/audio)
+  CTC linked:  12000 → /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/workspace/ctc_pretg
+  Ready for MFA pipeline (2000 stems)
+
+  >>> [normalize_punct] Normalize punctuation (ASCII → CJK)
+  Normalized punctuation in 15 files
+
+  >>> [normalize] Normalize numerals (Arabic → Chinese)
+  Normalized numerals in 0 files
+
+  >>> [normalize_en] Normalise English-word fragments in CTC output
+
+============================================================
+  Step 2b: Normalise English tokens
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/normalize_english_tokens.py --txt-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/workspace/ctc_pretg
+============================================================
+
+
+  >>> [resample] Resample to 16kHz for MFA
+  Found 2000 WAVs from manifest (skipping directory scan)
+  Resampled to 16000Hz → /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/workspace/audio_16k  (2000 done, 2000 resampled)
+
+  >>> [adjust] Adjust CTC boundaries (energy-based)
+
+============================================================
+  Step 5: Adjust CTC boundaries (energy-based)
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/adjust_ctc_boundaries.py --ctc-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/workspace/ctc_pretg --audio-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/audio --output-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/workspace/ctc_pretg_adj
+============================================================
+
+
+  >>> [align] MFA align (NVASR corpus + CTC anchors)
+  NVASR corpus: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/workspace/ctc_pretg_adj (.lab files from ASR text)
+  CTC anchors:  /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/workspace/ctc_pretg_adj
+  Transcript and anchors from SAME source → 100% word match
+
+============================================================
+  Step 6: MFA Align (NVASR corpus + CTC anchors)
+============================================================
+
+
+  >>> [postprocess] Post-processing (includes NVV brackets + sp1 normalization)
+
+============================================================
+  Step 7: Post-processing
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/postprocess_textgrids.py --txt-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/workspace/ctc_pretg_adj --textgrid-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/workspace/aligned --output-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/output --filtered-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/workspace/filtered --wav-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/audio --raw-text-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/workspace/ctc_pretg_adj --pinyin-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/fullpinyin_enword.dict --ipa-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/mfa_ipa.dict --merge-max-sil-sec 0.2 --fix-short-word-sec 0.25 --fix-min-silence-sec 0.4 --fix-search-sec 0.5 --bgm-noise-floor-ratio 2.0 --bgm-min-sil-dur 0.3 --bgm-speech-ratio 1.0 --bgm-min-energy 0.01 --filter-short-phone-sec 0.015 --filter-long-word-sec 1.0 --filter-min-word-sec 0.15 --filter-min-word-dur-sec 0.02 --filter-word-energy-ratio 2.0 --filter-min-phone-coverage 0.35 --filter-edge-gap-sec 0.25 --filter-flank-silence-sec 0.4 --filter-long-consonant-sec 999.0 --filter-long-vowel-sec 999.0 --overwrite
+============================================================
+
+  Kept 16kHz audio: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/workspace/audio_16k
+
+############################################################
+  DONE: Success
+  Output: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0000/output
+############################################################
+
+
+  PROCESS batch 1: OK (110.9s)
+
+  [UPLOAD] batch 1/14 → /mnt/Raw/ASR_MFA/Xuehusang ...
+  [UPLOAD] batch 3 done (232.9s)
+
+############################################################
+  PIPELINE COMPLETE
+  Prefetched: 3/3
+  Processed:  3/3
+  Uploaded:   3/3
+############################################################
+  [W2] [9/13] 嘉然 — DONE (0 left)
+  [PREFETCH] batch 2 done (225.4s, 2000 stems)
+
+  [PREFETCH] batch 3/14 (2000 stems) NAS → local ...
+
+============================================================
+  PROCESS batch 2/14 (2000 stems)
+  Workspace: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/workspace
+============================================================
+
+Normalised 0/2000 stems
+  Parallel mode: 32 workers for 2000 files (ProcessPool, BLAS=1 per worker)
+  ... 2000/2000 files adjusted
+
+==================================================
+Total: 2000 files
+  Start adjustments:   2147
+  End extended:        872
+  End shortened:       174
+  Punct adjustments:   1811
+Output: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/workspace/ctc_pretg_adj
+<frozen runpy>:128: RuntimeWarning: 'montreal_forced_aligner.command_line.mfa' found in sys.modules after import of package 'montreal_forced_aligner.command_line', but prior to execution of 'montreal_forced_aligner.command_line.mfa'; this may result in unpredictable behaviour
+ INFO     Setting up corpus information...                                      
+ INFO     Loading corpus from source files...                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/100  [ 0:00:00 < 0:00:00 , 1,006 it/s ]
+ INFO     Found 1 speaker across 2000 files, average number of utterances per   
+          speaker: 2000.0                                                       
+ INFO     Initializing multiprocessing jobs...                                  
+ INFO     Normalizing text...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Generating MFCCs...                                                   
+  Found 32912 valid stems
+MFA Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Streaming Pipeline
+  Batches: 17 × ~2000 stems
+  Local work: /mnt/nvme0/mfa_work/worker_4/Wumi
+  NAS output: /mnt/Raw/ASR_MFA/Wumi
+############################################################
+
+  [PREFETCH] batch 1/17 (2000 stems) NAS → local ...
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:55 < 0:00:00 , 37 it/s ]
+ INFO     Calculating CMVN...                                                   
+ INFO     Generating final features...                                          
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:02 < 0:00:00 , ? it/s ]
+ INFO     Creating corpus split...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:01 < 0:00:00 , ? it/s ]
+ WARNING  There were 37 pronunciations in the dictionary that were ignored for  
+          containing one of 37 phones not present in the trained acoustic model.
+          Please run `mfa validate` to get more details.                        
+ INFO     Compiling training graphs...                                          
+ INFO     Performing first-pass alignment...                                    
+ INFO     Generating alignments...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:02 < 0:00:00 , ? it/s ]
+ INFO     Collecting phone and word alignments from alignment lattices...       
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸ 1,999/2,000  [ 0:00:09 < -:--:-- , ? it/s ]
+ INFO     Analyzing alignment quality...                                        
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━╸ 1,999/2,000  [ 0:00:16 < 0:00:01 , 123 it/s ]
+ INFO     Exporting alignment TextGrids to                                      
+          /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/workspace/aligned...
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━╸ 1,999/2,000  [ 0:00:02 < 0:00:01 , 1,965 it/s ]
+ INFO     Finished exporting TextGrids to                                       
+          /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/workspace/aligned!  
+ INFO     Done! Everything took 99.898 seconds                                  
+Loading dictionaries...
+  Pinyin dict: 2210 entries
+  IPA dict: 2207 entries
+  IPA→Pinyin phone mappings: 119
+  Tone reference table: /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/output/tone_mapping.json
+  Tone marks: ˥->1, ˥˥->1, ˧˥->2, ˨˩˦->3, ˥˩->4, ˩->5
+  Postprocess parallel: 32 workers for 1999 files (ProcessPool)
+Done. {'ok': 1966, 'filtered_word_in_silence': 26, 'filtered_bgm_suspect': 5, 'error': 1, 'filtered_mid_sp_unexpected_silence': 1}. report=/mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/output/postprocess_report.jsonl
+Config: configs/batch_all.yaml
+ctc_ready mode: CTC dir = /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/ctc
+Pipeline mode: ctc_ready
+Using Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Chinese MFA Pipeline  [ctc_ready]
+  Input:  /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/audio
+  Output: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/output
+  Steps:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+############################################################
+
+  >>> [link] Link pre-existing CTC output (ctc_ready mode)
+  CTC dir:   /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/ctc
+  Audio dir: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/audio
+  Scanning CTC directory for .lab files ...
+  CTC presence index: 12001 flat files, 0 nested dirs
+  Found 2000 stems via .lab scan (flat)
+  Audio index: 2000 WAV files
+  Text index:  0 TXT files
+
+  Candidates:     2000
+  Valid stems:    2000
+
+  Audio in-place: 2000/2000 stems indexed (audio at /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/audio)
+  CTC linked:  12000 → /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/workspace/ctc_pretg
+  Ready for MFA pipeline (2000 stems)
+
+  >>> [normalize_punct] Normalize punctuation (ASCII → CJK)
+  Normalized punctuation in 7 files
+
+  >>> [normalize] Normalize numerals (Arabic → Chinese)
+  Normalized numerals in 0 files
+
+  >>> [normalize_en] Normalise English-word fragments in CTC output
+
+============================================================
+  Step 2b: Normalise English tokens
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/normalize_english_tokens.py --txt-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/workspace/ctc_pretg
+============================================================
+
+
+  >>> [resample] Resample to 16kHz for MFA
+  Found 2000 WAVs from manifest (skipping directory scan)
+  Resampled to 16000Hz → /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/workspace/audio_16k  (2000 done, 2000 resampled)
+
+  >>> [adjust] Adjust CTC boundaries (energy-based)
+
+============================================================
+  Step 5: Adjust CTC boundaries (energy-based)
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/adjust_ctc_boundaries.py --ctc-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/workspace/ctc_pretg --audio-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/audio --output-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/workspace/ctc_pretg_adj
+============================================================
+
+
+  >>> [align] MFA align (NVASR corpus + CTC anchors)
+  NVASR corpus: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/workspace/ctc_pretg_adj (.lab files from ASR text)
+  CTC anchors:  /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/workspace/ctc_pretg_adj
+  Transcript and anchors from SAME source → 100% word match
+
+============================================================
+  Step 6: MFA Align (NVASR corpus + CTC anchors)
+============================================================
+
+
+  >>> [postprocess] Post-processing (includes NVV brackets + sp1 normalization)
+
+============================================================
+  Step 7: Post-processing
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/postprocess_textgrids.py --txt-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/workspace/ctc_pretg_adj --textgrid-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/workspace/aligned --output-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/output --filtered-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/workspace/filtered --wav-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/audio --raw-text-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/workspace/ctc_pretg_adj --pinyin-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/fullpinyin_enword.dict --ipa-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/mfa_ipa.dict --merge-max-sil-sec 0.2 --fix-short-word-sec 0.25 --fix-min-silence-sec 0.4 --fix-search-sec 0.5 --bgm-noise-floor-ratio 2.0 --bgm-min-sil-dur 0.3 --bgm-speech-ratio 1.0 --bgm-min-energy 0.01 --filter-short-phone-sec 0.015 --filter-long-word-sec 1.0 --filter-min-word-sec 0.15 --filter-min-word-dur-sec 0.02 --filter-word-energy-ratio 2.0 --filter-min-phone-coverage 0.35 --filter-edge-gap-sec 0.25 --filter-flank-silence-sec 0.4 --filter-long-consonant-sec 999.0 --filter-long-vowel-sec 999.0 --overwrite
+============================================================
+
+  Kept 16kHz audio: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/workspace/audio_16k
+
+############################################################
+  DONE: Success
+  Output: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0001/output
+############################################################
+
+
+  PROCESS batch 2: OK (111.4s)
+  rsync timed out after 300s — falling back to file-by-file copy
+  [PREFETCH] batch 3 done (261.8s, 2000 stems)
+
+  [PREFETCH] batch 4/14 (2000 stems) NAS → local ...
+
+============================================================
+  PROCESS batch 3/14 (2000 stems)
+  Workspace: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/workspace
+============================================================
+
+Normalised 0/2000 stems
+  Parallel mode: 32 workers for 2000 files (ProcessPool, BLAS=1 per worker)
+  ... 2000/2000 files adjusted
+
+==================================================
+Total: 2000 files
+  Start adjustments:   2034
+  End extended:        875
+  End shortened:       151
+  Punct adjustments:   1735
+Output: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/workspace/ctc_pretg_adj
+<frozen runpy>:128: RuntimeWarning: 'montreal_forced_aligner.command_line.mfa' found in sys.modules after import of package 'montreal_forced_aligner.command_line', but prior to execution of 'montreal_forced_aligner.command_line.mfa'; this may result in unpredictable behaviour
+ INFO     Setting up corpus information...                                      
+ INFO     Loading corpus from source files...                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/100  [ 0:00:00 < 0:00:00 , 1,033 it/s ]
+ INFO     Found 1 speaker across 2000 files, average number of utterances per   
+          speaker: 2000.0                                                       
+ INFO     Initializing multiprocessing jobs...                                  
+ INFO     Normalizing text...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Generating MFCCs...                                                   
+  [PREFETCH] batch 1 done (241.4s, 2000 stems)
+
+  [PREFETCH] batch 2/17 (2000 stems) NAS → local ...
+
+============================================================
+  PROCESS batch 1/17 (2000 stems)
+  Workspace: /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/workspace
+============================================================
+
+Normalised 0/2000 stems
+  Parallel mode: 32 workers for 2000 files (ProcessPool, BLAS=1 per worker)
+  ... 2000/2000 files adjusted
+
+==================================================
+Total: 2000 files
+  Start adjustments:   2507
+  End extended:        753
+  End shortened:       270
+  Punct adjustments:   1976
+Output: /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/workspace/ctc_pretg_adj
+<frozen runpy>:128: RuntimeWarning: 'montreal_forced_aligner.command_line.mfa' found in sys.modules after import of package 'montreal_forced_aligner.command_line', but prior to execution of 'montreal_forced_aligner.command_line.mfa'; this may result in unpredictable behaviour
+ INFO     Setting up corpus information...                                      
+ INFO     Loading corpus from source files...                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/100  [ 0:00:00 < 0:00:00 , 1,059 it/s ]
+ INFO     Found 1 speaker across 2000 files, average number of utterances per   
+          speaker: 2000.0                                                       
+ INFO     Initializing multiprocessing jobs...                                  
+ INFO     Normalizing text...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Generating MFCCs...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:52 < 0:00:00 , 38 it/s ]
+ INFO     Calculating CMVN...                                                   
+ INFO     Generating final features...                                          
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:02 < 0:00:00 , ? it/s ]
+ INFO     Creating corpus split...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:01 < 0:00:00 , ? it/s ]
+ WARNING  There were 37 pronunciations in the dictionary that were ignored for  
+          containing one of 37 phones not present in the trained acoustic model.
+          Please run `mfa validate` to get more details.                        
+ INFO     Compiling training graphs...                                          
+ INFO     Performing first-pass alignment...                                    
+ INFO     Generating alignments...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:03 < 0:00:00 , ? it/s ]
+ INFO     Collecting phone and word alignments from alignment lattices...       
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:08 < 0:00:00 , ? it/s ]
+ INFO     Analyzing alignment quality...                                        
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:16 < 0:00:00 , 121 it/s ]
+ INFO     Exporting alignment TextGrids to                                      
+          /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/workspace/aligned...
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:54 < 0:00:00 , 37 it/s ]
+ INFO     Calculating CMVN...                                                   
+ INFO     Generating final features...                                          
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:02 < 0:00:00 , 1,966 it/s ]
+ INFO     Finished exporting TextGrids to                                       
+          /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/workspace/aligned!  
+ INFO     Done! Everything took 96.130 seconds                                  
+Loading dictionaries...
+  Pinyin dict: 2210 entries
+  IPA dict: 2207 entries
+  IPA→Pinyin phone mappings: 119
+  Tone reference table: /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/output/tone_mapping.json
+  Tone marks: ˥˥->1, ˥->1, ˧˥->2, ˨˩˦->3, ˥˩->4, ˩->5
+  Postprocess parallel: 32 workers for 2000 files (ProcessPool)
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:02 < 0:00:00 , ? it/s ]
+ INFO     Creating corpus split...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:01 < 0:00:00 , ? it/s ]
+ WARNING  There were 37 pronunciations in the dictionary that were ignored for  
+          containing one of 37 phones not present in the trained acoustic model.
+          Please run `mfa validate` to get more details.                        
+Done. {'ok': 1958, 'filtered_word_in_silence': 37, 'filtered_bgm_suspect': 4, 'filtered_mid_sp_unexpected_silence': 1}. report=/mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/output/postprocess_report.jsonl
+ INFO     Compiling training graphs...                                          
+Config: configs/batch_all.yaml
+ctc_ready mode: CTC dir = /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/ctc
+Pipeline mode: ctc_ready
+Using Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Chinese MFA Pipeline  [ctc_ready]
+  Input:  /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/audio
+  Output: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/output
+  Steps:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+############################################################
+
+  >>> [link] Link pre-existing CTC output (ctc_ready mode)
+  CTC dir:   /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/ctc
+  Audio dir: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/audio
+  Scanning CTC directory for .lab files ...
+  CTC presence index: 12001 flat files, 0 nested dirs
+  Found 2000 stems via .lab scan (flat)
+  Audio index: 2000 WAV files
+  Text index:  0 TXT files
+
+  Candidates:     2000
+  Valid stems:    2000
+
+  Audio in-place: 2000/2000 stems indexed (audio at /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/audio)
+  CTC linked:  12000 → /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/workspace/ctc_pretg
+  Ready for MFA pipeline (2000 stems)
+
+  >>> [normalize_punct] Normalize punctuation (ASCII → CJK)
+  Normalized punctuation in 10 files
+
+  >>> [normalize] Normalize numerals (Arabic → Chinese)
+  Normalized numerals in 0 files
+
+  >>> [normalize_en] Normalise English-word fragments in CTC output
+
+============================================================
+  Step 2b: Normalise English tokens
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/normalize_english_tokens.py --txt-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/workspace/ctc_pretg
+============================================================
+
+
+  >>> [resample] Resample to 16kHz for MFA
+  Found 2000 WAVs from manifest (skipping directory scan)
+  Resampled to 16000Hz → /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/workspace/audio_16k  (2000 done, 2000 resampled)
+
+  >>> [adjust] Adjust CTC boundaries (energy-based)
+
+============================================================
+  Step 5: Adjust CTC boundaries (energy-based)
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/adjust_ctc_boundaries.py --ctc-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/workspace/ctc_pretg --audio-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/audio --output-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/workspace/ctc_pretg_adj
+============================================================
+
+
+  >>> [align] MFA align (NVASR corpus + CTC anchors)
+  NVASR corpus: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/workspace/ctc_pretg_adj (.lab files from ASR text)
+  CTC anchors:  /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/workspace/ctc_pretg_adj
+  Transcript and anchors from SAME source → 100% word match
+
+============================================================
+  Step 6: MFA Align (NVASR corpus + CTC anchors)
+============================================================
+
+
+  >>> [postprocess] Post-processing (includes NVV brackets + sp1 normalization)
+
+============================================================
+  Step 7: Post-processing
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/postprocess_textgrids.py --txt-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/workspace/ctc_pretg_adj --textgrid-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/workspace/aligned --output-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/output --filtered-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/workspace/filtered --wav-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/audio --raw-text-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/workspace/ctc_pretg_adj --pinyin-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/fullpinyin_enword.dict --ipa-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/mfa_ipa.dict --merge-max-sil-sec 0.2 --fix-short-word-sec 0.25 --fix-min-silence-sec 0.4 --fix-search-sec 0.5 --bgm-noise-floor-ratio 2.0 --bgm-min-sil-dur 0.3 --bgm-speech-ratio 1.0 --bgm-min-energy 0.01 --filter-short-phone-sec 0.015 --filter-long-word-sec 1.0 --filter-min-word-sec 0.15 --filter-min-word-dur-sec 0.02 --filter-word-energy-ratio 2.0 --filter-min-phone-coverage 0.35 --filter-edge-gap-sec 0.25 --filter-flank-silence-sec 0.4 --filter-long-consonant-sec 999.0 --filter-long-vowel-sec 999.0 --overwrite
+============================================================
+
+  Kept 16kHz audio: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/workspace/audio_16k
+
+############################################################
+  DONE: Success
+  Output: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0002/output
+############################################################
+
+
+  PROCESS batch 3: OK (108.2s)
+ INFO     Performing first-pass alignment...                                    
+ INFO     Generating alignments...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:03 < 0:00:00 , ? it/s ]
+ INFO     Collecting phone and word alignments from alignment lattices...       
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸ 1,995/2,000  [ 0:00:10 < -:--:-- , ? it/s ]
+ INFO     Analyzing alignment quality...                                        
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━╸ 1,995/2,000  [ 0:00:20 < 0:00:01 , 102 it/s ]
+ INFO     Exporting alignment TextGrids to                                      
+          /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/workspace/aligned...     
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━╸ 1,995/2,000  [ 0:00:02 < 0:00:01 , 1,962 it/s ]
+ INFO     Finished exporting TextGrids to                                       
+          /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/workspace/aligned!       
+ INFO     Done! Everything took 104.592 seconds                                 
+Loading dictionaries...
+  Pinyin dict: 2210 entries
+  IPA dict: 2207 entries
+  IPA→Pinyin phone mappings: 119
+  Tone reference table: /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/output/tone_mapping.json
+  Tone marks: ˥->1, ˥˥->1, ˧˥->2, ˨˩˦->3, ˥˩->4, ˩->5
+  Postprocess parallel: 32 workers for 1995 files (ProcessPool)
+Done. {'ok': 1913, 'filtered_word_in_silence': 80, 'filtered_sp3': 1, 'filtered_bgm_suspect': 1}. report=/mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/output/postprocess_report.jsonl
+Config: configs/batch_all.yaml
+ctc_ready mode: CTC dir = /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/ctc
+Pipeline mode: ctc_ready
+Using Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Chinese MFA Pipeline  [ctc_ready]
+  Input:  /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/audio
+  Output: /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/output
+  Steps:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+############################################################
+
+  >>> [link] Link pre-existing CTC output (ctc_ready mode)
+  CTC dir:   /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/ctc
+  Audio dir: /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/audio
+  Scanning CTC directory for .lab files ...
+  CTC presence index: 12001 flat files, 0 nested dirs
+  Found 2000 stems via .lab scan (flat)
+  Audio index: 2000 WAV files
+  Text index:  0 TXT files
+
+  Candidates:     2000
+  Valid stems:    2000
+
+  Audio in-place: 2000/2000 stems indexed (audio at /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/audio)
+  CTC linked:  12000 → /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/workspace/ctc_pretg
+  Ready for MFA pipeline (2000 stems)
+
+  >>> [normalize_punct] Normalize punctuation (ASCII → CJK)
+  Normalized punctuation in 0 files
+
+  >>> [normalize] Normalize numerals (Arabic → Chinese)
+  Normalized numerals in 0 files
+
+  >>> [normalize_en] Normalise English-word fragments in CTC output
+
+============================================================
+  Step 2b: Normalise English tokens
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/normalize_english_tokens.py --txt-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/workspace/ctc_pretg
+============================================================
+
+
+  >>> [resample] Resample to 16kHz for MFA
+  Found 2000 WAVs from manifest (skipping directory scan)
+  Resampled to 16000Hz → /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/workspace/audio_16k  (2000 done, 2000 resampled)
+
+  >>> [adjust] Adjust CTC boundaries (energy-based)
+
+============================================================
+  Step 5: Adjust CTC boundaries (energy-based)
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/adjust_ctc_boundaries.py --ctc-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/workspace/ctc_pretg --audio-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/audio --output-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/workspace/ctc_pretg_adj
+============================================================
+
+
+  >>> [align] MFA align (NVASR corpus + CTC anchors)
+  NVASR corpus: /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/workspace/ctc_pretg_adj (.lab files from ASR text)
+  CTC anchors:  /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/workspace/ctc_pretg_adj
+  Transcript and anchors from SAME source → 100% word match
+
+============================================================
+  Step 6: MFA Align (NVASR corpus + CTC anchors)
+============================================================
+
+
+  >>> [postprocess] Post-processing (includes NVV brackets + sp1 normalization)
+
+============================================================
+  Step 7: Post-processing
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/postprocess_textgrids.py --txt-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/workspace/ctc_pretg_adj --textgrid-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/workspace/aligned --output-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/output --filtered-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/workspace/filtered --wav-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/audio --raw-text-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/workspace/ctc_pretg_adj --pinyin-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/fullpinyin_enword.dict --ipa-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/mfa_ipa.dict --merge-max-sil-sec 0.2 --fix-short-word-sec 0.25 --fix-min-silence-sec 0.4 --fix-search-sec 0.5 --bgm-noise-floor-ratio 2.0 --bgm-min-sil-dur 0.3 --bgm-speech-ratio 1.0 --bgm-min-energy 0.01 --filter-short-phone-sec 0.015 --filter-long-word-sec 1.0 --filter-min-word-sec 0.15 --filter-min-word-dur-sec 0.02 --filter-word-energy-ratio 2.0 --filter-min-phone-coverage 0.35 --filter-edge-gap-sec 0.25 --filter-flank-silence-sec 0.4 --filter-long-consonant-sec 999.0 --filter-long-vowel-sec 999.0 --overwrite
+============================================================
+
+  Kept 16kHz audio: /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/workspace/audio_16k
+
+############################################################
+  DONE: Success
+  Output: /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0000/output
+############################################################
+
+
+  PROCESS batch 1: OK (117.1s)
+
+  [UPLOAD] batch 1/17 → /mnt/Raw/ASR_MFA/Wumi ...
+  [PREFETCH] batch 4 done (225.1s, 2000 stems)
+
+  [PREFETCH] batch 5/14 (2000 stems) NAS → local ...
+============================================================
+  PROCESS batch 4/14 (2000 stems)
+
+  Workspace: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/workspace
+============================================================
+
+Normalised 0/2000 stems
+  Parallel mode: 32 workers for 2000 files (ProcessPool, BLAS=1 per worker)
+  ... 2000/2000 files adjusted
+
+==================================================
+Total: 2000 files
+  Start adjustments:   2036
+  End extended:        816
+  End shortened:       168
+  Punct adjustments:   1709
+Output: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/workspace/ctc_pretg_adj
+<frozen runpy>:128: RuntimeWarning: 'montreal_forced_aligner.command_line.mfa' found in sys.modules after import of package 'montreal_forced_aligner.command_line', but prior to execution of 'montreal_forced_aligner.command_line.mfa'; this may result in unpredictable behaviour
+ INFO     Setting up corpus information...                                      
+ INFO     Loading corpus from source files...                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/100  [ 0:00:00 < 0:00:00 , 1,008 it/s ]
+ INFO     Found 1 speaker across 2000 files, average number of utterances per   
+          speaker: 2000.0                                                       
+ INFO     Initializing multiprocessing jobs...                                  
+ INFO     Normalizing text...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Generating MFCCs...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:54 < 0:00:00 , 38 it/s ]
+ INFO     Calculating CMVN...                                                   
+ INFO     Generating final features...                                          
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:02 < 0:00:00 , ? it/s ]
+ INFO     Creating corpus split...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:01 < 0:00:00 , ? it/s ]
+ WARNING  There were 37 pronunciations in the dictionary that were ignored for  
+          containing one of 37 phones not present in the trained acoustic model.
+          Please run `mfa validate` to get more details.                        
+  [PREFETCH] batch 2 done (262.2s, 2000 stems)
+
+  [PREFETCH] batch 3/17 (2000 stems) NAS → local ...
+
+============================================================
+  PROCESS batch 2/17 (2000 stems)
+  Workspace: /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/workspace
+============================================================
+ INFO     Compiling training graphs...                                          
+
+Normalised 0/2000 stems
+ INFO     Performing first-pass alignment...                                    
+ INFO     Generating alignments...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:02 < 0:00:00 , ? it/s ]
+ INFO     Collecting phone and word alignments from alignment lattices...       
+  Parallel mode: 32 workers for 2000 files (ProcessPool, BLAS=1 per worker)
+  ... 2000/2000 files adjusted
+
+==================================================
+Total: 2000 files
+  Start adjustments:   2644
+  End extended:        749
+  End shortened:       305
+  Punct adjustments:   2086
+Output: /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/workspace/ctc_pretg_adj
+<frozen runpy>:128: RuntimeWarning: 'montreal_forced_aligner.command_line.mfa' found in sys.modules after import of package 'montreal_forced_aligner.command_line', but prior to execution of 'montreal_forced_aligner.command_line.mfa'; this may result in unpredictable behaviour
+ INFO     Setting up corpus information...                                      
+ INFO     Loading corpus from source files...                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/100  [ 0:00:00 < 0:00:00 , 1,047 it/s ]
+ INFO     Found 1 speaker across 2000 files, average number of utterances per   
+          speaker: 2000.0                                                       
+ INFO     Initializing multiprocessing jobs...                                  
+ INFO     Normalizing text...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸ 1,999/2,000  [ 0:00:06 < -:--:-- , ? it/s ]
+ INFO     Analyzing alignment quality...                                        
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:01 < 0:00:00 , ? it/s ]
+ INFO     Generating MFCCs...                                                   
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━╸ 1,999/2,000  [ 0:00:15 < 0:00:01 , 124 it/s ]
+ INFO     Exporting alignment TextGrids to                                      
+          /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/workspace/aligned...
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━╸ 1,999/2,000  [ 0:00:02 < 0:00:01 , 1,965 it/s ]
+ INFO     Finished exporting TextGrids to                                       
+          /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/workspace/aligned!  
+ INFO     Done! Everything took 94.969 seconds                                  
+Loading dictionaries...
+  Pinyin dict: 2210 entries
+  IPA dict: 2207 entries
+  IPA→Pinyin phone mappings: 119
+  Tone reference table: /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/output/tone_mapping.json
+  Tone marks: ˥->1, ˥˥->1, ˧˥->2, ˨˩˦->3, ˥˩->4, ˩->5
+  Postprocess parallel: 32 workers for 1999 files (ProcessPool)
+Done. {'ok': 1967, 'filtered_word_in_silence': 25, 'filtered_bgm_suspect': 5, 'error': 2}. report=/mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/output/postprocess_report.jsonl
+Config: configs/batch_all.yaml
+ctc_ready mode: CTC dir = /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/ctc
+Pipeline mode: ctc_ready
+Using Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Chinese MFA Pipeline  [ctc_ready]
+  Input:  /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/audio
+  Output: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/output
+  Steps:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+############################################################
+
+  >>> [link] Link pre-existing CTC output (ctc_ready mode)
+  CTC dir:   /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/ctc
+  Audio dir: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/audio
+  Scanning CTC directory for .lab files ...
+  CTC presence index: 12001 flat files, 0 nested dirs
+  Found 2000 stems via .lab scan (flat)
+  Audio index: 2000 WAV files
+  Text index:  0 TXT files
+
+  Candidates:     2000
+  Valid stems:    2000
+
+  Audio in-place: 2000/2000 stems indexed (audio at /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/audio)
+  CTC linked:  12000 → /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/workspace/ctc_pretg
+  Ready for MFA pipeline (2000 stems)
+
+  >>> [normalize_punct] Normalize punctuation (ASCII → CJK)
+  Normalized punctuation in 13 files
+
+  >>> [normalize] Normalize numerals (Arabic → Chinese)
+  Normalized numerals in 0 files
+
+  >>> [normalize_en] Normalise English-word fragments in CTC output
+
+============================================================
+  Step 2b: Normalise English tokens
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/normalize_english_tokens.py --txt-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/workspace/ctc_pretg
+============================================================
+
+
+  >>> [resample] Resample to 16kHz for MFA
+  Found 2000 WAVs from manifest (skipping directory scan)
+  Resampled to 16000Hz → /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/workspace/audio_16k  (2000 done, 2000 resampled)
+
+  >>> [adjust] Adjust CTC boundaries (energy-based)
+
+============================================================
+  Step 5: Adjust CTC boundaries (energy-based)
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/adjust_ctc_boundaries.py --ctc-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/workspace/ctc_pretg --audio-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/audio --output-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/workspace/ctc_pretg_adj
+============================================================
+
+
+  >>> [align] MFA align (NVASR corpus + CTC anchors)
+  NVASR corpus: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/workspace/ctc_pretg_adj (.lab files from ASR text)
+  CTC anchors:  /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/workspace/ctc_pretg_adj
+  Transcript and anchors from SAME source → 100% word match
+
+============================================================
+  Step 6: MFA Align (NVASR corpus + CTC anchors)
+============================================================
+
+
+  >>> [postprocess] Post-processing (includes NVV brackets + sp1 normalization)
+
+============================================================
+  Step 7: Post-processing
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/postprocess_textgrids.py --txt-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/workspace/ctc_pretg_adj --textgrid-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/workspace/aligned --output-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/output --filtered-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/workspace/filtered --wav-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/audio --raw-text-dir /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/workspace/ctc_pretg_adj --pinyin-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/fullpinyin_enword.dict --ipa-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/mfa_ipa.dict --merge-max-sil-sec 0.2 --fix-short-word-sec 0.25 --fix-min-silence-sec 0.4 --fix-search-sec 0.5 --bgm-noise-floor-ratio 2.0 --bgm-min-sil-dur 0.3 --bgm-speech-ratio 1.0 --bgm-min-energy 0.01 --filter-short-phone-sec 0.015 --filter-long-word-sec 1.0 --filter-min-word-sec 0.15 --filter-min-word-dur-sec 0.02 --filter-word-energy-ratio 2.0 --filter-min-phone-coverage 0.35 --filter-edge-gap-sec 0.25 --filter-flank-silence-sec 0.4 --filter-long-consonant-sec 999.0 --filter-long-vowel-sec 999.0 --overwrite
+============================================================
+
+  Kept 16kHz audio: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/workspace/audio_16k
+
+############################################################
+  DONE: Success
+  Output: /mnt/nvme0/mfa_work/worker_5/Xuehusang/batch_0003/output
+############################################################
+
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:55 < 0:00:00 , 36 it/s ]
+ INFO     Calculating CMVN...                                                   
+ INFO     Generating final features...                                          
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:02 < 0:00:00 , ? it/s ]
+ INFO     Creating corpus split...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:01 < 0:00:00 , ? it/s ]
+ WARNING  There were 37 pronunciations in the dictionary that were ignored for  
+          containing one of 37 phones not present in the trained acoustic model.
+          Please run `mfa validate` to get more details.                        
+ INFO     Compiling training graphs...                                          
+ INFO     Performing first-pass alignment...                                    
+ INFO     Generating alignments...                                              
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2,000/2,000  [ 0:00:03 < 0:00:00 , ? it/s ]
+ INFO     Collecting phone and word alignments from alignment lattices...       
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸ 1,995/2,000  [ 0:00:10 < -:--:-- , ? it/s ]
+ INFO     Analyzing alignment quality...                                        
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━╸ 1,995/2,000  [ 0:00:20 < 0:00:01 , 101 it/s ]
+ INFO     Exporting alignment TextGrids to                                      
+          /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/workspace/aligned...     
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━╸ 1,995/2,000  [ 0:00:02 < 0:00:01 , 1,962 it/s ]
+ INFO     Finished exporting TextGrids to                                       
+          /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/workspace/aligned!       
+ INFO     Done! Everything took 106.045 seconds                                 
+Loading dictionaries...
+  Pinyin dict: 2210 entries
+  IPA dict: 2207 entries
+  IPA→Pinyin phone mappings: 119
+  Tone reference table: /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/output/tone_mapping.json
+  Tone marks: ˥->1, ˥˥->1, ˧˥->2, ˨˩˦->3, ˥˩->4, ˩->5
+  Postprocess parallel: 32 workers for 1995 files (ProcessPool)
+Done. {'ok': 1920, 'filtered_word_in_silence': 73, 'filtered_bgm_suspect': 2}. report=/mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/output/postprocess_report.jsonl
+Config: configs/batch_all.yaml
+ctc_ready mode: CTC dir = /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/ctc
+Pipeline mode: ctc_ready
+Using Python: /home/user/miniconda3/envs/mfa-dev/bin/python3
+
+############################################################
+  Chinese MFA Pipeline  [ctc_ready]
+  Input:  /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/audio
+  Output: /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/output
+  Steps:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
+############################################################
+
+  >>> [link] Link pre-existing CTC output (ctc_ready mode)
+  CTC dir:   /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/ctc
+  Audio dir: /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/audio
+  Scanning CTC directory for .lab files ...
+  CTC presence index: 12001 flat files, 0 nested dirs
+  Found 2000 stems via .lab scan (flat)
+  Audio index: 2000 WAV files
+  Text index:  0 TXT files
+
+  Candidates:     2000
+  Valid stems:    2000
+
+  Audio in-place: 2000/2000 stems indexed (audio at /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/audio)
+  CTC linked:  12000 → /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/workspace/ctc_pretg
+  Ready for MFA pipeline (2000 stems)
+
+  >>> [normalize_punct] Normalize punctuation (ASCII → CJK)
+  Normalized punctuation in 0 files
+
+  >>> [normalize] Normalize numerals (Arabic → Chinese)
+  Normalized numerals in 0 files
+
+  >>> [normalize_en] Normalise English-word fragments in CTC output
+
+============================================================
+  Step 2b: Normalise English tokens
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/normalize_english_tokens.py --txt-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/workspace/ctc_pretg
+============================================================
+
+
+  >>> [resample] Resample to 16kHz for MFA
+  Found 2000 WAVs from manifest (skipping directory scan)
+  Resampled to 16000Hz → /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/workspace/audio_16k  (2000 done, 2000 resampled)
+
+  >>> [adjust] Adjust CTC boundaries (energy-based)
+
+============================================================
+  Step 5: Adjust CTC boundaries (energy-based)
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/adjust_ctc_boundaries.py --ctc-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/workspace/ctc_pretg --audio-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/audio --output-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/workspace/ctc_pretg_adj
+============================================================
+
+
+  >>> [align] MFA align (NVASR corpus + CTC anchors)
+  NVASR corpus: /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/workspace/ctc_pretg_adj (.lab files from ASR text)
+  CTC anchors:  /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/workspace/ctc_pretg_adj
+  Transcript and anchors from SAME source → 100% word match
+
+============================================================
+  Step 6: MFA Align (NVASR corpus + CTC anchors)
+============================================================
+
+
+  >>> [postprocess] Post-processing (includes NVV brackets + sp1 normalization)
+
+============================================================
+  Step 7: Post-processing
+  /home/user/miniconda3/envs/mfa-dev/bin/python3 /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/scripts/postprocess_textgrids.py --txt-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/workspace/ctc_pretg_adj --textgrid-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/workspace/aligned --output-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/output --filtered-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/workspace/filtered --wav-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/audio --raw-text-dir /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/workspace/ctc_pretg_adj --pinyin-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/fullpinyin_enword.dict --ipa-dict /mnt/local_E/Audio Event Detection/chinese_mfa_pipeline/dict/mfa_ipa.dict --merge-max-sil-sec 0.2 --fix-short-word-sec 0.25 --fix-min-silence-sec 0.4 --fix-search-sec 0.5 --bgm-noise-floor-ratio 2.0 --bgm-min-sil-dur 0.3 --bgm-speech-ratio 1.0 --bgm-min-energy 0.01 --filter-short-phone-sec 0.015 --filter-long-word-sec 1.0 --filter-min-word-sec 0.15 --filter-min-word-dur-sec 0.02 --filter-word-energy-ratio 2.0 --filter-min-phone-coverage 0.35 --filter-edge-gap-sec 0.25 --filter-flank-silence-sec 0.4 --filter-long-consonant-sec 999.0 --filter-long-vowel-sec 999.0 --overwrite
+============================================================
+
+  Kept 16kHz audio: /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/workspace/audio_16k
+
+############################################################
+  DONE: Success
+  Output: /mnt/nvme0/mfa_work/worker_4/Wumi/batch_0001/output
+############################################################
+

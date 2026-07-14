@@ -1,0 +1,12 @@
+{
+  "config_file": "E:\\Audio Event Detection\\chinese_mfa_pipeline\\config.yaml",
+  "mode": "ctc_ready",
+  "workspace": "workspace",
+  "data_dir": "E:\\Audio Event Detection\\video\\713",
+  "output_dir": "E:\\Audio Event Detection\\chinese_mfa_pipeline\\output\\workspace\\output",
+  "n_stems": 1,
+  "manifest_path": "E:\\Audio Event Detection\\chinese_mfa_pipeline\\output\\workspace\\ctc_pretg\\ctc_ready_manifest.json",
+  "ctc_dir": "E:\\Audio Event Detection\\video\\713",
+  "version": 1,
+  "scanned_at": "2026-07-13T14:41:01"
+}

@@ -1,0 +1,8 @@
+{
+  "config_file": "configs/batch_missing.yaml",
+  "mode": "batch_ctc_ready",
+  "ctc_root": "\\\\RS3621\\Research_TTS\\Data\\Raw\\ASRNEW",
+  "audio_root": "\\\\RS3621\\Research_TTS\\Data\\Raw\\v5_0707",
+  "output_root": "\\\\RS3621\\Research_TTS\\Data\\Raw\\ASR_MFA",
+  "datasets": []
+}

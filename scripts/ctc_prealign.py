@@ -25,6 +25,7 @@ import json
 import os
 import re
 import time
+from collections import Counter
 from itertools import groupby
 from pathlib import Path
 
@@ -82,21 +83,12 @@ def chars_and_pinyin(text: str):
     return chars, pinyins
 
 
-def is_pinyin_syllable(token: str) -> bool:
-    """检查 token 是否为有效的拼音音节 (可被 MFA 词典识别).
-
-    拼音音节: 小写字母序列 + 可选声调数字 1-5.
-    例如: kuai4, ni3, hao3, e2, a1, nv3, lve4
-    不匹配: , . ? ! ... (标点), hello (英文), 123 (数字)
-    """
-    import re
-    return bool(re.match(r'^[a-z]+[1-5]$', token))
-
-
-def is_nvv_token(token: str) -> bool:
-    """检查 token 是否为 NVV 大写标签 (QUESTION-YI, BREATHING 等)."""
-    import re
-    return bool(re.match(r'^[A-Z][A-Z0-9-]*[A-Z0-9]$', token))
+# ── Import shared constants from pipeline_utils ──
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+from pipeline_utils import (
+    NVV_NAMES, NVV_TO_MFA,
+    is_nvv_token, is_english_token, is_pinyin_syllable,
+)
 
 
 def load_mfa_word_set(dict_path: Path | None) -> set[str] | None:
@@ -112,39 +104,17 @@ def load_mfa_word_set(dict_path: Path | None) -> set[str] | None:
     return words
 
 
-# ─── NVV 标签 → MFA 大写 token 映射 ───
-
-NVV_TO_MFA: dict[str, str] = {
-    "Breathing": "BREATHING",
-    "Laughter": "LAUGHTER",
-    "Burp": "BURP",
-    "Cough": "COUGH",
-    "Crying": "CRYING",
-    "Groan": "GROAN",
-    "Hiss": "HISS",
-    "Hum": "HUM",
-    "Shh": "SHH",
-    "Sigh": "SIGH",
-    "Sneeze": "SNEEZE",
-    "Sniff": "SNIFF",
-    "Snore": "SNORE",
-    "Tsk": "TSK",
-    "Uhm": "UHM",
-    "Whistle": "WHISTLE",
-    "Yawn": "YAWN",
-    "Question-yi": "QUESTION-YI",
-    "Question-en": "QUESTION-EN",
-    "Question-oh": "QUESTION-OH",
-    "Question-ah": "QUESTION-AH",
-    "Question-ei": "QUESTION-EI",
-    "Question-huh": "QUESTION-HUH",
-    "Surprise-oh": "SURPRISE-OH",
-    "Surprise-ah": "SURPRISE-AH",
-    "Surprise-wa": "SURPRISE-WA",
-    "Surprise-yo": "SURPRISE-YO",
-    "Confirmation-en": "CONFIRMATION-EN",
-    "Dissatisfaction-hnn": "DISSATISFACTION-HNN",
-}
+def valid_mfa_word(token: str, mfa_words: set[str] | None = None) -> bool:
+    """Check if *token* should be kept in the MFA words tier."""
+    if is_nvv_token(token):
+        return token in mfa_words if mfa_words is not None else True
+    if is_pinyin_syllable(token):
+        return token in mfa_words if mfa_words is not None else True
+    if is_english_token(token):
+        return True
+    if token.isdigit():
+        return True
+    return False
 
 
 def nvv_to_mfa(label: str) -> str:
@@ -160,11 +130,11 @@ def preprocess_asr_for_mfa(text: str) -> str:
     "[Breathing]" → "BREATHING"
     其他文本 (汉字/标点) 保持不变.
     """
-    return re.sub(
+    text = re.sub(
         r'\[([A-Za-z][^\]]*?)\]',
-        lambda m: nvv_to_mfa(m.group(0)),
-        text
-    )
+        lambda m: ' ' + nvv_to_mfa(m.group(0)) + ' ',
+        text)
+    return re.sub(r'\s+', ' ', text).strip()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -184,6 +154,10 @@ def make_patched_inference(ref_texts: dict[str, str],
 
     ref_texts: {stem: chinese_text}  — 键为音频文件 stem (无扩展名)
     """
+    try:
+        import cn2an as _cn2an
+    except ImportError:
+        _cn2an = None
 
     def patched(self, data_in, data_lengths=None,
                 key=["wav_file_tmp_name"], tokenizer=None,
@@ -276,8 +250,14 @@ def make_patched_inference(ref_texts: dict[str, str],
             asr_text = tokenizer.decode(token_int)  # 仅用于显示/nvv标签
 
             # ── 后处理 (省略号标点去重等) ──
+            # Adjacent ellipsis+punct → punct only
             asr_text = re.sub(r'…([，。！？、；：,\.!\?;:])', r'\1', asr_text)
             asr_text = re.sub(r'([，。！？、；：,\.!\?;:])…', r'\1', asr_text)
+            # ，NVV… → ，NVV  (ellipsis redundant when punct already exists
+            # before the NVV token; the comma already marks the pause)
+            asr_text = re.sub(
+                r'([，。！？、；：,\.!\?;:])([A-Z][A-Z0-9-]*[A-Z0-9])…',
+                r'\1\2', asr_text)
             asr_text = re.sub(r'…{2,}', '…', asr_text)
             asr_text = re.sub(r'^((?:<\|[^|]+\|>|\[[^\]]+\])*)…+', r'\1', asr_text)
             asr_text = re.sub(
@@ -301,19 +281,16 @@ def make_patched_inference(ref_texts: dict[str, str],
                 align_text = asr_clean
 
             # cn2an 数字正则化 (参考文本和 ASR 文本都可能含阿拉伯数字)
-            try:
-                import cn2an
+            if _cn2an is not None:
                 parts = re.split(r'(\[[^\]]+\]|[A-Z][A-Z0-9-]*[A-Z0-9])', align_text)
                 for k, part in enumerate(parts):
                     if re.match(r'^(\[[^\]]+\]|[A-Z][A-Z0-9-]*[A-Z0-9])$', part):
                         continue
                     try:
-                        parts[k] = cn2an.transform(part, 'an2cn')
+                        parts[k] = _cn2an.transform(part, 'an2cn')
                     except Exception:
                         pass
                 align_text = ''.join(parts)
-            except ImportError:
-                pass
 
             words_aligned = []  # token 级别时间戳
             if align_text:
@@ -367,6 +344,27 @@ def make_patched_inference(ref_texts: dict[str, str],
                             tid += 1
                         _s = _e
 
+            # ── Check English token completeness ──
+            # CTC forced alignment can drop tokens that get 0 frames
+            # (e.g. "live"→"li"+"ve" but only "li" survives).  Detect
+            # this by comparing tokenizer output against aligned tokens.
+            expected_eng: list[str] = []
+            for t in speech_tokens:
+                t_clean = str(t).lstrip('▁')
+                if is_english_token(t_clean):
+                    expected_eng.append(t_clean)
+            actual_eng = [w['word'].lstrip('▁') for w in words_aligned
+                          if is_english_token(w['word'].lstrip('▁'))]
+            exp_counts = Counter(expected_eng)
+            act_counts = Counter(actual_eng)
+            english_complete = True
+            missing_english: list[str] = []
+            for tok, count in exp_counts.items():
+                if act_counts.get(tok, 0) < count:
+                    english_complete = False
+                    missing_english.append(
+                        f"{tok}(expected {count}, got {act_counts.get(tok, 0)})")
+
             results.append({
                 "key": key[i],
                 "text_asr": asr_final,
@@ -374,6 +372,8 @@ def make_patched_inference(ref_texts: dict[str, str],
                 "duration_s": round(duration_s, 3),
                 "words": words_aligned,
                 "blank_runs": blank_runs,
+                "english_complete": english_complete,
+                "missing_english": missing_english,
             })
 
         return results, meta
@@ -531,8 +531,59 @@ def clean_unsupported_punct(text: str) -> str:
     return ''.join(result)
 
 
-def find_ref_text(stem: str, data_dir: Path) -> str | None:
-    """在 data_dir 递归搜索与 stem 匹配的原始中文文本."""
+def _build_txt_index(data_dir: Path) -> dict[str, Path]:
+    """Build {stem: path} index for .txt files — single scan, O(1) lookup."""
+    index: dict[str, Path] = {}
+    # Single-level scan first (fast, handles flat directories)
+    try:
+        with os.scandir(str(data_dir)) as it:
+            for entry in it:
+                if entry.is_file() and entry.name.endswith(".txt"):
+                    stem = entry.name[:-4]
+                    if stem not in index:
+                        index[stem] = Path(entry.path)
+    except OSError:
+        pass
+    # One level of subdirectories if top-level empty
+    if not index:
+        try:
+            with os.scandir(str(data_dir)) as it:
+                for entry in it:
+                    if entry.is_dir():
+                        try:
+                            with os.scandir(entry.path) as it2:
+                                for e2 in it2:
+                                    if e2.is_file() and e2.name.endswith('.txt'):
+                                        stem = e2.name[:-4]
+                                        if stem not in index:
+                                            index[stem] = Path(e2.path)
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+    return index
+
+
+def find_ref_text(stem: str, data_dir: Path,
+                  txt_index: dict[str, Path] | None = None) -> str | None:
+    """Look up reference text for *stem* using pre-built index or rglob fallback."""
+    # Use index if provided (O(1) lookup)
+    if txt_index is not None:
+        path = txt_index.get(stem)
+        if path:
+            return path.read_text(encoding="utf-8").strip()
+        for suffix in ("_qwen3-api", "_qwen3", "_firered"):
+            path = txt_index.get(f"{stem}{suffix}")
+            if path:
+                return path.read_text(encoding="utf-8").strip()
+        m = re.search(r"_(firered|qwen3|qwen3-api)$", stem)
+        if m:
+            path = txt_index.get(stem[:m.start()])
+            if path:
+                return path.read_text(encoding="utf-8").strip()
+        return None
+
+    # Fallback: slow rglob (for backward compatibility)
     candidates = list(data_dir.rglob(f"{stem}.txt"))
     if candidates:
         return candidates[0].read_text(encoding="utf-8").strip()
@@ -555,7 +606,7 @@ def main():
     parser.add_argument("--data-dir", type=Path, required=True,
                         help="原始数据目录 (含 wav + 中文 txt)")
     parser.add_argument("--pinyin-dir", type=Path, required=True,
-                        help="拼音语料目录 (prepare_corpus 输出, 用于 fallback)")
+                        help="拼音语料目录 (用于 fallback)")
     parser.add_argument("--audio-dir", type=Path, default=None,
                         help="处理后的音频目录 (trim 输出), 默认同 data-dir")
     parser.add_argument("--output-dir", type=Path,
@@ -586,9 +637,13 @@ def main():
     ref_texts: dict[str, str] = {}
     missing_ref = []
     skipped_jp = []
+    # Build text index once (O(1) lookup per stem, no repeated rglob)
+    txt_index = _build_txt_index(args.data_dir)
+    print(f"  已索引 {len(txt_index)} 个文本文件")
+
     for wav_path in wav_files:
         stem = wav_path.stem
-        ref = find_ref_text(stem, args.data_dir)
+        ref = find_ref_text(stem, args.data_dir, txt_index)
         if ref:
             if has_japanese(ref):
                 skipped_jp.append(stem)
@@ -623,7 +678,23 @@ def main():
     # ── 批量推理 ──
     t0 = time.time()
     all_results = []
-    BATCH = 16  # 比 export_mfa_textgrid.py 稍小, 留 GPU 空间给 forced alignment
+
+    # Auto-select batch size based on GPU memory (if CUDA available)
+    def _detect_batch_size(device: str) -> int:
+        if device == "cpu" or not device.startswith("cuda"):
+            return 4
+        try:
+            mem_gb = torch.cuda.get_device_properties(device).total_mem / 1024**3
+            if mem_gb >= 40:   return 64   # A100, RTX 6000 Ada
+            if mem_gb >= 24:   return 32   # RTX 3090/4090
+            if mem_gb >= 16:   return 24   # RTX 3080/4080, A4000
+            if mem_gb >= 8:    return 16   # RTX 2070/3070
+            return 8
+        except Exception:
+            return 16
+
+    BATCH = _detect_batch_size(args.device)
+    print(f"  推理 batch size: {BATCH} (device: {args.device})")
     for bs in range(0, len(paths), BATCH):
         batch = paths[bs:bs + BATCH]
         res = model.generate(input=batch, language="zh", use_itn=True,
@@ -654,25 +725,15 @@ def main():
         words_aligned = r["words"]
         duration_s = r["duration_s"]
 
-        # 判断 token 类型并决定是否保留到 TextGrid
-        def valid_word(token: str) -> bool:
-            """token 在 MFA 词典中 → 保留; 标点/空白 → 剔除."""
-            # NVV 大写标签
-            if is_nvv_token(token):
-                if mfa_words is not None:
-                    return token in mfa_words
-                return True  # 无词典时也保留 NVV
-            # 拼音音节
-            if is_pinyin_syllable(token):
-                if mfa_words is not None:
-                    return token in mfa_words
-                return True
-            # 英文/数字 (可能有)
-            if token.isalpha() or token.isdigit():
-                if mfa_words is not None:
-                    return token in mfa_words
-                return len(token) <= 1  # 单个字母/数字保留
-            return False
+        # ── Skip stems with incomplete English fragments ──
+        # CTC forced alignment can drop OOV English fragments (e.g.
+        # "live"→"li"+"ve" but only "li" gets frames).  These stems
+        # would produce incomplete transcriptions — filter them out.
+        if not r.get("english_complete", True):
+            missing = r.get("missing_english", [])
+            print(f"  SKIP {stem}: incomplete English fragments - {', '.join(missing)}")
+            fail += 1
+            continue
 
         # 将 CTC 对齐 token 映射到 MFA 词条
         # 策略: 遍历 words_aligned, 检测并合并 [NVV] 模式:
@@ -747,6 +808,39 @@ def main():
                     "end": w["end"],
                 })
 
+        # ── Merge consecutive single-ASCII-letter tokens ──
+        # The NVASR tokenizer splits OOV English words into individual
+        # letter tokens (e.g. "ria"→"R"+"I"+"A").  Merge them back so
+        # the token count stays aligned with reference-text word units.
+        if words_pinyin:
+            merged_pinyin = []
+            i = 0
+            while i < len(words_pinyin):
+                w = words_pinyin[i]
+                token = w["word"]
+                if (len(token) == 1 and token.isascii() and token.isalpha()
+                        and not is_nvv_token(token)):
+                    letters = [token]
+                    j = i + 1
+                    while j < len(words_pinyin):
+                        nt = words_pinyin[j]["word"]
+                        if (len(nt) == 1 and nt.isascii() and nt.isalpha()
+                                and not is_nvv_token(nt)):
+                            letters.append(nt)
+                            j += 1
+                        else:
+                            break
+                    merged_pinyin.append({
+                        "word": "".join(letters),
+                        "start": w["start"],
+                        "end": words_pinyin[j - 1]["end"],
+                    })
+                    i = j
+                else:
+                    merged_pinyin.append(w)
+                    i += 1
+            words_pinyin = merged_pinyin
+
         # 写 TextGrid — 含 pauses tier
         try:
             # 从 blank_runs 计算 ≥200ms 的停顿段
@@ -779,21 +873,27 @@ def main():
                 for p in punct_entries:
                     all_seq.append({"text": p["word"], "start": p["start"], "kind": "p"})
                 all_seq.sort(key=lambda x: x["start"])
-                # 最后标点: end = max(start, duration - 0.5s), 尾部留给静音
+                # 最後标点: end = max(start, duration - 0.5s), 尾部留给静音
                 last_punct = max(punct_entries, key=lambda x: x["start"]) if punct_entries else None
-                trailing_silence_s = max(0, duration_s - 0.5)
+                # Pre-extract sorted start times for O(P+T) monotonic lookup
+                seq_starts = [t["start"] for t in all_seq]
                 punct_data = []
+                next_idx = 0  # monotonic pointer
                 for p in punct_entries:
                     next_start = None
-                    for t in all_seq:
-                        if t["start"] > p["start"] + 0.001:
-                            next_start = t["start"]
-                            break
+                    while next_idx < len(seq_starts) and seq_starts[next_idx] <= p["start"] + 0.001:
+                        next_idx += 1
+                    if next_idx < len(seq_starts):
+                        next_start = seq_starts[next_idx]
                     if p is last_punct:
                         # 最后标点直接延续到音频结束
                         end_s = duration_s
                     else:
                         end_s = next_start if next_start is not None else p["end"]
+                    # Guard: CTC overlap (e.g. NVV inside word) can make
+                    # end_s < start_s, producing invalid intervals.
+                    if end_s <= p["start"]:
+                        end_s = p["start"] + 0.060  # min 1 frame width
                     punct_data.append({
                         "word": p["word"],
                         "start_ms": round(p["start"] * 1000, 1),
@@ -801,6 +901,22 @@ def main():
                         "start_s": p["start"],
                         "end_s": end_s,
                     })
+                # Dedup: remove … if it overlaps with a real punctuation mark
+                # (comma, period, etc.) — the punct mark already serves the
+                # pause-marking function.  NVV tokens must be preserved.
+                non_ellipsis = [p for p in punct_data if p["word"] != "…"]
+                ellipsis_only = [p for p in punct_data if p["word"] == "…"]
+                if non_ellipsis and ellipsis_only:
+                    kept_ellipsis = []
+                    for ep in ellipsis_only:
+                        overlap = any(
+                            nep["start_s"] < ep["end_s"]
+                            and nep["end_s"] > ep["start_s"]
+                            for nep in non_ellipsis)
+                        if not overlap:
+                            kept_ellipsis.append(ep)
+                    punct_data = non_ellipsis + kept_ellipsis
+
                 punct_path.write_text(json.dumps(punct_data, ensure_ascii=False),
                                      encoding="utf-8")
 
@@ -823,7 +939,15 @@ def main():
                                  text_cn)
             text_cn = re.sub(
                 r'\[([A-Za-z][^\]]*?)\]',
-                lambda m: nvv_to_mfa(m.group(0)), text_cn)
+                lambda m: ' ' + nvv_to_mfa(m.group(0)) + ' ', text_cn)
+            text_cn = re.sub(r'\s+', ' ', text_cn).strip()
+            # Same ellipsis-punct dedup as asr_text (lines 308-316)
+            text_cn = re.sub(r'…([，。！？、；：,\.!\?;:])', r'\1', text_cn)
+            text_cn = re.sub(r'([，。！？、；：,\.!\?;:])…', r'\1', text_cn)
+            text_cn = re.sub(
+                r'([，。！？、；：,\.!\?;:])([A-Z][A-Z0-9-]*[A-Z0-9])…',
+                r'\1\2', text_cn)
+            text_cn = re.sub(r'…{2,}', '…', text_cn)
             cn_path = args.output_dir / f"{stem}_text_cn.txt"
             cn_path.write_text(text_cn + "\n", encoding="utf-8")
 
@@ -843,6 +967,35 @@ def main():
         except Exception as e:
             print(f"  FAIL {stem}: {e}")
             fail += 1
+
+    # ── Auto-add English tokens to MFA dictionary ──
+    # English tokens (like "li", "ve", "A", "I") are self-referential
+    # in the MFA dict — MFA can't model them acoustically, so they get
+    # CTC-only boundaries like NVV tokens.
+    if args.dict_path and args.dict_path.exists():
+        english_tokens_found: set[str] = set()
+        for entry in manifest:
+            for w in entry.get("_words", []):
+                token = w["word"]
+                if is_english_token(token):
+                    english_tokens_found.add(token)
+
+        if english_tokens_found:
+            existing = set()
+            with open(args.dict_path, encoding='utf-8-sig') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        existing.add(line.split()[0])
+            new_tokens = sorted(t for t in english_tokens_found if t not in existing)
+            if new_tokens:
+                with open(args.dict_path, 'a', encoding='utf-8') as f:
+                    for t in new_tokens:
+                        f.write(f"{t} {t}\n")
+                print(f"  Added {len(new_tokens)} English tokens to MFA dict: {', '.join(new_tokens)}")
+                mfa_words = load_mfa_word_set(args.dict_path)
+            else:
+                print(f"  English tokens already in MFA dict: {', '.join(sorted(english_tokens_found))}")
 
     # ── 保存 manifest + 逐词 tokens JSONL ──
     with open(args.output_dir / "manifest.json", "w", encoding="utf-8") as f:
