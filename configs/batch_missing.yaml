@@ -1,0 +1,38 @@
+# 批量处理缺失文件 — 只处理有缺失 stems 的 speaker，最大资源利用
+# 运行:
+#   python scripts/streaming_pipeline.py --config configs/batch_missing.yaml
+#
+# 资源分配:
+#   12 parallel workers × 32 MFA jobs = 384 MFA 进程 → 跑满 384 CPU 核心
+#   4 NVMe 盘轮询分配 (mnt/nvme0/1/3/4) → 每盘 3 worker → I/O 均衡
+
+mode: batch_ctc_ready
+
+use_cache: true
+
+streaming:
+  local_work:
+    - /mnt/nvme0/mfa_work
+    - /mnt/nvme1/mfa_work
+    - /mnt/nvme3/mfa_work
+    - /mnt/nvme4/mfa_work
+  batch_size: 2000
+  parallel: 12
+  batch_cache: cache/batch_missing.cache.json
+
+batch:
+  ctc_root: \\RS3621\Research_TTS\Data\Raw\ASRNEW
+  audio_root: \\RS3621\Research_TTS\Data\Raw\v5_0707
+  output_root: \\RS3621\Research_TTS\Data\Raw\ASR_MFA
+
+ctc_ready:
+  require_all: true
+
+mfa:
+  num_jobs: 32
+  single_speaker: true
+
+postprocess:
+  filter_suspicious: true
+  enable_text_correction: true
+  handle_unexpected_sil: true
