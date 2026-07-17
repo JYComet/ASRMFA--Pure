@@ -1874,7 +1874,7 @@ def _inject_punctuation(words_tier: Tier, pp_tier: Tier | None,
     # 微小静音间隙合并到后续标点或 NVV (<sp> -> 吸收进标点/NVV)
     for gi in range(len(merged)):
         gs, ge, gtext, gkind = merged[gi]
-        if not (gkind == "word" and is_silence(gtext)):
+        if not (gkind in ("word", "gap") and is_silence(gtext)):
             continue
         # 找后面紧接的标点或 NVV
         for pi in range(len(merged)):
@@ -1909,7 +1909,7 @@ def _inject_punctuation(words_tier: Tier, pp_tier: Tier | None,
     # 标点延展后清理被覆盖的间隙
     for gi in range(len(merged)):
         gs, ge, gtext, gkind = merged[gi]
-        if not (gkind == "word" and is_silence(gtext)):
+        if not (gkind in ("word", "gap") and is_silence(gtext)):
             continue
         for pi in range(len(merged)):
             ps, pe, ptext, pkind = merged[pi]
@@ -1926,7 +1926,7 @@ def _inject_punctuation(words_tier: Tier, pp_tier: Tier | None,
     # 残余微小 <sp> 合并到前一词 (词间微间隙吸收)
     for gi in range(len(merged)):
         gs, ge, gtext, gkind = merged[gi]
-        if not (gkind == "word" and is_silence(gtext)):
+        if not (gkind in ("word", "gap") and is_silence(gtext)):
             continue
         if ge - gs > 0.5:
             continue
@@ -2232,7 +2232,8 @@ def _merge_nvv_ellipsis(words_tier: Tier, pp_tier: Tier | None,
 
 def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
                                   search_window: float = 0.2,
-                                  min_word_dur: float = 0.03) -> Tier:
+                                  min_word_dur: float = 0.03,
+                                  punct_entries: list | None = None) -> Tier:
     """词落在静音段时向后搜索语音起点, 整体后移 (不越过后词).  Vectorised."""
     import numpy as _np
     all_rms, _ = _frame_rms_vec(audio, sr, frame_ms=10.0)
@@ -2317,19 +2318,393 @@ def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
                                         intervals[i + 1].text)
         intervals[i] = Interval(new_start, new_end, iv.text)
 
-    # ── End trimming: word tails that decay into silence ──
-    # Sentence-final words often have their tail silence absorbed
-    # into the word boundary (e.g. 630ms for single-syllable 远).
-    # Trim the end to the last frame above threshold, convert tail
-    # to a new silence gap so _inject_punctuation can mark it as ….
-    for i in range(n - 1, -1, -1):
+    # ── Silence-adjacent word start pull-back ──
+    # When a word follows a silence gap (or another word but the
+    # boundary region is all silence), and its energy onset is
+    # clearly before the word start, pull the start back to the onset.
+    # ── Silence-adjacent word start pull-back ──
+    # When a word follows a SILENCE gap and its energy onset is
+    # clearly before the word start, pull the start back to the onset.
+    # Only silence-to-word (not word-to-word, which is handled by the
+    # start pull-back below and is more prone to false positives).
+    for i in range(1, n):
         iv = intervals[i]
         if is_silence(iv.text) or not iv.text.strip():
             continue
         if is_english_token(iv.text) or is_nvv_token(iv.text):
             continue
+        prev_iv = intervals[i - 1]
+        if not is_silence(prev_iv.text):
+            continue
+        word_start = iv.xmin
+        search_back = min(0.150, word_start - prev_iv.xmin)
+        if search_back < 0.030:
+            continue
+        s_sample = int((word_start - search_back) * sr)
+        e_sample = int(word_start * sr)
+        win3 = max(1, int(0.010 * sr))
+        n_wins3 = (e_sample - s_sample) // win3
+        if n_wins3 < 5:
+            continue
+        rms_vals3 = []
+        for j in range(n_wins3):
+            chunk = audio[s_sample + j*win3 : s_sample + (j+1)*win3]
+            rms_vals3.append(float(_np.mean(_np.abs(chunk))))
+        onset_win3 = None
+        for j in range(1, n_wins3):
+            if rms_vals3[j] > rms_vals3[j-1] * 5.0 and rms_vals3[j] > 0.0005:
+                onset_win3 = j
+                break
+        if onset_win3 is None or onset_win3 < 2:
+            continue
+        onset_time = word_start - search_back + (onset_win3 - 0.5) * win3 / sr
+        pull = word_start - onset_time
+        if pull < 0.020 or pull > 0.120:
+            continue
+        # Verify onset area has real energy (check 3 frames around onset)
+        onset_peak = max(rms_vals3[onset_win3:min(onset_win3+3, n_wins3)])
+        if onset_peak < 0.002:
+            continue
+        new_boundary = round(onset_time, 3)
+        intervals[i - 1] = Interval(prev_iv.xmin, new_boundary, prev_iv.text)
+        intervals[i] = Interval(new_boundary, iv.xmax, iv.text)
+
+    # ── Start pull-back: MFA boundary placed too late ──
+    # When energy shows a deep dip followed by a clear syllable onset
+    # before the word start, pull the start back to the dip.
+    for i in range(1, n):
+        iv = intervals[i]
+        if is_silence(iv.text) or not iv.text.strip():
+            continue
+        if is_english_token(iv.text) or is_nvv_token(iv.text):
+            continue
+        prev_iv = intervals[i - 1]
+        if prev_iv.xmax <= prev_iv.xmin:
+            continue
+        # Only adjust if previous interval is a real word (not silence)
+        if is_silence(prev_iv.text):
+            continue
+
+        word_start = iv.xmin
+
+        # Search up to 80ms backward.  Window must be short enough
+        # that max_rms reflects the LOCAL neighbourhood, not a distant
+        # peak from syllables 50ms away (which would make shallow vowel
+        # decays appear as "deep valleys").
+        search_back = min(0.08, word_start - prev_iv.xmin)
+        if search_back < 0.030:
+            continue
+
+        s_sample = int((word_start - search_back) * sr)
+        e_sample = int(word_start * sr)
+        if e_sample <= s_sample:
+            continue
+
+        win = max(1, int(0.010 * sr))
+        n_wins = (e_sample - s_sample) // win
+        if n_wins < 5:
+            continue
+
+        rms_vals = []
+        for j in range(n_wins):
+            chunk = audio[s_sample + j*win : s_sample + (j+1)*win]
+            rms_vals.append(float(_np.mean(_np.abs(chunk))))
+
+        max_rms = max(rms_vals) if rms_vals else 1.0
+        if max_rms < 0.003:
+            continue  # too quiet to be meaningful
+
+        # Find the deepest valley that satisfies:
+        # 1. Below 50% of max energy in window (clear dip)
+        # 2. Local minimum
+        # 3. At least 25ms before word_start
+        best_valley = None
+        for j in range(2, n_wins - 2):
+            r = rms_vals[j]
+            if r >= max_rms * 0.50 or r < 0.003:
+                continue
+            # Local minimum check
+            if r > rms_vals[j-1] or r > rms_vals[j+1]:
+                continue
+            valley_time = word_start - search_back + (j + 0.5) * win / sr
+            pull = word_start - valley_time
+            if pull < 0.025 or pull > 0.080:
+                continue
+            # Energy should be rising after the valley
+            post_valley = rms_vals[j+1:min(j+4, n_wins)]
+            if len(post_valley) >= 2 and _np.mean(post_valley) <= r * 1.2:
+                continue  # no clear rise after valley
+            # Don't make previous word shorter than 80ms
+            new_prev_dur = valley_time - prev_iv.xmin
+            if new_prev_dur < 0.080:
+                continue
+            best_valley = valley_time
+            break  # take the earliest qualifying valley
+
+        if best_valley is None:
+            continue
+
+        new_boundary = round(best_valley, 3)
+        intervals[i - 1] = Interval(prev_iv.xmin, new_boundary, prev_iv.text)
+        intervals[i] = Interval(new_boundary, iv.xmax, iv.text)
+
+    # ── End extension: MFA boundary cut off vowel tail ──
+    # When a word's energy continues past its MFA end into a silence
+    # or NVV interval (i.e. the decay was mislabeled), extend the word
+    # end to the true energy drop point.  Process left→right so
+    # extensions chain correctly.
+    _extended_indices: set[int] = set()  # track which words were extended
+    for i in range(n):
+        iv = intervals[i]
+        if is_silence(iv.text) or not iv.text.strip():
+            continue
+        if is_english_token(iv.text) or is_nvv_token(iv.text):
+            continue
+        if i + 1 >= n:
+            continue
+        next_iv = intervals[i + 1]
+        if next_iv.xmax <= next_iv.xmin:
+            continue
+        # Extend into: NVV always; silence gaps when no punctuation follows;
+        # regular words when leading portion is dead silence.
+        # Only skip real punctuation (not silence tokens like <eps>/<spN>).
+        # Silence gaps adjacent to words without punctuation are absorbable.
+        if is_punct(next_iv.text) and not is_silence(next_iv.text):
+            continue
+
+        extend_into_word = False
+        if not is_nvv_token(next_iv.text):
+            # Silence or word: check if there's dead silence worth absorbing
+            check_s = int(iv.xmax * sr)
+            check_e = int(min(iv.xmax + 0.300, next_iv.xmax) * sr)
+            if check_e - check_s < int(0.080 * sr):
+                continue
+            win_s = max(1, int(0.010 * sr))
+            n2 = (check_e - check_s) // win_s
+            if n2 < 10:
+                continue
+            max_silent_run = 0
+            silent_run = 0
+            for j2 in range(n2):
+                chunk = audio[check_s + j2*win_s : check_s + (j2+1)*win_s]
+                if float(_np.mean(_np.abs(chunk))) < 0.002:
+                    silent_run += 1
+                    max_silent_run = max(max_silent_run, silent_run)
+                else:
+                    silent_run = 0
+            if max_silent_run < 8:
+                continue
+            # Check for punctuation in the gap: if punct exists, let
+            # _inject_punctuation handle the silence placement.
+            # Search through the FULL next interval(s), not just the
+            # silent run — punct may sit past where energy rises.
+            gap_end_full = next_iv.xmax
+            # Also check the word after silence, if any
+            if is_silence(next_iv.text) and i + 2 < n and not is_silence(intervals[i+2].text):
+                gap_end_full = intervals[i+2].xmax
+            has_punct_in_gap = False
+            if punct_entries:
+                for p in punct_entries:
+                    if iv.xmax <= p["start_s"] <= gap_end_full:
+                        has_punct_in_gap = True
+                        break
+            if has_punct_in_gap:
+                continue  # punct will absorb the silence
+            extend_into_word = True
+
+        word_end = iv.xmax
+        next_end = next_iv.xmax
+
+        # When next interval is silence, look past it to the following word
+        # for onset detection (silence itself has no energy to detect).
+        onset_next = next_iv
+        onset_end = next_end
+        if is_silence(next_iv.text) and i + 2 < n:
+            onset_next = intervals[i + 2]
+            if not is_silence(onset_next.text) and not is_punct(onset_next.text):
+                onset_end = onset_next.xmax
+
+        if extend_into_word:
+            # Dead silence after current word — skip the silence and
+            # extend current word's end to where energy returns in the
+            # following word (or silence gap end if no following word).
+            search_s = int(word_end * sr)
+            search_e = int(onset_end * sr)
+            win_s = max(1, int(0.010 * sr))
+            # Measure silent baseline from first 5 windows
+            baseline_rms = 0.001
+            count = 0
+            for j in range(min(10, (search_e - search_s) // win_s)):
+                chunk = audio[search_s + j*win_s : search_s + (j+1)*win_s]
+                r = float(_np.mean(_np.abs(chunk)))
+                if r < 0.003:
+                    baseline_rms += r
+                    count += 1
+            if count > 0:
+                baseline_rms /= count
+            onset_threshold = max(baseline_rms * 3.0, 0.0015)
+            onset_idx = None
+            for j in range(0, (search_e - search_s) // win_s):
+                chunk = audio[search_s + j*win_s : search_s + (j+1)*win_s]
+                if float(_np.mean(_np.abs(chunk))) >= onset_threshold:
+                    onset_idx = j
+                    break
+            if onset_idx is None or onset_idx < 10:
+                continue
+            # Leave at least 60ms for the word after the silence gap
+            new_end_raw = word_end + onset_idx * win_s / sr
+            onset_word_min_start = onset_end - 0.060
+            new_end = min(new_end_raw, onset_word_min_start)
+            if new_end - word_end < 0.050:
+                continue
+            ext_limit = new_end
+        else:
+            # NVV path: Check up to 250ms past word_end
+            ext_limit = min(word_end + 0.25, next_end - 0.015)
+        if ext_limit <= word_end + 0.015:
+            continue
+
+        if extend_into_word:
+            # ext_limit already computed above; skip RMS vowel-tail analysis
+            new_end = ext_limit
+        else:
+            s_sample = int(word_end * sr)
+            e_sample = int(ext_limit * sr)
+            if e_sample <= s_sample:
+                continue
+
+            win = max(1, int(0.010 * sr))
+            n_wins = (e_sample - s_sample) // win
+            if n_wins < 3:
+                continue
+
+            rms_vals = []
+            for j in range(n_wins):
+                chunk = audio[s_sample + j*win : s_sample + (j+1)*win]
+                rms_vals.append(float(_np.mean(_np.abs(chunk))))
+
+            first_half = _np.mean(rms_vals[:max(1, n_wins//2)])
+            second_half = _np.mean(rms_vals[max(1, n_wins//2):])
+            if second_half > first_half * 1.3:
+                continue
+
+            below_run = 0
+            cutoff_win = n_wins
+            for j, r in enumerate(rms_vals):
+                if r < threshold:
+                    below_run += 1
+                    if below_run >= 3:
+                        cutoff_win = j - below_run + 1
+                        break
+                else:
+                    below_run = 0
+
+            if cutoff_win < 2:
+                continue
+
+            new_end = word_end + (cutoff_win * win) / sr
+            new_end = min(new_end, next_end - 0.005)
+
+        if new_end - word_end < 0.020:
+            continue  # too small to matter
+
+        # Extend word, shorten next interval(s).
+        min_next_dur = 0.040  # unified minimum for next word
+        if onset_end - new_end < min_next_dur:
+            new_end = onset_end - min_next_dur
+            if new_end - word_end < 0.020:
+                continue
+        intervals[i] = Interval(iv.xmin, new_end, iv.text)
+        _extended_indices.add(i)
+        if is_silence(next_iv.text) and new_end >= next_iv.xmax - 0.001:
+            # Silence fully absorbed: remove it, shift the following word.
+            # Preserve the original end of the shifted word (don't shrink it).
+            shifted_end = max(onset_end, onset_next.xmax)
+            intervals[i + 1] = Interval(new_end, shifted_end, onset_next.text)
+            if onset_next is not next_iv and i + 2 < n:
+                intervals[i + 2] = Interval(0, 0, '')
+        elif new_end < next_end:
+            intervals[i + 1] = Interval(new_end, next_end, next_iv.text)
+
+    # ── NVV forward extension: breath/paralinguistic energy often
+    # continues past the MFA/CTC NVV boundary into the following
+    # silence.  Extend NVV end to where energy truly drops to noise.
+    for i in range(n):
+        iv = intervals[i]
+        if not is_nvv_token(iv.text):
+            continue
+        if i + 1 >= n:
+            continue
+        next_iv = intervals[i + 1]
+        if not is_silence(next_iv.text):
+            continue
+        if next_iv.xmax <= next_iv.xmin:
+            continue
+
+        nvv_end = iv.xmax
+        # Look up to 400ms into following silence
+        ext_limit = min(nvv_end + 0.4, next_iv.xmax)
+        if ext_limit <= nvv_end + 0.015:
+            continue
+
+        s_sample = int(nvv_end * sr)
+        e_sample = int(ext_limit * sr)
+        win = max(1, int(0.010 * sr))
+        n_wins = (e_sample - s_sample) // win
+        if n_wins < 5:
+            continue
+
+        rms_vals = []
+        for j in range(n_wins):
+            chunk = audio[s_sample + j*win : s_sample + (j+1)*win]
+            rms_vals.append(float(_np.mean(_np.abs(chunk))))
+
+        # A breath-level energy floor: above absolute silence but
+        # below speech.  Use max(nf * 1.5, 0.0003) so we catch
+        # quiet breathing but not dead silence.
+        breath_floor = max(float(nf) * 1.5, 0.0003)
+
+        # Find sustained silence (3 frames = 30ms below breath_floor)
+        below_run = 0
+        cutoff_win = n_wins
+        for j, r in enumerate(rms_vals):
+            if r < breath_floor:
+                below_run += 1
+                if below_run >= 3:
+                    cutoff_win = j - below_run + 1
+                    break
+            else:
+                below_run = 0
+
+        if cutoff_win < 5:
+            continue  # less than 50ms extension — not worth it
+
+        new_end = nvv_end + (cutoff_win * win) / sr
+        new_end = min(new_end, next_iv.xmax - 0.005)
+
+        if new_end - nvv_end < 0.050:
+            continue
+
+        intervals[i] = Interval(iv.xmin, new_end, iv.text)
+        if new_end < next_iv.xmax:
+            intervals[i + 1] = Interval(new_end, next_iv.xmax, next_iv.text)
+
+    # ── End trimming: word tails that decay into silence ──
+    # Sentence-final words often have their tail silence absorbed
+    # into the word boundary.  Trim the end to the last frame above
+    # threshold.  Applies to ALL word types including English (e.g. "bug"
+    # at sentence end with 900ms trailing silence).
+    # Skip words that were intentionally extended by end-extension above.
+    for i in range(n - 1, -1, -1):
+        iv = intervals[i]
+        if i in _extended_indices:
+            continue
+        if is_silence(iv.text) or not iv.text.strip():
+            continue
+        if is_nvv_token(iv.text):
+            continue  # NVV: no acoustic model for energy checks
         if is_punct(iv.text):
-            continue  # punctuation has no acoustic energy to trim
+            continue
         dur = iv.xmax - iv.xmin
         if dur < 0.15:
             continue  # already short, don't trim further
@@ -2455,7 +2830,6 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
             # Unmatched token — keep MFA boundaries unchanged
             word_start = mfa_iv.xmin
             word_end = mfa_iv.xmax
-            new_word_ivs.append((word_start, word_end, mfa_iv.text, "word"))
             for p_iv in (pp_tier.intervals if pp_tier else []):
                 if p_iv.xmax > mfa_iv.xmin and p_iv.xmin < mfa_iv.xmax:
                     new_phone_ivs.append((p_iv.xmin, p_iv.xmax, p_iv.text))
@@ -2481,8 +2855,13 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
         if mfa_iv.text.strip() == '<unk>':
             use_mfa = False
             mfa_iv.text = ctc.get('word', mfa_iv.text)
-        # Rule 1: NVV / English — no MFA acoustic model, always CTC
-        if is_nvv_token(mfa_iv.text) or is_english_token(mfa_iv.text):
+        # Rule 1: NVV / English — no MFA acoustic model, always CTC.
+        # Exception: NVV with CTC duration < 100ms — CTC detection may be
+        # a noise artifact; keep MFA boundaries to avoid squeezing adjacent
+        # words (e.g. BREATHING 60ms detection eating into ti2 tail).
+        if is_nvv_token(mfa_iv.text):
+            use_mfa = (ctc_end - ctc_start) < 0.10
+        elif is_english_token(mfa_iv.text):
             use_mfa = False
         # Rule 2a: MFA phone evidence arbitration.
         # When MFA placed phones in the disputed region between CTC end
@@ -2512,7 +2891,45 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
             use_mfa = False
         # Rule 3: MFA stretched or compressed beyond 2x ratio -> trust CTC
         # (skip if MFA phone evidence exists in disputed region)
-        if use_mfa and not has_mfa_phone_evidence and (mfa_dur > ctc_dur * 2.0 or ctc_dur > mfa_dur * 2.0):
+        # ALSO skip when MFA's shorter duration is due to trailing <eps>
+        # (silence) that CTC assigned to this word. Two patterns:
+        #   a) trailing silence before punctuation (jie2 case)
+        #   b) preceding word's trailing <eps> absorbed into this word's CTC span (er4 case)
+        ratio_skip = False
+        if use_mfa and not has_mfa_phone_evidence \
+           and ctc_dur > mfa_dur * 2.0:
+            # Check for trailing <eps> after this word's MFA end
+            has_trailing_sil = any(
+                is_silence(iv.text)
+                and iv.xmin >= mfa_end - 0.01
+                and iv.xmin < ctc_end + 0.05
+                for iv in words_tier.intervals
+            )
+            if has_trailing_sil:
+                # Pattern (a): trailing silence + punct
+                if punct_entries and mfa_end < ctc_end:
+                    for p in punct_entries:
+                        if mfa_end <= p["start_s"] <= mfa_end + 0.5:
+                            ratio_skip = True
+                            break
+            # Pattern (b): CTC assigned preceding word's <eps> to this word.
+            # This happens when Phase 1 (merge_short_silences) already merged
+            # the <eps> into the previous word AND when the <eps> is still
+            # visible between the two words.  In both cases the inflated CTC
+            # duration is from absorbed silence, not actual speech compression.
+            if not ratio_skip and ctc_start < mfa_start - 0.02:
+                # Case 1: <eps> still visible between prev word and this word
+                gap_sil = any(
+                    is_silence(iv.text)
+                    and iv.xmin >= prev_end - 0.01
+                    and iv.xmax <= mfa_start + 0.02
+                    and iv.xmax - iv.xmin > 0.03
+                    for iv in words_tier.intervals
+                )
+                if gap_sil:
+                    ratio_skip = True
+        if use_mfa and not has_mfa_phone_evidence and not ratio_skip \
+           and (mfa_dur > ctc_dur * 2.0 or ctc_dur > mfa_dur * 2.0):
             use_mfa = False
 
         if use_mfa:
@@ -2522,28 +2939,62 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
             if start_diff > 0.15:
                 word_start = round((ctc_start + mfa_start) / 2, 3)
             if end_diff > 0.15:
-                word_end = round((ctc_end + mfa_end) / 2, 3)
+                # MFA thinks word ends sooner than CTC (trailing <eps>/silence).
+                # If MFA's trailing silence is followed by punctuation within
+                # 500ms, keep MFA's end so the gap can be absorbed by the punct
+                # instead of being snapped back into the word via midpoint.
+                keep_mfa_end = False
+                if mfa_end < ctc_end and punct_entries:
+                    has_trailing_sil = any(
+                        is_silence(iv.text)
+                        and iv.xmin >= mfa_end - 0.01
+                        and iv.xmin < ctc_end + 0.05
+                        for iv in words_tier.intervals
+                    )
+                    if has_trailing_sil:
+                        for p in punct_entries:
+                            if mfa_end <= p["start_s"] <= mfa_end + 0.5:
+                                keep_mfa_end = True
+                                break
+                if not keep_mfa_end:
+                    word_end = round((ctc_end + mfa_end) / 2, 3)
             # MFA 把词放在长静音之后, CTC 说更早 -> 取标点之后的纯静音间隙
-            # 如果纯静音间隙 > 100ms, 优先用 CTC 起点
+            # 如果纯静音间隙 > 100ms, 优先用 CTC 起点。
+            # 但如果间隙中有标点，静音应归标点处理（_inject_punctuation），
+            # 不应通过 SILENCE_GAP_SNAP_THRESH 把词首拉到 CTC。
             SILENCE_GAP_SNAP_THRESH = 0.10
             if mfa_start > ctc_start and start_diff <= snap_threshold:
                 gap_start = prev_end
+                has_punct_in_gap = False
                 if punct_entries:
                     for p in punct_entries:
                         if p["start_s"] < mfa_start and p["end_s"] > prev_end:
                             gap_start = max(gap_start, p["end_s"])
-                pure_silence_gap = mfa_start - gap_start
-                if pure_silence_gap > SILENCE_GAP_SNAP_THRESH:
-                    word_start = max(ctc_start, gap_start)
+                            has_punct_in_gap = True
+                if has_punct_in_gap:
+                    pass  # punct handles silence placement
+                else:
+                    pure_silence_gap = mfa_start - gap_start
+                    if pure_silence_gap > SILENCE_GAP_SNAP_THRESH:
+                        word_start = max(ctc_start, gap_start)
         else:
             word_start = ctc_start
             word_end = ctc_end
 
         # 防止词间重叠: start 不能在前一词 end 之前
         # NVV: 缩短前词尾让路（NVV 无 MFA 声学模型，CTC 是唯一依据）
-        # English/Chinese: 不缩短前词（MFA 边界有声学证据），推后当前词
+        # English/Chinese normally push forward (MFA boundaries have acoustic
+        # evidence), BUT when the previous word was extended beyond its CTC end
+        # by a silence merge (prev_end > prev_ctc_end AND a real CTC gap),
+        # the extra length is silence — shorten the previous word instead of
+        # squeezing the current one.
         if word_start < prev_end - 0.002:
-            if is_nvv_token(mfa_iv.text):
+            prev_was_silence_extended = (
+                prev_end > prev_ctc_end + 0.10  # >100ms silence extension
+                and not is_nvv_token(mfa_iv.text)
+                and not is_english_token(mfa_iv.text)
+            )
+            if is_nvv_token(mfa_iv.text) or prev_was_silence_extended:
                 if len(new_word_ivs) >= 1 and new_word_ivs[-1][3] == "word":
                     prev_entry = new_word_ivs[-1]
                     new_prev_end = max(word_start - 0.005, prev_entry[0] + 0.010)
@@ -2804,7 +3255,8 @@ def _apply_en_phones(words_tier: Tier, pp_tier: Tier | None,
                     s = round(w_start + rs * word_dur, 4)
                     e = round(w_start + re * word_dur, 4)
                     if e > s + 0.010:
-                        new_phone_ivs.append(Interval(s, e, f"{phone_prefix}{cmu_phones[i]}"))
+                        label = f"{phone_prefix}{cmu_phones[i]}"
+                        new_phone_ivs.append(Interval(s, e, label))
             elif n_cmu > n_ipa:
                 # More CMUdict phones than IPA slices — split the longest slice(s)
                 # to make room.  Build target relative cuts from IPA boundaries,
@@ -2992,8 +3444,13 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     """
     stem = tg_path.stem
 
-    # Load English MFA phone data (may be None — safe to ignore)
+    # Load English MFA phone data.
+    # Auto-detect en_phones dir from workspace if not explicitly provided.
     en_phones_dir = getattr(args, 'en_phones_dir', None)
+    if en_phones_dir is None:
+        auto_dir = output_dir.parent / "en_phones"
+        if auto_dir.exists():
+            en_phones_dir = auto_dir
     en_data = load_en_phones(stem, en_phones_dir)
     report: dict = {"stem": stem, "status": "ok", "warnings": []}
     txt_path = txt_dir / f"{stem}.txt"
@@ -3240,7 +3697,8 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     if wav_audio is not None:
         words_tier = tier_by_name(new_tg, "words")
         if words_tier:
-            words_tier = _refine_boundaries_by_energy(words_tier, wav_audio, wav_sr)
+            words_tier = _refine_boundaries_by_energy(words_tier, wav_audio, wav_sr,
+                                                         punct_entries=punct_entries)
             for i, t in enumerate(new_tg.tiers):
                 if t.name == "words":
                     new_tg.tiers[i] = words_tier
@@ -3284,6 +3742,16 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                     if t.name == "phones":
                         new_tg.tiers[i] = phones_tier
                         break
+    else:
+        # No en_data — check if there are English tokens that need it
+        words_tier = tier_by_name(new_tg, "words")
+        if words_tier:
+            en_tokens = [iv.text for iv in words_tier.intervals
+                         if is_english_token(iv.text)]
+            if en_tokens:
+                report.setdefault("warnings", []).append(
+                    f"English tokens {en_tokens} found but no en_phones data. "
+                    f"Pass --en-phones-dir or place en_phones/ next to output/.")
 
     # ═══════════════════════════════════════════════════════════════
     # Phase 4 — Post-boundary processing (ORDER CRITICAL).

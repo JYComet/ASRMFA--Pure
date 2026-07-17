@@ -1,0 +1,12 @@
+{
+  "config_file": "E:\\MFA_Pause\\repo\\configs\\hechengria_10.yaml",
+  "mode": "ctc_ready",
+  "workspace": "hechengria_10",
+  "data_dir": "\\\\RS3621\\Research_TTS\\Data\\Raw\\v5_0707\\合成ria\\wavs",
+  "output_dir": "E:\\MFA_Pause\\repo\\output\\hechengria_10\\output",
+  "n_stems": 10,
+  "manifest_path": "E:\\MFA_Pause\\repo\\output\\hechengria_10\\ctc_pretg\\ctc_ready_manifest.json",
+  "ctc_dir": "//RS3621/Research_TTS/Data/Raw/ASRNEW/合成ria/wavs",
+  "version": 1,
+  "scanned_at": "2026-07-17T22:00:29"
+}

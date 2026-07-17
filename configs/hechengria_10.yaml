@@ -1,0 +1,58 @@
+# 合成ria — 随机10条, 完整管线 (ctc_ready)
+# Auto-generated 2026-07-17 13:04
+# Stems: ['01251', '06894', '08420', '10126', '13074', '13714', '15136', '15653', '19615', '21174']
+
+mode: ctc_ready
+workspace: hechengria_10
+
+data_dir: //RS3621/Research_TTS/Data/Raw/v5_0707/合成ria/wavs
+keep_16k_audio: true
+
+ctc_ready:
+  ctc_dir: //RS3621/Research_TTS/Data/Raw/ASRNEW/合成ria/wavs
+  require_all: true
+  stem_prefix: "合成ria_"
+  stems: ["01251", "06894", "08420", "10126", "13074", "13714", "15136", "15653", "19615", "21174"]
+
+mfa:
+  num_jobs: 4
+  single_speaker: true
+  output_format: "long_textgrid"
+  clean: false
+  no_tokenization: true
+  skip_validate: true
+  fine_tune: false
+
+mfa_en:
+  enabled: true
+
+ctc_adjust:
+  enabled: true
+  limit: 0
+
+postprocess:
+  merge_silence: true
+  min_sil_merge_sec: 0.2
+  fix_short_word: true
+  short_word_max_sec: 0.25
+  flank_silence_sec: 0.4
+  short_word_search_window: 0.5
+  detect_bgm: true
+  bgm_noise_floor_ratio: 2.0
+  bgm_min_sil_dur: 0.3
+  bgm_speech_ratio: 1.0
+  bgm_min_energy: 0.01
+  filter_suspicious: true
+  filter_short_phone_sec: 0.015
+  filter_long_word_sec: 1.0
+  filter_min_word_sec: 0.15
+  filter_min_word_dur_sec: 0.02
+  filter_word_energy_ratio: 2.0
+  filter_min_phone_coverage: 0.35
+  filter_edge_gap_sec: 0.25
+  filter_flank_silence_sec: 0.4
+  filter_long_consonant_sec: 999.0
+  filter_long_vowel_sec: 999.0
+  enable_text_correction: true
+  handle_unexpected_sil: true
+  workers: 0

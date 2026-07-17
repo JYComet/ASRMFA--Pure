@@ -1,0 +1,26 @@
+# AED test — 3 extra 合成ria files with network CTC data
+mode: ctc_ready
+workspace: aed_test
+
+data_dir: E:/MFA_Pause/repo/data_dir/aed_test
+
+ctc_ready:
+  ctc_dir: //RS3621/Research_TTS/Data/Raw/ASRNEW/合成ria/wavs
+  require_all: true
+  stem_prefix: "合成ria_"
+  stems: ["35018", "35019", "35020"]
+
+mfa:
+  num_jobs: 4
+  single_speaker: true
+  output_format: "long_textgrid"
+  clean: false
+  no_tokenization: true
+  skip_validate: true
+  fine_tune: false
+
+postprocess:
+  enable_text_correction: true
+  handle_unexpected_sil: true
+
+output_dir: E:/MFA_Pause/repo/output/aed_test/output

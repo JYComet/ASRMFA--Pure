@@ -769,17 +769,56 @@ def _normalize_numerals(ctc_dir: Path) -> int:
     return changed
 
 
+def _merge_ria_tokens(tokens_path: Path) -> bool:
+    """合并 tokens.jsonl 中相邻的 ruiN + yaN 条目为单个 ria 条目."""
+    try:
+        lines = tokens_path.read_text(encoding="utf-8").strip().split("\n")
+        entries = [json.loads(l) for l in lines if l.strip()]
+    except Exception:
+        return False
+    if len(entries) < 2:
+        return False
+
+    new_entries, i, changed = [], 0, False
+    while i < len(entries):
+        w = entries[i]["word"]
+        if (re.match(r'^rui[0-5]$', w) and i + 1 < len(entries)
+                and re.match(r'^ya[0-5]$', entries[i + 1]["word"])):
+            a, b = entries[i], entries[i + 1]
+            new_entries.append({
+                "word": "ria",
+                "start_ms": a["start_ms"], "end_ms": b["end_ms"],
+                "start_s": a["start_s"], "end_s": b["end_s"],
+                "type": a.get("type", "word"),
+            })
+            i += 2
+            changed = True
+        else:
+            new_entries.append(entries[i])
+            i += 1
+
+    if changed:
+        tokens_path.write_text(
+            "\n".join(json.dumps(e, ensure_ascii=False) for e in new_entries) + "\n",
+            encoding="utf-8")
+    return changed
+
+
 def _normalize_ria(ctc_dir: Path) -> int:
-    """ASR 后处理安全网: 修复旧 CTC 输出中 ria 的拼音碎片.
+    """ASR 后处理安全网: 修复旧 CTC 输出中 ria 的拼音碎片和 CTC 锚点.
 
     新数据已在 align_text 上通过 replace_ria_variants() 实时处理,
-    .lab 从源头就是 ria. 此函数覆盖旧版 pipeline 产生的 CTC 输出:
-      直接修复 .lab 中的 rui4 ya4 → ria,
-      _text_cn.txt 和 _text_raw.txt 保持原样 (ASR 原始输出存档).
+    .lab / _tokens.jsonl 从源头就是 ria. 此函数覆盖旧版 pipeline 输出:
+      1. 修复 .lab:          rui4 ya4 → ria
+      2. 合并 _tokens.jsonl: rui4 + ya4 → ria (含 CTC 时间戳)
+
+    _text_cn.txt 和 _text_raw.txt 保持原样 (ASR 原始输出存档).
 
     使用 rglob 同时支持 flat 和嵌套目录结构.
     """
-    changed = 0
+    lab_changed = 0
+    tokens_changed = 0
+
     for lab_file in sorted(ctc_dir.rglob("*.lab")):
         try:
             lab_text = lab_file.read_text(encoding="utf-8").strip()
@@ -791,11 +830,18 @@ def _normalize_ria(ctc_dir: Path) -> int:
 
         if new_lab != lab_text:
             lab_file.write_text(new_lab + "\n", encoding="utf-8")
-            changed += 1
+            lab_changed += 1
 
-    if changed:
-        print(f"  [normalize_ria] {changed} .lab files (safety net)")
-    return changed
+            # 同步合并 _tokens.jsonl
+            tokens_path = lab_file.with_suffix(".jsonl")
+            if not tokens_path.exists():
+                tokens_path = lab_file.parent / f"{lab_file.stem}_tokens.jsonl"
+            if tokens_path.exists() and _merge_ria_tokens(tokens_path):
+                tokens_changed += 1
+
+    if lab_changed:
+        print(f"  [normalize_ria] {lab_changed} .lab + {tokens_changed} tokens.jsonl (safety net)")
+    return lab_changed
 
 
 def _normalize_english(ctc_dir: Path, dict_path: Path | None = None) -> int:

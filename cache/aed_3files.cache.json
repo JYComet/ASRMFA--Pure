@@ -1,0 +1,12 @@
+{
+  "config_file": "E:\\MFA_Pause\\repo\\configs\\aed_3files.yaml",
+  "mode": "ctc_ready",
+  "workspace": "aed_test",
+  "data_dir": "E:\\MFA_Pause\\repo\\data_dir\\aed_test",
+  "output_dir": "E:\\MFA_Pause\\repo\\output\\aed_test\\output",
+  "n_stems": 3,
+  "manifest_path": "E:\\MFA_Pause\\repo\\output\\aed_test\\ctc_pretg\\ctc_ready_manifest.json",
+  "ctc_dir": "//RS3621/Research_TTS/Data/Raw/ASRNEW/合成ria/wavs",
+  "version": 1,
+  "scanned_at": "2026-07-17T22:28:23"
+}

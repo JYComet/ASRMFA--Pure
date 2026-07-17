@@ -795,20 +795,21 @@ def step_normalize_text(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
 
 
 def step_normalize_ria(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
-    """Fix ria pinyin fragments in .lab files (safety net for old CTC output).
+    """Fix ria pinyin fragments in .lab + merge CTC anchors in _tokens.jsonl.
 
-    New data is already handled inline by ctc_prealign (align_text gets
-    CJK→ria before tokenizer, so .lab has "ria" from the start).
-    This step only touches .lab files — _text_cn.txt and _text_raw.txt
-    are preserved as the original ASR output archive.
+    Safety net for old CTC output.  New data is handled inline by
+    ctc_prealign (align_text gets CJK→ria before tokenizer).
+    Does NOT modify _text_cn.txt / _text_raw.txt (ASR archive).
     """
-    import re
+    import json, re
 
     ctc_dir = ctx["ctc_pretg"]
     if not ctc_dir or not ctc_dir.exists():
         return 0
 
-    changed = 0
+    lab_changed = 0
+    tokens_changed = 0
+
     for lab_file in sorted(ctc_dir.rglob("*.lab")):
         try:
             lab_text = lab_file.read_text(encoding="utf-8").strip()
@@ -818,12 +819,43 @@ def step_normalize_ria(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         new_lab = re.sub(r'rui[0-5]\s+ya[0-5]', 'ria', lab_text)
         new_lab = re.sub(r'rui[0-5]\s+a[0-5]', 'ria', new_lab)
 
-        if new_lab != lab_text:
-            lab_file.write_text(new_lab + "\n", encoding="utf-8")
-            changed += 1
+        if new_lab == lab_text:
+            continue
 
-    if changed:
-        print(f"  [normalize_ria] {changed} .lab files (safety net)")
+        lab_file.write_text(new_lab + "\n", encoding="utf-8")
+        lab_changed += 1
+
+        # Merge tokens.jsonl: ruiN + yaN → ria
+        tokens_path = lab_file.with_name(lab_file.stem + "_tokens.jsonl")
+        if not tokens_path.exists():
+            tokens_path = lab_file.with_suffix(".jsonl")
+        if tokens_path.exists():
+            try:
+                entries = [json.loads(l) for l in
+                           tokens_path.read_text(encoding="utf-8").strip().split("\n") if l.strip()]
+                new_entries, i, changed = [], 0, False
+                while i < len(entries):
+                    w = entries[i]["word"]
+                    if (re.match(r'^rui[0-5]$', w) and i + 1 < len(entries)
+                            and re.match(r'^ya[0-5]$', entries[i + 1]["word"])):
+                        a, b = entries[i], entries[i + 1]
+                        new_entries.append({
+                            "word": "ria", "start_ms": a["start_ms"], "end_ms": b["end_ms"],
+                            "start_s": a["start_s"], "end_s": b["end_s"],
+                            "type": a.get("type", "word")})
+                        i += 2; changed = True
+                    else:
+                        new_entries.append(entries[i]); i += 1
+                if changed:
+                    tokens_path.write_text(
+                        "\n".join(json.dumps(e, ensure_ascii=False) for e in new_entries) + "\n",
+                        encoding="utf-8")
+                    tokens_changed += 1
+            except Exception:
+                pass
+
+    if lab_changed:
+        print(f"  [normalize_ria] {lab_changed} .lab + {tokens_changed} tokens.jsonl (safety net)")
     return 0
 
 
