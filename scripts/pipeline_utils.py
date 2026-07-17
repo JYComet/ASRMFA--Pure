@@ -17,14 +17,14 @@ from typing import Optional
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # ═══════════════════════════════════════════════════════════════
-# UNC → Linux 路径翻译
+# UNC -> Linux 路径翻译
 # ═══════════════════════════════════════════════════════════════
 
 _WIN_UNC_MAP: dict[str, str] = {}
 
 
 def _detect_smb_mounts() -> dict[str, str]:
-    """Parse /proc/mounts for CIFS mounts → UNC→linux mapping."""
+    """Parse /proc/mounts for CIFS mounts -> UNC->linux mapping."""
     mapping: dict[str, str] = {}
     if platform.system() == "Windows":
         return mapping
@@ -58,7 +58,7 @@ _WIN_UNC_MAP = _detect_smb_mounts()
 
 
 def translate_path(path_str: str) -> str:
-    """Convert Windows UNC → Linux mount path."""
+    """Convert Windows UNC -> Linux mount path."""
     if not path_str or platform.system() == "Windows":
         return path_str
     normalized = path_str.replace("\\", "/")
@@ -72,7 +72,7 @@ def translate_path(path_str: str) -> str:
 
 
 def resolve_input_path(raw: str, base: Path = PROJECT_ROOT) -> Path:
-    """Translate UNC + resolve relative → absolute Path."""
+    """Translate UNC + resolve relative -> absolute Path."""
     if not raw:
         return base
     translated = translate_path(raw)
@@ -87,7 +87,7 @@ def resolve_input_path(raw: str, base: Path = PROJECT_ROOT) -> Path:
 def find_mfa_python(cfg_python: str = "") -> Optional[Path]:
     """Auto-detect Python with MFA installed.
 
-    Checks (in order): explicit config path → ``mfa`` on PATH →
+    Checks (in order): explicit config path -> ``mfa`` on PATH ->
     common conda environments (Linux & Windows).
     """
     if cfg_python:
@@ -155,7 +155,7 @@ CTC_SUFFIXES: list[str] = [
 
 
 def build_ctc_presence(ctc_dir: Path) -> "tuple[set[str], dict[str, set[str]]]":
-    """单次 os.scandir → O(1) 文件名查找。
+    """单次 os.scandir -> O(1) 文件名查找。
 
     Returns:
         flat_names:   顶层文件名集合
@@ -234,7 +234,7 @@ def count_files_fast(dirpath: Path, suffix: str, max_count: int = 10000) -> int:
 
 
 def find_wav(audio_dir: Path, stem: str) -> Optional[Path]:
-    """Find {stem}.wav — flat → nested → zero-padded → glob fallback."""
+    """Find {stem}.wav — flat -> nested -> zero-padded -> glob fallback."""
     wav = audio_dir / f"{stem}.wav"
     if wav.exists():
         return wav
@@ -259,7 +259,7 @@ def find_wav(audio_dir: Path, stem: str) -> Optional[Path]:
 
 
 def link_or_copy_file(src: Path, dst: Path) -> bool:
-    """Best-effort: hard-link → symlink → copy."""
+    """Best-effort: hard-link -> symlink -> copy."""
     if not src.exists():
         return False
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -473,7 +473,7 @@ def copy_tree_fast(src: Path, dst: Path) -> bool:
 
 
 def sync_tree_back(src: Path, dst: Path) -> bool:
-    """Sync local → NAS with 3 retries + exponential backoff."""
+    """Sync local -> NAS with 3 retries + exponential backoff."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     for attempt in range(3):
         if _has_rsync():
@@ -511,7 +511,17 @@ def sync_tree_back(src: Path, dst: Path) -> bool:
 import re as _re
 
 # ── Silence / pause tokens ──────────────────────────────────────
-SILENCE_LABELS: set[str] = {"<eps>", "<sil>", "sil", "<sp0>", "<sp1>", "<sp2>", "<sp3>"}
+SILENCE_LABELS: set[str] = {"<eps>", "<sil>", "sil", "<sp0>", "<sp1>", "<sp2>", "<sp3>", "spn"}
+
+
+def is_silence(text: str) -> bool:
+    """Check if *text* is a silence / pause token."""
+    t = text.strip()
+    return t in SILENCE_LABELS or t.startswith("<sp") or t in ("", "<eps>")
+
+
+# ── English phone prefix for mixed-language tier output ──────────
+EN_PHONE_PREFIX: str = "en:"
 
 # ── NVV (Non-Verbal Vocalisation) names ─────────────────────────
 NVV_NAMES: set[str] = {
@@ -550,7 +560,7 @@ CHINESE_INITIALS_SET: set[str] = {
     "ŋ", "ʔ",
 }
 
-# ── IPA → pinyin mapping tables ─────────────────────────────────
+# ── IPA -> pinyin mapping tables ─────────────────────────────────
 IPA_CONSONANT_MAP: dict[str, str] = {
     'p': 'b', 'pʰ': 'p', 't': 'd', 'tʰ': 't', 'k': 'g', 'kʰ': 'k',
     'tɕ': 'j', 'tɕʰ': 'q', 'ʈʂ': 'zh', 'ʈʂʰ': 'ch', 'ts': 'z', 'tsʰ': 'c',
@@ -617,6 +627,64 @@ CHINESE_SHORT_WORDS: set[str] = {
 
 
 # ═══════════════════════════════════════════════════════════════
+# ASR 后处理 — 标点规范化 + ria 音译还原
+# (ctc_prealign.py 和 run_pipeline.py 共享, 单一真相源)
+# ═══════════════════════════════════════════════════════════════
+
+# ASCII→CJK 标点映射 (逐条即时处理, 替代批量后处理扫描)
+_ASCII_TO_CJK_PUNCT: dict[str, str] = {
+    ",": "，", ".": "。", "?": "？", "!": "！", ";": "；", ":": "：",
+}
+_ASCII_TO_CJK_TABLE = str.maketrans(_ASCII_TO_CJK_PUNCT)
+
+# 白名单 CJK 标点 — 非白名单 CJK 标点将被替换为 ，
+_NORM_ALLOWED_PUNCT = frozenset("，。！？、；：…")
+
+# ria 中文音译变体 → 拉丁原文
+# SenseVoice 有时将英文名 "ria" 识别为近音 CJK 组合
+RIA_VARIANTS: dict[str, str] = {
+    "瑞娅": "ria",
+    "瑞亚": "ria",
+    "瑞雅": "ria",
+    "瑞啊": "ria",
+}
+
+
+def replace_ria_variants(text: str) -> str:
+    """将文本中的中文 ria 音译变体替换为拉丁 ria."""
+    for variant, replacement in RIA_VARIANTS.items():
+        text = text.replace(variant, replacement)
+    return text
+
+
+def normalize_punct_inline(text: str) -> str:
+    """逐条标点规范化: ASCII→CJK + 相邻标点合并 + 非白名单→，."""
+    # Phase 1: ASCII → CJK
+    text = text.translate(_ASCII_TO_CJK_TABLE)
+
+    # Phase 2: non-whitelist CJK punct/symbol → ，
+    chars: list[str] = []
+    for ch in text:
+        o = ord(ch)
+        if ((0x3000 <= o <= 0x303F or 0xFF00 <= o <= 0xFFEF)
+                and ch not in _NORM_ALLOWED_PUNCT
+                and ch != ' ' and not ('a' <= ch.lower() <= 'z')
+                and not ch.isdigit()):
+            chars.append('，')
+            continue
+        chars.append(ch)
+    text = ''.join(chars)
+
+    # Phase 3: adjacent punct merge
+    merged: list[str] = []
+    for ch in text:
+        if merged and ch in _NORM_ALLOWED_PUNCT and merged[-1] in _NORM_ALLOWED_PUNCT:
+            continue
+        merged.append(ch)
+    return ''.join(merged)
+
+
+# ═══════════════════════════════════════════════════════════════
 # Character / token classification helpers
 # ═══════════════════════════════════════════════════════════════
 
@@ -658,6 +726,332 @@ def is_word_like(s: str) -> bool:
 def is_punct(s: str) -> bool:
     """True if *s* is a non-word token (punctuation / symbol)."""
     return bool(s.strip()) and not is_word_like(s)
+
+
+# ── English MFA phone classification ─────────────────────────────
+
+_ENGLISH_VOWELS: set[str] = {
+    'AA', 'AE', 'AH', 'AO', 'AW', 'AX', 'AXR', 'AY',
+    'EH', 'ER', 'EY', 'IH', 'IX', 'IY', 'OW', 'OY', 'UH', 'UW', 'UX',
+}
+_ENGLISH_CONSONANTS: set[str] = {
+    'B', 'CH', 'D', 'DH', 'DX', 'EL', 'EM', 'EN', 'ENG', 'F', 'G',
+    'HH', 'JH', 'K', 'L', 'M', 'N', 'NG', 'NX', 'P', 'Q', 'R', 'S',
+    'SH', 'T', 'TH', 'V', 'W', 'WH', 'Y', 'Z', 'ZH',
+}
+_ENGLISH_SILENCE_PHONES: set[str] = {'sil', 'sp', 'spn', '<eps>'}
+
+
+def is_english_phone(phone: str) -> bool:
+    """Check if *phone* is an MFA English phone (ARPABET-based, with optional stress)."""
+    p = phone.strip().rstrip('012')
+    return p in _ENGLISH_VOWELS or p in _ENGLISH_CONSONANTS or p in _ENGLISH_SILENCE_PHONES
+
+
+def is_english_vowel_phone(phone: str) -> bool:
+    """Check if *phone* is an English vowel (MFA ARPABET-based)."""
+    p = phone.strip().rstrip('012')
+    return p in _ENGLISH_VOWELS
+
+
+def is_english_consonant_phone(phone: str) -> bool:
+    """Check if *phone* is an English consonant (MFA ARPABET-based)."""
+    p = phone.strip().rstrip('012')
+    return p in _ENGLISH_CONSONANTS
+
+
+# ── English IPA -> ARPABET mapping (legacy compat) ─────────────────
+# When using the ARPABET-native english_us_arpa model, the mapping is
+# a no-op (ARPABET phones pass through unchanged).  The table is kept
+# for backward compatibility with english_mfa (IPA-based) output.
+# Vowels default to stress level 0; stress can be overridden with a
+# lexicon lookup in postprocessing.
+
+_EN_IPA_TO_ARPABET: dict[str, str] = {
+    # ── Stops ──
+    "p": "P", "pʰ": "P", "pʲ": "P", "pʷ": "P",
+    "b": "B", "bʲ": "B",
+    "t": "T", "tʰ": "T", "tʲ": "T", "tʷ": "T", "t̪": "T",
+    "d": "D", "dʲ": "D", "d̪": "D",
+    "k": "K", "kʰ": "K", "kʷ": "K", "kp": "K",
+    "ɡ": "G", "g": "G",
+    "ʔ": "",  # glottal stop -> dropped
+    "c": "K", "cʰ": "K", "cʷ": "K",
+    "ɟ": "G", "ɟʷ": "G",
+    "ʈ": "T", "ʈʰ": "T", "ʈʲ": "T", "ʈʷ": "T",
+
+    # ── Affricates ──
+    "tʃ": "CH",
+    "dʒ": "JH",
+
+    # ── Fricatives ──
+    "f": "F", "fʲ": "F", "fʷ": "F",
+    "v": "V", "vʲ": "V",
+    "θ": "TH",
+    "ð": "DH",
+    "s": "S",
+    "z": "Z",
+    "ʃ": "SH",
+    "ʒ": "ZH",
+    "h": "HH",
+    "ç": "HH",
+    "ɦ": "HH",
+
+    # ── Nasals ──
+    "m": "M", "mʲ": "M", "m̩": "M",
+    "n": "N", "n̩": "N",
+    "ŋ": "NG",
+    "ɱ": "M",
+    "ɲ": "N",
+    "ɳ": "N",
+
+    # ── Liquids ──
+    "l": "L",
+    "ɫ": "L",
+    "ɹ": "R",
+    "ɻ": "R",
+    "ɾ": "R",
+
+    # ── Glides ──
+    "j": "Y",
+    "w": "W",
+    "ʋ": "W",
+    "ʎ": "Y",
+
+    # ── Vowels (monophthongs) -> stress-0 by default ──
+    "i": "IY0", "iː": "IY0",
+    "ɪ": "IH0",
+    "e": "EY0", "eː": "EY0",
+    "ɛ": "EH0", "ɛ̃": "EH0",
+    "æ": "AE0",
+    "a": "AA0", "aː": "AA0",
+    "ɑ": "AA0",
+    "ɒ": "AA0",
+    "ɔ": "AO0",
+    "o": "OW0", "oː": "OW0",
+    "ʊ": "UH0",
+    "u": "UW0", "uː": "UW0",
+    "ə": "AH0",
+    "ʌ": "AH0",
+    "ɜ": "ER0",
+    "ɝ": "ER0",
+    "ɐ": "AH0",
+    "ɨ": "IH0",
+    "ʉ": "UW0", "ʉː": "UW0",
+    "ɤ": "AH0",
+
+    # ── Diphthongs ──
+    "aj": "AY0",
+    "aw": "AW0",
+    "ɔj": "OY0",
+    "ej": "EY0",
+    "ow": "OW0",
+    "əw": "OW0",
+}
+
+# Tracks unexpected IPA→ARPABET mapping hits when using the ARPA model.
+# With english_us_arpa, this set should remain empty (all phones are no-op pass-through).
+_en_ipa_mapping_hits: set[str] = set()
+
+
+def en_ipa_to_arpabet(phone: str) -> str:
+    """Map a single MFA English IPA phone to ARPABET.
+
+    Returns the ARPABET equivalent, or the original phone unchanged
+    if it cannot be mapped (silence / spn / unrecognised).
+
+    With the ARPABET-native english_us_arpa model, this is normally
+    a no-op.  When an IPA→ARPABET conversion actually fires, the
+    mapping is recorded to :data:`_en_ipa_mapping_hits` for later
+    diagnostics.
+    """
+    p = phone.strip()
+    if not p:
+        return p
+    # Already ARPABET or silence — pass through
+    if p in ("sil", "sp", "spn", "<eps>"):
+        return p
+    if p.startswith("en:"):
+        inner = p[3:]
+        mapped = _EN_IPA_TO_ARPABET.get(inner, inner)
+        if mapped != inner:
+            _en_ipa_mapping_hits.add(f"{inner}→{mapped}")
+        if mapped == "":
+            return ""  # explicitly dropped (glottal stop)
+        return f"en:{mapped}" if mapped else f"en:{inner}"
+    mapped = _EN_IPA_TO_ARPABET.get(p, p)
+    if mapped != p:
+        _en_ipa_mapping_hits.add(f"{p}→{mapped}")
+    if mapped == "":
+        return ""  # explicitly dropped (glottal stop)
+    return mapped
+
+
+def report_en_ipa_mappings() -> int:
+    """Log IPA→ARPABET conversion hits and return the count.
+
+    When the ARPABET-native model is working correctly the count is 0.
+    Non-zero means some IPA phones were unexpectedly converted.
+    """
+    if _en_ipa_mapping_hits:
+        print(f"  IPA→ARPABET mapping triggered ({len(_en_ipa_mapping_hits)} unique): "
+              f"{', '.join(sorted(_en_ipa_mapping_hits)[:20])}"
+              f"{'…' if len(_en_ipa_mapping_hits) > 20 else ''}")
+    return len(_en_ipa_mapping_hits)
+
+
+# ── Sequence alignment (Needleman-Wunsch) ──────────────────────────
+
+def align_sequences(a: list[str], b: list[str]) -> list[tuple[int, int]]:
+    """Needleman-Wunsch global alignment of two token sequences.
+
+    Returns list of (index_in_a, index_in_b) for matched pairs.
+    Unmatched tokens are omitted.  Used by _snap_to_ctc and stress mapping.
+    """
+    import numpy as _np
+    n, m = len(a), len(b)
+    if n == 0 or m == 0:
+        return []
+    dp = _np.full((n + 1, m + 1), 9999, dtype=_np.int32)
+    dp[0, 0] = 0
+    for i in range(n + 1):
+        dp[i, 0] = i
+    for j in range(m + 1):
+        dp[0, j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            dp[i, j] = min(dp[i - 1, j] + 1, dp[i, j - 1] + 1, dp[i - 1, j - 1] + cost)
+    pairs = []
+    i, j = n, m
+    while i > 0 and j > 0:
+        cost = 0 if a[i - 1] == b[j - 1] else 1
+        if dp[i, j] == dp[i - 1, j - 1] + cost:
+            if cost == 0:
+                pairs.append((i - 1, j - 1))
+            i -= 1
+            j -= 1
+        elif dp[i, j] == dp[i - 1, j] + 1:
+            i -= 1
+        else:
+            j -= 1
+    pairs.reverse()
+    return pairs
+
+
+# ── CMUdict stress lookup ──────────────────────────────────────────
+
+import threading as _threading
+
+_cmudict: dict[str, list[str]] | None = None
+_cmudict_lock = _threading.Lock()
+
+
+def _load_cmudict() -> dict[str, list[str]]:
+    """Lazy-load CMU Pronouncing Dictionary (ARPABET with stress)."""
+    global _cmudict
+    if _cmudict is not None:
+        return _cmudict
+
+    with _cmudict_lock:
+        if _cmudict is not None:
+            return _cmudict
+
+        result: dict[str, list[str]] = {}
+        # Try nltk first
+        try:
+            import nltk
+            entries = nltk.corpus.cmudict.entries()
+            for word, phones in entries:
+                word_lower = word.lower()
+                if word_lower not in result:
+                    result[word_lower] = list(phones)
+            if result:
+                import sys
+                print(f"  CMUdict loaded via nltk: {len(result)} entries", file=sys.stderr)
+        except Exception:
+            pass
+
+        # Fallback: try local cmudict file
+        if not result:
+            for path in [
+                "dict/cmudict.dict",
+                "/usr/share/cmudict/cmudict.dict",
+            ]:
+                try:
+                    p = Path(__file__).parent.parent / path if not Path(path).is_absolute() else Path(path)
+                    if p.exists():
+                        for line in p.read_text(encoding="latin-1").splitlines():
+                            line = line.strip()
+                            if not line or line.startswith(";;;"):
+                                continue
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                word = parts[0].split("(")[0].lower()
+                                phones = [p for p in parts[1:] if p]
+                                if word not in result:
+                                    result[word] = phones
+                        import sys
+                        print(f"  CMUdict loaded from {p}: {len(result)} entries", file=sys.stderr)
+                        break
+                except Exception:
+                    pass
+
+        if not result:
+            import sys
+            print("  CMUdict not available — English ARPABET stress will default to 0", file=sys.stderr)
+
+        _cmudict = result
+        return _cmudict
+
+
+def apply_arpabet_stress(arpabet_phones: list[str], word: str) -> list[str]:
+    """Apply CMUdict stress markers to unstressed ARPABET phones.
+
+    Looks up *word* in CMUdict to get the canonical ARPABET pronunciation
+    with stress (e.g. HH AH0 L OW1).  Maps stress digits onto the
+    aligned unstressed phones by position.
+
+    When CMUdict is unavailable or the word is unknown, returns the
+    input phones unchanged.
+    """
+    if not arpabet_phones:
+        return arpabet_phones
+
+    cmu = _load_cmudict()
+    if not cmu:
+        return arpabet_phones  # CMUdict not available — stress stays 0
+
+    canonical = cmu.get(word.lower())
+    if not canonical:
+        return arpabet_phones
+
+    # Extract stress pattern from canonical: [0=unstressed, 1=primary, 2=secondary]
+    stress_pattern = []
+    for p in canonical:
+        s = p[-1]
+        stress_pattern.append(int(s) if s in "012" else 0)
+
+    # Map stress to aligned phones (without stress digits)
+    aligned = [p.rstrip("012") for p in arpabet_phones]
+    canonical_no_stress = [p.rstrip("012") for p in canonical]
+
+    # Align aligned phones to canonical via Needleman-Wunsch
+    pairs = align_sequences(aligned, canonical_no_stress)
+
+    # Build stress mapping: aligned_pos -> canonical_stress
+    stress_map: dict[int, int] = {}
+    for ai, ci in pairs:
+        stress_map[ai] = stress_pattern[ci]
+
+    # Apply stress (only to vowels; ARPABET consonants carry no stress digit)
+    result = list(arpabet_phones)
+    for idx, stress in stress_map.items():
+        base = result[idx].rstrip("012")
+        if base in _ENGLISH_VOWELS:
+            result[idx] = f"{base}{stress}"
+
+    return result
 
 
 def extract_word_chars(text: str) -> list[str]:

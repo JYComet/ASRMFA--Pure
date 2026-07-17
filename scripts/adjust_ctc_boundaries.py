@@ -363,6 +363,8 @@ def main():
     parser.add_argument("--audio-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Re-run adjustment even if output files exist.")
     parser.add_argument("--verbose", action="store_true",
                         help="Print per-stem adjustment details.")
     args = parser.parse_args()
@@ -375,14 +377,15 @@ def main():
     if args.limit > 0:
         stems = stems[:args.limit]
 
-    # Skip stems that already have adjusted output (NAS cache from previous run)
-    existing = {p.stem for p in args.output_dir.glob("*.TextGrid")}
-    if existing:
-        new_stems = [s for s in stems if s not in existing]
-        skipped = len(stems) - len(new_stems)
-        if skipped:
-            print(f"  Skipping {skipped}/{len(stems)} stems (already cached in output dir)")
-        stems = new_stems
+    # Skip stems that already have adjusted output (unless --overwrite)
+    if not args.overwrite:
+        existing = {p.stem for p in args.output_dir.glob("*.TextGrid")}
+        if existing:
+            new_stems = [s for s in stems if s not in existing]
+            skipped = len(stems) - len(new_stems)
+            if skipped:
+                print(f"  Skipping {skipped}/{len(stems)} stems (already cached in output dir)")
+            stems = new_stems
 
     if not stems:
         print("  All stems already have adjusted output. Nothing to do.")

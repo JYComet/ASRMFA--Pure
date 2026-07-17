@@ -1,0 +1,34 @@
+# Test config — English MFA pipeline (full ctc_ready mode)
+mode: ctc_ready
+workspace: test_en_mfa
+data_dir: E:/Audio Event Detection/output/test
+
+# Models (relative to repo root)
+models_dir: output/test_en_mfa/models/mfa
+acoustic_model: E:/MFA_Pause/pretrained_models/acoustic/mandarin_mfa/mandarin_mfa
+mfa_dict: output/test_en_mfa/dict/mfa_ipa.dict
+pinyin_dict: output/test_en_mfa/dict/fullpinyin_enword.dict
+
+# CTC
+ctc_ready:
+  ctc_dir: E:/Audio Event Detection/output/test
+  require_all: false
+
+mfa:
+  num_jobs: 1
+  single_speaker: true
+  skip_validate: true
+  fine_tune: false
+
+mfa_en:
+  enabled: true
+  num_jobs: 1
+  acoustic_model: E:/MFA_Pause/pretrained_models/acoustic/english_us_arpa.zip
+  dictionary: E:/MFA_Pause/repo/dict/cmudict.dict
+  g2p_model: E:/MFA_Pause/pretrained_models/g2p/english_us_arpa.zip
+
+postprocess:
+  filter_suspicious: false
+  enable_text_correction: false
+  handle_unexpected_sil: false
+  detect_bgm: false

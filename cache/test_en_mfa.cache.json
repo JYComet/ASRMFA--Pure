@@ -1,0 +1,12 @@
+{
+  "config_file": "configs\\test_en_mfa.yaml",
+  "mode": "ctc_ready",
+  "workspace": "test_en_mfa",
+  "data_dir": "E:\\Audio Event Detection\\output\\test",
+  "output_dir": "E:\\MFA_Pause\\repo\\output\\test_en_mfa\\output",
+  "n_stems": 10,
+  "manifest_path": "E:\\MFA_Pause\\repo\\output\\test_en_mfa\\ctc_pretg\\ctc_ready_manifest.json",
+  "ctc_dir": "E:/Audio Event Detection/output/test",
+  "version": 1,
+  "scanned_at": "2026-07-16T19:19:35"
+}

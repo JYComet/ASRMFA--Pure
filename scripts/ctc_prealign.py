@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import time
 from collections import Counter
 from itertools import groupby
@@ -87,7 +88,9 @@ def chars_and_pinyin(text: str):
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 from pipeline_utils import (
     NVV_NAMES, NVV_TO_MFA,
-    is_nvv_token, is_english_token, is_pinyin_syllable,
+    is_nvv_token, is_english_token, is_pinyin_syllable, is_punct,
+    RIA_VARIANTS, replace_ria_variants, normalize_punct_inline,
+    _ASCII_TO_CJK_PUNCT,
 )
 
 
@@ -291,6 +294,14 @@ def make_patched_inference(ref_texts: dict[str, str],
                     except Exception:
                         pass
                 align_text = ''.join(parts)
+
+            # ria 音译还原: 必须在 tokenizer 之前处理, 确保 .lab / .TextGrid
+            # / _tokens.jsonl 从源头就使用 ria, 而非 rui4 ya4 拼音碎片.
+            align_text = replace_ria_variants(align_text)
+
+            # 标点规范化 inline: ASCII→CJK + 相邻合并, 必须在 tokenizer 之前,
+            # 确保 punct entries / .lab / .TextGrid 均为 CJK 标点.
+            align_text = normalize_punct_inline(align_text)
 
             words_aligned = []  # token 级别时间戳
             if align_text:
@@ -600,6 +611,242 @@ def find_ref_text(stem: str, data_dir: Path,
     return None
 
 
+# ═══════════════════════════════════════════════════════════════
+# 输出后处理 (与 run_pipeline.py 的 normalize_punct / normalize / normalize_en 等价)
+# 两种模式走不同逻辑, 这里独立实现避免导入 run_pipeline 的副作用.
+# ═══════════════════════════════════════════════════════════════
+
+_NORM_ALLOWED_PUNCT = frozenset("，。！？、；：…")
+_ASCII_TO_CJK = {
+    ",": "，", ".": "。", "?": "？", "!": "！", ";": "；", ":": "：",
+}
+
+
+def _normalize_punct(ctc_dir: Path) -> int:
+    """ASCII→CJK 标点映射 + 相邻标点合并 + 非白名单标点替换."""
+    changed = 0
+    for txt_file in sorted(ctc_dir.glob("*_text_cn.txt")):
+        stem = txt_file.stem.replace("_text_cn", "")
+        try:
+            text = txt_file.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            continue
+
+        punct_file = ctc_dir / f"{stem}_punct.json"
+        punct_entries: list[dict] = []
+        if punct_file.exists():
+            try:
+                punct_entries = json.loads(punct_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        # Phase 1: ASCII → CJK
+        text = text.translate(str.maketrans(_ASCII_TO_CJK))
+        for p in punct_entries:
+            w = p.get("word", "")
+            if w in _ASCII_TO_CJK:
+                p["word"] = _ASCII_TO_CJK[w]
+
+        # Phase 2: classify each character
+        char_info: list[tuple[str, bool | None, str]] = []
+        for ch in text:
+            if is_punct(ch):
+                char_info.append(("punct", ch in _NORM_ALLOWED_PUNCT, ch))
+            else:
+                char_info.append(("other", None, ch))
+
+        for p in punct_entries:
+            p["_merge_del"] = False
+
+        # Phase 3: replace abnormal + merge adjacent
+        new_chars: list[str] = []
+        i = 0
+        punct_seq = 0
+        while i < len(char_info):
+            kind, is_allowed, ch = char_info[i]
+            if kind != "punct":
+                new_chars.append(ch)
+                i += 1
+                continue
+
+            group: list[tuple[int, bool, str]] = []
+            j = i
+            while j < len(char_info) and char_info[j][0] == "punct":
+                group.append((j, char_info[j][1], char_info[j][2]))
+                j += 1
+
+            if len(group) == 1:
+                _, ia, ch = group[0]
+                if ia:
+                    new_chars.append(ch)
+                else:
+                    new_chars.append("，")
+                    if punct_seq < len(punct_entries):
+                        punct_entries[punct_seq]["word"] = "，"
+                punct_seq += 1
+                i = j
+                continue
+
+            new_chars.append("，")
+            first_seq = punct_seq
+            last_seq = punct_seq + len(group) - 1
+            if first_seq < len(punct_entries) and last_seq < len(punct_entries):
+                first = punct_entries[first_seq]
+                last = punct_entries[last_seq]
+                first["word"] = "，"
+                first["end_ms"] = last["end_ms"]
+                first["end_s"] = last["end_s"]
+                for k in range(first_seq + 1, last_seq + 1):
+                    if k < len(punct_entries):
+                        punct_entries[k]["_merge_del"] = True
+            punct_seq += len(group)
+            i = j
+
+        # Phase 4: write back
+        new_text = "".join(new_chars)
+        new_punct = [p for p in punct_entries if not p.pop("_merge_del", False)]
+
+        if new_text != text or len(new_punct) != len(punct_entries):
+            txt_file.write_text(new_text + "\n", encoding="utf-8")
+            if punct_file.exists() or new_punct:
+                punct_file.write_text(
+                    json.dumps(new_punct, ensure_ascii=False), encoding="utf-8")
+            changed += 1
+
+    if changed:
+        print(f"  [normalize_punct] {changed} files")
+    return changed
+
+
+def _normalize_numerals(ctc_dir: Path) -> int:
+    """阿拉伯数字→中文数字 (cn2an), 同步更新 _text_cn.txt 和 .lab."""
+    try:
+        import cn2an as _cn2an
+    except ImportError:
+        print("  [normalize_numerals] cn2an not installed, skipping")
+        return 0
+
+    changed = 0
+    for txt_file in sorted(ctc_dir.glob("*_text_cn.txt")):
+        try:
+            text = txt_file.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            continue
+
+        # Protect NVV tokens and non-numeral content from cn2an
+        parts = re.split(r'(\[[^\]]+\]|[A-Z][A-Z0-9-]*[A-Z0-9])', text)
+        for k, part in enumerate(parts):
+            if re.match(r'^(\[[^\]]+\]|[A-Z][A-Z0-9-]*[A-Z0-9])$', part):
+                continue
+            try:
+                parts[k] = _cn2an.transform(part, "an2cn")
+            except Exception:
+                pass
+        normalized = "".join(parts)
+
+        if normalized != text:
+            txt_file.write_text(normalized + "\n", encoding="utf-8")
+            lab_file = ctc_dir / txt_file.name.replace("_text_cn.txt", ".lab")
+            if lab_file.exists():
+                try:
+                    lab_text = lab_file.read_text(encoding="utf-8").strip()
+                    lab_parts = re.split(
+                        r'(\[[^\]]+\]|[A-Z][A-Z0-9-]*[A-Z0-9])', lab_text)
+                    for k, part in enumerate(lab_parts):
+                        if re.match(r'^(\[[^\]]+\]|[A-Z][A-Z0-9-]*[A-Z0-9])$', part):
+                            continue
+                        try:
+                            lab_parts[k] = _cn2an.transform(part, "an2cn")
+                        except Exception:
+                            pass
+                    lab_file.write_text("".join(lab_parts) + "\n", encoding="utf-8")
+                except FileNotFoundError:
+                    pass
+            changed += 1
+
+    if changed:
+        print(f"  [normalize_numerals] {changed} files")
+    return changed
+
+
+def _normalize_ria(ctc_dir: Path) -> int:
+    """ASR 后处理安全网: 修复旧 CTC 输出中 ria 的拼音碎片.
+
+    新数据已在 align_text 上通过 replace_ria_variants() 实时处理,
+    .lab 从源头就是 ria. 此函数覆盖旧版 pipeline 产生的 CTC 输出:
+      直接修复 .lab 中的 rui4 ya4 → ria,
+      _text_cn.txt 和 _text_raw.txt 保持原样 (ASR 原始输出存档).
+
+    使用 rglob 同时支持 flat 和嵌套目录结构.
+    """
+    changed = 0
+    for lab_file in sorted(ctc_dir.rglob("*.lab")):
+        try:
+            lab_text = lab_file.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            continue
+
+        new_lab = re.sub(r'rui[0-5]\s+ya[0-5]', 'ria', lab_text)
+        new_lab = re.sub(r'rui[0-5]\s+a[0-5]', 'ria', new_lab)
+
+        if new_lab != lab_text:
+            lab_file.write_text(new_lab + "\n", encoding="utf-8")
+            changed += 1
+
+    if changed:
+        print(f"  [normalize_ria] {changed} .lab files (safety net)")
+    return changed
+
+
+def _normalize_english(ctc_dir: Path, dict_path: Path | None = None) -> int:
+    """英文 token 碎片合并 (rui4+ya4 → ria), 同步更新 .lab / .TextGrid / _tokens.jsonl."""
+    try:
+        from normalize_english_tokens import normalize_stem
+    except ImportError:
+        print("  [normalize_en] normalize_english_tokens not found, skipping")
+        return 0
+
+    stems = set()
+    for f in ctc_dir.glob("*_text_cn.txt"):
+        stems.add(f.name.replace("_text_cn.txt", ""))
+    if not stems:
+        for f in ctc_dir.glob("*.lab"):
+            if (ctc_dir / f"{f.stem}_text_cn.txt").exists():
+                stems.add(f.stem)
+
+    changed = 0
+    for stem in sorted(stems):
+        if normalize_stem(ctc_dir, stem, dry_run=False):
+            changed += 1
+
+    if changed:
+        print(f"  [normalize_en] {changed} files")
+
+    # Auto-add English tokens to MFA dictionary
+    if dict_path and dict_path.exists() and changed:
+        english_tokens_found: set[str] = set()
+        for lab_path in sorted(ctc_dir.glob("*.lab")):
+            tokens = lab_path.read_text(encoding="utf-8").strip().split()
+            for t in tokens:
+                if is_english_token(t):
+                    english_tokens_found.add(t)
+        if english_tokens_found:
+            existing = set()
+            with open(dict_path, encoding='utf-8-sig') as f:
+                for line in f:
+                    if line.strip():
+                        existing.add(line.split()[0])
+            new_tokens = sorted(t for t in english_tokens_found if t not in existing)
+            if new_tokens:
+                with open(dict_path, 'a', encoding='utf-8') as f:
+                    for t in new_tokens:
+                        f.write(f"{t} {t}\n")
+                print(f"  [normalize_en] Added {len(new_tokens)} tokens to MFA dict: "
+                      f"{', '.join(new_tokens)}")
+
+    return changed
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="CTC Pre-alignment: NVASR → MFA anchor TextGrids (pinyin)")
@@ -802,8 +1049,10 @@ def main():
             #   避免 MFA 打乱 phone 层. CTC 时间戳由 postprocess 后注入.
             #   只保留白名单内的标点, 其余单字符符号 (」『』【】等) 直接丢弃.
             if token_clean and len(token_clean) == 1 and token_clean in ALLOWED_PUNCT:
+                # ASCII→CJK 标点 inline 转换 (安全网: align_text 已规范化, 兜底 tokenizer 输出的 ASCII)
+                word_cjk = _ASCII_TO_CJK_PUNCT.get(token_clean, token_clean)
                 punct_entries.append({
-                    "word": token_clean,
+                    "word": word_cjk,
                     "start": w["start"],
                     "end": w["end"],
                 })
@@ -840,6 +1089,36 @@ def main():
                     merged_pinyin.append(w)
                     i += 1
             words_pinyin = merged_pinyin
+
+        # ── Dedup adjacent identical NVV tokens ──
+        # NVASR can produce [Breathing][Breathing] from reference text or
+        # ASR output where punctuation between two identical NVV tags is
+        # stripped.  Keep the first token, extend its end to cover the
+        # last duplicate so the time span encompasses the full event.
+        if words_pinyin:
+            deduped_pinyin = []
+            i = 0
+            while i < len(words_pinyin):
+                w = words_pinyin[i]
+                token = w["word"]
+                if is_nvv_token(token):
+                    j = i + 1
+                    while j < len(words_pinyin) and words_pinyin[j]["word"] == token:
+                        j += 1
+                    if j > i + 1:
+                        deduped_pinyin.append({
+                            "word": token,
+                            "start": w["start"],
+                            "end": words_pinyin[j - 1]["end"],
+                        })
+                        i = j
+                    else:
+                        deduped_pinyin.append(w)
+                        i += 1
+                else:
+                    deduped_pinyin.append(w)
+                    i += 1
+            words_pinyin = deduped_pinyin
 
         # 写 TextGrid — 含 pauses tier
         try:
@@ -941,6 +1220,8 @@ def main():
                 r'\[([A-Za-z][^\]]*?)\]',
                 lambda m: ' ' + nvv_to_mfa(m.group(0)) + ' ', text_cn)
             text_cn = re.sub(r'\s+', ' ', text_cn).strip()
+            # Dedup adjacent identical NVV tokens (BREATHING BREATHING → BREATHING)
+            text_cn = re.sub(r'\b([A-Z][A-Z0-9-]+)\s+\1\b', r'\1', text_cn)
             # Same ellipsis-punct dedup as asr_text (lines 308-316)
             text_cn = re.sub(r'…([，。！？、；：,\.!\?;:])', r'\1', text_cn)
             text_cn = re.sub(r'([，。！？、；：,\.!\?;:])…', r'\1', text_cn)
@@ -1061,6 +1342,14 @@ def main():
     )
     print(f"\n{summary}")
     (args.output_dir / "summary.txt").write_text(summary, encoding="utf-8")
+
+    # ── 输出后处理 (等价于 run_pipeline.py 的 normalize_punct → normalize → normalize_en) ──
+    if ok > 0:
+        print("\n── 输出后处理 ──")
+        _normalize_punct(args.output_dir)
+        _normalize_numerals(args.output_dir)
+        _normalize_ria(args.output_dir)
+        _normalize_english(args.output_dir, args.dict_path)
 
     # ── 恢复模型 ──
     model.model.inference = orig_inf

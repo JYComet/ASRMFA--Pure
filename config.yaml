@@ -66,6 +66,19 @@
 #   no_tokenization: true
 #   skip_validate: true     # MFA align validates internally
 
+# ── English MFA ──────────────────────────────────────────────────────────
+# mfa_en:
+#   enabled: true           # set to false to skip English MFA entirely
+#   num_jobs: 4             # parallel MFA jobs for English segments
+#   padding_ms: 50          # audio padding around English segments
+#   min_segment_dur_ms: 200 # skip segments shorter than this (use G2P split)
+#   max_gap_merge_s: 0.35   # max gap between consecutive English words to merge
+#   beam: 10                # MFA Viterbi beam width
+#   retry_beam: 40          # MFA retry beam width
+#   acoustic_model: pretrained_models/acoustic/english_us_arpa.zip
+#   dictionary: dict/cmudict.dict
+#   g2p_model: pretrained_models/g2p/english_us_arpa.zip
+
 # ── 后处理 ──────────────────────────────────────────────────────────────
 # postprocess:
 #   merge_silence: true
@@ -91,6 +104,10 @@
 #   filter_flank_silence_sec: 0.4
 #   filter_long_consonant_sec: 999.0
 #   filter_long_vowel_sec: 999.0
+#   filter_short_phone_en_sec: 0.010        # English phone min duration
+#   filter_long_vowel_en_sec: 0.500         # English vowel max duration
+#   filter_long_consonant_en_sec: 1.000     # English consonant max duration
+#   filter_min_en_phone_coverage: 0.25      # min phone coverage for English words
 #   enable_text_correction: true
 #   handle_unexpected_sil: true
 #   workers: 0              # 0 = auto (os.cpu_count())

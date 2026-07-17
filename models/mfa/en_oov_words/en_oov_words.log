@@ -1,0 +1,242 @@
+2026-07-15 14:21:21,721 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 14:21:21,721 - mfa - DEBUG - Using "global" profile
+2026-07-15 14:21:21,721 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 14:21:21,721 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 14:21:21,721 - mfa - DEBUG - Cleaned previous run
+2026-07-15 14:21:22,590 - mfa - INFO - Generating pronunciations...
+2026-07-15 14:21:22,882 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 14:21:22,890 - mfa - DEBUG - Minimum score: 11.8044777
+2026-07-15 14:21:22,890 - mfa - DEBUG - Maximum score: 11.8044777
+2026-07-15 14:21:22,890 - mfa - DEBUG - Processed 1 in 0.301 seconds
+2026-07-15 14:21:22,892 - mfa - INFO - Done! Everything took 1.176 seconds
+2026-07-15 14:22:54,773 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 14:22:54,773 - mfa - DEBUG - Using "global" profile
+2026-07-15 14:22:54,773 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 14:22:54,773 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 14:22:54,773 - mfa - DEBUG - Cleaned previous run
+2026-07-15 14:22:55,580 - mfa - INFO - Generating pronunciations...
+2026-07-15 14:22:55,828 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 14:22:55,832 - mfa - DEBUG - Minimum score: 11.8044777
+2026-07-15 14:22:55,833 - mfa - DEBUG - Maximum score: 11.8044777
+2026-07-15 14:22:55,833 - mfa - DEBUG - Processed 1 in 0.253 seconds
+2026-07-15 14:22:55,833 - mfa - INFO - Done! Everything took 1.072 seconds
+2026-07-15 15:31:02,633 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 15:31:02,633 - mfa - DEBUG - Using "global" profile
+2026-07-15 15:31:02,633 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 15:31:02,633 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 15:31:02,633 - mfa - DEBUG - Cleaned previous run
+2026-07-15 15:31:03,386 - mfa - INFO - Generating pronunciations...
+2026-07-15 15:31:03,615 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 15:31:03,620 - mfa - DEBUG - Minimum score: 11.8044777
+2026-07-15 15:31:03,620 - mfa - DEBUG - Maximum score: 11.8044777
+2026-07-15 15:31:03,620 - mfa - DEBUG - Processed 1 in 0.234 seconds
+2026-07-15 15:31:03,620 - mfa - INFO - Done! Everything took 0.993 seconds
+2026-07-15 15:34:11,635 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 15:34:11,635 - mfa - DEBUG - Using "global" profile
+2026-07-15 15:34:11,635 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 15:34:11,635 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 15:34:11,635 - mfa - DEBUG - Cleaned previous run
+2026-07-15 15:34:12,438 - mfa - INFO - Generating pronunciations...
+2026-07-15 15:34:12,662 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 15:34:12,668 - mfa - DEBUG - Minimum score: 11.8044777
+2026-07-15 15:34:12,668 - mfa - DEBUG - Maximum score: 11.8044777
+2026-07-15 15:34:12,668 - mfa - DEBUG - Processed 1 in 0.230 seconds
+2026-07-15 15:34:12,669 - mfa - INFO - Done! Everything took 1.040 seconds
+2026-07-15 15:37:22,892 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 15:37:22,893 - mfa - DEBUG - Using "global" profile
+2026-07-15 15:37:22,893 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 15:37:22,893 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 15:37:22,893 - mfa - DEBUG - Cleaned previous run
+2026-07-15 15:37:23,680 - mfa - INFO - Generating pronunciations...
+2026-07-15 15:37:23,909 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 15:37:23,913 - mfa - DEBUG - Minimum score: 11.8044777
+2026-07-15 15:37:23,914 - mfa - DEBUG - Maximum score: 11.8044777
+2026-07-15 15:37:23,914 - mfa - DEBUG - Processed 1 in 0.234 seconds
+2026-07-15 15:37:23,914 - mfa - INFO - Done! Everything took 1.029 seconds
+2026-07-15 15:40:37,720 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 15:40:37,720 - mfa - DEBUG - Using "global" profile
+2026-07-15 15:40:37,721 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 15:40:37,721 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 15:40:37,721 - mfa - DEBUG - Cleaned previous run
+2026-07-15 15:40:38,606 - mfa - INFO - Generating pronunciations...
+2026-07-15 15:40:38,905 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 15:40:38,911 - mfa - DEBUG - Minimum score: 11.8044777
+2026-07-15 15:40:38,912 - mfa - DEBUG - Maximum score: 11.8044777
+2026-07-15 15:40:38,912 - mfa - DEBUG - Processed 1 in 0.306 seconds
+2026-07-15 15:40:38,913 - mfa - INFO - Done! Everything took 1.199 seconds
+2026-07-15 15:42:56,341 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 15:42:56,341 - mfa - DEBUG - Using "global" profile
+2026-07-15 15:42:56,341 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 15:42:56,341 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 15:42:56,342 - mfa - DEBUG - Cleaned previous run
+2026-07-15 15:42:57,200 - mfa - INFO - Generating pronunciations...
+2026-07-15 15:42:57,446 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 15:42:57,454 - mfa - DEBUG - Minimum score: 11.8044777
+2026-07-15 15:42:57,454 - mfa - DEBUG - Maximum score: 11.8044777
+2026-07-15 15:42:57,454 - mfa - DEBUG - Processed 1 in 0.254 seconds
+2026-07-15 15:42:57,455 - mfa - INFO - Done! Everything took 1.120 seconds
+2026-07-15 15:48:22,057 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 15:48:22,057 - mfa - DEBUG - Using "global" profile
+2026-07-15 15:48:22,057 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 15:48:22,057 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 15:48:22,057 - mfa - DEBUG - Cleaned previous run
+2026-07-15 15:48:22,881 - mfa - INFO - Generating pronunciations...
+2026-07-15 15:48:23,166 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 15:48:23,171 - mfa - DEBUG - Minimum score: 11.8044777
+2026-07-15 15:48:23,171 - mfa - DEBUG - Maximum score: 11.8044777
+2026-07-15 15:48:23,171 - mfa - DEBUG - Processed 1 in 0.290 seconds
+2026-07-15 15:48:23,172 - mfa - INFO - Done! Everything took 1.120 seconds
+2026-07-15 15:52:37,882 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 15:52:37,882 - mfa - DEBUG - Using "global" profile
+2026-07-15 15:52:37,883 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 15:52:37,883 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 15:52:37,883 - mfa - DEBUG - Cleaned previous run
+2026-07-15 15:52:38,620 - mfa - INFO - Generating pronunciations...
+2026-07-15 15:52:38,861 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 15:52:38,868 - mfa - DEBUG - Minimum score: 11.8044777
+2026-07-15 15:52:38,868 - mfa - DEBUG - Maximum score: 11.8044777
+2026-07-15 15:52:38,868 - mfa - DEBUG - Processed 1 in 0.248 seconds
+2026-07-15 15:52:38,869 - mfa - INFO - Done! Everything took 0.992 seconds
+2026-07-15 15:55:23,782 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 15:55:23,782 - mfa - DEBUG - Using "global" profile
+2026-07-15 15:55:23,782 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 15:55:23,782 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 15:55:23,782 - mfa - DEBUG - Cleaned previous run
+2026-07-15 15:55:24,492 - mfa - INFO - Generating pronunciations...
+2026-07-15 15:55:24,724 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 15:55:24,729 - mfa - DEBUG - Minimum score: 11.8044777
+2026-07-15 15:55:24,729 - mfa - DEBUG - Maximum score: 11.8044777
+2026-07-15 15:55:24,729 - mfa - DEBUG - Processed 1 in 0.237 seconds
+2026-07-15 15:55:24,730 - mfa - INFO - Done! Everything took 0.954 seconds
+2026-07-15 17:20:26,437 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 17:20:26,437 - mfa - DEBUG - Using "global" profile
+2026-07-15 17:20:26,437 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 17:20:26,437 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 17:20:26,437 - mfa - DEBUG - Cleaned previous run
+2026-07-15 17:20:27,092 - mfa - INFO - Generating pronunciations...
+2026-07-15 17:20:27,126 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 17:20:27,131 - mfa - DEBUG - Minimum score: 10.9496841
+2026-07-15 17:20:27,131 - mfa - DEBUG - Maximum score: 10.9496841
+2026-07-15 17:20:27,131 - mfa - DEBUG - Processed 1 in 0.039 seconds
+2026-07-15 17:20:27,131 - mfa - INFO - Done! Everything took 0.698 seconds
+2026-07-15 17:21:36,506 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 17:21:36,506 - mfa - DEBUG - Using "global" profile
+2026-07-15 17:21:36,506 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 17:21:36,506 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 17:21:36,506 - mfa - DEBUG - Cleaned previous run
+2026-07-15 17:21:37,142 - mfa - INFO - Generating pronunciations...
+2026-07-15 17:21:37,179 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 17:21:37,184 - mfa - DEBUG - Minimum score: 10.9496841
+2026-07-15 17:21:37,184 - mfa - DEBUG - Maximum score: 10.9496841
+2026-07-15 17:21:37,184 - mfa - DEBUG - Processed 1 in 0.042 seconds
+2026-07-15 17:21:37,185 - mfa - INFO - Done! Everything took 0.684 seconds
+2026-07-15 17:33:10,998 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 17:33:10,998 - mfa - DEBUG - Using "global" profile
+2026-07-15 17:33:10,998 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 17:33:10,998 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 17:33:10,998 - mfa - DEBUG - Cleaned previous run
+2026-07-15 17:33:11,623 - mfa - INFO - Generating pronunciations...
+2026-07-15 17:33:11,654 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 17:33:11,659 - mfa - DEBUG - Minimum score: 10.9496841
+2026-07-15 17:33:11,659 - mfa - DEBUG - Maximum score: 10.9496841
+2026-07-15 17:33:11,659 - mfa - DEBUG - Processed 1 in 0.036 seconds
+2026-07-15 17:33:11,660 - mfa - INFO - Done! Everything took 0.667 seconds
+2026-07-15 18:19:50,260 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 18:19:50,261 - mfa - DEBUG - Using "global" profile
+2026-07-15 18:19:50,261 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 18:19:50,261 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 18:19:50,261 - mfa - DEBUG - Cleaned previous run
+2026-07-15 18:19:50,922 - mfa - INFO - Generating pronunciations...
+2026-07-15 18:19:50,979 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 18:19:50,984 - mfa - DEBUG - Minimum score: 21.5968285
+2026-07-15 18:19:50,984 - mfa - DEBUG - Maximum score: 21.5968285
+2026-07-15 18:19:50,984 - mfa - DEBUG - Processed 1 in 0.062 seconds
+2026-07-15 18:19:50,985 - mfa - INFO - Done! Everything took 0.737 seconds
+2026-07-15 18:21:39,955 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 18:21:39,955 - mfa - DEBUG - Using "global" profile
+2026-07-15 18:21:39,955 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 18:21:39,955 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 18:21:39,955 - mfa - DEBUG - Cleaned previous run
+2026-07-15 18:21:40,582 - mfa - INFO - Generating pronunciations...
+2026-07-15 18:21:40,630 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 18:21:40,636 - mfa - DEBUG - Minimum score: 21.5968285
+2026-07-15 18:21:40,636 - mfa - DEBUG - Maximum score: 21.5968285
+2026-07-15 18:21:40,636 - mfa - DEBUG - Processed 1 in 0.054 seconds
+2026-07-15 18:21:40,637 - mfa - INFO - Done! Everything took 0.692 seconds
+2026-07-15 18:30:36,607 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 18:30:36,608 - mfa - DEBUG - Using "global" profile
+2026-07-15 18:30:36,608 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 18:30:36,608 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 18:30:36,608 - mfa - DEBUG - Cleaned previous run
+2026-07-15 18:30:37,354 - mfa - INFO - Generating pronunciations...
+2026-07-15 18:30:37,410 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 18:30:37,415 - mfa - DEBUG - Minimum score: 21.5968285
+2026-07-15 18:30:37,415 - mfa - DEBUG - Maximum score: 21.5968285
+2026-07-15 18:30:37,415 - mfa - DEBUG - Processed 1 in 0.061 seconds
+2026-07-15 18:30:37,416 - mfa - INFO - Done! Everything took 0.819 seconds
+2026-07-15 18:46:50,190 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 18:46:50,191 - mfa - DEBUG - Using "global" profile
+2026-07-15 18:46:50,191 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 18:46:50,191 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 18:46:50,191 - mfa - DEBUG - Cleaned previous run
+2026-07-15 18:46:50,832 - mfa - INFO - Generating pronunciations...
+2026-07-15 18:46:50,887 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 18:46:50,892 - mfa - DEBUG - Minimum score: 21.5968285
+2026-07-15 18:46:50,892 - mfa - DEBUG - Maximum score: 21.5968285
+2026-07-15 18:46:50,892 - mfa - DEBUG - Processed 1 in 0.061 seconds
+2026-07-15 18:46:50,893 - mfa - INFO - Done! Everything took 0.708 seconds
+2026-07-15 18:53:06,042 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-15 18:53:06,042 - mfa - DEBUG - Using "global" profile
+2026-07-15 18:53:06,042 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-15 18:53:06,042 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-15 18:53:06,042 - mfa - DEBUG - Cleaned previous run
+2026-07-15 18:53:06,680 - mfa - INFO - Generating pronunciations...
+2026-07-15 18:53:06,728 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-15 18:53:06,733 - mfa - DEBUG - Minimum score: 21.5968285
+2026-07-15 18:53:06,733 - mfa - DEBUG - Maximum score: 21.5968285
+2026-07-15 18:53:06,733 - mfa - DEBUG - Processed 1 in 0.054 seconds
+2026-07-15 18:53:06,734 - mfa - INFO - Done! Everything took 0.697 seconds
+2026-07-16 18:20:16,636 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-16 18:20:16,636 - mfa - DEBUG - Using "global" profile
+2026-07-16 18:20:16,636 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-16 18:20:16,636 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-16 18:20:16,636 - mfa - DEBUG - Cleaned previous run
+2026-07-16 18:20:17,362 - mfa - INFO - Generating pronunciations...
+2026-07-16 18:20:17,421 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-16 18:20:17,426 - mfa - DEBUG - Minimum score: 21.5968285
+2026-07-16 18:20:17,426 - mfa - DEBUG - Maximum score: 21.5968285
+2026-07-16 18:20:17,426 - mfa - DEBUG - Processed 1 in 0.065 seconds
+2026-07-16 18:20:17,426 - mfa - INFO - Done! Everything took 0.801 seconds
+2026-07-16 18:23:40,513 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-16 18:23:40,513 - mfa - DEBUG - Using "global" profile
+2026-07-16 18:23:40,513 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-16 18:23:40,514 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-16 18:23:40,514 - mfa - DEBUG - Cleaned previous run
+2026-07-16 18:23:41,312 - mfa - INFO - Generating pronunciations...
+2026-07-16 18:23:41,374 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-16 18:23:41,381 - mfa - DEBUG - Minimum score: 21.5968285
+2026-07-16 18:23:41,381 - mfa - DEBUG - Maximum score: 21.5968285
+2026-07-16 18:23:41,381 - mfa - DEBUG - Processed 1 in 0.070 seconds
+2026-07-16 18:23:41,382 - mfa - INFO - Done! Everything took 0.873 seconds
+2026-07-16 19:03:46,630 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-16 19:03:46,637 - mfa - DEBUG - Using "global" profile
+2026-07-16 19:03:46,637 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-16 19:03:46,637 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-16 19:03:46,637 - mfa - DEBUG - Cleaned previous run
+2026-07-16 19:03:48,137 - mfa - INFO - Generating pronunciations...
+2026-07-16 19:03:48,270 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-16 19:03:48,284 - mfa - DEBUG - Minimum score: 21.5968285
+2026-07-16 19:03:48,284 - mfa - DEBUG - Maximum score: 21.5968285
+2026-07-16 19:03:48,284 - mfa - DEBUG - Processed 1 in 0.146 seconds
+2026-07-16 19:03:48,287 - mfa - INFO - Done! Everything took 1.675 seconds
+2026-07-16 19:08:19,574 - mfa - DEBUG - Beginning run for en_oov_words
+2026-07-16 19:08:19,574 - mfa - DEBUG - Using "global" profile
+2026-07-16 19:08:19,574 - mfa - DEBUG - Using multiprocessing with 3
+2026-07-16 19:08:19,574 - mfa - DEBUG - Set up logger for MFA version: 3.3.9
+2026-07-16 19:08:19,574 - mfa - DEBUG - Cleaned previous run
+2026-07-16 19:08:21,053 - mfa - INFO - Generating pronunciations...
+2026-07-16 19:08:21,171 - mfa - DEBUG - Skipping 0 words for containing the following graphemes: 
+2026-07-16 19:08:21,185 - mfa - DEBUG - Minimum score: 21.5968285
+2026-07-16 19:08:21,185 - mfa - DEBUG - Maximum score: 21.5968285
+2026-07-16 19:08:21,185 - mfa - DEBUG - Processed 1 in 0.132 seconds
+2026-07-16 19:08:21,187 - mfa - INFO - Done! Everything took 1.622 seconds

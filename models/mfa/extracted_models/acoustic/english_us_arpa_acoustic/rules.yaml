@@ -1,0 +1,91 @@
+dialects:
+  us:
+  - following_context: $
+    non_silence_before_correction: 0.03
+    preceding_context: ''
+    probability: 0.62
+    replacement: AA1
+    segment: AO1
+    silence_after_probability: 0.39
+    silence_before_correction: -0.18
+  - following_context: '[^R]'
+    non_silence_before_correction: 0.0
+    preceding_context: ''
+    probability: 0.71
+    replacement: AA1
+    segment: AO1
+    silence_after_probability: 0.96
+    silence_before_correction: -0.01
+  - following_context: $
+    non_silence_before_correction: -0.03
+    preceding_context: ''
+    probability: 0.37
+    replacement: AA2
+    segment: AO2
+    silence_after_probability: 0.48
+    silence_before_correction: 0.06
+  - following_context: '[^R]'
+    non_silence_before_correction: -0.02
+    preceding_context: ''
+    probability: 0.78
+    replacement: AA2
+    segment: AO2
+    silence_after_probability: 0.7
+    silence_before_correction: 0.06
+  - following_context: $
+    non_silence_before_correction: -0.03
+    preceding_context: ''
+    probability: 0.3
+    replacement: AA0
+    segment: AO0
+    silence_after_probability: 0.81
+    silence_before_correction: 0.13
+  - following_context: '[^R]'
+    non_silence_before_correction: -0.03
+    preceding_context: ''
+    probability: 0.6
+    replacement: AA0
+    segment: AO0
+    silence_after_probability: 1.26
+    silence_before_correction: 0.05
+  - following_context: ''
+    non_silence_before_correction: 0.01
+    preceding_context: ''
+    probability: 0.15
+    replacement: L AH0
+    segment: AH0 L AH0
+    silence_after_probability: 0.78
+    silence_before_correction: -0.04
+  - following_context: ''
+    non_silence_before_correction: 0.04
+    preceding_context: ''
+    probability: 0.18
+    replacement: N AH0
+    segment: AH0 N AH0
+    silence_after_probability: 0.74
+    silence_before_correction: -0.15
+  - following_context: ''
+    non_silence_before_correction: 0.05
+    preceding_context: ''
+    probability: 0.17
+    replacement: M AH0
+    segment: AH0 M AH0
+    silence_after_probability: 0.95
+    silence_before_correction: -0.16
+  - following_context: $
+    non_silence_before_correction: 0.0
+    preceding_context: '[A-Z]{2}[0-2]'
+    probability: 0.04
+    replacement: ''
+    segment: T
+    silence_after_probability: 0.33
+    silence_before_correction: 0.0
+  - following_context: $
+    non_silence_before_correction: 0.01
+    preceding_context: '[A-Z]{2}[0-2]'
+    probability: 0.02
+    replacement: ''
+    segment: D
+    silence_after_probability: 1.0
+    silence_before_correction: 0.0
+rules: []

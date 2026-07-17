@@ -44,30 +44,14 @@ def _is_alpha_group(s: str) -> bool:
 
 
 
-# ── Words to keep as single units ──────────────────────────────────────
-# Read from dict/merge_words.dict.  Format: self-referential (word word).
+# ── English word detection ───────────────────────────────────────────
+# Auto-detected from reference text: ASCII-alpha words of length >= 2.
 # The NVASR tokenizer's phonetic approximations at these word positions
-# are merged into the canonical form.  Add new words by editing the dict.
+# are merged into the canonical form.
 # ────────────────────────────────────────────────────────────────────────
 
-def _load_merge_words() -> set[str]:
-    """Load the set of words to keep un-split from dict/merge_words.dict."""
-    dict_path = PROJECT_ROOT / "dict" / "merge_words.dict"
-    if not dict_path.exists():
-        return set()
-    words: set[str] = set()
-    with open(dict_path, 'r', encoding='utf-8-sig') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            parts = line.split()
-            if len(parts) >= 1:
-                words.add(parts[0])
-    return words
-
-
-MERGE_WORDS = _load_merge_words()
+# MERGE_WORDS whitelist removed — English words are now auto-detected
+# from the reference text (ASCII-alpha, length >= 2).
 
 
 
@@ -172,10 +156,12 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
         if is_word_like(u):
             ref_units.append((i, u))
 
-    # English words in reference — only normalise those in MERGE_WORDS.
+    # English words in reference — auto-detect ASCII-alpha words (len >= 2)
+    # as candidates for fragment merging.
     en_ref_positions: dict[int, str] = {}  # ref_unit_idx → word
     for ri, (ci, u) in enumerate(ref_units):
-        if u.lower() in MERGE_WORDS:
+        # Auto-detect: pure ASCII alpha, length >= 2 → almost certainly English
+        if u.isascii() and u.isalpha() and len(u) >= 2:
             en_ref_positions[ri] = u
 
     if not en_ref_positions:
@@ -304,6 +290,42 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
     tokens_path.write_text(
         "\n".join(json.dumps(t, ensure_ascii=False) for t in new_ctc) + "\n",
         encoding="utf-8")
+
+    # Also update the CTC TextGrid anchors to match the corrected tokens.
+    # MFA uses the TextGrid as word-boundary anchors; inconsistent anchors
+    # (e.g. "rui4"+"ya4" in TextGrid vs "ria" in .lab) cause MFA to split
+    # English words into fragments.
+    tg_path = txt_dir / f"{stem}.TextGrid"
+    if tg_path.exists():
+        raw = tg_path.read_text(encoding="utf-8")
+        lines_out = []
+        in_words = False
+        iv_idx = 0
+        for line in raw.split("\n"):
+            stripped = line.strip()
+            if 'name = "words"' in stripped:
+                in_words = True
+                lines_out.append(line)
+            elif in_words and stripped.startswith("intervals: size"):
+                lines_out.append(f"        intervals: size = {len(new_ctc)}")
+            elif in_words and stripped.startswith("intervals ["):
+                # Skip old interval blocks, will be replaced below
+                pass
+            elif in_words and (stripped.startswith("xmin =") or stripped.startswith("xmax =") or stripped.startswith("text =")):
+                # Skip old interval detail lines
+                pass
+            elif in_words and 'name = "' in stripped and 'pauses' in stripped.lower():
+                # End of words tier — insert new intervals before pauses tier
+                for idx, t in enumerate(new_ctc):
+                    lines_out.append(f"        intervals [{idx}]:")
+                    lines_out.append(f"            xmin = {t['start_s']:.6f}")
+                    lines_out.append(f"            xmax = {t['end_s']:.6f}")
+                    lines_out.append(f'            text = "{t["word"]}"')
+                in_words = False
+                lines_out.append(line)
+            else:
+                lines_out.append(line)
+        tg_path.write_text("\n".join(lines_out), encoding="utf-8")
 
     for en_word, indices in changes:
         old = " + ".join(lab_tokens[i] for i in indices)

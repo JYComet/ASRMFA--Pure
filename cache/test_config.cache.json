@@ -1,0 +1,12 @@
+{
+  "config_file": "E:\\Audio Event Detection\\test_run\\test_config.yaml",
+  "mode": "ctc_ready",
+  "workspace": "E:/Audio Event Detection/test_run",
+  "data_dir": "E:\\Audio Event Detection\\output\\test",
+  "output_dir": "E:\\Audio Event Detection\\test_run\\output",
+  "n_stems": 1,
+  "manifest_path": "E:\\Audio Event Detection\\test_run\\ctc_pretg\\ctc_ready_manifest.json",
+  "ctc_dir": "E:/Audio Event Detection/test_run/ctc_pretg",
+  "version": 1,
+  "scanned_at": "2026-07-14T17:33:06"
+}
