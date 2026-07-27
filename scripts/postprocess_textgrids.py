@@ -581,13 +581,15 @@ def _resolve_spn(phone_iv: Interval, words_tier: Tier | None,
 # ---------------------------------------------------------------------------
 
 def handle_unexpected_silences(textgrid: TextGrid, pinyin_text: str) -> list[str]:
-    """Merge sp0 gaps that lack punctuation; flag sp1-3 gaps for filtering.
+    """Merge sp0 gaps unconditionally; flag sp1-3 gaps for filtering.
 
     After the punctuation–silence cross-check, any silence between words that
     has *no* corresponding punctuation is an unexpected pause:
-      - ``<sp0>`` (< 0.2 s)  -> merge into the previous word (extend phone,
-        word, and pinyin_phones tiers in sync)
-      - ``<sp1-3>`` (≥ 0.2 s) -> return as filter reasons
+      - ``<sp0>`` (< 0.2 s)  -> merge unconditionally (into adjacent
+        punctuation when present, otherwise into the previous word).
+        Short gaps have no semantic meaning in any context.
+      - ``<sp1-3>`` (≥ 0.2 s) -> return as filter reasons (when no punct
+        is present; <sp1-3> after punct is handled by the absorb pass).
     """
     words_tier = tier_by_name(textgrid, "words")
     phones_tier = tier_by_name(textgrid, "phones")
@@ -634,10 +636,14 @@ def handle_unexpected_silences(textgrid: TextGrid, pinyin_text: str) -> list[str
     for k in range(1, n):
         sil_label = gap_sil[k]
         has_punct = gap_punct[k]
-        if sil_label is None or has_punct:
+        if sil_label is None:
             continue
-
-        if sil_label in ("<sp1>", "<sp2>", "<sp3>"):
+        if sil_label == "<sp0>":
+            pass  # Always merge <sp0> regardless of punctuation — 15 ms
+            # gaps have no semantic meaning in any context.
+        elif has_punct:
+            continue  # <sp1-3> + punct: skip (handled by absorb phase later)
+        elif sil_label in ("<sp1>", "<sp2>", "<sp3>"):
             # Skip gaps adjacent to English/NVV tokens — these are MFA
             # artifacts (MFA can't model English phones, inserts spn).
             prev_text = word_items[tg_word_idx[k - 1]][0]
@@ -647,7 +653,7 @@ def handle_unexpected_silences(textgrid: TextGrid, pinyin_text: str) -> list[str
                 filter_reasons.append("unexpected_silence")
             continue
 
-        # <sp0>: merge into previous word
+        # <sp0>: merge into previous word (or adjacent punctuation).
         prev_word_idx = tg_word_idx[k - 1]
         sil_idx = None
         for j in range(prev_word_idx + 1, tg_word_idx[k]):
@@ -658,23 +664,63 @@ def handle_unexpected_silences(textgrid: TextGrid, pinyin_text: str) -> list[str
             continue
 
         sil_iv = words_tier.intervals[sil_idx]
-        prev_w_iv = words_tier.intervals[prev_word_idx]
 
-        # Record merge op (apply after all scans, avoids index shifting hell)
-        merge_ops.append((prev_word_idx, sil_idx, sil_iv.xmax))
-        to_delete_words.add(sil_idx)
+        # When punct exists, absorb <sp0> into the adjacent punctuation
+        # rather than the previous word (extending the word over punct
+        # would create an overlap).
+        if has_punct:
+            # Find the punctuation interval nearest to the <sp0>.
+            punct_idx = sil_idx - 1
+            while punct_idx > prev_word_idx:
+                if is_punct(word_items[punct_idx][0]):
+                    break
+                punct_idx -= 1
+            if punct_idx > prev_word_idx and is_punct(word_items[punct_idx][0]):
+                # Extend punctuation to absorb the <sp0>.
+                words_tier.intervals[punct_idx].xmax = sil_iv.xmax
+                to_delete_words.add(sil_idx)
+                # Clean up matching silence in phones & pp tiers
+                # (punct has no phone entries, just delete the sil).
+                for pi, p in enumerate(phones_tier.intervals):
+                    if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
+                       and abs(p.xmax - sil_iv.xmax) < 0.01:
+                        to_delete_phones.add(pi)
+                        break
+                for pi, p in enumerate(pp_tier.intervals):
+                    if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
+                       and abs(p.xmax - sil_iv.xmax) < 0.01:
+                        to_delete_pp.add(pi)
+                        break
+            else:
+                # Fallback: merge into previous word (no punct found adjacent).
+                merge_ops.append((prev_word_idx, sil_idx, sil_iv.xmax))
+                to_delete_words.add(sil_idx)
+                for pi, p in enumerate(phones_tier.intervals):
+                    if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
+                       and abs(p.xmax - sil_iv.xmax) < 0.01:
+                        to_delete_phones.add(pi)
+                        break
+                for pi, p in enumerate(pp_tier.intervals):
+                    if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
+                       and abs(p.xmax - sil_iv.xmax) < 0.01:
+                        to_delete_pp.add(pi)
+                        break
+        else:
+            # No punct — original behaviour: merge into previous word.
+            merge_ops.append((prev_word_idx, sil_idx, sil_iv.xmax))
+            to_delete_words.add(sil_idx)
 
-        # Find matching silence in phones & pp tiers
-        for pi, p in enumerate(phones_tier.intervals):
-            if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
-               and abs(p.xmax - sil_iv.xmax) < 0.01:
-                to_delete_phones.add(pi)
-                break
-        for pi, p in enumerate(pp_tier.intervals):
-            if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
-               and abs(p.xmax - sil_iv.xmax) < 0.01:
-                to_delete_pp.add(pi)
-                break
+            # Find matching silence in phones & pp tiers
+            for pi, p in enumerate(phones_tier.intervals):
+                if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
+                   and abs(p.xmax - sil_iv.xmax) < 0.01:
+                    to_delete_phones.add(pi)
+                    break
+            for pi, p in enumerate(pp_tier.intervals):
+                if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
+                   and abs(p.xmax - sil_iv.xmax) < 0.01:
+                    to_delete_pp.add(pi)
+                    break
 
     # Apply merge ops (extend word + last phone)
     for prev_wi, sil_idx, sil_xmax in merge_ops:
@@ -707,6 +753,172 @@ def handle_unexpected_silences(textgrid: TextGrid, pinyin_text: str) -> list[str
                           if iv.duration > 0.001 or not iv.text.strip()]
 
     return filter_reasons
+
+
+def absorb_nvv_trailing(textgrid: TextGrid) -> None:
+    """NVV absorbs trailing punctuation + silence chain until next content word.
+
+    MFA cannot acoustically model NVV tokens (LAUGHTER, BREATHING, …).
+    Their boundaries are imprecise, and the audio between an NVV and the
+    next real word — punctuation and silence — is actually part of the
+    NVV (e.g. laughter tail).  This pass extends NVV ``xmax`` to absorb
+    that chain, so ``mid_sp`` doesn't flag the orphaned intervals.
+
+    Example::
+
+        <LAUGHTER> [9.745-9.81]  ！ [9.81-9.815]  <sp2> [9.815-10.51]  bie2
+        → <LAUGHTER> [9.745-10.51]  bie2
+
+    Operates on words, phones, and pinyin_phones tiers in sync.
+    """
+    words_tier = tier_by_name(textgrid, "words")
+    phones_tier = tier_by_name(textgrid, "phones")
+    pp_tier = tier_by_name(textgrid, "pinyin_phones")
+    if words_tier is None:
+        return
+
+    intervals = list(words_tier.intervals)
+    to_delete_words: set[int] = set()
+    to_delete_phones: set[int] = set()
+    to_delete_pp: set[int] = set()
+
+    for i in range(len(intervals)):
+        if not is_nvv_token(intervals[i].text):
+            continue
+
+        # Absorb trailing punct + silence chain.
+        j = i + 1
+        absorbed_sil_ranges: list[tuple[float, float]] = []
+        while j < len(intervals):
+            text = intervals[j].text.strip()
+            if is_punct(text):
+                j += 1
+            elif is_silence(text) and text:
+                absorbed_sil_ranges.append((intervals[j].xmin, intervals[j].xmax))
+                j += 1
+            else:
+                break
+
+        if j <= i + 1:
+            continue  # Nothing to absorb.
+
+        # Extend NVV to the start of the next content word.
+        next_iv = intervals[j] if j < len(intervals) else None
+        new_xmax = next_iv.xmin if next_iv else intervals[j - 1].xmax
+        intervals[i] = Interval(intervals[i].xmin, new_xmax, intervals[i].text)
+
+        # Mark punct + silence for deletion.
+        for d in range(i + 1, j):
+            to_delete_words.add(d)
+
+        # Clean up matching silence from phones & pp tiers.
+        for sil_xmin, sil_xmax in absorbed_sil_ranges:
+            if phones_tier:
+                for pi, p in enumerate(phones_tier.intervals):
+                    if is_silence(p.text) and abs(p.xmin - sil_xmin) < 0.01 \
+                       and abs(p.xmax - sil_xmax) < 0.01:
+                        to_delete_phones.add(pi)
+                        break
+            if pp_tier:
+                for pi, p in enumerate(pp_tier.intervals):
+                    if is_silence(p.text) and abs(p.xmin - sil_xmin) < 0.01 \
+                       and abs(p.xmax - sil_xmax) < 0.01:
+                        to_delete_pp.add(pi)
+                        break
+
+    if not to_delete_words:
+        return
+
+    # Apply deletions.
+    intervals = [iv for idx, iv in enumerate(intervals)
+                 if idx not in to_delete_words]
+    words_tier.intervals = intervals
+    if phones_tier and to_delete_phones:
+        phones_tier.intervals = [iv for idx, iv in enumerate(phones_tier.intervals)
+                                 if idx not in to_delete_phones]
+    if pp_tier and to_delete_pp:
+        pp_tier.intervals = [iv for idx, iv in enumerate(pp_tier.intervals)
+                             if idx not in to_delete_pp]
+
+    # Clean up zero-duration remnants.
+    for tier in (words_tier, phones_tier, pp_tier):
+        if tier:
+            tier.intervals = [iv for iv in tier.intervals
+                              if iv.duration > 0.001 or not iv.text.strip()]
+
+
+def absorb_silence_into_punct(textgrid: TextGrid) -> None:
+    """Absorb trailing ``<spN>`` silence intervals into preceding punctuation.
+
+    Punctuation is silent by nature — the silence that follows it is its
+    realised duration.  This is the **fallback** pass: it handles residual
+    ``<spN>`` after punctuation that was not already absorbed by an NVV
+    in :func:`absorb_nvv_trailing`.
+
+    Without this step, a 5 ms ``！`` followed by a 695 ms ``<sp2>`` leaves
+    an orphaned silence in the middle of the words tier, which the
+    ``mid_sp`` filter would reject.
+
+    Operates on words, phones, and pinyin_phones tiers in sync.
+    """
+    words_tier = tier_by_name(textgrid, "words")
+    phones_tier = tier_by_name(textgrid, "phones")
+    pp_tier = tier_by_name(textgrid, "pinyin_phones")
+    if words_tier is None:
+        return
+
+    intervals = list(words_tier.intervals)
+    to_delete_words: set[int] = set()
+    to_delete_phones: set[int] = set()
+    to_delete_pp: set[int] = set()
+
+    i = 0
+    while i < len(intervals) - 1:
+        cur_text = intervals[i].text.strip()
+        next_text = intervals[i + 1].text.strip()
+        if is_punct(cur_text) and is_silence(next_text) and next_text:
+            sil_iv = intervals[i + 1]
+            # Extend punctuation to absorb the silence duration.
+            intervals[i] = Interval(intervals[i].xmin, sil_iv.xmax, intervals[i].text)
+            to_delete_words.add(i + 1)
+
+            # Remove matching silence from phones & pp tiers.
+            if phones_tier:
+                for pi, p in enumerate(phones_tier.intervals):
+                    if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
+                       and abs(p.xmax - sil_iv.xmax) < 0.01:
+                        to_delete_phones.add(pi)
+                        break
+            if pp_tier:
+                for pi, p in enumerate(pp_tier.intervals):
+                    if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
+                       and abs(p.xmax - sil_iv.xmax) < 0.01:
+                        to_delete_pp.add(pi)
+                        break
+
+            i += 2  # Skip the absorbed silence.
+        else:
+            i += 1
+
+    if not to_delete_words:
+        return
+
+    # Apply deletions.
+    intervals = [iv for idx, iv in enumerate(intervals)
+                 if idx not in to_delete_words]
+    words_tier.intervals = intervals
+    if phones_tier and to_delete_phones:
+        phones_tier.intervals = [iv for idx, iv in enumerate(phones_tier.intervals)
+                                 if idx not in to_delete_phones]
+    if pp_tier and to_delete_pp:
+        pp_tier.intervals = [iv for idx, iv in enumerate(pp_tier.intervals)
+                             if idx not in to_delete_pp]
+
+    # Clean up zero-duration remnants.
+    for tier in (words_tier, phones_tier, pp_tier):
+        if tier:
+            tier.intervals = [iv for iv in tier.intervals
+                              if iv.duration > 0.001 or not iv.text.strip()]
 
 
 def _finalise_textgrid(textgrid: TextGrid, raw_text: str, pinyin_text: str,
@@ -3796,6 +4008,10 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     #   D. handle_unexpected_silences — MUST be after _inject_punctuation:
     #      long silences are now '…' ellipsis, not <spN> gaps.
     #      Running before C would flag gaps that no longer exist.
+    #   D2. absorb_nvv_trailing — NVV absorbs trailing punct+silence
+    #      chain, extending NVV xmax to next content word.
+    #   D3. absorb_silence_into_punct — fallback: punct absorbs trailing
+    #      <spN> not already absorbed by an NVV.
     #   E. NVV+ellipsis unconditional merge — MUST be after C:
     #      needs '…' from punct injection.
     #   F. _merge_nvv_ellipsis (energy-based)
@@ -3811,6 +4027,16 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         sil_filter_reasons = handle_unexpected_silences(new_tg, pinyin_text)
         if sil_filter_reasons:
             report["unexpected_silence"] = sil_filter_reasons
+
+    # --- D2. NVV absorbs trailing punctuation + silence chain ---
+    # MFA cannot model NVV acoustically; the audio between an NVV and
+    # the next real word is part of the NVV (e.g. laughter tail).
+    absorb_nvv_trailing(new_tg)
+
+    # --- D3. Absorb residual trailing silence into punctuation ---
+    # Fallback: any <spN> still orphaned after punctuation (not already
+    # absorbed by an NVV) is absorbed here so mid_sp won't flag it.
+    absorb_silence_into_punct(new_tg)
 
     # --- E. NVV + ellipsis unconditional merge ---
     words_tier = tier_by_name(new_tg, "words")

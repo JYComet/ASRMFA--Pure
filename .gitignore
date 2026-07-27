@@ -32,6 +32,8 @@ models/Multilingual-NVASR/
 
 # Project data (user-provided)
 data_dir/
+test_data/
+cache/
 
 # MFA runtime
 models/mfa/command_history.yaml

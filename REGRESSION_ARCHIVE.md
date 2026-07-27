@@ -17,6 +17,7 @@
 | 6 | 2026-07-17 | postprocess_textgrids.py | 静音段延伸+end-trimming回截冲突 (ji2) |
 | 7 | 2026-07-23 | postprocess_textgrids.py | pinyin_phones首音素与词界间隙 (ru2→r, NVV邻接) |
 | 8 | 2026-07-27 | postprocess_textgrids.py | 标点间隙中<sp0>因has_punct跳过合并→mid_sp误报 |
+| 9 | 2026-07-27 | postprocess_textgrids.py | 标点后<spN>未被标点吸收→mid_sp误报 |
 
 ---
 
@@ -39,6 +40,10 @@
 | R | `process_one` ~3708 | Phase 3.B 后同步：能量调整 words 后立即重建 pinyin_phones |
 | S | `process_one` ~3760 | Phase 3.5 后同步：英语音素注入后立即重建 pinyin_phones |
 | T | `_snap_to_ctc` ~3118 | words tier 连续性清理：吸收 ≤5ms 词间间隙 |
+| U | `handle_unexpected_silences` ~636-641 | `<sp0>` 无条件合并：`has_punct` 不再拦截 `<sp0>` |
+| V | `handle_unexpected_silences` ~668-693 | has_punct 时 `<sp0>` 合并到标点而非前词 |
+| W1 | `absorb_nvv_trailing` ~758-851 (新增) | Pass 1: NVV 吸收标点+静音链 (D2 步骤) |
+| W2 | `absorb_silence_into_punct` ~854-920 (新增) | Pass 2 (兜底): 标点吸收残余 `<spN>` (D3 步骤) |
 
 ---
 
@@ -474,57 +479,50 @@ words tier:
   [6.660-6.820] wei4        (160ms) ← 与 <sp0> 同时开始
 ```
 
-`<sp0>` 与 `wei4` 同时开始 (6.660)，说明这是 MFA 的对齐 artifact——MFA 在帧精度边界处插入了与后词重叠的静音标签。15ms 的间隙没有任何语义意义，应该被吸收掉。
-
-但 `handle_unexpected_silences` 未能合并它，最终被 `mid_sp` 检测抓到，文件被误滤。
+`<sp0>` 与 `wei4` 同时开始 (6.660)，说明这是 MFA 的对齐 artifact。15ms 的间隙没有任何语义意义。
 
 ### 根因链
 
-1. **MFA 对齐 artifact**: MFA 在 `,` (6.630-6.660) 和 `wei4` (6.660-6.820) 之间插入 `<sp0>` [6.660-6.675]。注意 `<sp0>.xmin == wei4.xmin == 6.660`——这是 MFA 帧精度边界处的残余标签，不是真正的静音。
+1. MFA 在 `,` 和 `wei4` 之间插入 `<sp0>` [6.660-6.675]，`<sp0>.xmin == wei4.xmin`
+2. `tg_word_idx` 过滤标点 → 内容词 `le5`, `wei4`
+3. `gap_sil` 正确捕获 `<sp0>`, `gap_punct` 检测到逗号
+4. **`has_punct` 短路跳过** (旧 L637): `if sil_label is None or has_punct: continue` → `<sp0>` 未被合并
+5. `mid_sp` 检测命中 → 文件被误滤
 
-2. **tg_word_idx 过滤**: line 600-601 将标点从内容词列表中排除。`le5` 和 `wei4` 被识别为两个相邻内容词，中间的 `,` 和 `<sp0>` 构成间隙。
+### 修改点
 
-3. **gap_sil 正确捕获 `<sp0>`**: line 611-617 扫描 words tier 在 `le5` 和 `wei4` 之间的间隔，跳过 `,` (is_silence=False)，在 `<sp0>` 处命中 → `gap_sil[k] = "<sp0>"`。
+**U. `handle_unexpected_silences` — `<sp0>` 无条件合并** (~line 636-641)
 
-4. **gap_punct 检测到标点**: line 621-624 在 pinyin tokens 中检测到逗号 → `gap_punct[k] = True`。
+修改前:
+```python
+if sil_label is None or has_punct:
+    continue
+```
 
-5. **has_punct 短路跳过 (line 637)**: 
-   ```python
-   if sil_label is None or has_punct:
-       continue
-   ```
-   `has_punct=True` → 直接 `continue`，跳过所有静音处理。`<sp0>` 既不被合并，也不被标记为 unexpected_silence。它在 words tier 中残留。
+修改后:
+```python
+if sil_label is None:
+    continue
+if sil_label == "<sp0>":
+    pass  # Always merge <sp0> regardless of punctuation
+elif has_punct:
+    continue  # <sp1-3> + punct: skip (handled by absorb pass)
+elif sil_label in ("<sp1>", "<sp2>", "<sp3>"):
+    ...
+```
 
-6. **mid_sp 检测命中 (line 4205-4210)**: 最终过滤阶段扫描 words tier，发现中间有非空静音标签 → `filter_reasons.append("mid_sp")`，文件被误滤。
+**V. `handle_unexpected_silences` — has_punct 时 `<sp0>` 合并到标点** (~line 668-693)
 
-7. **line 704-707 的零时长清理无法救回**: 清理条件是 `duration > 0.001 or not text.strip()`。`<sp0>` 有非空文本且时长 15ms > 1ms → 不会被清理。
-
-### 关键代码位置
-
-| 位置 | 行号 | 作用 |
-|------|------|------|
-| `handle_unexpected_silences` L637 | 637 | `has_punct` 短路跳过——**根因** |
-| `handle_unexpected_silences` L634-648 | 634-648 | 主循环：gap 遍历 + sil_label/has_punct 判断 |
-| `handle_unexpected_silences` L704-707 | 704-707 | 零时长清理（1ms 阈值，无法清除非空的 15ms `<sp0>`） |
-| `process_one` mid_sp 检测 | 4205-4210 | 检测 words 层中间残留静音 → `mid_sp` |
-
-### 应修复的逻辑
-
-当 `has_punct=True` 但间隙中同时存在 `<sp0>` 时，不应直接 `continue` 跳过。`<sp0>` 应被合并到相邻的标点间隔中（扩展标点的 `xmax`），而不是残留在 words tier 里。
-
-修复方向：在 line 637 的 `continue` 之前，增加对 `sil_label == "<sp0>"` 的特判——将 `<sp0>` 吸收到前一个标点间隔（或后一个标点间隔）中，从 words/phonemes/pinyin_phones 三个 tier 中删除 `<sp0>`。
+当 `has_punct=True` 时，`<sp0>` 不是合并到前词（会覆盖标点），而是查找邻近的标点间隔，扩展其 `xmax` 吸收 `<sp0>`，并从三个 tier 中删除 `<sp0>`。
 
 ```
 修复前: le5[6.540-6.630] ，[6.630-6.660] <sp0>[6.660-6.675] wei4[6.660-6.820]
 修复后: le5[6.540-6.630] ，[6.630-6.675]              wei4[6.660-6.820]
 ```
 
-`<sp0>` 的 15ms 被标点吸收，逗号 xmax 从 6.660 延伸到 6.675。
-
 ### 验证方法
 
 ```python
-# 在标点 + <sp0> 共存的间隙中，<sp0> 必须被合并
 # words tier 中不应残留标点后的孤立 <sp0>
 for i, iv in enumerate(words_tier.intervals):
     if i > 0 and iv.text.strip() == "<sp0>":
@@ -539,15 +537,114 @@ for i, iv in enumerate(words_tier.intervals):
 
 ---
 
+## Case 9: NVV 后的标点+静音链未被吸收 → mid_sp 误报
+
+**日期**: 2026-07-27
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `absorb_nvv_trailing` (新增), `absorb_silence_into_punct` (新增)
+**触发场景**: NVV 后跟标点+静音链，标点仅 5ms，`<sp2>` 695ms 成为孤立句中静音
+
+### 现象
+
+```
+words tier:
+  [9.270-9.745] zhi4
+  [9.745-9.81]  <LAUGHTER>  (65ms, NVV)
+  [9.81-9.815]  ！           (5ms)   ← 标点
+  [9.815-10.51] <sp2>        (695ms) ← 孤立静音
+  [10.51-10.65] bie2
+```
+
+实际音频中，9.81-10.51 是笑声尾音——它不是静音，是 NVV 的一部分。MFA 因无法对 NVV 做声学建模而将其标记为标点+`<sp2>`。
+
+### 根本原因
+
+MFA 无法对两类 token 做声学建模——**NVV** 和**标点**。它们在 MFA 的声学模型里没有对应 phone：
+
+| Token | MFA 行为 | 产生的 artifact |
+|------|---------|---------------|
+| NVV (`<LAUGHTER>`, `<BREATHING>`, …) | 保留占位符，边界不精炼 | 后随的标点+静音残留 |
+| 标点 (`，`, `！`, `…`, …) | 时长压缩到接近 0 | 后随的 `<sp>` 孤悬 |
+
+CTC 预对齐给了初始边界但不准，MFA 无法精炼，postprocess 必须兜底清理。
+
+### 根因链
+
+1. **CTC prealign**: NVV token 无 phone 序列 → CTC 无法分配帧数 → NVV 只分到 65ms，剩余给了 `！` (5ms) 和 `<sp2>` (695ms)
+2. **MFA align**: NVV 无 phone 模型 → 占位符保留，边界不精炼 → 相邻未建模段落变成 `<sp2>`
+3. **handle_unexpected_silences**: `has_punct=True` → `<sp2>` 被跳过（合理——有标点的长静音不应标记为 unexpected）
+4. **旧代码无补救**: 直到 `mid_sp` 检测前，无代码吸收此链
+5. **mid_sp**: 孤立的 `<sp2>` → 文件误滤
+
+### 修改点
+
+**W1. 新增 `absorb_nvv_trailing` — Pass 1: NVV 吸收标点+静音链** (~line 758-851)
+
+NVV 向右吞掉连续的标点+静音，直到下一个内容词。将 NVV 的 `xmax` 延伸到下一个实词的 `xmin`。
+
+```
+修复前: <LAUGHTER>[9.745-9.81] ！[9.81-9.815] <sp2>[9.815-10.51] bie2[10.51-10.65]
+修复后: <LAUGHTER>[9.745-10.51]                                    bie2[10.51-10.65]
+```
+
+同步从 phones 和 pinyin_phones tier 删除被吸收的 `<spN>`（标点无 phone 条目无需处理）。
+
+**W2. `absorb_silence_into_punct` — Pass 2 (兜底): 标点吸收残余 `<spN>`** (~line 854-920)
+
+处理未被 NVV 吸收的残余场景（如无 NVV 时的 `标点 → <spN>`）。扩展标点的 `xmax` 吸收紧随其后的 `<spN>`。
+
+**调用顺序** (~line 4031-4039): Phase 4 中 D → D2(`absorb_nvv_trailing`) → D3(`absorb_silence_into_punct`) → E:
+
+```python
+# D. handle_unexpected_silences (gap-level <sp0> merge)
+# D2. absorb_nvv_trailing (NVV absorbs punct+silence chain)
+# D3. absorb_silence_into_punct (fallback: punct absorbs residual <spN>)
+```
+
+### 与 Case 8 的关系
+
+| | Case 8 | Case 9 |
+|------|------|------|
+| 静音类型 | `<sp0>` (< 0.2s) | `<sp1-3>` (≥ 0.2s) |
+| artifact 来源 | 标点后的 MFA 帧精度残余 | NVV 无法声学建模 |
+| 旧行为 | 残留 → mid_sp | 残留 → mid_sp |
+| 修复位置 | `handle_unexpected_silences` (gap 级别) | `absorb_nvv_trailing` + `absorb_silence_into_punct` |
+| 修复策略 | `<sp0>` 无条件合并 | Pass 1: NVV 吞链; Pass 2: 标点兜底 |
+
+### 验证方法
+
+```python
+# NVV 后不应残留标点+<spN> 链
+for i, iv in enumerate(words_tier.intervals):
+    if is_nvv_token(iv.text) and i + 1 < len(words_tier.intervals):
+        nxt = words_tier.intervals[i + 1].text.strip()
+        assert not (is_punct(nxt) or (is_silence(nxt) and nxt)), \
+            f"NVV trailed by punct/sil: {iv.text} → {nxt}"
+
+# 标点后不应有孤立的 <spN>
+for i in range(len(words_tier.intervals) - 1):
+    cur = words_tier.intervals[i].text.strip()
+    nxt = words_tier.intervals[i + 1].text.strip()
+    assert not (is_punct(cur) and is_silence(nxt) and nxt), \
+        f"<spN> after punct not absorbed: {cur} → {nxt}"
+```
+
+### 关联样本
+
+- 外部项目: `zhi4 → <LAUGHTER> → ！ → <sp2> → bie2` (9.270-10.65s)
+
+---
+
 ### 待处理
 
-- **37443 yu2** (Case 9): 目标 end=0.78s，当前 end=0.81s。yu2 尾部 (0.75-0.78) 有明显能量衰减，但 gang1 辅音起振 (0.795s, RMS 0.022) 落在 yu2 边界内，tail_rms gate 阻止了裁剪。end-trimming 无法区分"本词元音衰减"和"后词辅音起振"。需多词边界检测或能量谷底分割。
+- **37443 yu2**: 目标 end=0.78s，当前 end=0.81s。yu2 尾部 (0.75-0.78) 有明显能量衰减，但 gang1 辅音起振 (0.795s, RMS 0.022) 落在 yu2 边界内，tail_rms gate 阻止了裁剪。end-trimming 无法区分"本词元音衰减"和"后词辅音起振"。需多词边界检测或能量谷底分割。
 
 ### 已解决
 
 - **37435 jiu4**：修改 P 修复。jiu4 [10.39-10.49]，目标 [10.38-10.50]。
 - **37434 ru2**：silence-adjacent 词首前拉 (N)。冒号 [6.80-7.355]，ru2 [7.355-7.50]。
-- **冒号 `：` 在白名单**：`_NORM_ALLOWED_PUNCT` 包含 `：`，会被保留
+- **Case 8 (标点间隙<sp0>残留)**：修改 U+V。`handle_unexpected_silences` 中 `<sp0>` 无条件合并。
+- **Case 9 (NVV后标点+静音链)**：修改 W1+W2。新增 `absorb_nvv_trailing` (D2) + `absorb_silence_into_punct` (D3 兜底)。
 
 ---
 
