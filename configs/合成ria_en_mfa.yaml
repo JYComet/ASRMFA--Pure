@@ -1,0 +1,49 @@
+# 合成ria — ctc_ready 模式 + 英语 MFA 对齐 (中英混合)
+# 运行:
+#   python scripts/run_pipeline.py --config configs/合成ria_en_mfa.yaml \
+#       --python /home/user/miniconda3/envs/mfa-dev/bin/python3 \
+#       --workspace /mnt/nvme0/mfa_hechengria \
+#       --overwrite --force
+#
+# 跳过 pad_silence (如果音频已预处理过):
+#   --skip-pad_silence
+#
+# ⚠️ 重要:
+#   1. 必须使用 --workspace 指向本地 NVMe，MFA 在 CIFS 网络盘上会 SQLite 锁死
+#   2. pad_silence 步骤会自动检测首尾静音，统一补全/裁剪到 0.5s
+#      补全后的音频输出到 ASRMFA_EN/合成ria/padded_audio/
+
+mode: ctc_ready
+workspace: hechengria_en_mfa
+
+# 预处理后的音频目录
+data_dir: \\RS3621\Research_TTS\Data\Raw\v5_0707\合成ria\wavs
+
+ctc_ready:
+  # NVASR CTC 输出目录 (嵌套结构: {stem}/{stem}.lab)
+  ctc_dir: \\RS3621\Research_TTS\Data\Raw\ASRNEW\合成ria\wavs
+  require_all: true
+  stem_prefix: "合成ria_"
+
+# MFA 对齐参数
+mfa:
+  num_jobs: 32
+  single_speaker: true
+
+# 英语 MFA 对齐
+mfa_en:
+  enabled: true
+  num_jobs: 4
+  beam: 10
+  retry_beam: 40
+  acoustic_model: /mnt/local_E/MFA_Pause/pretrained_models/acoustic/english_us_arpa.zip
+  dictionary: dict/cmudict.dict
+  g2p_model: /mnt/local_E/MFA_Pause/pretrained_models/g2p/english_us_arpa.zip
+
+postprocess:
+  filter_suspicious: true
+  enable_text_correction: true
+  handle_unexpected_sil: true
+
+# 输出到 ASRMFA_EN/合成ria
+output_dir: \\RS3621\Research_TTS\Data\Raw\ASRMFA_EN\合成ria

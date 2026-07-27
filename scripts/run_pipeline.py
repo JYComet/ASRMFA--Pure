@@ -187,6 +187,11 @@ DEFAULT_CFG: dict = {
         "target_sr": None,
         "workers": 8,
     },
+    "pad_silence": {
+        "target_edge_silence_sec": 0.5,
+        "silence_threshold": 0.001,
+        "frame_length": 1024,
+    },
     "prepare": {"copy_wav": False, "keep_punctuation": True},
     "ctc_prealign": {
         "enabled": True,
@@ -1430,8 +1435,19 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         print(f"  Found {total_candidates} stems via .lab scan ({layout_kind})")
 
         # Build audio/text indices (single-level scan, then match in memory)
-        audio_index = build_file_index(audio_src, ".wav")
-        print(f"  Audio index: {len(audio_index)} WAV files")
+        # Check for pre-built wav_index.json first (for deeply nested audio on CIFS)
+        wav_index_path = ctc_dir_src / "wav_index.json"
+        audio_index: dict[str, Path] = {}
+        if wav_index_path.exists():
+            try:
+                raw = json.loads(wav_index_path.read_text(encoding='utf-8'))
+                audio_index = {stem: Path(p) for stem, p in raw.items()}
+                print(f"  Audio index: {len(audio_index)} WAV files (from wav_index.json)")
+            except Exception:
+                pass
+        if not audio_index:
+            audio_index = build_file_index(audio_src, ".wav")
+            print(f"  Audio index: {len(audio_index)} WAV files")
         if text_src.exists():
             text_index = build_file_index(text_src, ".txt")
             print(f"  Text index:  {len(text_index)} TXT files")
@@ -1561,12 +1577,53 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     return 0
 
 
+def step_pad_silence(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
+    """Pad/trim head and tail silence to 0.5s, shift CTC timestamps.
+
+    Modifies audio in-place: audio_dir is replaced with padded versions.
+    All CTC timestamps (.TextGrid, _tokens.jsonl, _punct.json) are shifted
+    by the net head change so downstream steps see consistent alignment.
+    """
+    pc = cfg.get("pad_silence", {})
+    target_silence_sec = pc.get("target_edge_silence_sec", 0.5)
+
+    ctc_dir = ctx["ctc_pretg"]
+    padded_audio_dir = ctx["workspace"] / "padded_audio"
+    output_audio_dir = ctx["output_dir"] / "padded_audio"
+
+    pad_args = [
+        "--ctc-dir", str(ctc_dir),
+        "--audio-dir", str(ctx["audio_dir"]),
+        "--padded-audio-dir", str(padded_audio_dir),
+        "--output-audio-dir", str(output_audio_dir),
+        "--target-silence-sec", str(target_silence_sec),
+    ]
+
+    # Pass pre-built wav index if available (avoids slow glob on deeply nested CIFS)
+    cr = cfg.get("ctc_ready", {})
+    ctc_src = resolve_input_path(cr.get("ctc_dir", ""), PROJECT_ROOT)
+    wav_index_path = ctc_src / "wav_index.json"
+    if wav_index_path.exists():
+        pad_args += ["--wav-index", str(wav_index_path)]
+
+    rc = run_python(SCRIPTS_DIR / "pad_silence_edges.py", pad_args, mfa_python,
+                     ctx["models_dir"], desc="Pad/trim silence edges")
+
+    if rc == 0:
+        # Switch audio_dir to padded versions for all downstream steps
+        ctx["audio_dir"] = padded_audio_dir
+        print(f"  Switched audio_dir → {padded_audio_dir}")
+
+    return rc
+
+
 # ---------------------------------------------------------------------------
 # Step registry — must come after all step functions are defined
 # ---------------------------------------------------------------------------
 
 STEPS = {
     "link": ("Link pre-existing CTC output (ctc_ready mode)", step_link_ctc),
+    "pad_silence": ("Pad/trim head+tail silence to 0.5s", step_pad_silence),
     "trim": ("Audio preprocessing", step_trim_silence),
     "resample": ("Resample to 16kHz for MFA", step_resample_for_mfa),
     "prealign": ("CTC pre-alignment (NVASR -> MFA anchors)", step_prealign),
@@ -1582,8 +1639,8 @@ STEPS = {
 }
 
 FULL_STEP_ORDER = list(STEPS.keys())
-CTC_READY_STEP_ORDER = ["link", "normalize_punct", "normalize", "normalize_ria", "normalize_en", "resample", "adjust", "align", "align_en", "postprocess"]
-NVASR_FALLBACK_STEP_ORDER = ["prealign", "normalize_punct", "normalize", "normalize_ria", "normalize_en", "resample", "adjust", "align", "align_en", "postprocess"]
+CTC_READY_STEP_ORDER = ["link", "pad_silence", "normalize_punct", "normalize", "normalize_ria", "normalize_en", "resample", "adjust", "align", "align_en", "postprocess"]
+NVASR_FALLBACK_STEP_ORDER = ["prealign", "pad_silence", "normalize_punct", "normalize", "normalize_ria", "normalize_en", "resample", "adjust", "align", "align_en", "postprocess"]
 
 
 def main():
@@ -1967,6 +2024,7 @@ def main():
     _ctc_pretg_adj_dir = workspace / cfg.get("ctc_pretg_adj", "ctc_pretg_adj")
     step_dirs = {
         "link": [audio_dir, _ctc_pretg_dir],
+        "pad_silence": [workspace / "padded_audio", output_dir / "padded_audio"],
         "trim": [audio_dir, temp_dir],
         "resample": [temp_dir],
         "prealign": [_ctc_pretg_dir],

@@ -530,10 +530,13 @@ def build_pinyin_phones_tier(phones_tier: Tier,
                 new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, dict_phones[0]))
             else:
                 # Initial: first MFA phone -> dict initial
-                new_intervals.append(Interval(word_phones[0][0], word_phones[0][1], dict_phones[0]))
+                # Snap initial start to word start to prevent gaps
+                # (MFA fine_tune may shift word boundary earlier than phone onset,
+                #  e.g. at NVV→word transitions).  See Regression Case 7.
+                new_intervals.append(Interval(w_iv.xmin, word_phones[0][1], dict_phones[0]))
                 # Final: remaining MFA phones combined -> dict final
                 final_start = word_phones[1][0] if len(word_phones) > 1 else word_phones[0][1]
-                final_end = word_phones[-1][1]
+                final_end = w_iv.xmax
                 final_label = " ".join(dict_phones[1:]) if len(dict_phones) > 2 else dict_phones[1]
                 new_intervals.append(Interval(final_start, final_end, final_label))
         else:
@@ -3112,6 +3115,18 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
             merged_pp.append(item)
     new_phone_ivs = merged_pp
 
+    # Eliminate tiny gaps between consecutive word intervals.
+    # MFA frame precision is 10 ms; gaps below that are alignment
+    # residuals, not real silences.  Absorb them into the preceding
+    # word so the words tier is always contiguous — downstream tiers
+    # (hanzi, pinyin_phones) depend on this invariant.
+    for k in range(len(new_word_ivs) - 1, 0, -1):
+        cur = new_word_ivs[k]
+        prev = new_word_ivs[k - 1]
+        gap = cur[0] - prev[1]
+        if 0 < gap <= 0.005 and prev[3] == "word":
+            new_word_ivs[k - 1] = (prev[0], cur[0], prev[2], prev[3])
+
     # Build new tiers
     new_words_tier = Tier(words_tier.name, words_tier.xmin, words_tier.xmax,
                           [Interval(s, e, t) for s, e, t, _ in new_word_ivs])
@@ -3703,6 +3718,19 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                 if t.name == "words":
                     new_tg.tiers[i] = words_tier
                     break
+            # Re-sync pinyin_phones after energy refinement.
+            # _refine_boundaries_by_energy only adjusts words boundaries;
+            # pinyin_phones still reflects the pre-refinement positions.
+            # Rebuild from the current phones tier + updated words so all
+            # three boundary tiers stay in lockstep.
+            cur_phones_tier = tier_by_name(new_tg, "phones")
+            if cur_phones_tier is not None:
+                synced_pp = build_pinyin_phones_tier(cur_phones_tier, ipa_to_pinyin,
+                                                      words_tier, pinyin_dict)
+                for i, t in enumerate(new_tg.tiers):
+                    if t.name == "pinyin_phones":
+                        new_tg.tiers[i] = synced_pp
+                        break
 
     # --- C. Inject punctuation from CTC anchors ---
     words_tier = tier_by_name(new_tg, "words")
@@ -3741,6 +3769,15 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                 for i, t in enumerate(new_tg.tiers):
                     if t.name == "phones":
                         new_tg.tiers[i] = phones_tier
+                        break
+                # Re-sync pinyin_phones after English phone injection.
+                # _apply_en_phones rewrites phone intervals for English words;
+                # pinyin_phones must reflect the updated phones.
+                synced_pp = build_pinyin_phones_tier(phones_tier, ipa_to_pinyin,
+                                                      words_tier, pinyin_dict)
+                for i, t in enumerate(new_tg.tiers):
+                    if t.name == "pinyin_phones":
+                        new_tg.tiers[i] = synced_pp
                         break
     else:
         # No en_data — check if there are English tokens that need it

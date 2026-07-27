@@ -215,6 +215,21 @@ def build_file_index(root: Path, suffix: str) -> dict[str, Path]:
                             pass
         except OSError:
             pass
+
+    # Deeply-nested fallback (e.g. session/clip/stem.wav) — use find(1)
+    if not index:
+        try:
+            import subprocess as _sp
+            result = _sp.run(
+                ["find", str(root), "-name", f"*{suffix}", "-type", "f"],
+                capture_output=True, text=True, timeout=120)
+            for line in result.stdout.splitlines():
+                stem = Path(line).stem
+                if stem and stem not in index:
+                    index[stem] = Path(line)
+        except Exception:
+            pass
+
     return index
 
 
@@ -312,6 +327,21 @@ def discover_stems(ctc_dir: Path, audio_dir: Path,
     except OSError:
         pass
 
+    # Deeply-nested fallback (e.g. session/clip/stem.wav) — use find(1) which
+    # is orders of magnitude faster than Python rglob over CIFS.
+    if not audio_index:
+        try:
+            import subprocess as _sp
+            result = _sp.run(
+                ["find", str(audio_dir), "-name", "*.wav", "-type", "f"],
+                capture_output=True, text=True, timeout=120)
+            for line in result.stdout.splitlines():
+                stem = Path(line).stem
+                if stem:
+                    audio_index.add(stem)
+        except Exception:
+            pass
+
     # Collect candidates
     candidate_stems: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -388,6 +418,21 @@ def discover_stems_separated(ctc_dir: Path, audio_dir: Path,
                 pass
     except OSError:
         pass
+
+    # Deeply-nested fallback (e.g. session/clip/stem.wav) — use find(1) which
+    # is orders of magnitude faster than Python rglob over CIFS.
+    if not audio_index:
+        try:
+            import subprocess as _sp
+            result = _sp.run(
+                ["find", str(audio_dir), "-name", "*.wav", "-type", "f"],
+                capture_output=True, text=True, timeout=120)
+            for line in result.stdout.splitlines():
+                stem = Path(line).stem
+                if stem:
+                    audio_index.add(stem)
+        except Exception:
+            pass
 
     # Collect candidates
     candidate_stems: list[tuple[str, str]] = []

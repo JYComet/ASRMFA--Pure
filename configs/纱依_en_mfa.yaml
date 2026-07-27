@@ -1,0 +1,54 @@
+# 纱依 — ctc_ready 模式 + 英语 MFA 对齐 (中英混合)
+# 音频来源: AAAresult (非 v5_0707)，嵌套目录结构
+# 运行:
+#   python scripts/run_pipeline.py --config configs/纱依_en_mfa.yaml \
+#       --python /home/user/miniconda3/envs/mfa-dev/bin/python3 \
+#       --workspace /mnt/nvme0/mfa_shayi \
+#       --overwrite --force
+#
+# 跳过归一化 + pad_silence (保留原始 CTC 输出、不补静音):
+#   --skip-pad_silence --skip-normalize_punct --skip-normalize --skip-normalize_ria --skip-normalize_en
+#
+# ⚠️ 重要:
+#   1. 必须使用 --workspace 指向本地 NVMe，MFA 在 CIFS 网络盘上会 SQLite 锁死
+#   2. 纱依 CTC 是嵌套结构 (ASRNEW/纱依/{stem}/{stem}.lab)，无 wavs/ 子目录
+#   3. 纱依音频在 AAAresult 深层嵌套，管线通过 find_wav 自动递归查找
+#   4. require_all: false — 纱依可能缺少 _text_cn.txt 等参考文本
+#   5. pad_silence 步骤会自动检测首尾静音，统一补全/裁剪到 0.5s
+#      补全后的音频输出到 ASRMFA_EN/纱依/padded_audio/
+
+mode: ctc_ready
+workspace: 纱依_en_mfa
+
+# 纱依音频在 AAAresult (titanet 匹配后)，不在 v5_0707
+# 嵌套结构: {session}/{clip}/{stem}.wav
+data_dir: \\RS3621\Research_TTS\Data\Raw\AAAresult\纱依\titanet_matched\纱依
+
+ctc_ready:
+  # NVASR CTC 输出目录 (嵌套结构: {stem}/{stem}.lab 等 6 个文件)
+  ctc_dir: \\RS3621\Research_TTS\Data\Raw\ASRNEW\纱依
+  # 纱依可能缺少 _text_cn.txt / _text_raw.txt，不要求全部 CTC 文件
+  require_all: false
+
+# MFA 对齐参数 (纱依: 单说话人，充分利用 CPU)
+mfa:
+  num_jobs: 32
+  single_speaker: true
+
+# 英语 MFA 对齐
+mfa_en:
+  enabled: true
+  num_jobs: 4
+  beam: 10
+  retry_beam: 40
+  acoustic_model: /mnt/local_E/MFA_Pause/pretrained_models/acoustic/english_us_arpa.zip
+  dictionary: dict/cmudict.dict
+  g2p_model: /mnt/local_E/MFA_Pause/pretrained_models/g2p/english_us_arpa.zip
+
+postprocess:
+  filter_suspicious: true
+  enable_text_correction: true
+  handle_unexpected_sil: true
+
+# 输出到 ASRMFA_EN/纱依 (按文件夹分类)
+output_dir: \\RS3621\Research_TTS\Data\Raw\ASRMFA_EN\纱依

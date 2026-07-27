@@ -1,0 +1,52 @@
+# 批量处理 v5_0707 下全部数据集 → ASRMFA_EN (中英混合对齐)
+# 运行:
+#   预扫描:  python scripts/run_pipeline.py --config configs/batch_asrmfa_en.yaml --scan-only
+#   正式运行: python scripts/run_pipeline.py --config configs/batch_asrmfa_en.yaml
+#
+# 自动发现 ASRNEW/{数据集}/wavs/ 下有 CTC 的所有数据集
+# 对应音频在 v5_0707/{数据集}/wavs/
+# 输出到 ASRMFA_EN/{数据集}/
+#
+# 注意: 纱依 不在此批次中 (音频在 AAAresult 而非 v5_0707)，需单独运行
+
+mode: batch_ctc_ready
+
+# 扫描缓存 (默认 true)
+use_cache: true
+
+# 流式管线默认值 (批量模式建议用 streaming_pipeline.py 以获得更好的性能)
+streaming:
+  local_work: /mnt/nvme0/mfa_work
+  batch_size: 2000
+  parallel: 4
+  batch_cache: cache/batch_asrmfa_en.cache.json
+
+batch:
+  ctc_root: \\RS3621\Research_TTS\Data\Raw\ASRNEW
+  audio_root: \\RS3621\Research_TTS\Data\Raw\v5_0707
+  output_root: \\RS3621\Research_TTS\Data\Raw\ASRMFA_EN
+  # include: [合成ria, BCNbanma]  # 可选：只处理指定数据集
+  # exclude: [test]                # 可选：排除指定数据集
+  # limit: 5                       # 可选：只处理前N个（测试用）
+
+ctc_ready:
+  require_all: true
+
+mfa:
+  num_jobs: 32
+  single_speaker: true
+
+# 英语 MFA 对齐 (默认启用)
+mfa_en:
+  enabled: true
+  num_jobs: 4
+  beam: 10
+  retry_beam: 40
+  acoustic_model: /mnt/local_E/MFA_Pause/pretrained_models/acoustic/english_us_arpa.zip
+  dictionary: dict/cmudict.dict
+  g2p_model: /mnt/local_E/MFA_Pause/pretrained_models/g2p/english_us_arpa.zip
+
+postprocess:
+  filter_suspicious: true
+  enable_text_correction: true
+  handle_unexpected_sil: true

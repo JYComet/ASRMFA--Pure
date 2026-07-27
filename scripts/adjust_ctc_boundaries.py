@@ -31,6 +31,7 @@ from audio_energy import (
     noise_floor_from_rms, global_noise_floor,
     speech_onset, speech_offset, median,
 )
+from pipeline_utils import find_wav
 
 
 # ===== Speech boundary search (vectorised) =====
@@ -300,7 +301,9 @@ def process_one(stem: str, ctc_dir: Path, audio_dir: Path,
 
     tokens_path = ctc_dir / f"{stem}_tokens.jsonl"
     punct_path = ctc_dir / f"{stem}_punct.json"
-    wav_path = audio_dir / f"{stem}.wav"
+    wav_path = find_wav(audio_dir, stem)
+    if wav_path is None:
+        return {"stem": stem, "error": "no wav"}
 
     if not tokens_path.exists():
         return {"stem": stem, "error": "no tokens"}

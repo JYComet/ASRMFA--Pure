@@ -1,0 +1,32 @@
+# Test: 合成ria — 1 stem (合成ria_00001)
+mode: ctc_ready
+workspace: test_hechengria_1
+
+data_dir: test_data/hechengria_test/audio
+
+ctc_ready:
+  ctc_dir: test_data/hechengria_test/ctc
+  require_all: true
+
+mfa:
+  num_jobs: 1
+  single_speaker: true
+  fine_tune: false
+  skip_validate: true
+
+mfa_en:
+  enabled: true
+  num_jobs: 1
+  beam: 10
+  retry_beam: 40
+  acoustic_model: /mnt/local_E/MFA_Pause/pretrained_models/acoustic/english_us_arpa.zip
+  dictionary: dict/cmudict.dict
+  g2p_model: /mnt/local_E/MFA_Pause/pretrained_models/g2p/english_us_arpa.zip
+
+postprocess:
+  filter_suspicious: false
+  enable_text_correction: false
+  handle_unexpected_sil: false
+  detect_bgm: false
+
+output_dir: \\RS3621\Research_TTS\Data\Raw\ASRMFA_EN\合成ria
