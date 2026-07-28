@@ -3,9 +3,13 @@ workspace: hualishaxuan
 data_dir: data_dir/花礼筛选
 mode: full
 
+# Use local temp dir to avoid SQLite locking issues on CIFS mount
+temp_dir: /tmp/hualishaxuan_temp
+
 python_path: /home/devuser/miniconda3/envs/mfa_chinese/bin/python
 
 ctc_prealign:
+  enabled: true
   python: /usr/bin/python3
   model_path: /mnt/project/nvvasr_standalone/models/Multilingual-NVASR
   device: cuda:0
