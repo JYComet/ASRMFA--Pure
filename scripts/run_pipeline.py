@@ -678,9 +678,18 @@ def step_normalize_punct(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
 
         # === Phase 2 — classify each character ===
         # char_info[i] = ("punct"|"other", is_allowed | None, char)
+        # '-' between two ASCII letters is part of an NVV token
+        # (e.g. SURPRISE-OH, QUESTION-YI) — never treat as punct.
+        # Regression Case 17-E.
         char_info: list[tuple[str, bool | None, str]] = []
-        for ch in text:
-            if is_punct(ch):
+        for i, ch in enumerate(text):
+            is_hyphen_in_nvv = (
+                ch == '-'
+                and i > 0 and i + 1 < len(text)
+                and text[i - 1].isascii() and text[i - 1].isalpha()
+                and text[i + 1].isascii() and text[i + 1].isalpha()
+            )
+            if is_punct(ch) and not is_hyphen_in_nvv:
                 char_info.append(("punct", ch in ALLOWED_PUNCT, ch))
             else:
                 char_info.append(("other", None, ch))
