@@ -85,9 +85,10 @@ class TextGrid:
 # ---------------------------------------------------------------------------
 
 _NVV_PATTERN = re.compile(
-    r"(?<![A-Z-])("
+    r"(?<![A-Za-z-])("
     + "|".join(re.escape(name) for name in sorted(NVV_NAMES, key=len, reverse=True))
-    + r")(?![A-Z-])"
+    + r")(?![A-Za-z-])",
+    re.IGNORECASE
 )
 
 _SP_PREFIX_PATTERN = re.compile(r"^<sp[0-9]>")
@@ -138,7 +139,7 @@ def _finalize_textgrid(tg: TextGrid) -> None:
         for iv in tier.intervals:
             if not iv.text:
                 continue
-            iv.text = _NVV_PATTERN.sub(r"<\1>", iv.text)
+            iv.text = _NVV_PATTERN.sub(lambda m: f"<{m.group(1).upper()}>", iv.text)
 
         if t_idx == 0:
             first_iv = tier.intervals[0] if tier.intervals else None
@@ -465,6 +466,26 @@ def build_pinyin_phones_tier(phones_tier: Tier,
                 word_phones.append((max(p.xmin, w_iv.xmin), min(p.xmax, w_iv.xmax), p.text))
             phone_idx += 1
 
+        # ── Filter out leaking phones from adjacent words ──
+        # When MFA aligns a word as silence/spn (common for NVV tokens and
+        # OOV English words), the only phones in its range are fragments of
+        # the next word's first phone.  These fragments don't belong to this
+        # word.  Detect: filter out all non-silence phones whose start is
+        # more than 30% past the word's own start.
+        if word_phones and not is_punct(w_iv.text):
+            w_dur = w_iv.xmax - w_iv.xmin
+            if w_dur > 0.06:
+                # Find the first non-silence phone
+                real_phones = [(s, e, t) for s, e, t in word_phones
+                               if not is_silence(t)]
+                if real_phones and real_phones[0][0] > w_iv.xmin + w_dur * 0.30:
+                    # The first real phone starts well into the word — phones
+                    # before it were all silence/spn.  Remove the leaking ones.
+                    # Keep only silence labels that are fully within the word.
+                    word_phones = [(s, e, t) for s, e, t in word_phones
+                                   if is_silence(t) and s >= w_iv.xmin - 0.001
+                                   and e <= w_iv.xmax + 0.001]
+
         if not word_phones:
             new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, word))
             continue
@@ -481,9 +502,10 @@ def build_pinyin_phones_tier(phones_tier: Tier,
             new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, w_iv.text))
             continue
 
-        # NVV token: one self-referential phone
+        # NVV token: one self-referential phone — normalize to <UPPERCASE>
         if is_nvv_token(w_iv.text):
-            new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, w_iv.text))
+            nvv_text = f"<{w_iv.text.strip().strip('<>').upper()}>"
+            new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, nvv_text))
             continue
 
         # English token: use phoneme intervals if available, else self-reference.
@@ -496,18 +518,25 @@ def build_pinyin_phones_tier(phones_tier: Tier,
             # neighbouring Chinese phones from leaking into English ranges.
             if word_phones and en_mfa_windows:
                 wl = w_iv.text.strip().lower()
-                es, ee = en_mfa_windows.get(wl, (w_iv.xmin, w_iv.xmax))
-                # Use English MFA time window to identify English phones.
-                # Phones already en:-prefixed are always kept.  Others must
-                # be inside the MFA window AND not match Chinese IPA patterns
-                # to prevent neighbouring Chinese phones from leaking in.
-                word_phones = [
-                    (s, e, t) for s, e, t in word_phones
-                    if t.startswith(EN_PHONE_PREFIX)
-                    or (s >= es - 0.3 and e <= ee + 0.3
-                        and not _looks_chinese_phone(t)
-                        and not is_silence(t))
-                ]
+                if wl in en_mfa_windows:
+                    es, ee = en_mfa_windows[wl]
+                    # Use English MFA time window to identify English phones.
+                    # Phones already en:-prefixed are always kept.  Others must
+                    # be inside the MFA window AND not match Chinese IPA patterns
+                    # to prevent neighbouring Chinese phones from leaking in.
+                    word_phones = [
+                        (s, e, t) for s, e, t in word_phones
+                        if t.startswith(EN_PHONE_PREFIX)
+                        or (s >= es - 0.3 and e <= ee + 0.3
+                            and not _looks_chinese_phone(t)
+                            and not is_silence(t))
+                    ]
+                else:
+                    # Word not in en_mfa_windows — English MFA didn't process
+                    # it.  Clear word_phones so the self-reference fallback
+                    # below is used.  Prevents leaking Chinese phones from
+                    # adjacent words.  See Regression Case 17.
+                    word_phones = []
             if word_phones:
                 for s, e, txt in word_phones:
                     if is_silence(txt):
@@ -847,6 +876,155 @@ def absorb_nvv_trailing(textgrid: TextGrid) -> None:
                               if iv.duration > 0.001 or not iv.text.strip()]
 
 
+def _sync_derived_tiers(textgrid: TextGrid, ipa_to_pinyin: dict[str, str],
+                        pinyin_dict: dict[str, list[str]] | None = None,
+                        raw_text: str = "",
+                        en_mfa_windows: dict[str, tuple[float, float]] | None = None,
+                        report_warnings: list[str] | None = None) -> None:
+    """Rebuild hanzi and pinyin_phones from the current words + phones tiers.
+
+    Call this after ANY in-place modification to words tier boundaries
+    to keep all three boundary tiers (words, hanzi, pinyin_phones) in
+    lockstep.  Without this, downstream code reads stale tier data.
+
+    This is the SINGLE sync point for derived tiers — every words-tier
+    mutation path must go through here.
+    """
+    words_tier = tier_by_name(textgrid, "words")
+    phones_tier = tier_by_name(textgrid, "phones")
+    if words_tier is None:
+        return
+
+    # 1. Rebuild hanzi from updated words tier
+    if raw_text:
+        try:
+            hanzi_tier = _build_hanzi_tier(words_tier, raw_text,
+                                            report_warnings or [])
+            if hanzi_tier:
+                found = False
+                for i, t in enumerate(textgrid.tiers):
+                    if t.name == "hanzi":
+                        textgrid.tiers[i] = hanzi_tier
+                        found = True
+                        break
+                if not found:
+                    for i, t in enumerate(textgrid.tiers):
+                        if t.name == "words":
+                            textgrid.tiers.insert(i, hanzi_tier)
+                            break
+        except Exception:
+            pass
+
+    # 2. Rebuild pinyin_phones from updated phones + words tiers
+    if phones_tier is not None and pinyin_dict is not None:
+        try:
+            synced_pp = build_pinyin_phones_tier(
+                phones_tier, ipa_to_pinyin, words_tier, pinyin_dict,
+                en_mfa_windows=en_mfa_windows)
+            if synced_pp:
+                for i, t in enumerate(textgrid.tiers):
+                    if t.name == "pinyin_phones":
+                        textgrid.tiers[i] = synced_pp
+                        break
+        except Exception:
+            pass
+
+
+def strip_edge_punctuation(textgrid: TextGrid) -> None:
+    """Remove leading/trailing punctuation that sits at the edge before/after
+    all real words, absorbing its time into the adjacent interval.
+
+    Edge punctuation appears when NVASR strips NVV tags (e.g. ``<|HAPPY|>``)
+    but leaves orphaned ellipsis/punct between the removed tag and the first
+    word.  Without this cleanup, ``…`` can appear as the first word in the
+    hanzi/words tiers.
+    """
+    from dataclasses import replace as _replace
+
+    words_tier = tier_by_name(textgrid, "words")
+    if words_tier is None:
+        return
+    intervals = list(words_tier.intervals)
+    if len(intervals) < 2:
+        return
+
+    def _is_real_word(iv) -> bool:
+        """True if this interval is a content word, not silence/NVV/punct."""
+        return (
+            not is_silence(iv.text)
+            and not is_punct(iv.text)
+            and iv.text.strip() not in ("", "<eps>")
+        )
+        # Note: NVV tokens are real content — they occupy time and can absorb punct
+
+    # ── Find first and last real word ──
+    first_real = None
+    last_real = None
+    for i, iv in enumerate(intervals):
+        if _is_real_word(iv):
+            first_real = i
+            break
+    for i in range(len(intervals) - 1, -1, -1):
+        if _is_real_word(intervals[i]):
+            last_real = i
+            break
+
+    if first_real is None or last_real is None:
+        return
+
+    # ── Strip leading punct: absorb into the preceding interval ──
+    # Walk backwards from first_real-1 to 0; every punct gets absorbed into its neighbour
+    leading_punct_indices = []
+    for i in range(first_real):
+        if is_punct(intervals[i].text):
+            leading_punct_indices.append(i)
+
+    for pi in sorted(leading_punct_indices, reverse=True):
+        p_iv = intervals[pi]
+        # Absorb into preceding interval (if any) by extending its xmax
+        if pi > 0:
+            intervals[pi - 1] = _replace(intervals[pi - 1], xmax=p_iv.xmax)
+        elif pi + 1 < len(intervals):
+            # First interval is punct — absorb into next interval
+            intervals[pi + 1] = _replace(intervals[pi + 1], xmin=p_iv.xmin)
+        intervals[pi] = _replace(intervals[pi], xmin=0, xmax=0, text="")
+
+    # ── Strip trailing punct: absorb into the following interval ──
+    trailing_punct_indices = []
+    for i in range(last_real + 1, len(intervals)):
+        if is_punct(intervals[i].text):
+            trailing_punct_indices.append(i)
+
+    for pi in sorted(trailing_punct_indices, reverse=True):
+        p_iv = intervals[pi]
+        # Absorb into following interval (if any) by extending its xmin
+        if pi + 1 < len(intervals):
+            intervals[pi + 1] = _replace(intervals[pi + 1], xmin=p_iv.xmin)
+        elif pi > 0:
+            # Last interval is punct — absorb into previous interval
+            intervals[pi - 1] = _replace(intervals[pi - 1], xmax=p_iv.xmax)
+        intervals[pi] = _replace(intervals[pi], xmin=0, xmax=0, text="")
+
+    # ── Apply changes ──
+    intervals = [iv for iv in intervals if iv.xmax > iv.xmin + 0.001]
+    new_words = Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals)
+    for i, t in enumerate(textgrid.tiers):
+        if t.name == "words":
+            textgrid.tiers[i] = new_words
+            break
+
+    # Sync pinyin_phones: remove corresponding punct intervals (same time range)
+    pp_tier = tier_by_name(textgrid, "pinyin_phones")
+    if pp_tier is not None:
+        pp_ivs = [iv for iv in pp_tier.intervals
+                  if iv.duration > 0.001 and not is_punct(iv.text)]
+        new_pp = Tier(pp_tier.name, pp_tier.xmin, pp_tier.xmax, pp_ivs)
+        for i, t in enumerate(textgrid.tiers):
+            if t.name == "pinyin_phones":
+                textgrid.tiers[i] = new_pp
+                break
+
+
 def absorb_silence_into_punct(textgrid: TextGrid) -> None:
     """Absorb trailing ``<spN>`` silence intervals into preceding punctuation.
 
@@ -922,7 +1100,7 @@ def absorb_silence_into_punct(textgrid: TextGrid) -> None:
 
 
 def _finalise_textgrid(textgrid: TextGrid, raw_text: str, pinyin_text: str,
-                       args) -> TextGrid:
+                       args, warnings: list | None = None) -> TextGrid:
     """Clean up corrected text and restructure tiers for final output.
 
     1. Remove ``[sp]`` markers from corrected_text (merged as sp0).
@@ -931,6 +1109,9 @@ def _finalise_textgrid(textgrid: TextGrid, raw_text: str, pinyin_text: str,
     4. Sync pinyin tier punctuation + ``<sp1>`` prefix.
     5. Insert a hanzi tier (one CJK char per word interval).
     6. Reorder: raw_text, pinyin, hanzi, words, phones, pinyin_phones.
+
+    *warnings* (when provided) is threaded through to
+    :func:`_build_hanzi_tier` for defensive mismatch detection.
     """
     corrected_tier = tier_by_name(textgrid, "corrected_text")
     if corrected_tier is None:
@@ -955,7 +1136,7 @@ def _finalise_textgrid(textgrid: TextGrid, raw_text: str, pinyin_text: str,
 
     # 5. Build hanzi tier — one CJK char per word interval
     words_tier = tier_by_name(textgrid, "words")
-    hanzi_tier = _build_hanzi_tier(words_tier, raw_text) if words_tier else None
+    hanzi_tier = _build_hanzi_tier(words_tier, raw_text, warnings) if words_tier else None
 
     # 6. Remove corrected_text, reorder tiers
     new_tiers = []
@@ -998,7 +1179,13 @@ def _sync_pinyin_punctuation(pinyin_text: str, raw_text: str, final_text: str) -
 
 def _extract_word_chars(text: str) -> list[str]:
     """Extract word-like chars from raw text, grouping consecutive non-CJK alpha chars
-    and trailing digits (pinyin tone numbers)."""
+    and trailing digits (pinyin tone numbers).
+
+    Angle brackets (``<``, ``>``) are grouped with the alpha buffer so that
+    NVV tokens like ``<LAUGHTER>`` and ``<QUESTION-YI>`` stay as a single
+    unit.  ``<`` flushes any pending buffer and opens a new group; ``>``
+    closes the group and flushes immediately so the next word is separate.
+    """
     result = []
     buf = ""
     for c in text:
@@ -1007,6 +1194,15 @@ def _extract_word_chars(text: str) -> list[str]:
                 result.append(buf)
                 buf = ""
             result.append(c)
+        elif c == '<':
+            if buf:
+                result.append(buf)
+                buf = ""
+            buf += c
+        elif c == '>':
+            buf += c
+            result.append(buf)
+            buf = ""
         elif c.isalpha() or c == '-':
             buf += c  # hyphen in NVV tokens like QUESTION-YI stays with alpha
         elif c.isdigit():
@@ -1064,14 +1260,13 @@ def _word_matches(ctc_token: str, ref_unit: str) -> bool:
         return True
 
     # Pinyin-syllable phonetic rendering of an English word.
-    # Accept any pinyin syllable (e.g. "ai4"->"idol", "rui4"->"ria").
-    # Local over-matching is harmless: the DP global alignment will
-    # only use this match when it leads to the lowest total cost.
-    # If a CJK character needs this pinyin, its exact-match cost of 0
-    # wins over the fuzzy alpha-group match that forces mismatches
-    # downstream.
+    # Only accept when the English reference has ≥2 vowels — prevents
+    # short words like "OH"/"OP"/"in"/"up" from matching pinyin syllables
+    # (e.g. qie4↔OH cost 0 → NW gap-first picks OH over CJK 切).
+    # Examples that still match: "ai4"↔"idol" (2 vowels), "rui4"↔"ria" (2 vowels).
     if len(c) >= 2 and c[-1].isdigit() and c[:-1].isalpha():
-        return True
+        vowel_count = sum(1 for ch in r if ch in 'aeiou')
+        return vowel_count >= 2
 
     return False
 
@@ -1131,82 +1326,172 @@ def _align_word_sequences(ctc_seq: list[str],
     return pairs
 
 
-def _build_hanzi_tier(words_tier: Tier, raw_text: str) -> Tier:
-    """Build the *hanzi* tier by aligning word tokens to reference text units.
+def _alpha_text_matches(token: str, ref: str) -> bool:
+    """Check if an alpha-group word token matches a reference word unit.
 
-    Uses Needleman-Wunsch sequence alignment (:func:`_align_word_sequences`)
-    to robustly match CTC/MFA word tokens (pinyin + NVV + English fragments)
-    against reference word units (CJK characters + alpha groups), handling
-    tokenizer fragmentation and phonetic rendering without heuristics.
+    Uses fuzzy substring matching to handle tokenizer fragmentation
+    and phonetic rendering.  Used by :func:`_build_hanzi_tier` for
+    greedy consumption of English / NVV reference units.
+
+    Pinyin-syllable fallback: only accepts when the English reference
+    has ≥2 vowels — prevents short words like ``OH`` / ``OP`` / ``in``
+    from matching pinyin syllables (e.g. ``qie4`` ↔ ``OH``).
+    """
+    c = token.strip().lower()
+    r = ref.lower()
+
+    # Direct substring containment
+    if c in r or r in c:
+        return True
+
+    # Single-letter CTC token -> fragment of the English word
+    if len(c) == 1 and c.isalpha():
+        return c in r
+
+    # NVV token matching (strip angle brackets)
+    c_clean = c.strip('<>')
+    r_clean = r.strip('<>')
+    if c_clean in r_clean or r_clean in c_clean:
+        return True
+
+    # Pinyin-syllable phonetic rendering of an English word.
+    # Only accept when the reference has ≥2 vowels.
+    if len(c) >= 2 and c[-1].isdigit() and c[:-1].isalpha():
+        vowel_count = sum(1 for ch in r if ch in 'aeiou')
+        return vowel_count >= 2
+
+    return False
+
+
+def _build_hanzi_tier(words_tier: Tier, raw_text: str,
+                      warnings: list | None = None) -> Tier:
+    """Build the *hanzi* tier by sequential mapping of word tokens to
+    reference text units.
+
+    **CJK characters**: each pinyin-syllable token in *words_tier*
+    consumes the next unused CJK character from the reference text
+    in order.  This mapping is purely positional — it does not depend
+    on pypinyin tone accuracy or any dictionary.
+
+    **English / NVV tokens**: greedy substring matching against alpha
+    reference units, handling tokenizer fragmentation (``li`` + ``ve``
+    → ``live``) and MFA merging (``SURPRISE-OH`` → ``SURPRISE`` +
+    ``OH``).
+
+    **Punctuation**: passed through without consuming any cursor.
+
+    **Silence**: silence label preserved.
+
+    Emits warnings via *warnings* (when provided) if the number of
+    pinyin-syllable tokens does not equal the number of reference CJK
+    characters.
     """
     clean = raw_text.replace('<sp1>', '')
     char_units = _extract_word_chars(clean)
 
-    # ── Build reference word-unit sequence (punct filtered out) ──
-    ref_units: list[tuple[int, str]] = []   # (char_units_index, unit_text)
-    for i, u in enumerate(char_units):
-        if is_word_like(u):
-            ref_units.append((i, u))
-
-    # ── Build CTC word-token sequence (silence & punct filtered out) ──
-    ctc_pool: list[tuple[int, str]] = []    # (words_tier_index, token_text)
-    for i, iv in enumerate(words_tier.intervals):
-        if is_silence(iv.text) or not iv.text.strip():
-            continue
-        if is_punct(iv.text):
-            continue
-        ctc_pool.append((i, iv.text.strip()))
-
-    # ── Align ──
-    ctc_texts = [t for _, t in ctc_pool]
-    ref_texts = [u for _, u in ref_units]
-    alignment = _align_word_sequences(ctc_texts, ref_texts)
-
-    # Build mapping: ctc_pool_index -> (char_units_index, label) or None
-    ctc_map: dict[int, tuple[int, str] | None] = {}
-    for ctc_i, ref_i in alignment:
-        if ctc_i is None:
-            continue                       # reference-only gap — punct or missing token
-        if ref_i is None:
-            # CTC fragment with no reference unit — use its own text as label
-            ctc_map[ctc_i] = (None, ctc_pool[ctc_i][1])
+    # ── Separate reference units into CJK queue and alpha queue ──
+    ref_cjk: list[str] = []     # CJK characters in reference order
+    ref_alpha: list[str] = []   # English words / NVV tokens in reference order
+    for u in char_units:
+        if not is_word_like(u):
+            continue            # skip punct in reference
+        if is_cjk(u):
+            ref_cjk.append(u)
         else:
-            ref_ci, ref_label = ref_units[ref_i]
-            ctc_text = ctc_pool[ctc_i][1]
-            # Use the canonical reference spelling for all English words.
-            # normalize_english_tokens.py already merges fragments pre-MFA,
-            # so CTC text should match the reference; this is a safety net
-            # for any remaining mismatches.
-            if ref_label.isascii() and not is_cjk(ref_label):
-                ctc_map[ctc_i] = (ref_ci, ref_label)
-            else:
-                ctc_map[ctc_i] = (ref_ci, ref_label)
+            ref_alpha.append(u)
 
     # ── Build hanzi intervals ──
     intervals: list[Interval] = []
-    ctc_pool_cursor = 0
+    cjk_idx = 0
+    alpha_idx = 0
+
+    # Track pinyin-syllable count for defensive mismatch detection
+    pinyin_count = 0
 
     for iv in words_tier.intervals:
-        if is_silence(iv.text) or not iv.text.strip():
-            intervals.append(Interval(iv.xmin, iv.xmax, silence_label(iv.duration)))
+        token = iv.text.strip()
+
+        # Silence → keep silence label
+        if is_silence(iv.text) or not token:
+            intervals.append(Interval(iv.xmin, iv.xmax,
+                                      silence_label(iv.duration)))
             continue
 
+        # Punctuation → pass through, consume no cursor
         if is_punct(iv.text):
             intervals.append(Interval(iv.xmin, iv.xmax, iv.text))
             continue
 
-        if ctc_pool_cursor >= len(ctc_pool):
-            intervals.append(Interval(iv.xmin, iv.xmax, iv.text))
+        # ── Pinyin syllable → consume next CJK character ──
+        if is_pinyin_syllable(token):
+            pinyin_count += 1
+            if cjk_idx < len(ref_cjk):
+                label = ref_cjk[cjk_idx]
+                cjk_idx += 1
+            else:
+                # No more CJK chars — fall back to token text
+                label = token
+            intervals.append(Interval(iv.xmin, iv.xmax, label))
             continue
 
-        mapping = ctc_map.get(ctc_pool_cursor)
-        ctc_pool_cursor += 1
+        # ── English / NVV token → greedy match against alpha refs ──
+        # An MFA token may consume multiple reference alpha units
+        # (merged case, e.g. SURPRISE-OH → "SURPRISE" + "OH").
+        # Conversely, a reference unit may be split across multiple
+        # MFA tokens (fragmented case, e.g. "li" + "ve" → "live").
+        # Strip angle brackets: _finalize_textgrid may have already
+        # wrapped NVV tokens with < > before we run.  Matching and
+        # fallback labels must use the clean form to avoid bracket
+        # pollution in the hanzi tier and misaligned cursors.
+        clean_token = token.strip('<>')
+        matched_refs: list[str] = []
+        while alpha_idx < len(ref_alpha):
+            ref_unit = ref_alpha[alpha_idx]
+            if _alpha_text_matches(clean_token, ref_unit):
+                matched_refs.append(ref_unit)
+                alpha_idx += 1
+                # Check if the token also consumes the NEXT ref unit
+                # by seeing whether both refs are substrings of the token
+                continue_match = False
+                if alpha_idx < len(ref_alpha):
+                    next_ref = ref_alpha[alpha_idx].lower()
+                    if next_ref in clean_token.lower() or clean_token.lower() in next_ref:
+                        continue_match = True
+                if not continue_match:
+                    break
+            else:
+                break
 
-        if mapping is None:
-            intervals.append(Interval(iv.xmin, iv.xmax, ''))
+        if matched_refs:
+            # Use the first consumed reference unit as the label
+            # (for the common single-consumption case this is just
+            # the matched ref unit)
+            label = matched_refs[0]
+        elif clean_token.isascii() and all(c.isalpha() or c == '-' for c in clean_token):
+            # NVV / English token with no matching ref unit — use as-is
+            label = clean_token
         else:
-            _, label = mapping
-            intervals.append(Interval(iv.xmin, iv.xmax, label))
+            label = clean_token
+
+        intervals.append(Interval(iv.xmin, iv.xmax, label))
+
+    # ── Defensive mismatch detection ──
+    if warnings is not None and len(ref_cjk) > 0:
+        n_cjk = len(ref_cjk)
+        if pinyin_count > n_cjk:
+            warnings.append(
+                f"hanzi tier mismatch: {pinyin_count} pinyin tokens vs "
+                f"{n_cjk} reference CJK chars — "
+                f"{pinyin_count - n_cjk} pinyin token(s) fell back "
+                f"(no more CJK chars to consume)"
+            )
+        elif pinyin_count < n_cjk:
+            warnings.append(
+                f"hanzi tier mismatch: {pinyin_count} pinyin tokens vs "
+                f"{n_cjk} reference CJK chars — "
+                f"{n_cjk - pinyin_count} reference CJK char(s) were not "
+                f"assigned to any pinyin token"
+            )
 
     return Tier("hanzi", words_tier.xmin, words_tier.xmax, intervals)
 
@@ -1214,8 +1499,8 @@ def _build_hanzi_tier(words_tier: Tier, raw_text: str) -> Tier:
 def _normalize_word_spellings(words_tier: Tier, raw_text: str) -> None:
     """Replace tokenizer fragments in *words_tier* with canonical reference spellings.
 
-    Uses the same Needleman-Wunsch alignment as :func:`_build_hanzi_tier`
-    to map word-tier tokens to reference word units.  When a token is a
+    Uses Needleman-Wunsch alignment (:func:`_align_word_sequences`) to
+    map word-tier tokens to reference word units.  When a token is a
     fragment of an English/NVV word (e.g. "R" for "ria"), the word-tier
     text is updated in-place to match the reference spelling so that all
     downstream tiers (words, pinyin_phones) stay consistent.
@@ -1263,6 +1548,13 @@ def _normalize_word_spellings(words_tier: Tier, raw_text: str) -> None:
         if not (ref_spelling.isascii() and ref_spelling.isalpha() and len(ref_spelling) >= 2):
             continue
         wi, w_text = word_entries[ctc_i]
+        # NEVER replace an NVV token's text — it has no MFA acoustic model and
+        # its canonical form (e.g. SURPRISE-OH) is the key to downstream NVV
+        # handling.  Replacing it with a reference spelling (e.g. SURPRISE)
+        # breaks NVV detection, causing the word to be treated as English and
+        # getting no valid phones.  See Regression Case 17.
+        if is_nvv_token(w_text):
+            continue
         if ref_spelling != w_text and ref_spelling.isascii():
             words_tier.intervals[wi].text = ref_spelling
 
@@ -2187,7 +2479,7 @@ def _inject_punctuation(words_tier: Tier, pp_tier: Tier | None,
         for m in merged:
             if m is last_punct:
                 new_merged.append((punct_start, words_tier.xmax, punct_text, "punct"))
-            elif m[0] < punct_start:
+            elif m[1] <= punct_start + 0.001:
                 new_merged.append(m)
         merged = new_merged
 
@@ -3223,6 +3515,13 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
             else:
                 word_start = prev_end
 
+        # Guard against inverted intervals: when overlap fix pushes word_start
+        # past word_end (prev word CTC-snapped longer than current word's MFA
+        # end), extend word_end to preserve the word with at least its MFA
+        # duration or a 30 ms floor.
+        if word_end < word_start:
+            word_end = word_start + max(mfa_dur, 0.030)
+
         # ── Gap absorption (ORDER CRITICAL — do not reorder) ──
         # 1. NVV absorption into preceding gap (paralinguistic)
         # 2. CTC-snap gap fill (boundary artifact from duration-ratio fix)
@@ -3876,6 +4175,9 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
 
     # Finalise: strip [sp] markers (merged), add <sp1> prefix,
     # sync pinyin, insert hanzi tier, reorder everything.
+    # NOTE: warnings are NOT passed here — the hanzi tier built by
+    # _finalise_textgrid is a throwaway (replaced in Phase 5).
+    # Passing warnings would duplicate every mismatch message.
     if args.enable_text_correction:
         new_tg = _finalise_textgrid(new_tg, raw_text, pinyin_text, args)
 
@@ -3955,6 +4257,14 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                     new_tg.tiers[i] = words_tier
                 elif t.name == "pinyin_phones" and pp_tier is not None:
                     new_tg.tiers[i] = pp_tier
+
+    # ── Build en_mfa_windows early (needed by _sync_derived_tiers throughout Phases 3.5–5) ──
+    en_mfa_windows: dict[str, tuple[float, float]] = {}
+    if en_data:
+        for entry in en_data:
+            es = entry.get("en_word_start", entry["word_start"])
+            ee = entry.get("en_word_end", entry["word_end"])
+            en_mfa_windows[entry["word_text"].strip().lower()] = (es, ee)
 
     # ═══════════════════════════════════════════════════════════════
     # Phase 3.5 — English MFA phoneme injection.
@@ -4038,6 +4348,16 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # absorbed by an NVV) is absorbed here so mid_sp won't flag it.
     absorb_silence_into_punct(new_tg)
 
+    # --- D4. Strip edge punctuation (leading/trailing) ---
+    # Punctuation sitting before the first real word or after the last
+    # real word is absorbed into adjacent intervals.  Fixes orphaned
+    # ellipsis left behind when NVASR strips NVV tags.  See Regression Case 17.
+    strip_edge_punctuation(new_tg)
+
+    # ── SYNC: D2/D3/D4 modified words tier in-place → rebuild derived tiers ──
+    _sync_derived_tiers(new_tg, ipa_to_pinyin, pinyin_dict,
+                         raw_text, en_mfa_windows, report.get("warnings", []))
+
     # --- E. NVV + ellipsis unconditional merge ---
     words_tier = tier_by_name(new_tg, "words")
     pp_tier = tier_by_name(new_tg, "pinyin_phones")
@@ -4100,6 +4420,10 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                         new_tg.tiers[i] = pp_tier
         except Exception:
             pass
+
+    # ── Final Phase 4 sync: ensure all derived tiers are current ──
+    _sync_derived_tiers(new_tg, ipa_to_pinyin, pinyin_dict,
+                         raw_text, en_mfa_windows, report.get("warnings", []))
 
     # ═══════════════════════════════════════════════════════════════
     # Phase 5 — Final text sync & QC.
@@ -4209,7 +4533,8 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         #    pinyin_phones tiers use the canonical reference spelling.
         _normalize_word_spellings(final_words_tier, raw_text)
         # 2. Rebuild hanzi from normalised words.
-        hanzi_tier = _build_hanzi_tier(final_words_tier, raw_text)
+        hanzi_tier = _build_hanzi_tier(final_words_tier, raw_text,
+                                        report.get("warnings", []))
         if hanzi_tier:
             found = False
             for i, t in enumerate(new_tg.tiers):
@@ -4228,14 +4553,6 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         # window are used (filtered by build_pinyin_phones_tier via en_mfa_windows).
         final_phones_tier = tier_by_name(new_tg, "phones")
         if final_phones_tier and final_words_tier:
-            # Build English MFA time window lookup for boundary filtering
-            en_mfa_windows = {}
-            if en_data:
-                for entry in en_data:
-                    es = entry.get("en_word_start", entry["word_start"])
-                    ee = entry.get("en_word_end", entry["word_end"])
-                    en_mfa_windows[entry["word_text"].strip().lower()] = (es, ee)
-
             synced_pp = build_pinyin_phones_tier(final_phones_tier, ipa_to_pinyin,
                                                   final_words_tier, pinyin_dict,
                                                   en_mfa_windows=en_mfa_windows)
@@ -4625,6 +4942,40 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             if "word_in_silence" not in filter_reasons:
                 filter_reasons.append("word_in_silence")
 
+    # ── Hanzi tier integrity checks (BEFORE path decision) ──
+    # These detect pinyin residue / CJK misalignment in the final
+    # hanzi tier.  Must run here so filter_reasons is complete when
+    # the output path is chosen below.
+    raw_tier = tier_by_name(new_tg, "raw_text")
+    hanzi_tier_final = tier_by_name(new_tg, "hanzi")
+    if raw_tier and hanzi_tier_final:
+        # (a) Direct pinyin residue scan — any pinyin syllable left in
+        #     the hanzi tier is a hard alignment error.
+        pinyin_labels: list[str] = []
+        for iv in hanzi_tier_final.intervals:
+            label = iv.text.strip()
+            if label and is_pinyin_syllable(label):
+                pinyin_labels.append(label)
+        if pinyin_labels:
+            filter_reasons.append("hanzi_pinyin")
+            report.setdefault("hanzi_pinyin", {})["count"] = len(pinyin_labels)
+            report["hanzi_pinyin"]["labels"] = pinyin_labels[:20]  # cap for report size
+
+        # (b) CJK character coverage — compare raw_text CJK sequence
+        #     against hanzi tier CJK sequence.  Missing or out-of-order
+        #     CJK chars indicate the alignment dropped or misassigned them.
+        raw_cjk = "".join(c for c in raw_tier.intervals[0].text.replace("<sp1>", "")
+                         if "一" <= c <= "鿿" or "㐀" <= c <= "䶿")
+        hanzi_cjk = "".join(iv.text.strip() for iv in hanzi_tier_final.intervals
+                           if iv.text.strip()
+                           and ("一" <= iv.text.strip() <= "鿿"
+                                or "㐀" <= iv.text.strip() <= "䶿"))
+        if raw_cjk != hanzi_cjk:
+            filter_reasons.append("cjk_mismatch")
+            report.setdefault("cjk_details", {})["raw_count"] = len(raw_cjk)
+            report["cjk_details"]["hanzi_count"] = len(hanzi_cjk)
+            report["cjk_details"]["delta"] = len(raw_cjk) - len(hanzi_cjk)
+
     # 统一设置过滤状态和输出路径
     if filter_reasons:
         report["status"] = "filtered_" + "_".join(filter_reasons)
@@ -4646,25 +4997,6 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
 
     if out_path.exists() and not args.overwrite:
         raise FileExistsError(f"Output exists: {out_path}")
-    # ── Alignment sanity check: CJK char coverage ──
-    # Compare raw_text CJK sequence against hanzi tier.  Missing or
-    # out-of-order characters indicate NW alignment failure in hanzi
-    # building or a word was swallowed by an adjacent English token.
-    if not filter_reasons:
-        raw_tier = tier_by_name(new_tg, "raw_text")
-        hanzi_tier = tier_by_name(new_tg, "hanzi")
-        if raw_tier and hanzi_tier:
-            raw_cjk = "".join(c for c in raw_tier.intervals[0].text.replace("<sp1>", "")
-                             if "一" <= c <= "鿿" or "㐀" <= c <= "䶿")
-            hanzi_cjk = "".join(iv.text.strip() for iv in hanzi_tier.intervals
-                               if iv.text.strip()
-                               and ("一" <= iv.text.strip() <= "鿿"
-                                    or "㐀" <= iv.text.strip() <= "䶿"))
-            if raw_cjk != hanzi_cjk:
-                filter_reasons.append("cjk_mismatch")
-                report.setdefault("cjk_details", {})["raw_count"] = len(raw_cjk)
-                report["cjk_details"]["hanzi_count"] = len(hanzi_cjk)
-                report["cjk_details"]["delta"] = len(raw_cjk) - len(hanzi_cjk)
 
     if stale.exists() and args.overwrite:
         stale.unlink()

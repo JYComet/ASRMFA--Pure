@@ -65,6 +65,8 @@
 #   clean: false            # keep feature cache for faster re-runs
 #   no_tokenization: true
 #   skip_validate: true     # MFA align validates internally
+#   fine_tune: false        # default off: adjust_ctc_boundaries already refines anchors
+#   fine_tune_boundary_tolerance: 0.02  # only used when fine_tune: true
 
 # ── English MFA ──────────────────────────────────────────────────────────
 # mfa_en:

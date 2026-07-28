@@ -209,6 +209,10 @@ DEFAULT_CFG: dict = {
         "clean": False,              # keep feature cache for faster re-runs
         "no_tokenization": True,
         "skip_validate": True,       # MFA align internally validates; standalone validate is redundant
+        "fine_tune": False,          # DISABLED: adjust_ctc_boundaries already refines anchors.
+                                     # MFA acoustic model drifts on NVV/BGM/short-words/English.
+                                     # Set true only for clean speech datasets.
+        "fine_tune_boundary_tolerance": 0.02,  # only used when fine_tune: true
     },
     "mfa_en": {
         "enabled": True,
@@ -999,11 +1003,17 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         mfa_args += ["--transition_scale", str(mc["transition_scale"])]
 
     # ── Fine-tune: allows CTC anchor boundaries to float during a refinement pass ──
-    if mc.get("fine_tune", True):
+    # DISABLED by default (2026-07-28): MFA's acoustic model is trained on clean
+    # speech and performs poorly on NVV tokens, short function words, BGM audio,
+    # and English words — causing boundary drift that _snap_to_ctc's 0.3s threshold
+    # cannot catch.  adjust_ctc_boundaries.py already refines CTC anchors via energy
+    # analysis, which is more reliable across all audio conditions.
+    # Set fine_tune: true in mfa: config to re-enable for clean speech datasets.
+    if mc.get("fine_tune", False):
         mfa_args.append("--fine_tune")
-    fine_tune_tolerance = mc.get("fine_tune_boundary_tolerance", 0.1)
-    if fine_tune_tolerance is not None and fine_tune_tolerance > 0:
-        mfa_args += ["--fine_tune_boundary_tolerance", str(fine_tune_tolerance)]
+        fine_tune_tolerance = mc.get("fine_tune_boundary_tolerance", 0.02)
+        if fine_tune_tolerance is not None and fine_tune_tolerance > 0:
+            mfa_args += ["--fine_tune_boundary_tolerance", str(fine_tune_tolerance)]
     return run_mfa(mfa_args, mfa_python, ctx["models_dir"],
                    "Step 6: MFA Align" + (" (NVASR corpus + CTC anchors)" if use_nvasr_corpus and use_anchors else ""))
 

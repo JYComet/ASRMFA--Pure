@@ -405,8 +405,8 @@ mfa:
   beam: 30                          # 原 20 → 30
   retry_beam: 120                   # 原 80 → 120
   boost_silence: 0.8                # 原 1.0 → 0.8 (减少静音偏好)
-  fine_tune: true
-  fine_tune_boundary_tolerance: 0.05  # 原 0.1 → 0.05 (减少边界漂移)
+  fine_tune: false                  # 原 true → false（2026-07-28: adjust_ctc_boundaries 已做能量修正，
+                                    #   fine_tune 会反向漂移锚点，详见 REGRESSION_ARCHIVE.md Case 16）
 ```
 
 ### 4.3 分数据集配置示例

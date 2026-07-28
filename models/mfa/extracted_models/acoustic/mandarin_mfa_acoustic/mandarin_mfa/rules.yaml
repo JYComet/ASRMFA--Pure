@@ -1,0 +1,244 @@
+dialects:
+  china:
+  - following_context: ''
+    non_silence_before_correction: 0.02
+    preceding_context: ''
+    probability: 0.2
+    replacement: ''
+    segment: ʔ
+    silence_after_probability: 0.95
+    silence_before_correction: 0.1
+  - following_context: ''
+    non_silence_before_correction: 0.15
+    preceding_context: ''
+    probability: 0.04
+    replacement: ''
+    segment: ɻ
+    silence_after_probability: 1.44
+    silence_before_correction: -0.33
+  - following_context: ''
+    non_silence_before_correction: -0.01
+    preceding_context: ''
+    probability: 0.08
+    replacement: mʲ
+    segment: m j
+    silence_after_probability: 0.31
+    silence_before_correction: -0.15
+  - following_context: ''
+    non_silence_before_correction: 0.03
+    preceding_context: ''
+    probability: 0.03
+    replacement: ʎ
+    segment: l j
+    silence_after_probability: 2.13
+    silence_before_correction: -0.14
+  - following_context: ''
+    non_silence_before_correction: -0.02
+    preceding_context: ''
+    probability: 0.01
+    replacement: ɲ
+    segment: n j
+    silence_after_probability: 1.09
+    silence_before_correction: -0.11
+  - following_context: ''
+    non_silence_before_correction: -0.06
+    preceding_context: ''
+    probability: 0.25
+    replacement: tʲ
+    segment: tʰ j
+    silence_after_probability: 0.08
+    silence_before_correction: 0.39
+  - following_context: ''
+    non_silence_before_correction: 0.01
+    preceding_context: ''
+    probability: 0.1
+    replacement: tʲ
+    segment: t j
+    silence_after_probability: 1.07
+    silence_before_correction: -0.1
+  - following_context: ''
+    non_silence_before_correction: -0.03
+    preceding_context: ''
+    probability: 0.03
+    replacement: pʲ
+    segment: pʰ j
+    silence_after_probability: 0.6
+    silence_before_correction: -0.02
+  - following_context: ''
+    non_silence_before_correction: 0.03
+    preceding_context: ''
+    probability: 0.01
+    replacement: pʲ
+    segment: p j
+    silence_after_probability: 1.03
+    silence_before_correction: -0.13
+  - following_context: ''
+    non_silence_before_correction: -0.08
+    preceding_context: ''
+    probability: 0.03
+    replacement: pʷ
+    segment: pʰ w
+    silence_after_probability: 0.71
+    silence_before_correction: -0.04
+  - following_context: ''
+    non_silence_before_correction: -0.07
+    preceding_context: ''
+    probability: 0.02
+    replacement: pʷ
+    segment: p w
+    silence_after_probability: 0.71
+    silence_before_correction: 0.16
+  - following_context: ''
+    non_silence_before_correction: 0.0
+    preceding_context: ''
+    probability: 0.03
+    replacement: tʷ
+    segment: tʰ w
+    silence_after_probability: 0.59
+    silence_before_correction: -0.04
+  - following_context: ''
+    non_silence_before_correction: 0.0
+    preceding_context: ''
+    probability: 0.01
+    replacement: tʷ
+    segment: t w
+    silence_after_probability: 1.74
+    silence_before_correction: -0.07
+  - following_context: ''
+    non_silence_before_correction: -0.02
+    preceding_context: ''
+    probability: 0.01
+    replacement: kʷ
+    segment: kʰ w
+    silence_after_probability: 1.55
+    silence_before_correction: -0.06
+  - following_context: ''
+    non_silence_before_correction: 0.02
+    preceding_context: ''
+    probability: 0.01
+    replacement: kʷ
+    segment: k w
+    silence_after_probability: 1.59
+    silence_before_correction: -0.23
+  taiwan:
+  - following_context: ''
+    non_silence_before_correction: -0.02
+    preceding_context: ''
+    probability: 0.11
+    replacement: ''
+    segment: ʔ
+    silence_after_probability: 1.27
+    silence_before_correction: 0.53
+  - following_context: ''
+    non_silence_before_correction: 0.14
+    preceding_context: ''
+    probability: 0.06
+    replacement: ''
+    segment: ɻ
+    silence_after_probability: 0.31
+    silence_before_correction: -0.17
+  - following_context: ''
+    non_silence_before_correction: -0.02
+    preceding_context: ''
+    probability: 0.08
+    replacement: mʲ
+    segment: m j
+    silence_after_probability: 0.38
+    silence_before_correction: 0.33
+  - following_context: ''
+    non_silence_before_correction: 0.01
+    preceding_context: ''
+    probability: 0.04
+    replacement: ʎ
+    segment: l j
+    silence_after_probability: 3.74
+    silence_before_correction: -0.11
+  - following_context: ''
+    non_silence_before_correction: -0.05
+    preceding_context: ''
+    probability: 0.01
+    replacement: ɲ
+    segment: n j
+    silence_after_probability: 0.77
+    silence_before_correction: -0.02
+  - following_context: ''
+    non_silence_before_correction: -0.06
+    preceding_context: ''
+    probability: 0.1
+    replacement: tʲ
+    segment: tʰ j
+    silence_after_probability: 0.17
+    silence_before_correction: 0.79
+  - following_context: ''
+    non_silence_before_correction: -0.11
+    preceding_context: ''
+    probability: 0.01
+    replacement: tʲ
+    segment: t j
+    silence_after_probability: 0.72
+    silence_before_correction: 0.1
+  - following_context: ''
+    non_silence_before_correction: 0.01
+    preceding_context: ''
+    probability: 0.03
+    replacement: pʲ
+    segment: pʰ j
+    silence_after_probability: 0.57
+    silence_before_correction: -0.07
+  - following_context: ''
+    non_silence_before_correction: -0.04
+    preceding_context: ''
+    probability: 0.02
+    replacement: pʲ
+    segment: p j
+    silence_after_probability: 1.45
+    silence_before_correction: -0.01
+  - following_context: ''
+    non_silence_before_correction: 0.02
+    preceding_context: ''
+    probability: 0.01
+    replacement: pʷ
+    segment: pʰ w
+    silence_after_probability: 2.0
+    silence_before_correction: -0.28
+  - following_context: ''
+    non_silence_before_correction: 0.01
+    preceding_context: ''
+    probability: 0.01
+    replacement: pʷ
+    segment: p w
+    silence_after_probability: 1.46
+    silence_before_correction: -0.2
+  - following_context: ''
+    non_silence_before_correction: -0.08
+    preceding_context: ''
+    probability: 0.03
+    replacement: tʷ
+    segment: tʰ w
+    silence_after_probability: 1.22
+    silence_before_correction: 0.16
+  - following_context: ''
+    non_silence_before_correction: -0.04
+    preceding_context: ''
+    probability: 0.01
+    replacement: tʷ
+    segment: t w
+    silence_after_probability: 2.16
+    silence_before_correction: 0.11
+  - following_context: ''
+    non_silence_before_correction: 0.04
+    preceding_context: ''
+    probability: 0.01
+    replacement: kʷ
+    segment: kʰ w
+    silence_after_probability: 1.26
+    silence_before_correction: -0.16
+  - following_context: ''
+    non_silence_before_correction: -0.02
+    preceding_context: ''
+    probability: 0.01
+    replacement: kʷ
+    segment: k w
+    silence_after_probability: 2.18
+    silence_before_correction: -0.11
+rules: []

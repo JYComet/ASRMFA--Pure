@@ -1,0 +1,17 @@
+# 花礼筛选 — 87 条 WAV 音频，完整管线处理
+workspace: hualishaxuan
+data_dir: data_dir/花礼筛选
+mode: full
+
+python_path: /home/devuser/miniconda3/envs/mfa_chinese/bin/python
+
+ctc_prealign:
+  python: /usr/bin/python3
+  model_path: /mnt/project/nvvasr_standalone/models/Multilingual-NVASR
+  device: cuda:0
+
+mfa:
+  clean: true
+
+postprocess:
+  handle_unexpected_sil: true

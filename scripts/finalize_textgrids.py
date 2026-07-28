@@ -51,7 +51,10 @@ def process_textgrid(input_path: Path, output_path: Path) -> bool:
     for tier in tg.tiers:
         for iv in tier.intervals:
             if iv.text and is_nvv(iv.text):
-                iv.text = f"<{iv.text}>"
+                # Normalize to <UPPERCASE> — strip existing brackets/case first
+                # to avoid double-wrapping and mixed-case inconsistencies.
+                cleaned = iv.text.strip().strip('<>').upper()
+                iv.text = f"<{cleaned}>"
 
     # Pass: tier 1 → prepend <sp1>
     raw = tg.tiers[0]

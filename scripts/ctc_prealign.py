@@ -304,6 +304,7 @@ def make_patched_inference(ref_texts: dict[str, str],
             align_text = normalize_punct_inline(align_text)
 
             words_aligned = []  # token 级别时间戳
+            speech_tokens = []  # initialize to avoid UnboundLocalError
             if align_text:
                 tokens = tokenizer.text2tokens(align_text)
                 speech_tokens = tokens
@@ -648,9 +649,18 @@ def _normalize_punct(ctc_dir: Path) -> int:
                 p["word"] = _ASCII_TO_CJK[w]
 
         # Phase 2: classify each character
+        # '-' between two ASCII letters is part of an NVV token
+        # (e.g. SURPRISE-OH, QUESTION-YI) — never treat as punct.
+        # Regression Case 17.
         char_info: list[tuple[str, bool | None, str]] = []
-        for ch in text:
-            if is_punct(ch):
+        for i, ch in enumerate(text):
+            is_hyphen_in_nvv = (
+                ch == '-'
+                and i > 0 and i + 1 < len(text)
+                and text[i - 1].isascii() and text[i - 1].isalpha()
+                and text[i + 1].isascii() and text[i + 1].isalpha()
+            )
+            if is_punct(ch) and not is_hyphen_in_nvv:
                 char_info.append(("punct", ch in _NORM_ALLOWED_PUNCT, ch))
             else:
                 char_info.append(("other", None, ch))
