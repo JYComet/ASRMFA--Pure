@@ -32,6 +32,7 @@
 | 21 | 2026-07-29 | postprocess_textgrids.py, pipeline_utils.py | is_punct 误判 <spN> 为标点 → strip_edge_punctuation 开头静音被吸收进首词 |
 | 22 | 2026-07-29 | postprocess_textgrids.py | MFA 对齐偏差→snap 修正后标点被 <spN> 替换→被吞标点恢复 |
 | 23 | 2026-07-29 | run_pipeline.py | step_normalize_punct 缺少 NVV 连字符保护 → QUESTION-EI 被拆成 QUESTION，EI |
+| 24 | 2026-07-29 | ctc_prealign.py | ASR 空输出先写 TextGrid 再检测 → 留下孤立的空 TextGrid |
 
 ---
 
