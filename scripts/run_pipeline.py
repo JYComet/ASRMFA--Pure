@@ -209,9 +209,7 @@ DEFAULT_CFG: dict = {
         "clean": False,              # keep feature cache for faster re-runs
         "no_tokenization": True,
         "skip_validate": True,       # MFA align internally validates; standalone validate is redundant
-        "fine_tune": False,          # DISABLED: adjust_ctc_boundaries already refines anchors.
-                                     # MFA acoustic model drifts on NVV/BGM/short-words/English.
-                                     # Set true only for clean speech datasets.
+        "fine_tune": False,          # DISABLED: adjust_ctc_boundaries already refines anchors (Regression Case 16)
         "fine_tune_boundary_tolerance": 0.02,  # only used when fine_tune: true
     },
     "mfa_en": {
@@ -677,10 +675,9 @@ def step_normalize_punct(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                 p["word"] = ASCII_MAP[w]
 
         # === Phase 2 — classify each character ===
-        # char_info[i] = ("punct"|"other", is_allowed | None, char)
         # '-' between two ASCII letters is part of an NVV token
-        # (e.g. SURPRISE-OH, QUESTION-YI) — never treat as punct.
-        # Regression Case 17-E.
+        # (e.g. SURPRISE-OH, QUESTION-EI) — never treat as punct.
+        # Regression Case 17-E / Case 23.
         char_info: list[tuple[str, bool | None, str]] = []
         for i, ch in enumerate(text):
             is_hyphen_in_nvv = (
@@ -1012,17 +1009,15 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         mfa_args += ["--transition_scale", str(mc["transition_scale"])]
 
     # ── Fine-tune: allows CTC anchor boundaries to float during a refinement pass ──
-    # DISABLED by default (2026-07-28): MFA's acoustic model is trained on clean
-    # speech and performs poorly on NVV tokens, short function words, BGM audio,
-    # and English words — causing boundary drift that _snap_to_ctc's 0.3s threshold
-    # cannot catch.  adjust_ctc_boundaries.py already refines CTC anchors via energy
-    # analysis, which is more reliable across all audio conditions.
-    # Set fine_tune: true in mfa: config to re-enable for clean speech datasets.
+    # DISABLED by default: adjust_ctc_boundaries already refines anchors via
+    # energy analysis; MFA fine_tune floats boundaries toward its acoustic
+    # model (trained on clean speech) and degrades alignment on NVV, BGM,
+    # English tokens, and short function words.  See Regression Case 16.
     if mc.get("fine_tune", False):
         mfa_args.append("--fine_tune")
-        fine_tune_tolerance = mc.get("fine_tune_boundary_tolerance", 0.02)
-        if fine_tune_tolerance is not None and fine_tune_tolerance > 0:
-            mfa_args += ["--fine_tune_boundary_tolerance", str(fine_tune_tolerance)]
+    fine_tune_tolerance = mc.get("fine_tune_boundary_tolerance", 0.02)
+    if fine_tune_tolerance is not None and fine_tune_tolerance > 0:
+        mfa_args += ["--fine_tune_boundary_tolerance", str(fine_tune_tolerance)]
     return run_mfa(mfa_args, mfa_python, ctx["models_dir"],
                    "Step 6: MFA Align" + (" (NVASR corpus + CTC anchors)" if use_nvasr_corpus and use_anchors else ""))
 
@@ -1657,7 +1652,7 @@ STEPS = {
     "postprocess": ("Post-processing (includes NVV brackets + sp1 normalization)", step_postprocess),
 }
 
-FULL_STEP_ORDER = list(STEPS.keys())
+FULL_STEP_ORDER = ["trim", "resample", "prealign", "normalize_punct", "normalize", "normalize_ria", "normalize_en", "adjust", "align", "align_en", "postprocess"]
 CTC_READY_STEP_ORDER = ["link", "pad_silence", "normalize_punct", "normalize", "normalize_ria", "normalize_en", "resample", "adjust", "align", "align_en", "postprocess"]
 NVASR_FALLBACK_STEP_ORDER = ["prealign", "pad_silence", "normalize_punct", "normalize", "normalize_ria", "normalize_en", "resample", "adjust", "align", "align_en", "postprocess"]
 

@@ -939,7 +939,7 @@ def main():
     print("构建参考文本查找表...")
     ref_texts: dict[str, str] = {}
     missing_ref = []
-    skipped_jp = []
+    skipped: dict[str, list[str]] = {}  # reason → stems (unified skip tracking)
     # Build text index once (O(1) lookup per stem, no repeated rglob)
     txt_index = _build_txt_index(args.data_dir)
     print(f"  已索引 {len(txt_index)} 个文本文件")
@@ -949,15 +949,15 @@ def main():
         ref = find_ref_text(stem, args.data_dir, txt_index)
         if ref:
             if has_japanese(ref):
-                skipped_jp.append(stem)
+                skipped.setdefault("japanese", []).append(stem)
                 continue
             ref = clean_unsupported_punct(ref)
             ref_texts[stem] = ref
         else:
             missing_ref.append(stem)
 
-    if skipped_jp:
-        print(f"  跳过日语: {len(skipped_jp)} 个文件 (含假名, 管线不支持)")
+    if skipped.get("japanese"):
+        print(f"  跳过日语: {len(skipped['japanese'])} 个文件 (含假名, 管线不支持)")
     if missing_ref:
         print(f"  注意: {len(missing_ref)} 个文件无参考文本, 将纯靠 ASR 文本")
     print(f"  已索引 {len(ref_texts)} 个参考文本, 共 {len(wav_files)} 个音频")
@@ -1035,7 +1035,7 @@ def main():
         if not r.get("english_complete", True):
             missing = r.get("missing_english", [])
             print(f"  SKIP {stem}: incomplete English fragments - {', '.join(missing)}")
-            fail += 1
+            skipped.setdefault("incomplete_english", []).append(stem)
             continue
 
         # 将 CTC 对齐 token 映射到 MFA 词条
@@ -1190,12 +1190,36 @@ def main():
                         "duration_ms": dur_ms,
                     })
 
+            # ── Strip leading punctuation (part A: remove from punct_entries) ──
+            # NVASR sometimes inserts a comma / period right after emotion
+            # tags (e.g. <|SAD|>，) at the very start of an utterance.
+            # Detect it early so we can drop the CTC anchor before _punct.json
+            # is written.  The text_asr string itself is cleaned in part B below.
+            # Subsequent word timestamps are NOT shifted.
+            _raw_text_check = re.sub(r"<\|[^|]+\|>", "",
+                                     r.get("text_asr", "")).strip()
+            _leading_punct = None
+            if _raw_text_check and is_punct(_raw_text_check[0]):
+                _leading_punct = _raw_text_check[0]
+                if punct_entries:
+                    _first_punct = min(punct_entries, key=lambda x: x["start"])
+                    if (_first_punct["word"] == _leading_punct
+                            and _first_punct["start"] < 0.100):
+                        punct_entries.remove(_first_punct)
+
+            # ── ASR 空文本检测: 无内容词时跳过输出, 不进 MFA ──
+            lab_tokens = " ".join(w["word"] for w in words_pinyin)
+            if not lab_tokens.strip():
+                print(f"  SKIP {stem}: ASR produced no text — skipping MFA alignment")
+                skipped.setdefault("empty_asr", []).append(stem)
+                continue
+
+            # 写 TextGrid — 含 pauses tier (空检测之后, 避免孤立的空 TextGrid)
             out_tg = args.output_dir / f"{stem}.TextGrid"
             write_textgrid(words_pinyin, duration_s, out_tg, pauses=pauses)
 
             # 写 .lab — MFA 将此作为 transcript, 与 TextGrid words tier 同源
             out_lab = args.output_dir / f"{stem}.lab"
-            lab_tokens = " ".join(w["word"] for w in words_pinyin)
             out_lab.write_text(lab_tokens + "\n", encoding="utf-8")
 
             # 写标点锚点文件 (供 postprocess 后注入)
@@ -1258,6 +1282,21 @@ def main():
             # 含情绪标签的原始文本 (保留 <|HAPPY|> <|zh|> 等, NVV 保持 [Bracket] 格式)
             text_asr = r.get("text_asr", "")
             text_asr = clean_unsupported_punct(text_asr)
+            # ── Strip leading punctuation (part B: remove from text_asr) ──
+            # Detection mirroring part A above; now that text_asr is available,
+            # delete the leading punct character so _text_raw.txt / _text_cn.txt
+            # are clean.  Subsequent token positions are not shifted.
+            _text_clean_b = re.sub(r"<\|[^|]+\|>", "", text_asr).strip()
+            if _text_clean_b and is_punct(_text_clean_b[0]):
+                _lp = _text_clean_b[0]
+                _tag_end = 0
+                for _m in re.finditer(r"<\|[^|]+\|>", text_asr):
+                    _tag_end = _m.end()
+                _pos = _tag_end
+                while _pos < len(text_asr) and text_asr[_pos] in ' \t':
+                    _pos += 1
+                if _pos < len(text_asr) and text_asr[_pos] == _lp:
+                    text_asr = text_asr[:_pos] + text_asr[_pos + 1:]
             raw_path = args.output_dir / f"{stem}_text_raw.txt"
             raw_path.write_text(text_asr + "\n", encoding="utf-8")
 
@@ -1382,11 +1421,23 @@ def main():
                 }
                 f.write(json.dumps(line, ensure_ascii=False) + "\n")
 
+    # ── Build skip summary lines ──
+    skip_lines = ""
+    skip_labels = {
+        "japanese": "含假名 (管线不支持)",
+        "incomplete_english": "英文碎片不完整",
+        "empty_asr": "ASR 无输出文本",
+    }
+    for reason, label in skip_labels.items():
+        if reason in skipped:
+            skip_lines += f"  Skipped ({label}): {len(skipped[reason])}\n"
+
     summary = (
         f"CTC Pre-alignment Report\n"
         f"{'=' * 40}\n"
         f"Files: {len(paths)} total, {ok} OK, {fail} failed\n"
-        f"Time: {infer_time:.1f}s\n\n"
+        + (skip_lines if skip_lines else "")
+        + f"Time: {infer_time:.1f}s\n\n"
         f"Output: {args.output_dir}\n"
         f"  *.TextGrid  → MFA anchors (words=pinyin+punct+NVV)\n"
         f"  *.lab       → MFA corpus (same source as anchors, 100% match)\n"

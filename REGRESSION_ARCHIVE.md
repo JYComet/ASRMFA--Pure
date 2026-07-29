@@ -26,6 +26,12 @@
 | 15 | 2026-07-28 | postprocess_textgrids.py | _extract_word_chars 拆分 NVV 尖括号：<LAUGHTER> → [<, LAUGHTER, >] |
 | 16 | 2026-07-28 | run_pipeline.py | MFA --fine_tune 默认开启→边界漂移+对齐失败 |
 | 17 | 2026-07-28 | postprocess_textgrids.py, ctc_prealign.py | NVV改写+首词标点+音素断层+轨道不同步+连字符替换 |
+| 18 | 2026-07-29 | ctc_prealign.py | NVASR 情绪标签后残留开头标点 → hanzi 首词为标点 |
+| 19 | 2026-07-29 | postprocess_textgrids.py | _snap_to_ctc 丢弃开头静音 → hanzi 缺失 <sp1> interval |
+| 20 | 2026-07-29 | postprocess_textgrids.py | strip_edge_punctuation 尾随标点过度剥离 → 句尾 。！？ 全部丢失 |
+| 21 | 2026-07-29 | postprocess_textgrids.py, pipeline_utils.py | is_punct 误判 <spN> 为标点 → strip_edge_punctuation 开头静音被吸收进首词 |
+| 22 | 2026-07-29 | postprocess_textgrids.py | MFA 对齐偏差→snap 修正后标点被 <spN> 替换→被吞标点恢复 |
+| 23 | 2026-07-29 | run_pipeline.py | step_normalize_punct 缺少 NVV 连字符保护 → QUESTION-EI 被拆成 QUESTION，EI |
 
 ---
 
@@ -297,6 +303,12 @@ scripts/streaming_pipeline.py    — 流式批处理（NAS→本地SSD→回传�
 | AH | `finalize_textgrids.py` ~50-54 | NVV 规范化：strip+upper 防双重包裹和大小写不一致 |
 | AI | `_build_hanzi_tier` ~1246-1278 | Alpha 分支 strip `<>`：`clean_token` 参与匹配和 fallback label，防 hanzi 污染 |
 | AJ | `_extract_word_chars` ~1004-1032 | `<` `>` 特殊处理：flush + 开新 group / flush + 闭合，防 NVV 被拆分 |
+| AK | `strip_edge_punctuation` ~997-1017 | **Case 20**: 删除尾随标点剥离逻辑（镜像设计错误——开头和尾随不是对称场景） |
+| AL | `_inject_punctuation` ~2482-2484 | **Case 20-B**: 最后标点 30ms 地板，防末词 xmax==tier.xmax 时坍缩为零时长 |
+| AM | `strip_edge_punctuation` ~983-985 | **Case 21**: 开头剥离增加 `not is_silence()` 检查，防 `<spN>` 被 `is_punct` 误判为标点 |
+| AN | `process_one` ~4343,~4366 | **Case 22-A**: Phase 4 前后标点快照比对 → `_swallowed_puncts`（被吞标点追踪） |
+| AO | `process_one` ~4665 | **Case 22-B**: 仅对 `_swallowed_puncts` 中确认被吞的标点, 若位置现为 `<spN>` → 替换恢复 |
+| AP | `step_normalize_punct` ~680 | **Case 23**: Phase 2 增加 `is_hyphen_in_nvv` 检查，防 NVV 连字符被当作标点替换 |
 
 ---
 
@@ -1851,6 +1863,559 @@ assert not is_nvv_token("SURPRISE") # False — 被截断的形式不会被误�
 ```
 
 ---
+
+## Case 18: NVASR 情绪标签后残留开头标点 → hanzi 首词为 `，`
+
+**日期**: 2026-07-29
+**涉及文件**: `scripts/ctc_prealign.py`
+**触发样本**: 花礼_八分音符鼠_20241122_2201_d8293668_clip0000_clip0000
+
+### 现象
+
+```
+ASR 输出:   <|zh|><|SAD|>， call恩你...
+去除标签:                 ， call恩你...   ← 逗号成为第一个字符
+hanzi:      ， | call | 恩 | ...           ← 首 interval 是标点
+```
+
+### 根因链
+
+1. SenseVoice 在音频开头检测到情绪标签（`<|SAD|>`）后自动附加标点
+2. `text_cn` 清洗只去标签不移除紧随其后的标点
+3. CTC 为该标点分配 0s 锚点 → postprocess 注入 → hanzi 首词是标点
+
+### 修改点
+
+**A. `ctc_prealign.py` — 输出前检测并删除开头标点** (~L1196, ~L1277)
+
+分两处：part A 从 `punct_entries` 删除首个标点锚点（start<100ms），part B 从 `text_asr` 中删除标点字符。后续词时间戳不平移。
+
+
+## Case 19: `_snap_to_ctc` 丢弃开头静音 → hanzi 缺失 `<sp1>` interval
+
+**日期**: 2026-07-29
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `_snap_to_ctc`
+**触发样本**: 花礼_八分音符鼠_20241122_2201_d8293668_clip0000_clip0000
+
+### 现象
+
+```
+MFA raw:   <eps>[0~1.88]  call[1.88~...]     ← 有开头静音
+最终输出:  call[1.95~...]                      ← 开头静音消失，raw_text 有 <sp1> 但 words/hanzi 无对应 interval
+```
+
+### 根因链
+
+1. `_snap_to_ctc` 的 `mfa_words` 过滤掉所有 silence/`<eps>`（L3284），只处理内容词
+2. 重建 words tier 时只处理了尾静音（L3610-3614），未补回开头静音
+3. 第一个词起点前的 gap 没被填充 → 开头静音 interval 丢失
+
+### 修改点
+
+**A. `_snap_to_ctc` — 补回头部静音** (~L3610)
+
+尾静音处理前插入：首个 word start>0.005s 时，在 `new_word_ivs` 头部补入 silence gap。
+
+**B. `_finalize_textgrid` — 兜底插入** (~L148)
+
+多 interval tier 首 interval 不从 0 开始且非 `<spN>` 时，补插 `<sp1>(0, first.xmin)`。确保即便上游丢弃了静音 interval，最终输出仍有 `<sp1>`。
+
+
+## Case 20: strip_edge_punctuation 尾随标点过度剥离 → 句尾 。！？ 全部丢失
+
+**日期**: 2026-07-29
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `strip_edge_punctuation`, `process_one`
+**触发样本**: 花礼_不困小鼠_20241117_2158_4ad6dee3_clip0023_clip0001
+
+### 现象
+
+所有 pipeline 输出的句尾标点（`。！？`）全部消失：
+
+```
+_text_cn.txt:     ...知道什么意思吧？            ← 有 ？
+TextGrid raw_text: ...知道什么意思吧              ← ？ 消失
+TextGrid words:    ... ba5[10.22-10.51] <sp2>...  ← 无 ？ interval
+TextGrid hanzi:    ... 吧                          ← 无 ？
+```
+
+受影响的 87 个文件中，几乎所有以 `。！？` 结尾的句子都丢失了结尾标点。
+
+### 设计缺陷："镜像处理"的逻辑谬误
+
+`strip_edge_punctuation` 是在 Case 17-B 中新增的函数，其设计意图是剥离**孤儿标点**——
+NVASR 去除情绪标签（`<|HAPPY|>`、`<|zh|>` 等）后，标签之间的标点（主要是 `…`）
+残留在文本开头/结尾，被 CTC 分配时间锚点后注入 words tier，成为孤立的首/尾标点 interval。
+
+函数的处理逻辑是对称的：
+
+```
+for i in range(0, first_real):         ← 开头: 第一个实词前的 punct → 剥离
+    if is_punct(intervals[i].text): ...
+for i in range(last_real + 1, len):    ← 尾随: 最后一个实词后的 punct → 剥离
+    if is_punct(intervals[i].text): ...
+```
+
+**开头剥离是正确的**：在第一个实词之前，不应该存在任何标点。
+如果出现（情绪标签剥离残留），它必然是孤儿，应该被吸收。
+
+**尾随剥离是错误的**：在最后一个实词之后，标点分两种：
+1. **孤儿 `…`**：NVV 标签剥离残留 → 但情绪标签几乎只在句首，不在句尾。即使标签在句尾（极其罕见），`你好<|HAPPY|>…` 去标签后变 `你好…`——这与正常句尾省略号**无法区分**，也不需要剥离
+2. **合法句尾标点 `。！？…`**：ASR 原始文本的句末标点 → **必须保留**
+
+尾随剥离从 Case 17-B 引入之初就没有需要解决的实际 bug——它是作为开头剥离的"镜像"顺手加上的。开头剥离有明确的孤儿标点场景（情绪标签在句首），尾随剥离没有。两者不是对称场景。
+
+**为什么"镜像"在此不成立**：
+
+句子结构是 `[内容词...] [标点]`，标点天然在句尾。开头的标点一定是异常的，
+但尾随的标点大多数是合法的。开头和尾随不是对称场景，镜像处理是设计错误。
+
+### 根因链
+
+1. **Case 17-B 引入 `strip_edge_punctuation`** (~L938)：解决 NVASR 剥离 `<|HAPPY|>` 情绪标签后残留 `…` 成为首词的问题。设计为"镜像处理"——开头的孤儿标点和尾随的标点一起剥离
+2. **镜像假设错误**：句子结构是 `[内容] [标点]`，标点天然在末尾。开头标点必然是异常，尾随标点大多数是合法的。两者不是对称场景
+3. **尾随剥离用 `is_punct()` 一刀切** (~L997-1011)：从 `last_real`（最后一个实词）之后扫描所有 interval，凡是 `is_punct()` 的一律清空，无法区分孤儿 `…` 和合法句尾标点 `。！？`
+4. **absorber 链已覆盖尾随清理**：`absorb_nvv_trailing` (Case 9 W1, Phase 4-D2) 和 `absorb_silence_into_punct` (Case 9 W2, Phase 4-D3) 在 `strip_edge_punctuation` (Phase 4-D4) **之前**执行，已经处理了 NVV 后的标点+静音链。尾随剥离不仅是逻辑错误的，而且是**冗余的**
+5. **Phase 5 不可逆传播** (~L4654)：`raw_text` 从 `hanzi` tier 重建覆盖 → 被剥离的标点永久消失，无法恢复
+
+### 完整数据流追踪
+
+以 `花礼_不困小鼠_clip0023` 为例，追踪 `？` 的完整生命周期：
+
+```
+Phase 1-2:  _text_cn.txt → raw_text 变量 → raw_text tier
+            "...知道什么意思吧？"                       ✅ ？ 存在
+
+Phase 3C:   _inject_punctuation: CTC ？[11.07-11.16] 注入 words tier
+            words: ... ba5[10.22-10.51] <sp2>[10.51-11.125] ？[11.125-11.16]
+            last_punct → punct_start=ba5.xmax=10.51
+            ？ → (10.51, 11.125, "？", "punct")  [615ms]  ✅ ？ 存在
+
+Phase 4-D2: absorb_nvv_trailing — 无 NVV → 无操作
+
+Phase 4-D3: absorb_silence_into_punct — 无残余 <spN> → 无操作
+
+Phase 4-D4: strip_edge_punctuation  ← 问题发生点！
+            last_real = ba5 的 index
+            for i in range(last_real+1, len):    # 扫描 ba5 之后
+              <sp2> → is_punct? NO  → skip
+              ？   → is_punct? YES → trailing_punct_indices.append(i)
+            → ？ 被清空: text="", xmin=0, xmax=0
+            → <sp2>.xmax 扩展到 11.16 (吸收 ？ 的时间)
+                                               ❌ ？ 被剥离！
+
+Phase 5:    _build_hanzi_tier(words) → hanzi 无 ？
+            raw_text = "".join(hanzi) → 覆盖 raw_text tier
+                                               ❌ ？ 永久消失！
+```
+
+### 触发条件
+
+任何满足以下条件的句子：
+- 最后一个实词后存在标点（`。！？`，经 `_inject_punctuation` 注入 words tier）
+- `strip_edge_punctuation` 将该标点识别为 "trailing punct" → 清空
+
+### 修改点
+
+**A. `strip_edge_punctuation` — 删除尾随标点剥离逻辑** (~L997-1017)
+
+尾随剥离从 Case 17-B 引入之初就是错误的——它作为开头剥离的"镜像"被顺手加上，
+但没有任何实际 bug 驱动。情绪标签几乎只在句首（`<|HAPPY|>…内容`），不在句尾。
+句尾的标点都是合法的句末标点，不应被剥离。
+
+修改前 (~L997-1011, 与开头剥离对称的镜像代码):
+```python
+# ── Strip trailing punct: absorb into the following interval ──
+trailing_punct_indices = []
+for i in range(last_real + 1, len(intervals)):
+    if is_punct(intervals[i].text):
+        trailing_punct_indices.append(i)
+
+for pi in sorted(trailing_punct_indices, reverse=True):
+    p_iv = intervals[pi]
+    if pi + 1 < len(intervals):
+        intervals[pi + 1] = _replace(intervals[pi + 1], xmin=p_iv.xmin)
+    elif pi > 0:
+        intervals[pi - 1] = _replace(intervals[pi - 1], xmax=p_iv.xmax)
+    intervals[pi] = _replace(intervals[pi], xmin=0, xmax=0, text="")
+```
+
+修改后（整个尾随剥离代码块删除，替换为注释说明）:
+```python
+    # NOTE: There is intentionally NO trailing strip.
+    # Trailing punctuation (。！？…) after the last real word is ALWAYS
+    # legitimate — sentences naturally end with punctuation.  The "mirror"
+    # design (stripping both edges) is a logical error because leading
+    # and trailing edges are NOT symmetric:
+    #   - Leading punct: always orphaned (tag-stripping artifact) → strip
+    #   - Trailing punct: always legitimate (end-of-sentence) → keep
+    # NVV-trailing punct+silence chains are already handled upstream by
+    # absorb_nvv_trailing (Case 9 W1) and absorb_silence_into_punct (Case 9 W2).
+```
+
+函数现在只做一件事：剥离开头（first_real 之前的）孤儿标点。这是它唯一的实际职责。
+
+**B. `_inject_punctuation` — 最后标点 30ms 地板保护** (~L2482-2484, 防御性)
+
+修改前：
+```python
+new_merged.append((punct_start, words_tier.xmax, punct_text, "punct"))
+```
+
+修改后：
+```python
+punct_end = max(punct_start + 0.030, words_tier.xmax)
+new_merged.append((punct_start, punct_end, punct_text, "punct"))
+```
+
+防止末词 xmax == words_tier.xmax 时标点坍缩为零时长（独立于本 Case 的边缘保护）。
+
+### 与关联 Case 的关系
+
+| Case | 问题 | 与本 Case 的关系 |
+|------|------|----------------|
+| 9 (W1/W2) | NVV后标点+静音链未被吸收 | `absorb_nvv_trailing` + `absorb_silence_into_punct` 已覆盖，尾随剥离冗余 |
+| 17-B | `…` 为首词（NVV 标签剥离残留） | 本 Case 的根因——17-B 引入 `strip_edge_punctuation`，尾随剥离过于激进 |
+| 18 | 情绪标签后残留开头标点 | ctc_prealign 层面修复，不依赖 postprocess 剥离 |
+
+### Phase 4 执行顺序与责任分工
+
+```
+Phase 4 执行顺序:
+  D.  handle_unexpected_silences    ← gap 级 <sp0> 无条件合并 (Case 8)
+  D2. absorb_nvv_trailing           ← NVV 吞并尾部标点+静音链 (Case 9 W1)
+  D3. absorb_silence_into_punct     ← 兜底: 标点吸收残余 <spN> (Case 9 W2)
+  D4. strip_edge_punctuation        ← 边缘标点剥离 (Case 17-B)  ← 本 Case
+  ── SYNC ── _sync_derived_tiers   ← words → hanzi + pp 同步 (Case 17-F)
+```
+
+D2 已经处理了 "NVV → 标点 → 静音" 链（如 `<LAUGHTER> → ！ → <sp2>`），
+D3 兜底处理了 "标点 → 残余 `<spN>`"。到 D4 执行时，所有 NVV 相关的尾随孤儿标点
+已经被 D2 吸收。D4 扫到的尾随标点**只可能是合法的句末标点**。
+
+D4 的尾随剥离不仅逻辑错误（镜像假设不成立），而且在执行顺序上也是冗余的。
+
+### 验证方法
+
+```python
+# 句尾标点必须在 words tier 中存在
+for iv in words_tier.intervals:
+    if iv.text.strip() in '。！？':
+        assert iv.xmax > iv.xmin + 0.001, f"zero-duration ending punct: {iv.text}"
+
+# raw_text tier 结尾标点应与 _text_cn.txt 一致
+assert raw_text_raw.endswith('？') == text_cn_raw.endswith('？')
+```
+
+### 关联样本
+
+- `花礼_不困小鼠_20241117_2158_4ad6dee3_clip0023_clip0001`：`知道什么意思吧？` → `？` 丢失
+- 花礼筛选全部 87 文件：句尾 `。！？` 系统性丢失
+
+
+## Case 21: `is_punct` 误判 `<spN>` 为标点 → `strip_edge_punctuation` 开头静音被吸收进首词
+
+**日期**: 2026-07-29
+**涉及文件**: `scripts/postprocess_textgrids.py`, `scripts/pipeline_utils.py`
+**涉及函数**: `strip_edge_punctuation`, `is_punct`
+**触发样本**: 花礼_变身_小鼠天使_20240924_2105_a90ca312_clip0010_clip0001
+
+### 现象
+
+首词 `喵` 从 0s 开始，开头静音 `<sp2>` 完全消失：
+
+```
+修复前:
+  words:  miao1[0.000-1.830]  …[1.830-2.010]  hao3[2.010-...]
+  hanzi:  喵[0.000-1.830]      …[1.830-2.010]  好[2.010-...]
+          ↑ 开头静音消失，首词从 0s 开始
+
+修复后:
+  words:  <sp2>[0.000-1.410]  miao1[1.410-1.830]  …[1.830-2.010]  hao3[2.010-...]
+  hanzi:  <sp2>[0.000-1.410]  喵[1.410-1.830]      …[1.830-2.010]  好[2.010-...]
+          ↑ 开头静音正确保留
+```
+
+MFA 对齐中 `<eps>` [0.000-1.940] 正确存在于开头，但最终输出中消失。
+
+### 根因链
+
+1. **`is_punct()` 定义过于宽泛** (`pipeline_utils.py` L771-773)：
+   ```python
+   def is_punct(s: str) -> bool:
+       return bool(s.strip()) and not is_word_like(s)
+   ```
+   `<sp2>` 以 `<` 开头，不是 alpha/CJK/digit，所以 `is_word_like("<sp2>")` → False，进而 `is_punct("<sp2>")` → True。
+
+2. **`strip_edge_punctuation` 开头剥离未排除静音** (L983-985)：开头剥离扫描 `first_real` 之前的所有 interval，发现 `<sp2>` → `is_punct` True → 加入剥离列表
+
+3. **剥离逻辑将静音吸收进首词** (L987-995)：`<sp2>` 是第一个 interval（pi=0），无前序 interval → `elif pi+1 < len`：下一个 interval (`miao1`) 的 xmin 被设为 `<sp2>.xmin = 0.0`
+
+### 与 Case 20 的同源性
+
+Case 20 和 Case 21 的根因都指向同一个设计问题：
+
+| | Case 20（尾随） | Case 21（开头） |
+|------|------|------|
+| 被剥离对象 | `。！？`（合法句尾标点） | `<sp2>`（开头静音标签） |
+| `is_punct` 返回值 | True（正确——确实是标点） | True（**错误**——静音不是标点） |
+| 问题本质 | 设计错误：不应剥离尾随 | **bug**：`is_punct` 定义太宽，未排除 `<spN>` |
+
+两者都在 `strip_edge_punctuation` 中触发，但性质不同。Case 20 已经通过删除尾随剥离解决，Case 21 需要修复开头剥离中的 `is_silence` 前置检查。
+
+### 修改点
+
+**A. `strip_edge_punctuation` — 开头剥离增加 `is_silence` 检查** (~L983-985)
+
+修改前：
+```python
+leading_punct_indices = []
+for i in range(first_real):
+    if is_punct(intervals[i].text):
+        leading_punct_indices.append(i)
+```
+
+修改后：
+```python
+leading_punct_indices = []
+for i in range(first_real):
+    if not is_silence(intervals[i].text) and is_punct(intervals[i].text):
+        leading_punct_indices.append(i)
+```
+
+`<spN>` 静音标签在 `is_punct` 检查之前被 `is_silence` 排除，不会被误剥离。
+
+### Case 20 + 21 的综合修复
+
+`strip_edge_punctuation` 函数最终的职责范围：
+
+```
+strip_edge_punctuation:
+  ├─ 开头剥离: first_real 之前的 punct (排除 <spN>) → 吸收   ← Case 21 修复
+  └─ 尾随剥离: 已删除                                       ← Case 20 修复
+```
+
+这两个修复一起，使函数只做它最初设计要做的一件事：剥离情绪标签去除后残留在句首的孤儿 `…`。
+
+### 关联样本
+
+- `花礼_变身_小鼠天使_20240924_2105_a90ca312_clip0010_clip0001`：`<sp2>` 被吃 → 喵从 0s 开始
+- 花礼筛选全部 87 文件：所有句首静音均受影响
+
+### 潜在其他影响范围
+
+`is_punct` 的宽泛定义可能在其他地方造成类似问题。任何仅用 `is_punct` 而未先检查 `is_silence` 的地方，都可能将 `<spN>` 误判为标点。搜索代码库中所有 `is_punct()` 调用可审计。
+
+
+## Case 22: MFA 对齐偏差 → snap 修正后标点被 `<spN>` 替换 → 被吞标点恢复
+
+**日期**: 2026-07-29
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `process_one` (Phase 5 末尾)
+**触发样本**: VR研学_小鼠粽子喜欢甜的还是咸的_20250531_2222_b330ee29_clip0010_clip0007, 3.15s 处的逗号
+
+### 现象
+
+ASR 识别出标点，CTC 有标点锚点，`_text_cn.txt` 中有标点，但最终 words tier 中标点消失，变成了 `<spN>` 静音间隙：
+
+```
+_text_cn.txt:   "...迪士尼，谢谢..."       ← ASR 有逗号
+CTC punct:       ，[3.245-4.710]           ← 有锚点
+最终 words:      ni2[2.75-3.15] <sp2>[3.15-3.81] xie4[3.81-4.05]
+                 ↑ 逗号消失，变成 <sp2>
+```
+
+### 根因链
+
+这是一个多步骤连锁反应：
+
+1. **MFA 对齐偏差**：MFA 将 `xie4` 错放到 [3.15-3.26]（仅 110ms，实际应该是 [3.81-4.05]），导致 `ni2` 和 `xie4` 之间出现本不应存在的大段 `<eps>`
+
+2. **`_snap_to_ctc` 修正词边界**：检测到 CTC 时长 > MFA 时长 ×2，把 `xie4` 拉到 CTC 正确位置 [3.81-4.05]。`ni2` [2.75-3.15] 和 `xie4` [3.81-4.05] 之间出现 660ms 间隙 → 被 `<sp2>` 填充。**词边界修正了，但间隙中的标点被埋没了**
+
+3. **`_inject_punctuation` 重叠裁剪跳过静音**：`，` [3.245-4.710] 与 `<sp2>` [3.15-3.81] 重叠，但 `<sp2>` 因 `is_silence=True` 被重叠裁剪逻辑跳过（L2338-2340），逗号只与后续 `xie4` 发生裁剪，被推到 [4.29-4.71]
+
+4. **逗号被孤立**：推到 [4.29-4.71] 的逗号位于 `xie4` 和 `shou1` 之间，但后续 Phase 4 步骤中可能被某个操作误吸收（具体步骤待精确追踪确认）。最终 `shou1` 从 CTC [4.71-4.95] 变成 [4.29-4.95]——逗号的时间被吸收了
+
+5. **间隙变回 `<spN>`**：逗号消失后，`xie4` 和 `shou1` 之间的间隙被重新标记为静音
+
+### 设计认知
+
+这个 bug 的根源不是某个步骤的代码错误，而是**两种修正逻辑的交互冲突**：
+
+| 步骤 | 做什么 | 副作用 |
+|------|--------|--------|
+| `_snap_to_ctc` | 把词边界拉到 CTC 锚点（修正 MFA 偏差） | 词之间产生新的间隙，埋没原本覆盖在上的标点 |
+| `_inject_punctuation` | 把 CTC 标点注入 words tier | 重叠裁剪时 `<spN>` 不参与，标点被推向词边界之外 |
+
+两者各自正确，但交互产生了一个"无主之地"——MFA 对齐偏差导致的间隙中，标点被推向边界后孤立，最终被后续 absorb 步骤吃掉。
+
+### 修复策略
+
+**事后兜底**（不改变现有逻辑，在 Phase 5 末尾做最后检查）：
+
+在所有处理完成后，扫描 words tier 中的 `<spN>` 区间。若 CTC 标点锚点落在该区间内，且该标点未出现在 words tier 的其他位置，则直接将 `<spN>` 替换为该标点字符，时长不变。然后同步重建 hanzi、pinyin_phones、raw_text。
+
+选择"事后兜底"而非"修改前置逻辑"的原因：
+- `_snap_to_ctc` 的边界修正逻辑已经过 19 个 Case 的验证，不宜改动
+- `_inject_punctuation` 跳过 `<spN>` 是刻意的（静音不参与标点裁剪），改动风险大
+- 兜底修复只影响"标点被吞"这一种已确认的失效模式，不改变正常路径
+
+### 修改点
+
+**A. `process_one` Phase 5 — 被吞标点恢复** (~L4665 之后，QC 之前)
+
+```python
+# ── 被吞标点恢复 ──
+# 若 <spN> 区间包含 CTC 标点锚点, 且该标点未在 words 中,
+# 则替换 <spN> 为该标点, 时长不变, 同步所有派生 tier.
+if punct_entries:
+    _words_t = tier_by_name(new_tg, "words")
+    if _words_t:
+        _existing_punct = {iv.text.strip() for iv in _words_t.intervals
+                           if is_punct(iv.text) and not is_silence(iv.text)}
+        for iv in _words_t.intervals:
+            if not is_silence(iv.text): continue
+            for p in punct_entries:
+                if p["word"] not in '，。！？': continue
+                if p["word"] in _existing_punct: continue
+                overlap = min(iv.xmax, p["end_s"]) - max(iv.xmin, p["start_s"])
+                if overlap > 0:
+                    iv.text = p["word"]
+                    _existing_punct.add(p["word"])
+                    # → 同步重建 hanzi, pinyin_phones, raw_text
+                    break
+```
+
+### 与关联 Case 的关系
+
+| Case | 问题 | 与本 Case 的关系 |
+|------|------|----------------|
+| 1-3 | MFA 尾静音被 snap 回词 | 同属 snap→间隙→标点问题的前置条件 |
+| 7 (Mod T) | ≤5ms 间隙吸收 | snap 后间隙处理的同族逻辑 |
+| 12 | overlap fix 产生倒置 interval | snap 副作用导致标点异常 |
+| 20 | strip_edge_punctuation 尾随剥离 | 另一个导致标点消失的路径（已修复） |
+
+### 验证方法
+
+```python
+# 所有 CTC 标点锚点必须在 words tier 中有对应
+for p in punct_entries:
+    if p["word"] in '，。！？':
+        found = any(iv.text.strip() == p["word"] and
+                    abs(iv.xmin - p["start_s"]) < 0.5
+                    for iv in words_tier.intervals)
+        assert found, f"CTC punct {p['word']} at {p['start_s']}s not in words tier"
+```
+
+### 关联样本
+
+- `VR研学_小鼠粽子喜欢甜的还是咸的_20250531_2222_b330ee29_clip0010_clip0007`：3.15s 逗号被吞
+
+### 被吞标点恢复的触发条件（精确版）
+
+```
+① CTC 标点锚点存在于 _punct.json（ASR 识别到了）
+② _inject_punctuation 后该标点在 words tier 中（快照确认）
+③ Phase 4 后该标点从 words tier 消失（比对确认 → _swallowed_puncts）
+④ 该位置现在是 <spN>（间隙被重新暴露）
+→ 四个条件全部满足 → 替换 <spN> 为原标点
+```
+
+只恢复"确认被吞"的标点，不会误恢复从未存在过的标点。
+
+
+## Case 23: `step_normalize_punct` 缺少 NVV 连字符保护 → `QUESTION-EI` 被拆成 `QUESTION，EI`
+
+**日期**: 2026-07-29
+**涉及文件**: `scripts/run_pipeline.py`
+**涉及函数**: `step_normalize_punct`
+**触发样本**: 花礼_和帕小聊_20241221_0914_7103ddf1_clip0016_clip0008, 6.99s 处的 `QUESTION-EI`
+
+### 现象
+
+含连字符的 NVV token `QUESTION-EI` 在 pipeline 处理后被拆散：
+
+```
+修复前:
+  words:         <QUESTION-EI>[6.99-7.29]  EI[7.29-7.38]        ← EI 独立成词
+  hanzi:         QUESTION[6.99-7.29]       EI[7.29-7.38]        ← 无 <>，被拆开
+  pinyin_phones: <<QUESTION-EI>>[6.99-7.29]  en:ei[7.29-7.38]   ← 双重包裹 + 音素泄漏
+
+修复后:
+  words:         <QUESTION-EI>[6.99-7.29]                       ← 完整 NVV
+  hanzi:         QUESTION-EI[6.99-7.29]                         ← 正确
+  pinyin_phones: <QUESTION-EI>[6.99-7.29]                       ← 正确
+```
+
+### 根因链
+
+1. **NVASR 输出** `[Question-ei]`（NVV 方括号格式），`ctc_prealign` 转换为 `QUESTION-EI`
+2. **`.lab` 文件**中 `QUESTION-EI` 保留连字符（不经过 `step_normalize_punct`）
+3. **`_text_cn.txt`** 经过 `step_normalize_punct`（Phase 2 标点分类）：
+   ```python
+   for ch in text:
+       if is_punct(ch):  # '-' 命中! is_punct 定义为 not is_word_like
+           char_info.append(("punct", ch in ALLOWED_PUNCT, ch))
+           # '-' 不在白名单 → 后续被替换为 ，
+   ```
+4. **`_text_cn.txt` 变成** `QUESTION，EI`（连字符变逗号）
+5. **MFA 对齐**：`.lab` 中有 `QUESTION-EI EI`（lab 不受影响），MFA 将 `EI` 当作独立词
+6. **Postprocess**：`EI` 被 `is_english_token` 识别 → 送入 English MFA → 泄漏 `en:ei` 音素
+7. **Hanzi tier**：`QUESTION` 不是 NVV 格式（无 `<>`），`_build_hanzi_tier` 将其当作普通英文词
+
+### Case 17-E 修复不完整
+
+Case 17-E 在 `ctc_prealign._normalize_punct` 中添加了 NVV 连字符保护，但 **`run_pipeline.step_normalize_punct` 没有被同步修复**。两个函数做同样的标点规范化，但只有前者有 `is_hyphen_in_nvv` 检查。
+
+```
+ctc_prealign._normalize_punct     ← Case 17-E 已修复 ✅
+run_pipeline.step_normalize_punct ← 遗漏！ ❌ → Case 23
+```
+
+### 修改点
+
+**A. `step_normalize_punct` — Phase 2 增加 `is_hyphen_in_nvv` 检查** (~L680)
+
+修改前：
+```python
+for ch in text:
+    if is_punct(ch):
+        char_info.append(("punct", ch in ALLOWED_PUNCT, ch))
+    else:
+        char_info.append(("other", None, ch))
+```
+
+修改后：
+```python
+for i, ch in enumerate(text):
+    is_hyphen_in_nvv = (
+        ch == '-'
+        and i > 0 and i + 1 < len(text)
+        and text[i - 1].isascii() and text[i - 1].isalpha()
+        and text[i + 1].isascii() and text[i + 1].isalpha()
+    )
+    if is_punct(ch) and not is_hyphen_in_nvv:
+        char_info.append(("punct", ch in ALLOWED_PUNCT, ch))
+    else:
+        char_info.append(("other", None, ch))
+```
+
+### 全面审计
+
+对 pipeline 中所有处理 `_text_cn.txt` 标点规范化的函数进行了审计：
+
+| 函数 | 文件 | 连字符保护 | 状态 |
+|------|------|-----------|------|
+| `_normalize_punct` | ctc_prealign.py | ✅ Case 17-E | 已修复 |
+| `step_normalize_punct` | run_pipeline.py | ✅ Case 23 | **本次修复** |
+| `normalize_punct_inline` | pipeline_utils.py | N/A（`-` 不在其处理范围） | 安全 |
+
+### 关联样本
+
+- `花礼_和帕小聊_20241221_0914_7103ddf1_clip0016_clip0008`：`QUESTION-EI` → `QUESTION，EI` + `EI` 独立成词
+
 
 ## 模板 (新 Case 用)
 

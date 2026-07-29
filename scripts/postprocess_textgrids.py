@@ -146,6 +146,11 @@ def _finalize_textgrid(tg: TextGrid) -> None:
             if first_iv and first_iv.text.strip() and not first_iv.text.startswith("<sp"):
                 first_iv.text = f"<sp1>{first_iv.text}"
         elif t_idx <= 4:
+            # Insert leading <sp1> when the first interval starts after 0
+            # and no silence interval marks the opening gap.
+            if (tier.intervals and tier.intervals[0].xmin > 0.005
+                    and not tier.intervals[0].text.startswith("<sp")):
+                tier.intervals.insert(0, Interval(0.0, tier.intervals[0].xmin, "<sp1>"))
             for iv in tier.intervals:
                 if not iv.text:
                     continue
@@ -973,10 +978,12 @@ def strip_edge_punctuation(textgrid: TextGrid) -> None:
         return
 
     # ── Strip leading punct: absorb into the preceding interval ──
-    # Walk backwards from first_real-1 to 0; every punct gets absorbed into its neighbour
+    # Walk backwards from first_real-1 to 0; every punct gets absorbed into
+    # its neighbour.  Silence intervals (<spN>) are NOT punct and must be
+    # skipped — is_punct() returns True for some bracket-wrapped tokens.
     leading_punct_indices = []
     for i in range(first_real):
-        if is_punct(intervals[i].text):
+        if not is_silence(intervals[i].text) and is_punct(intervals[i].text):
             leading_punct_indices.append(i)
 
     for pi in sorted(leading_punct_indices, reverse=True):
@@ -989,21 +996,15 @@ def strip_edge_punctuation(textgrid: TextGrid) -> None:
             intervals[pi + 1] = _replace(intervals[pi + 1], xmin=p_iv.xmin)
         intervals[pi] = _replace(intervals[pi], xmin=0, xmax=0, text="")
 
-    # ── Strip trailing punct: absorb into the following interval ──
-    trailing_punct_indices = []
-    for i in range(last_real + 1, len(intervals)):
-        if is_punct(intervals[i].text):
-            trailing_punct_indices.append(i)
-
-    for pi in sorted(trailing_punct_indices, reverse=True):
-        p_iv = intervals[pi]
-        # Absorb into following interval (if any) by extending its xmin
-        if pi + 1 < len(intervals):
-            intervals[pi + 1] = _replace(intervals[pi + 1], xmin=p_iv.xmin)
-        elif pi > 0:
-            # Last interval is punct — absorb into previous interval
-            intervals[pi - 1] = _replace(intervals[pi - 1], xmax=p_iv.xmax)
-        intervals[pi] = _replace(intervals[pi], xmin=0, xmax=0, text="")
+    # NOTE: There is intentionally NO trailing strip.
+    # Trailing punctuation (。！？…) after the last real word is ALWAYS
+    # legitimate — sentences naturally end with punctuation.  The "mirror"
+    # design (stripping both edges) is a logical error because leading
+    # and trailing edges are NOT symmetric:
+    #   - Leading punct: always orphaned (tag-stripping artifact) → strip
+    #   - Trailing punct: always legitimate (end-of-sentence) → keep
+    # NVV-trailing punct+silence chains are already handled upstream by
+    # absorb_nvv_trailing (Case 9 W1) and absorb_silence_into_punct (Case 9 W2).
 
     # ── Apply changes ──
     intervals = [iv for iv in intervals if iv.xmax > iv.xmin + 0.001]
@@ -2474,11 +2475,14 @@ def _inject_punctuation(words_tier: Tier, pp_tier: Tier | None,
             if m[3] == "word" and not is_silence(m[2]):
                 punct_start = m[1]
                 break
+        # 确保最后标点至少 30ms: 当末词 xmax == words_tier.xmax 时
+        # (如音频恰好在词边界结束), 标点不会变成零时长被丢弃.
+        punct_end = max(punct_start + 0.030, words_tier.xmax)
         # 重建: 保留非静音 + 最后标点(延伸)
         new_merged = []
         for m in merged:
             if m is last_punct:
-                new_merged.append((punct_start, words_tier.xmax, punct_text, "punct"))
+                new_merged.append((punct_start, punct_end, punct_text, "punct"))
             elif m[1] <= punct_start + 0.001:
                 new_merged.append(m)
         merged = new_merged
@@ -3607,6 +3611,11 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
         prev_ctc_start = ctc_start
         prev_ctc_end = ctc_end
 
+    # Leading silence — from 0 to first word start (mirrors trailing silence)
+    if new_word_ivs and new_word_ivs[0][0] > 0.005:
+        dur_label = silence_label(new_word_ivs[0][0])
+        new_word_ivs.insert(0, (0.0, new_word_ivs[0][0], dur_label, "gap"))
+
     # Trailing silence — from last word end to total duration
     total_dur = words_tier.xmax
     if total_dur > prev_end + 0.005:
@@ -4331,6 +4340,21 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # among themselves, but all depend on C having run first.
     # ═══════════════════════════════════════════════════════════════
 
+    # ── Phase 4 前快照: 记录当前 words tier 中已有的 CTC 标点 ──
+    # 用于 Phase 4 结束后比对哪些标点被融合/吸收了 (Regression Case 22).
+    _punct_before: list[dict] = []
+    if punct_entries:
+        _wt_before = tier_by_name(new_tg, "words")
+        if _wt_before:
+            for p in punct_entries:
+                if p["word"] not in '，。！？':
+                    continue
+                for iv in _wt_before.intervals:
+                    if (not is_silence(iv.text) and iv.text.strip() == p["word"]
+                            and abs(iv.xmin - p["start_s"]) < 0.5):
+                        _punct_before.append(dict(p))
+                        break
+
     # --- D. Handle unexpected silences ---
     sil_filter_reasons = []
     if args.handle_unexpected_sil:
@@ -4353,6 +4377,24 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # real word is absorbed into adjacent intervals.  Fixes orphaned
     # ellipsis left behind when NVASR strips NVV tags.  See Regression Case 17.
     strip_edge_punctuation(new_tg)
+
+    # ── Phase 4 后比对: 哪些标点在 Phase 4 中被吞了 ──
+    _swallowed_puncts: list[dict] = []
+    if _punct_before:
+        _wt_after = tier_by_name(new_tg, "words")
+        if _wt_after:
+            for p in _punct_before:
+                _still_exists = False
+                for iv in _wt_after.intervals:
+                    if (not is_silence(iv.text) and iv.text.strip() == p["word"]
+                            and abs(iv.xmin - p["start_s"]) < 0.5):
+                        _still_exists = True
+                        break
+                if not _still_exists:
+                    _swallowed_puncts.append(p)
+            if _swallowed_puncts:
+                report.setdefault("swallowed_punct", [])
+                report["swallowed_punct"] = [p["word"] for p in _swallowed_puncts]
 
     # ── SYNC: D2/D3/D4 modified words tier in-place → rebuild derived tiers ──
     _sync_derived_tiers(new_tg, ipa_to_pinyin, pinyin_dict,
@@ -4653,6 +4695,64 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                         iv.text = p["word"]
                         break
 
+    # ── 被吞标点恢复 ───────────────────────────────────────────────
+    # 前提: ① CTC 标点在 _inject_punctuation 后存在于 words tier,
+    #        ② Phase 4 (D/D2/D3/D4) 中该标点被融合/吸收 → 消失,
+    #        ③ 该位置现在是 <spN> (MFA 对齐偏差经 snap 修正, 标点被吞后
+    #           间隙重新暴露出来成为裸 <spN>)。
+    # 不是泛泛地"标点缺失就补"——必须先确认标点确实经历过"存在→被吞"
+    # 的过程, 且被吞后间隙以 <spN> 形态重新出现, 才替换恢复。
+    # Regression Case 22.
+    if _swallowed_puncts:
+        _words_t = tier_by_name(new_tg, "words")
+        if _words_t:
+            _restored = 0
+            for p in _swallowed_puncts:
+                # 前提: 该位置现在是 <spN>
+                for iv in _words_t.intervals:
+                    if not is_silence(iv.text) or not iv.text.strip():
+                        continue
+                    overlap = min(iv.xmax, p["end_s"]) - max(iv.xmin, p["start_s"])
+                    if overlap > 0:
+                        # <spN> 覆盖了被吞标点的原始位置 → 替换恢复
+                        iv.text = p["word"]
+                        _restored += 1
+                        break
+            if _restored:
+                # 同步 hanzi: 从更新后的 words 重建
+                _hanzi_t = tier_by_name(new_tg, "hanzi")
+                if _hanzi_t:
+                    _new_hanzi = _build_hanzi_tier(
+                        _words_t,
+                        raw_text if raw_text else "",
+                        report.get("warnings", []))
+                    if _new_hanzi:
+                        for _i, _t in enumerate(new_tg.tiers):
+                            if _t.name == "hanzi":
+                                new_tg.tiers[_i] = _new_hanzi
+                                break
+                # 同步 pinyin_phones
+                _phones_t = tier_by_name(new_tg, "phones")
+                if _phones_t:
+                    _new_pp = build_pinyin_phones_tier(
+                        _phones_t, ipa_to_pinyin, _words_t, pinyin_dict,
+                        en_mfa_windows=en_mfa_windows)
+                    if _new_pp:
+                        for _i, _t in enumerate(new_tg.tiers):
+                            if _t.name == "pinyin_phones":
+                                new_tg.tiers[_i] = _new_pp
+                                break
+                # 同步 raw_text: 从更新后的 hanzi 重建
+                _raw_t = tier_by_name(new_tg, "raw_text")
+                _hanzi_t2 = tier_by_name(new_tg, "hanzi")
+                if _raw_t and _hanzi_t2:
+                    _raw_tokens = [iv.text for iv in _hanzi_t2.intervals
+                                   if not is_silence(iv.text) and iv.text.strip()]
+                    if _raw_tokens:
+                        _raw_t.intervals[0].text = "".join(_raw_tokens)
+                report.setdefault("restored_punct", 0)
+                report["restored_punct"] = _restored
+
     # ================================================================
     # 最终筛选: 所有处理完成后再统一判断 (用最终的边界和静音结构)
     # ================================================================
@@ -4740,13 +4840,20 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             report["misaligned_phones"] = f"{_misaligned_phones}/{_total_phones}"
 
     # sp3 / mid_sp: 检查最终 words 层的静音结构
+    # 首尾静音 (<spN> 在开头/结尾) 是正常的音频裁剪结果, 不算异常。
+    # 只有中间 (非首非尾) 的长静音才是问题。
     if words_tier:
-        for iv in words_tier.intervals:
+        n_ivs = len(words_tier.intervals)
+        for i, iv in enumerate(words_tier.intervals):
             if iv.text.strip() == "<sp3>":
+                if i == 0 or i == n_ivs - 1:
+                    continue  # leading / trailing silence is normal
                 filter_reasons.append("sp3")
         sp_in_mid = False
         for i, iv in enumerate(words_tier.intervals):
-            if i > 0 and is_silence(iv.text) and iv.text.strip():
+            if i == 0 or i == n_ivs - 1:
+                continue  # leading / trailing silence is normal
+            if is_silence(iv.text) and iv.text.strip():
                 sp_in_mid = True
                 break
         if sp_in_mid:

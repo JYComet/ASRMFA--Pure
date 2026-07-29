@@ -47,12 +47,12 @@ def process_textgrid(input_path: Path, output_path: Path) -> bool:
     if n_tiers < 1:
         return False
 
-    # Pass: wrap bare NVV names with < > in every tier
+    # Pass: wrap bare NVV names with < > in every tier.
+    # Normalize to <UPPERCASE> — strip existing brackets / mixed case first
+    # to avoid double-wrapping and case inconsistencies (Regression Case 13).
     for tier in tg.tiers:
         for iv in tier.intervals:
             if iv.text and is_nvv(iv.text):
-                # Normalize to <UPPERCASE> — strip existing brackets/case first
-                # to avoid double-wrapping and mixed-case inconsistencies.
                 cleaned = iv.text.strip().strip('<>').upper()
                 iv.text = f"<{cleaned}>"
 

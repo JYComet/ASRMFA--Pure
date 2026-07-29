@@ -16,6 +16,7 @@ ctc_prealign:
 
 mfa:
   clean: true
+  fine_tune: false
 
 postprocess:
   handle_unexpected_sil: true
