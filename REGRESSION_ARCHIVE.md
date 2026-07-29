@@ -310,6 +310,7 @@ scripts/streaming_pipeline.py    — 流式批处理（NAS→本地SSD→回传�
 | AN | `process_one` ~4343,~4366 | **Case 22-A**: Phase 4 前后标点快照比对 → `_swallowed_puncts`（被吞标点追踪） |
 | AO | `process_one` ~4665 | **Case 22-B**: 仅对 `_swallowed_puncts` 中确认被吞的标点, 若位置现为 `<spN>` → 替换恢复 |
 | AP | `step_normalize_punct` ~680 | **Case 23**: Phase 2 增加 `is_hyphen_in_nvv` 检查，防 NVV 连字符被当作标点替换 |
+| AQ | `ctc_prealign.py` ~1193,~1217 | **Case 24**: TextGrid 写入移至空检测之后，避免 ASR 空输出留下孤立的空 TextGrid |
 
 ---
 
@@ -2416,6 +2417,77 @@ for i, ch in enumerate(text):
 ### 关联样本
 
 - `花礼_和帕小聊_20241221_0914_7103ddf1_clip0016_clip0008`：`QUESTION-EI` → `QUESTION，EI` + `EI` 独立成词
+
+
+## Case 24: ASR 空输出先写 TextGrid 再检测 → 留下孤立的空 TextGrid
+
+**日期**: 2026-07-29
+**涉及文件**: `scripts/ctc_prealign.py`
+**涉及函数**: `main` (推理循环 ~L1193-1218)
+**触发样本**: `花礼_-晚间吃口小鼠_20251120_2059_365e41bc_clip0017_clip0019` (raw_text=`<sp1>`，纯静音)
+
+### 现象
+
+ASR 输出为空的 stem 在 `ctc_pretg/` 中留下孤立的空 TextGrid，但没有 `.lab`、`_tokens.jsonl`、`_punct.json`、`_text_cn.txt`、`_text_raw.txt`：
+
+```
+ctc_pretg/
+  ├─ 花礼_-晚间吃口...TextGrid   ← 孤立的空 TG（words tier 仅一个空 interval）
+  ├─ （没有 .lab）
+  ├─ （没有 _tokens.jsonl）
+  ├─ （没有 _punct.json）
+  ├─ （没有 _text_cn.txt）
+  └─ （没有 _text_raw.txt）
+```
+
+### 根因链
+
+1. **写 TextGrid 在空检测之前**（L1193-1194）：无论 ASR 是否有输出，`write_textgrid()` 都在 `continue` 之前执行
+2. **空检测在 L1213-1218**：`lab_tokens.strip()` 为空时打印 SKIP 并 `continue`，跳过 `.lab` 等后续文件写入
+3. **下游步骤通过不同文件类型发现 stem**：`adjust_ctc` glob `*_tokens.jsonl`，`normalize_*` glob `*_text_cn.txt` / `*.lab`，MFA align 用 `.lab` 作 corpus → 空 stem 被自然排除
+4. **实际无功能影响**：下游从不触碰这个孤立的空 TextGrid，不影响管线结果
+5. **但造成不一致**：87 个 TextGrid vs 86 个其他文件，目录状态不一致
+
+### 修改点
+
+**AQ. `ctc_prealign.py` — TextGrid 写入移至空检测之后** (~L1193, ~L1217)
+
+修改前：
+```python
+# L1193 — 空检测之前写 TextGrid
+out_tg = args.output_dir / f"{stem}.TextGrid"
+write_textgrid(words_pinyin, duration_s, out_tg, pauses=pauses)
+
+# L1213 — 空检测，跳过后续文件
+lab_tokens = " ".join(w["word"] for w in words_pinyin)
+if not lab_tokens.strip():
+    print(f"  SKIP {stem}: ASR produced no text — skipping MFA alignment")
+    skipped.setdefault("empty_asr", []).append(stem)
+    continue
+
+# 写 .lab ...
+```
+
+修改后：
+```python
+# L1210 — 空检测，全部跳过（含 TextGrid）
+lab_tokens = " ".join(w["word"] for w in words_pinyin)
+if not lab_tokens.strip():
+    print(f"  SKIP {stem}: ASR produced no text — skipping MFA alignment")
+    skipped.setdefault("empty_asr", []).append(stem)
+    continue
+
+# L1217 — TextGrid 和 .lab 一起写入
+out_tg = args.output_dir / f"{stem}.TextGrid"
+write_textgrid(words_pinyin, duration_s, out_tg, pauses=pauses)
+
+out_lab = args.output_dir / f"{stem}.lab"
+out_lab.write_text(lab_tokens + "\n", encoding="utf-8")
+```
+
+### 关联样本
+
+- `花礼_-晚间吃口小鼠_20251120_2059_365e41bc_clip0017_clip0019`：16s 纯静音/噪音，ASR 输出 `<sp1>`
 
 
 ## 模板 (新 Case 用)
