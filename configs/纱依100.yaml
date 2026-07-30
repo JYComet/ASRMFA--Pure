@@ -1,0 +1,28 @@
+# 纱依 — 随机抽取100条，完整管线处理
+workspace: shayi100
+data_dir: data_dir/纱依100
+mode: full
+
+# Use local temp dir to avoid SQLite locking issues on CIFS mount
+temp_dir: /tmp/shayi100_temp
+
+python_path: /home/devuser/miniconda3/envs/mfa_chinese/bin/python
+
+ctc_prealign:
+  enabled: true
+  python: /usr/bin/python3
+  model_path: /mnt/project/nvvasr_standalone/models/Multilingual-NVASR
+  device: cuda:0
+
+mfa:
+  clean: true
+  fine_tune: false
+
+mfa_en:
+  enabled: true
+  acoustic_model: /mnt/project/MFA_Pause/pretrained_models/acoustic/english_us_arpa.zip
+  dictionary: dict/cmudict.dict
+  g2p_model: /mnt/project/MFA_Pause/pretrained_models/g2p/english_us_arpa.zip
+
+postprocess:
+  handle_unexpected_sil: true

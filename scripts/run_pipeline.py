@@ -236,6 +236,7 @@ DEFAULT_CFG: dict = {
         "bgm_min_sil_dur": 0.3,
         "bgm_speech_ratio": 1.0,
         "bgm_min_energy": 0.01,
+        "bgm_max_threshold": 0.05,
         "filter_suspicious": True,
         "filter_short_phone_sec": 0.015,
         "filter_long_word_sec": 1.0,
@@ -1045,11 +1046,18 @@ def step_mfa_align_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     en_dict = en_cfg.get("dictionary", str(PROJECT_ROOT / "dict" / "cmudict.dict"))
     en_g2p = en_cfg.get("g2p_model", str(PROJECT_ROOT / "pretrained_models" / "g2p" / "english_us_arpa.zip"))
 
-    # Resolve relative paths
+    # Resolve relative paths, with fallback to PROJECT_ROOT.parent/pretrained_models
     for val, key in [(en_acoustic, "acoustic_model"), (en_dict, "dictionary"), (en_g2p, "g2p_model")]:
         p = Path(val)
         if not p.is_absolute():
             resolved = PROJECT_ROOT / val
+            # Fallback: pretrained_models may live one level above the repo
+            # (e.g. /mnt/project/MFA_Pause/pretrained_models/ instead of
+            #  /mnt/project/MFA_Pause/repo/pretrained_models/)
+            if not resolved.exists() and "pretrained_models" in val:
+                _parent_resolved = PROJECT_ROOT.parent / val
+                if _parent_resolved.exists():
+                    resolved = _parent_resolved
             if key == "acoustic_model":
                 en_acoustic = str(resolved)
             elif key == "dictionary":
@@ -1122,6 +1130,7 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         pp_args += ["--bgm-min-sil-dur", str(pc.get("bgm_min_sil_dur", 0.3))]
         pp_args += ["--bgm-speech-ratio", str(pc.get("bgm_speech_ratio", 1.0))]
         pp_args += ["--bgm-min-energy", str(pc.get("bgm_min_energy", 0.01))]
+        pp_args += ["--bgm-max-threshold", str(pc.get("bgm_max_threshold", 0.05))]
     else:
         pp_args.append("--no-detect-bgm")
     # Quality filters

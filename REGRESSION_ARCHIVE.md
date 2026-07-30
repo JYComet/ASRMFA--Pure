@@ -33,6 +33,7 @@
 | 22 | 2026-07-29 | postprocess_textgrids.py | MFA 对齐偏差→snap 修正后标点被 <spN> 替换→被吞标点恢复 |
 | 23 | 2026-07-29 | run_pipeline.py | step_normalize_punct 缺少 NVV 连字符保护 → QUESTION-EI 被拆成 QUESTION，EI |
 | 24 | 2026-07-29 | ctc_prealign.py | ASR 空输出先写 TextGrid 再检测 → 留下孤立的空 TextGrid |
+| 25 | 2026-07-29 | postprocess_textgrids.py | _inject_punctuation 重叠判断 + _punct_before 范围 + 恢复匹配策略 |
 
 ---
 
@@ -311,6 +312,14 @@ scripts/streaming_pipeline.py    — 流式批处理（NAS→本地SSD→回传�
 | AO | `process_one` ~4665 | **Case 22-B**: 仅对 `_swallowed_puncts` 中确认被吞的标点, 若位置现为 `<spN>` → 替换恢复 |
 | AP | `step_normalize_punct` ~680 | **Case 23**: Phase 2 增加 `is_hyphen_in_nvv` 检查，防 NVV 连字符被当作标点替换 |
 | AQ | `ctc_prealign.py` ~1193,~1217 | **Case 24**: TextGrid 写入移至空检测之后，避免 ASR 空输出留下孤立的空 TextGrid |
+| AR | `_inject_punctuation` ~2346 | **Case 25-A**: else 分支改为 split: word 在 punct 内时不删除, 拆分 punct 为左右两段 |
+| AS | `postprocess_textgrids.py` ~4361,~4701 | **Case 25-B**: `_punct_before` 监控扩展至 `，。！？…、；：` |
+| AT | `postprocess_textgrids.py` ~4717-4748 | **Case 25-C**: 吞标点恢复从时间重叠匹配改为 CTC 序列顺序匹配（前后邻词定位） |
+| AU | `run_pipeline.py` ~238, `postprocess_textgrids.py` ~4942 | **Case 25-D**: bgm_threshold 天花板 `bgm_max_threshold` (默认 0.05)，防 60 分位噪声底被污染 |
+| AV | `postprocess_textgrids.py` ~4961 | **Case 25-E**: bgm 检测从整段平均值改为 50ms 帧级别，≥20% 帧超阈值才触发 |
+| AW | `postprocess_textgrids.py` ~4819-4888 | **Case 25-F**: 末尾标点强制保留：从前词截取 ≥60ms（弹性取 max(60ms, CTC原始时长)），同步 words/hanzi/pinyin_phones |
+| AX | `postprocess_textgrids.py` ~3028-3051 | **Case 25-G**: `_refine_boundaries_by_energy` 标点边界保护：标点起点与词尾重叠 <100ms 且主体在词尾之后 → 阻止 dead silence 延伸 |
+| AY | `run_pipeline.py` ~1049-1059, `align_english_mfa.py` ~382-393 | **Case 25-H**: 英文 MFA 词典/G2P 路径修复：pretrained_models fallback 到 PROJECT_ROOT.parent + G2P 失败时写 base dict 兜底 |
 
 ---
 
@@ -2488,6 +2497,241 @@ out_lab.write_text(lab_tokens + "\n", encoding="utf-8")
 ### 关联样本
 
 - `花礼_-晚间吃口小鼠_20251120_2059_365e41bc_clip0017_clip0019`：16s 纯静音/噪音，ASR 输出 `<sp1>`
+
+
+## Case 25: `_inject_punctuation` 标点包含词时被误删 + `_punct_before` 漏追踪 `…` + 恢复匹配仅按时间
+
+**日期**: 2026-07-29
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `_inject_punctuation`, process_one (吞标点恢复逻辑)
+**触发样本**: `花礼_呼噜呼噜小鼠毛_20250326_2058_cd0aeff6_clip0019_clip0027` (5.37s, `…` 被 `<sp2>` 替代 → mid_sp 过滤)
+
+### 现象
+
+CTC 预对齐在 `bu4` 和 `zhi3` 之间插入 900ms 的 `…`（省略号/长停顿标记），但最终 words tier 中 `…` 消失，被 `<sp2>` 替代，触发 `mid_sp` 过滤：
+
+```
+CTC tokens+punct:  bu4[4.35-5.37]  …[5.37-6.27]  zhi3[6.27-6.39]
+MFA aligned:       ...wo3, bu4[5.49-5.60], <eps>[5.60-6.05], zhi3[6.05-6.13]...
+最终 words tier:   bu4[4.35-5.37]  <sp2>[5.37-6.065]  zhi3[6.065-6.26]
+                                                        ↑ … 变成 <sp2>！
+```
+
+### 根因链
+
+**Bug A — `_inject_punctuation` 重叠判断缺分支 (~L2338-2347)**
+
+四分支重叠判断覆盖了三种正常情况，但 `else` 分支同时包含两种相反的场景：
+
+| 场景 | 条件 | 实际含义 | 旧行为 | 正确行为 |
+|------|------|---------|--------|---------|
+| punct 在 word 内 | ws≤ps ∧ we≥pe | word 包含 punct | 删除 ✓ | 删除 |
+| word 左盖 punct | ws≤ps ∧ we<pe | 左侧重叠 | trim ✓ | trim |
+| word 右盖 punct | ws>ps ∧ we≥pe | 右侧重叠 | trim ✓ | trim |
+| ***word 在 punct 内*** | ws>ps ∧ we<pe | **punct 包含 word** | **删除 ❌** | **split** |
+
+本例中 `…` [5.37-6.27] 包含 `zhi3` [6.065-6.26]（`5.37 < 6.065` 且 `6.27 > 6.26`），走 `else` 分支直接删除，900ms 的 `…` 全部丢失。
+
+**Bug B — `_punct_before` 监控范围过窄 (~L4361)**
+
+吞标点检测只追踪 `，。！？` 四种标点，`…`（省略号）被排除在外：
+
+```python
+if p["word"] not in '，。！？':   # ← …、；：等全被漏掉
+    continue
+```
+
+即使 `…` 在 Phase 3.C 成功注入后被 Phase 4 吸收吞掉，也不会进入 `_swallowed_puncts`，恢复逻辑完全看不到它。
+
+**Bug C — 吞标点恢复按时间重叠匹配而非顺序 (~L4726)**
+
+旧代码用时间区间重叠匹配被吞标点和 `<spN>`：
+
+```python
+overlap = min(iv.xmax, p["end_s"]) - max(iv.xmin, p["start_s"])
+if overlap > 0:
+    iv.text = p["word"]
+```
+
+当 MFA 对齐偏差导致 `<spN>` 的边界与 CTC punct 锚点偏差较大时，重叠为 0 或负，匹配失败。
+
+### 修改点
+
+**AR. `_inject_punctuation` — else 分支改为 split 而非 delete** (~L2346)
+
+修改前：
+```python
+            else:
+                resolved[pi] = (0, 0, "", pkind)
+```
+
+修改后：
+```python
+            else:
+                # word inside punct (ws > ps and we < pe):
+                # split punct into left part (before word) + right part (after word)
+                left_part  = (ps, ws, ptext, pkind)
+                right_part = (we, pe, ptext, pkind)
+                resolved[pi] = left_part
+                if right_part[1] > right_part[0] + 0.001:
+                    resolved.append(right_part)
+```
+
+效果：`…` [5.37-6.27] 被 `zhi3` [6.065-6.26] 切开 → `…` [5.37-6.065] + `zhi3` [6.065-6.26] + `…` [6.26-6.27]
+
+**AS. `_punct_before` — 扩展追踪标点集合** (~L4361, ~L4701)
+
+修改前：`if p["word"] not in '，。！？': continue`
+
+修改后：`if p["word"] not in '，。！？…、；：': continue`
+
+两处相同守卫条件同步修改。
+
+**AT. 吞标点恢复 — 时间匹配改为按 CTC 序列顺序匹配** (~L4717-4748)
+
+修改前按时间重叠匹配：
+```python
+for iv in _words_t.intervals:
+    if not is_silence(iv.text): continue
+    overlap = min(iv.xmax, p["end_s"]) - max(iv.xmin, p["start_s"])
+    if overlap > 0: ...
+```
+
+修改后按 CTC 序列中的前后邻词匹配：
+```python
+# Build CTC timeline: all tokens + puncts sorted by start
+_ctc_timeline = [(kind, word, start_s), ...]
+
+for p in _swallowed_puncts:
+    # Find p's neighbors in CTC sequence (prev_word, next_word)
+    # Walk words tier: find <spN> between same prev_word/next_word
+    for i in range(1, len(_word_ivs) - 1):
+        iv = _word_ivs[i]
+        if not is_silence(iv.text): continue
+        if _word_ivs[i-1].text == prev_word and _word_ivs[i+1].text == next_word:
+            iv.text = p['word']  # sequential match → replace
+```
+
+### 关联样本
+
+- `花礼_呼噜呼噜小鼠毛_20250326_2058_cd0aeff6_clip0019_clip0027`：`…` [5.37s] 被 zhi3 包含 → 被删 → `<sp2>` → mid_sp 过滤
+
+### 补充修改 (同日): 恢复逻辑中 `tokens` 变量作用域修复
+
+修改 AT 在吞标点恢复中引用 `tokens` 变量，但该变量在 `process_one` 中名为 `ctc_tokens` 且只在 `if tokens_path.exists():` 块内定义，恢复逻辑位置在其作用域外 → 32 条文件报 `NameError: name 'tokens' is not defined`。
+
+修复：恢复逻辑不从外部引用 `tokens`/`ctc_tokens`，改为直接从 `_tokens.jsonl` 重新读取构建 CTC timeline。
+
+### 补充修改 (同日): BGM 检测噪声底污染 + 帧级别检测
+
+**触发样本**: `花礼_emo来听小鼠歌吧_20250504_2058_3700c4b4_clip0003_clip0012`（`<sp1>` [0-1.71s] 内含巨响 RMS 3000-7000，但未被过滤）
+
+**Bug D — 60 分位噪声底被高能量内容污染**:
+
+bgm 检测用全音频 RMS 的 60 分位作为噪声底：
+```python
+k = max(1, int(len(all_rms) * 0.6))
+nf_bgm = float(np.partition(all_rms, k)[k])
+```
+
+当 `<sp1>` 区间有语音级能量时，60 分位被拉高 → `bgm_threshold` 被拉到语音级别 → 异常静音反而检不出。**声音越大越检不出**。
+
+修复：添加 `bgm_max_threshold`（默认 0.05）作为阈值天花板：
+```python
+bgm_threshold = min(bgm_threshold, args.bgm_max_threshold)
+```
+
+**Bug E — `_word_rms()` 整段平均掩盖局部高能量**:
+
+旧代码对 silence interval 取整段 mean absolute amplitude。长静音中夹杂短时巨响时，平均值被前后静音稀释（0.111 → 0.026），不触发检测。
+
+修复：改为 50ms 帧级别扫描，统计超阈值帧占比 ≥20% 才标记为可疑：
+```python
+# 50ms frames with 25ms hop
+for each frame in silence interval:
+    frame_energy = mean(abs( audio[frame_start:frame_end] ))
+    if frame_energy > bgm_threshold:
+        high_frames += 1
+if high_frames / n_frames >= 0.20:
+    suspect  # sustained high energy, not a transient click
+```
+
+**配置变更**:
+- `run_pipeline.py` DEFAULT_CFG: 新增 `bgm_max_threshold: 0.05`
+- `config.yaml`: 新增 `bgm_max_threshold: 0.05` 参考项
+- `postprocess_textgrids.py`: 新增 `--bgm-max-threshold` 参数
+
+
+### 补充修改 (同日): 末尾标点强制保留
+
+**触发样本**: `直播回放_zzZ_2026年06月03日14点场_ae037890_clip0008_clip0012`（`醉…BREATHING。`→ BREATHING 吸收末尾 `。`→ 句末无标点）
+
+**Bug F — 末尾标点被 NVV 吸收后无法恢复**:
+
+CTC 序列 `… BREATHING 。` 中 `。` 是最后一项。Phase 4 D2 中 BREATHING 吸收尾部 `。`，吞标点恢复逻辑因 `next_word = None` 跳过末尾标点。
+
+修复：在吞标点恢复之后、最终 QC 之前，新增**末尾标点强制保留**步骤：
+1. 找 CTC 最后一个标点（按 `end_s`）
+2. 若 words tier 末尾不是该标点 → 从前词末尾截取 ≥60ms
+3. 截取量 = `max(0.060, CTC原始时长)` — 弹性，至少 60ms
+4. 同步更新 words、hanzi、pinyin_phones 三个 tier
+
+```python
+_carve_s = max(0.060, (_last_punct_end - _last_punct["start_s"]))
+# Trim last word xmax to _punct_start, append punct interval
+# Sync all three tiers: words, hanzi, pinyin_phones
+```
+
+**同步修复**: 初版 hanzi tier 只 append 不 trim → 旧 BREATHING 与 `。` 重叠。改为统一处理：先 trim 末位 interval 的 xmax，再 append 标点。
+
+### 补充修改 (2026-07-30): 标点边界保护 — 防止 dead silence 延伸覆盖标点
+
+**触发样本**: `直播回放_三周年纪念活动进行中_2025年12月04日20点场_4d04746b_clip0010_clip0001`（`zai4` 被延伸至 5.47s 覆盖 `…` [4.95-5.43]→ `…` 被 `_inject_punctuation` 当作"word 包含 punct"删除）
+
+**Bug G — `_refine_boundaries_by_energy` dead silence 延伸未检测与词尾重叠的标点**:
+
+CTC 标点起点（4.95s）略早于 MFA 词尾（5.02s）→ 70ms 重叠。Dead silence 检查 `iv.xmax <= p["start_s"]` 失败，延伸未阻断 → `zai4` 延至 5.47 → Phase 3.C 中 `…` 被删。
+
+修复：新增标点边界邻近检测：
+```python
+_near = abs(p["start_s"] - iv.xmax) < 0.100    # 标点起点在词尾 ±100ms 内
+_body_past = p["end_s"] > iv.xmax + 0.060      # 标点主体(>60ms)在词尾之后
+if _near and _body_past:
+    has_punct_in_gap = True  # 阻断延伸, 标点留给 _inject_punctuation 处理
+```
+
+**参数传递链**: `_refine_boundaries_by_energy` 新增 `_punct_boundary_hits` 参数 → 由 `process_one` 传入 → 触发时记录词、标点、偏移量到 `report["punct_boundary_guard"]`。
+
+### 补充修改 (同日): 英文 MFA 词典/G2P 路径修复
+
+**触发样本**: 纱依100 全部 9 个英文词 `phones: []` → 英文音素全部三等分
+
+**Bug H1 — `pretrained_models/` 在 repo 外**:
+
+DEFAULT_CFG 中 `g2p_model: pretrained_models/g2p/english_us_arpa.zip` 相对 PROJECT_ROOT 解析 → `/mnt/project/MFA_Pause/repo/pretrained_models/...` 不存在。实际路径在 `/mnt/project/MFA_Pause/pretrained_models/...`（PROJECT_ROOT.parent）。
+
+修复：`run_pipeline.py` 路径解析增加 fallback：
+```python
+if not resolved.exists() and "pretrained_models" in val:
+    _parent_resolved = PROJECT_ROOT.parent / val
+    if _parent_resolved.exists():
+        resolved = _parent_resolved
+```
+
+**Bug H2 — G2P 失败后 `en_combined.dict` 未写入**:
+
+`build_en_dict` L336 先定义 `combined = temp_dir / "en_combined.dict"`，但 G2P 失败时 L384 直接 `return combined` — 文件从不存在 → MFA 拿到的 dict 路径指向不存在的文件 → 全部 0 个 TextGrid → `collect_en_phones` 全部 fallback 空 phones → `_apply_en_phones` 三等分。
+
+修复：G2P 失败或无输出时，写入纯 base dict（CMUdict）让 MFA 至少能对齐词典内已有的词：
+```python
+if not g2p_output.exists():
+    with open(combined, 'w', encoding='utf-8') as outf:
+        if base_dict.exists():
+            outf.write(_read_dict(base_dict))
+    return combined
+```
+
+**验证结果**: man 音素从三等分变为真实英文 MFA 对齐 `M:17% AE1:72% N:12%`。
 
 
 ## 模板 (新 Case 用)

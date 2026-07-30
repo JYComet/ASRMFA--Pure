@@ -381,15 +381,18 @@ def build_en_dict(en_segments: dict[str, list[dict]],
         )
         if rc.returncode != 0:
             print(f"  WARNING: G2P failed: {rc.stderr[-500:] if rc.stderr else 'unknown'}")
-            return combined
     except subprocess.TimeoutExpired:
         print("  WARNING: G2P timed out")
-        return combined
     except Exception as e:
         print(f"  WARNING: G2P error: {e}")
-        return combined
 
     if not g2p_output.exists():
+        # G2P failed — write base dict only so MFA can still run on
+        # words that ARE in the dictionary (OOV words will fall back to
+        # equal split in postprocessing)
+        with open(combined, 'w', encoding='utf-8') as outf:
+            if base_dict.exists():
+                outf.write(_read_dict(base_dict))
         return combined
 
     # Merge base dict + G2P output

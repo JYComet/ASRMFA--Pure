@@ -2336,15 +2336,26 @@ def _inject_punctuation(words_tier: Tier, pp_tier: Tier | None,
                 continue
             if ws < pe and we > ps:  # overlap exists
                 if ws <= ps and we >= pe:
+                    # word contains punct → delete punct
                     resolved[pi] = (0, 0, "", pkind)
                 elif ws <= ps:
+                    # word overlaps left side of punct → trim punct start
                     resolved[pi] = (we, pe, ptext, pkind)
-                    ps = we  # punct start 推到 word end
+                    ps = we
                 elif we >= pe:
+                    # word overlaps right side of punct → trim punct end
                     resolved[pi] = (ps, ws, ptext, pkind)
-                    pe = ws  # punct end 拉到 word start
+                    pe = ws
                 else:
-                    resolved[pi] = (0, 0, "", pkind)
+                    # word inside punct (ws > ps and we < pe):
+                    # split punct into left part (before word) + right part (after word)
+                    # Regression Case 24: else used to delete punct here,
+                    # losing pause markers like … when a word sits inside them
+                    left_part  = (ps, ws, ptext, pkind)
+                    right_part = (we, pe, ptext, pkind)
+                    resolved[pi] = left_part
+                    if right_part[1] > right_part[0] + 0.001:
+                        resolved.append(right_part)
 
     # 去掉零时长 interval
     resolved = [(s, e, t, k) for s, e, t, k in resolved if e > s + 0.001]
@@ -2744,9 +2755,12 @@ def _merge_nvv_ellipsis(words_tier: Tier, pp_tier: Tier | None,
 def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
                                   search_window: float = 0.2,
                                   min_word_dur: float = 0.03,
-                                  punct_entries: list | None = None) -> Tier:
+                                  punct_entries: list | None = None,
+                                  _punct_boundary_hits: list | None = None) -> Tier:
     """词落在静音段时向后搜索语音起点, 整体后移 (不越过后词).  Vectorised."""
     import numpy as _np
+    if _punct_boundary_hits is None:
+        _punct_boundary_hits = []
     all_rms, _ = _frame_rms_vec(audio, sr, frame_ms=10.0)
     if len(all_rms) == 0:
         return words_tier
@@ -3014,12 +3028,33 @@ def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
             if is_silence(next_iv.text) and i + 2 < n and not is_silence(intervals[i+2].text):
                 gap_end_full = intervals[i+2].xmax
             has_punct_in_gap = False
+            _punct_boundary_detail = None
             if punct_entries:
                 for p in punct_entries:
                     if iv.xmax <= p["start_s"] <= gap_end_full:
                         has_punct_in_gap = True
                         break
+                    # Also detect punct starting near the word boundary:
+                    # when CTC punct starts just before MFA word end
+                    # (within 100ms), but its body extends well past the
+                    # word end, it's a separate pause marker — not a
+                    # prolongation of the current word.  Regression Case 25-G.
+                    _near = abs(p["start_s"] - iv.xmax) < 0.100
+                    _body_past = p["end_s"] > iv.xmax + 0.060
+                    if _near and _body_past:
+                        has_punct_in_gap = True
+                        _punct_boundary_detail = {
+                            "word": iv.text.strip(),
+                            "word_xmax": round(iv.xmax, 3),
+                            "punct": p["word"],
+                            "punct_start": round(p["start_s"], 3),
+                            "punct_end": round(p["end_s"], 3),
+                            "offset_ms": round((iv.xmax - p["start_s"]) * 1000, 1),
+                        }
+                        break
             if has_punct_in_gap:
+                if _punct_boundary_detail:
+                    _punct_boundary_hits.append(_punct_boundary_detail)
                 continue  # punct will absorb the silence
             extend_into_word = True
 
@@ -3273,7 +3308,8 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
                   ctc_tokens: list[dict],
                   snap_threshold: float = 0.3,
                   punct_entries: list[dict] | None = None,
-                  audio=None, sr: int = 16000) -> tuple[Tier, Tier | None]:
+                  audio=None, sr: int = 16000,
+                  _punct_boundary_hits: list | None = None) -> tuple[Tier, Tier | None]:
     """Snap MFA word boundaries to CTC anchors only when they differ too much.
 
     If |MFA - CTC| <= snap_threshold: trust MFA, keep MFA boundaries.
@@ -3285,6 +3321,9 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
     When keeping MFA boundaries, silence gaps use CTC gap positions to
     correctly place punctuation between words.
     """
+    if _punct_boundary_hits is None:
+        _punct_boundary_hits = []
+
     mfa_words = [(i, iv) for i, iv in enumerate(words_tier.intervals)
                  if not is_silence(iv.text) and iv.text.strip() not in ("", "<eps>")
                  and not is_punct(iv.text)]
@@ -4222,9 +4261,14 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         words_tier = tier_by_name(new_tg, "words")
         pp_tier = tier_by_name(new_tg, "pinyin_phones")
         if words_tier and ctc_tokens:
+            _punct_boundary_hits: list[dict] = []
             words_tier, pp_tier = _snap_to_ctc(words_tier, pp_tier, ctc_tokens,
                                                    punct_entries=punct_entries,
-                                                   audio=wav_audio, sr=wav_sr or 16000)
+                                                   audio=wav_audio, sr=wav_sr or 16000,
+                                                   _punct_boundary_hits=_punct_boundary_hits)
+            if _punct_boundary_hits:
+                report.setdefault("punct_boundary_guard", [])
+                report["punct_boundary_guard"] = _punct_boundary_hits
             for i, t in enumerate(new_tg.tiers):
                 if t.name == "words":
                     new_tg.tiers[i] = words_tier
@@ -4236,7 +4280,8 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         words_tier = tier_by_name(new_tg, "words")
         if words_tier:
             words_tier = _refine_boundaries_by_energy(words_tier, wav_audio, wav_sr,
-                                                         punct_entries=punct_entries)
+                                                         punct_entries=punct_entries,
+                                                         _punct_boundary_hits=_punct_boundary_hits)
             for i, t in enumerate(new_tg.tiers):
                 if t.name == "words":
                     new_tg.tiers[i] = words_tier
@@ -4347,7 +4392,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         _wt_before = tier_by_name(new_tg, "words")
         if _wt_before:
             for p in punct_entries:
-                if p["word"] not in '，。！？':
+                if p["word"] not in '，。！？…、；：':
                     continue
                 for iv in _wt_before.intervals:
                     if (not is_silence(iv.text) and iv.text.strip() == p["word"]
@@ -4687,7 +4732,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         words_tier = tier_by_name(new_tg, "words")
         if words_tier:
             for p in punct_entries:
-                if p["word"] not in '，。！？':
+                if p["word"] not in '，。！？…、；：':
                     continue
                 # 检查 words tier 中是否有 …, 且位置接近 CTC punct
                 for iv in words_tier.intervals:
@@ -4703,21 +4748,73 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # 不是泛泛地"标点缺失就补"——必须先确认标点确实经历过"存在→被吞"
     # 的过程, 且被吞后间隙以 <spN> 形态重新出现, 才替换恢复。
     # Regression Case 22.
+    #
+    # 匹配策略 (Case 24 修复): 按CTC序列顺序匹配, 而非时间重叠.
+    # 标点在CTC序列中的前后邻词决定了其顺序位置;
+    # 在words tier中找到同一个前词→<spN>→后词的三元组, 即为恢复目标.
     if _swallowed_puncts:
         _words_t = tier_by_name(new_tg, "words")
         if _words_t:
+            # Build CTC timeline: all items (tokens + puncts) sorted by start time
+            _ctc_timeline = []
+            # Re-read tokens (they may not be in scope at this point — loaded inside
+            # a conditional block earlier in process_one)
+            _tokens_path = txt_dir / f"{stem}_tokens.jsonl"
+            if _tokens_path.exists():
+                for line in _tokens_path.read_text(encoding="utf-8").strip().split("\n"):
+                    if line:
+                        t = json.loads(line)
+                        _ctc_timeline.append(('token', t['word'], t['start_s']))
+            if punct_entries:
+                for p in punct_entries:
+                    _ctc_timeline.append(('punct', p['word'], p['start_s']))
+            _ctc_timeline.sort(key=lambda x: x[2])
+
             _restored = 0
             for p in _swallowed_puncts:
-                # 前提: 该位置现在是 <spN>
-                for iv in _words_t.intervals:
+                p_s = p['start_s']
+                # Find swallowed punct's sequential neighbors in CTC timeline
+                prev_word = next_word = None
+                for idx, (kind, word, ts) in enumerate(_ctc_timeline):
+                    if (kind == 'punct' and word == p['word']
+                            and abs(ts - p_s) < 0.01):
+                        # Find previous content word
+                        for j in range(idx - 1, -1, -1):
+                            if _ctc_timeline[j][0] == 'token':
+                                prev_word = _ctc_timeline[j][1]
+                                break
+                        # Find next content word
+                        for j in range(idx + 1, len(_ctc_timeline)):
+                            if _ctc_timeline[j][0] == 'token':
+                                next_word = _ctc_timeline[j][1]
+                                break
+                        break
+
+                if prev_word is None or next_word is None:
+                    continue
+
+                # Walk words tier sequentially:
+                # find <spN> whose neighbors match prev_word / next_word
+                _word_ivs = list(_words_t.intervals)
+                for i in range(1, len(_word_ivs) - 1):
+                    iv = _word_ivs[i]
                     if not is_silence(iv.text) or not iv.text.strip():
                         continue
-                    overlap = min(iv.xmax, p["end_s"]) - max(iv.xmin, p["start_s"])
-                    if overlap > 0:
-                        # <spN> 覆盖了被吞标点的原始位置 → 替换恢复
-                        iv.text = p["word"]
-                        _restored += 1
-                        break
+                    left_txt = _word_ivs[i - 1].text.strip()
+                    if is_silence(left_txt) or not left_txt:
+                        continue
+                    if left_txt != prev_word:
+                        continue
+                    right_txt = _word_ivs[i + 1].text.strip()
+                    if is_silence(right_txt) or not right_txt:
+                        continue
+                    if right_txt != next_word:
+                        continue
+                    # Sequential match confirmed: <spN> sits between the
+                    # same two content words as the swallowed punct in CTC
+                    iv.text = p['word']
+                    _restored += 1
+                    break
             if _restored:
                 # 同步 hanzi: 从更新后的 words 重建
                 _hanzi_t = tier_by_name(new_tg, "hanzi")
@@ -4752,6 +4849,84 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                         _raw_t.intervals[0].text = "".join(_raw_tokens)
                 report.setdefault("restored_punct", 0)
                 report["restored_punct"] = _restored
+
+    # ── 末尾标点强制保留 ───────────────────────────────────────────
+    # CTC 最后一个标点如果被前词 (通常是 NVV) 吸收, 从前词末尾截取至少
+    # 60ms 还给标点。保证每个音频的句末标点不丢失。
+    # Regression Case 25 follow-up: terminal punct recovery.
+    if punct_entries:
+        _words_t = tier_by_name(new_tg, "words")
+        if _words_t:
+            # Find the last (rightmost) CTC punct
+            _last_punct = max(punct_entries, key=lambda p: p["end_s"])
+            _last_punct_word = _last_punct["word"]
+            _last_punct_end = _last_punct["end_s"]
+
+            # Check if this punct already exists as the last item in words tier
+            _word_ivs = list(_words_t.intervals)
+            _last_word_iv = None
+            for iv in reversed(_word_ivs):
+                if iv.text.strip():
+                    _last_word_iv = iv
+                    break
+
+            _punct_at_end = (_last_word_iv is not None
+                             and _last_word_iv.text.strip() == _last_punct_word)
+
+            if not _punct_at_end and _last_word_iv is not None:
+                _last_idx = len(_word_ivs) - 1
+                for _i in range(len(_word_ivs) - 1, -1, -1):
+                    if _word_ivs[_i] is _last_word_iv:
+                        _last_idx = _i
+                        break
+
+                # Carve at least 60ms: use CTC punct's original duration if longer
+                _carve_s = max(0.060, (_last_punct_end - _last_punct["start_s"]))
+
+                if _carve_s < _last_word_iv.xmax - _last_word_iv.xmin:
+                    _punct_start = _last_word_iv.xmax - _carve_s
+                    from dataclasses import replace as _replace
+                    # Build new interval list: trim last word, append punct
+                    _new_ivs = [_replace(iv) for iv in _word_ivs]
+                    _new_ivs[_last_idx] = _replace(_last_word_iv,
+                                                   xmax=_punct_start)
+                    _new_ivs.append(_replace(_last_word_iv,
+                                             xmin=_punct_start,
+                                             xmax=_punct_start + _carve_s,
+                                             text=_last_punct_word))
+                    _words_t = Tier(_words_t.name, _words_t.xmin,
+                                    _words_t.xmax, _new_ivs)
+                    for _i, _t in enumerate(new_tg.tiers):
+                        if _t.name == "words":
+                            new_tg.tiers[_i] = _words_t
+                            break
+                    report.setdefault("final_punct_restored", {})
+                    report["final_punct_restored"] = {
+                        "punct": _last_punct_word,
+                        "carved_from": _last_word_iv.text.strip(),
+                        "carved_s": round(_carve_s, 3)}
+
+                    # Sync hanzi & pinyin_phones: trim last interval, append punct
+                    for _tier_name in ("hanzi", "pinyin_phones"):
+                        _t = tier_by_name(new_tg, _tier_name)
+                        if _t is None:
+                            continue
+                        _t_ivs = list(_t.intervals)
+                        # Trim the last non-empty interval to _punct_start
+                        for _j in range(len(_t_ivs) - 1, -1, -1):
+                            if _t_ivs[_j].text.strip():
+                                _t_ivs[_j] = _replace(_t_ivs[_j], xmax=_punct_start)
+                                break
+                        # Append the restored punct
+                        _t_ivs.append(_replace(_t_ivs[-1],
+                                               xmin=_punct_start,
+                                               xmax=_punct_start + _carve_s,
+                                               text=_last_punct_word))
+                        _t_new = Tier(_t.name, _t.xmin, _t.xmax, _t_ivs)
+                        for _i, _tt in enumerate(new_tg.tiers):
+                            if _tt.name == _tier_name:
+                                new_tg.tiers[_i] = _t_new
+                                break
 
     # ================================================================
     # 最终筛选: 所有处理完成后再统一判断 (用最终的边界和静音结构)
@@ -4877,6 +5052,11 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             nf_bgm = float(np.partition(all_rms, k)[k]) if len(all_rms) > 0 else 1e-6
             nf_bgm = max(nf_bgm, 1e-6)
             bgm_threshold = max(nf_bgm * args.bgm_noise_floor_ratio, 0.005)
+            # Hard ceiling: when the 60th-percentile "noise floor" is
+            # poisoned by loud content in silence regions, the threshold
+            # must not exceed a value that clearly indicates non-silence.
+            # Regression Case 25 follow-up.
+            bgm_threshold = min(bgm_threshold, args.bgm_max_threshold)
             speech_energies = []
             suspect_intervals = []
             total_sil_dur = 0.0
@@ -4890,14 +5070,42 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                     continue
                 if iv.xmax - iv.xmin < args.bgm_min_sil_dur:
                     continue
-                sil_energy = _word_rms(wav_audio, wav_sr, iv.xmin, iv.xmax)
                 total_sil_dur += iv.xmax - iv.xmin
-                if sil_energy > bgm_threshold:
+                # ── Frame-level energy check within silence interval ──
+                # _word_rms() averages over the entire interval, which can
+                # hide short bursts of loud content inside long silences.
+                # Instead, scan 50ms frames and flag intervals where a
+                # significant fraction of frames exceed the threshold.
+                # Regression Case 25 follow-up.
+                _frame_ms = 50.0
+                _frame_samp = max(1, int(_frame_ms / 1000.0 * wav_sr))
+                _s0 = int(iv.xmin * wav_sr)
+                _s1 = int(iv.xmax * wav_sr)
+                _n_frames = max(0, (_s1 - _s0 - _frame_samp) // max(1, _frame_samp // 2) + 1)
+                if _n_frames <= 0:
+                    _n_frames = 1
+                _high_frames = 0
+                _max_frame_e = 0.0
+                _hop = max(1, _frame_samp // 2)
+                for _fi in range(_n_frames):
+                    _fs = _s0 + _fi * _hop
+                    _fe = min(_fs + _frame_samp, _s1)
+                    if _fe <= _fs:
+                        continue
+                    _fe_val = float(np.mean(np.abs(wav_audio[_fs:_fe])))
+                    _max_frame_e = max(_max_frame_e, _fe_val)
+                    if _fe_val > bgm_threshold:
+                        _high_frames += 1
+                _high_ratio = _high_frames / max(_n_frames, 1)
+                # Flag if >= 20% of frames are above threshold (sustained
+                # high energy, not just a transient click)
+                if _high_ratio >= 0.20:
                     suspect_intervals.append({"xmin": round(iv.xmin, 3), "xmax": round(iv.xmax, 3),
                                               "duration": round(iv.xmax - iv.xmin, 3),
-                                              "energy": round(sil_energy, 6),
+                                              "energy": round(_max_frame_e, 6),
+                                              "high_ratio": round(_high_ratio, 3),
                                               "noise_floor": round(nf_bgm, 6)})
-                    suspect_dur += iv.xmax - iv.xmin
+                    suspect_dur += (iv.xmax - iv.xmin) * _high_ratio
             if suspect_intervals:
                 avg_speech = sum(speech_energies) / len(speech_energies) if speech_energies else 0
                 suspect_ratio = suspect_dur / total_sil_dur if total_sil_dur > 0 else 0
@@ -5178,6 +5386,10 @@ def main():
                         help="Silence energy > avg_speech * N triggers suspect (1.0 = at speech level).")
     parser.add_argument("--bgm-min-energy", type=float, default=0.01,
                         help="Absolute minimum RMS to trigger (filters out breathing/noise floor).")
+    parser.add_argument("--bgm-max-threshold", type=float, default=0.05,
+                        help="Hard ceiling on bgm_threshold. When 60th-percentile noise floor is "
+                             "contaminated by loud content, the threshold is capped here so "
+                             "abnormal silences are still detected.")
     parser.add_argument("--filter-suspicious", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--filter-long-word-sec", type=float, default=1.0)
     parser.add_argument("--filter-flank-silence-sec", type=float, default=0.4)

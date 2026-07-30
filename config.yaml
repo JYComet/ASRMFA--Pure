@@ -77,9 +77,9 @@
 #   max_gap_merge_s: 0.35   # max gap between consecutive English words to merge
 #   beam: 10                # MFA Viterbi beam width
 #   retry_beam: 40          # MFA retry beam width
-#   acoustic_model: pretrained_models/acoustic/english_us_arpa.zip
+#   acoustic_model: pretrained_models/acoustic/english_us_arpa.zip  # relative to PROJECT_ROOT; fallback to PROJECT_ROOT.parent
 #   dictionary: dict/cmudict.dict
-#   g2p_model: pretrained_models/g2p/english_us_arpa.zip
+#   g2p_model: pretrained_models/g2p/english_us_arpa.zip  # relative to PROJECT_ROOT; fallback to PROJECT_ROOT.parent
 
 # ── 后处理 ──────────────────────────────────────────────────────────────
 # postprocess:
@@ -94,6 +94,7 @@
 #   bgm_min_sil_dur: 0.3
 #   bgm_speech_ratio: 1.0
 #   bgm_min_energy: 0.01
+#   bgm_max_threshold: 0.05
 #   filter_suspicious: true
 #   filter_short_phone_sec: 0.015
 #   filter_long_word_sec: 1.0
