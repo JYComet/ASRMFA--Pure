@@ -85,9 +85,9 @@ class TextGrid:
 # ---------------------------------------------------------------------------
 
 _NVV_PATTERN = re.compile(
-    r"(?<![A-Za-z-])("
+    r"(?<![A-Za-z<>-])("
     + "|".join(re.escape(name) for name in sorted(NVV_NAMES, key=len, reverse=True))
-    + r")(?![A-Za-z-])",
+    + r")(?![A-Za-z<>-])",
     re.IGNORECASE
 )
 

@@ -320,6 +320,7 @@ scripts/streaming_pipeline.py    — 流式批处理（NAS→本地SSD→回传�
 | AW | `postprocess_textgrids.py` ~4819-4888 | **Case 25-F**: 末尾标点强制保留：从前词截取 ≥60ms（弹性取 max(60ms, CTC原始时长)），同步 words/hanzi/pinyin_phones |
 | AX | `postprocess_textgrids.py` ~3028-3051 | **Case 25-G**: `_refine_boundaries_by_energy` 标点边界保护：标点起点与词尾重叠 <100ms 且主体在词尾之后 → 阻止 dead silence 延伸 |
 | AY | `run_pipeline.py` ~1049-1059, `align_english_mfa.py` ~382-393 | **Case 25-H**: 英文 MFA 词典/G2P 路径修复：pretrained_models fallback 到 PROJECT_ROOT.parent + G2P 失败时写 base dict 兜底 |
+| AZ | `postprocess_textgrids.py` ~87-91 | **Case 25-I**: `_NVV_PATTERN` lookbehind/ahead 加 `<>` 排斥，防已包裹 NVV token 被 `_finalise_textgrid` 再次包裹 → pinyin_phones 出现 `<<TOKEN>>` |
 
 ---
 
@@ -2732,6 +2733,24 @@ if not g2p_output.exists():
 ```
 
 **验证结果**: man 音素从三等分变为真实英文 MFA 对齐 `M:17% AE1:72% N:12%`。
+
+### 补充修改 (同日): `_NVV_PATTERN` 重复包裹 `<>`
+
+**触发样本**: `直播回放_三周年纪念活动进行中_2025年12月07日19点场_7bd7ea1c_clip0007_clip0013`（pinyin_phones tier 中 `<CONFIRMATION-EN>` 变成 `<<CONFIRMATION-EN>>`）
+
+**Bug I — `_NVV_PATTERN` 匹配已包裹的 NVV token**:
+
+`_NVV_PATTERN` 的 lookbehind `(?<![A-Za-z-])` 和 lookahead `(?![A-Za-z-])` 不排斥 `<>`。`_finalise_textgrid` L142 用 `.sub()` 包裹未包裹的 NVV 时，已包裹的 `<CONFIRMATION-EN>` 被再次匹配 → `<<CONFIRMATION-EN>>`。
+
+words/hanzi tier 不受影响（只在 `_finalise_textgrid` 中包裹一次），但 pinyin_phones tier 在 `build_pinyin_phones_tier` 和后续 `_sync_derived_tiers` 之间被多次调用 `.sub()`，造成累积。
+
+修复：lookbehind 和 lookahead 均加入 `<>` 排斥：
+```python
+# 旧: (?<![A-Za-z-]) ... (?![A-Za-z-])
+# 新: (?<![A-Za-z<>-]) ... (?![A-Za-z<>-])
+```
+
+已包裹的 token 不再被匹配，未包裹的仍正常包裹。`build_pinyin_phones_tier` 的 `strip('<>')` 负责修复已有双重包裹数据。
 
 
 ## 模板 (新 Case 用)
