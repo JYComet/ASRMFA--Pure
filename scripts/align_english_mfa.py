@@ -414,7 +414,8 @@ def build_en_dict(en_segments: dict[str, list[dict]],
 def run_en_mfa(corpus_dir: Path, dict_path: Path, acoustic_model: str,
                output_dir: Path, temp_dir: Path, mfa_python: Path,
                models_dir: Path, num_jobs: int = 4,
-               beam: int = 10, retry_beam: int = 40) -> bool:
+               beam: int = 10, retry_beam: int = 40,
+               fine_tune: bool = False) -> bool:
     """Run MFA align with English models. Returns True on success."""
     output_dir.mkdir(parents=True, exist_ok=True)
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -436,6 +437,7 @@ def run_en_mfa(corpus_dir: Path, dict_path: Path, acoustic_model: str,
         "--no_tokenization",
         "--beam", str(beam),
         "--retry_beam", str(retry_beam),
+        "--fine_tune", str(fine_tune).lower(),
         "--clean",
         "--overwrite",
     ]
@@ -700,6 +702,9 @@ def main():
                         help="MFA Viterbi beam width for English alignment")
     parser.add_argument("--retry-beam", type=int, default=40,
                         help="MFA retry beam width for English alignment")
+    parser.add_argument("--fine-tune", type=str, default="false",
+                        choices=["true", "false"],
+                        help="Enable MFA fine-tuning pass (default: false)")
     parser.add_argument("--python", type=str, default=None,
                         help="Python interpreter with MFA installed")
     args = parser.parse_args()
@@ -797,6 +802,7 @@ def main():
         en_aligned_dir, temp_dir / "en_mfa_work",
         mfa_python, models_dir, args.num_jobs,
         beam=args.beam, retry_beam=args.retry_beam,
+        fine_tune=(args.fine_tune == "true"),
     )
 
     if not success:

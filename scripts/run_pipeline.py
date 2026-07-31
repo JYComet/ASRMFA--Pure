@@ -223,6 +223,7 @@ DEFAULT_CFG: dict = {
         "acoustic_model": "pretrained_models/acoustic/english_us_arpa.zip",
         "dictionary": "dict/cmudict.dict",
         "g2p_model": "pretrained_models/g2p/english_us_arpa.zip",
+        "fine_tune": False,
     },
     "postprocess": {
         "merge_silence": True,
@@ -1024,8 +1025,10 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     # energy analysis; MFA fine_tune floats boundaries toward its acoustic
     # model (trained on clean speech) and degrades alignment on NVV, BGM,
     # English tokens, and short function words.  See Regression Case 16.
-    if mc.get("fine_tune", False):
-        mfa_args.append("--fine_tune")
+    # NOTE: MFA 3.x defaults to fine_tune=True — we must always pass the flag
+    # to actually disable it.  mc.get("fine_tune", False) without the flag
+    # would have no effect.
+    mfa_args += ["--fine_tune", str(mc.get("fine_tune", False)).lower()]
     fine_tune_tolerance = mc.get("fine_tune_boundary_tolerance", 0.02)
     if fine_tune_tolerance is not None and fine_tune_tolerance > 0:
         mfa_args += ["--fine_tune_boundary_tolerance", str(fine_tune_tolerance)]
@@ -1092,6 +1095,7 @@ def step_mfa_align_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         "--max-gap-merge-s", str(en_cfg.get("max_gap_merge_s", 0.35)),
         "--beam", str(en_cfg.get("beam", 10)),
         "--retry-beam", str(en_cfg.get("retry_beam", 40)),
+        "--fine-tune", str(en_cfg.get("fine_tune", False)).lower(),
     ]
     if args.python:
         align_en_args += ["--python", str(mfa_python)]

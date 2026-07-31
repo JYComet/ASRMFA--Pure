@@ -1,0 +1,42 @@
+# Test: 纱依 — 10 stems from shayi_huali_wav
+mode: full
+workspace: test_shayi10
+
+data_dir: data_dir/test_shayi10
+
+# Use local temp to avoid CIFS SQLite locking
+temp_dir: /tmp/test_shayi10_temp
+
+# NVASR CTC pre-alignment (ASR transcription, no TXT needed)
+ctc_prealign:
+  enabled: true
+  python: /home/user/miniconda3/envs/asr/bin/python
+  model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
+  device: cuda:0
+
+# Trim silence
+trim:
+  workers: 4
+
+# MFA alignment
+mfa:
+  num_jobs: 4
+  single_speaker: true
+  clean: false
+  fine_tune: false
+  skip_validate: true
+
+# English MFA
+mfa_en:
+  enabled: true
+  num_jobs: 2
+  beam: 10
+  retry_beam: 40
+
+# Postprocessing
+postprocess:
+  filter_suspicious: true
+  enable_text_correction: true
+  handle_unexpected_sil: true
+  detect_bgm: false
+  workers: 4

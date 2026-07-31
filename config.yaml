@@ -77,6 +77,7 @@
 #   max_gap_merge_s: 0.35   # max gap between consecutive English words to merge
 #   beam: 10                # MFA Viterbi beam width
 #   retry_beam: 40          # MFA retry beam width
+#   fine_tune: false        # skip MFA fine-tuning pass (saves ~30% time)
 #   acoustic_model: pretrained_models/acoustic/english_us_arpa.zip  # relative to PROJECT_ROOT; fallback to PROJECT_ROOT.parent
 #   dictionary: dict/cmudict.dict
 #   g2p_model: pretrained_models/g2p/english_us_arpa.zip  # relative to PROJECT_ROOT; fallback to PROJECT_ROOT.parent
