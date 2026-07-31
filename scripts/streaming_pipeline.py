@@ -1962,15 +1962,18 @@ def run_pipelined_batch(args) -> None:
                         failed_set.add(ds_name)
                         _save_checkpoint(ckpt_path, completed_set, failed_set)
 
+    _CPU_SENTINEL = object()  # signals CPU worker to exit
+
     # ── CPU worker ──
     def cpu_worker(wid: int) -> tuple[int, list[str]]:
         w_ok = 0
         w_fails: list[str] = []
         while True:
-            try:
-                ds, batch_idx, batch_stems, local_base = cpu_queue.get(timeout=5)
-            except _queue.Empty:
+            item = cpu_queue.get()  # block until GPU produces or sentinel
+            if item is _CPU_SENTINEL:
+                cpu_queue.put(_CPU_SENTINEL)  # pass to next CPU worker
                 break
+            ds, batch_idx, batch_stems, local_base = item
             ds_name = ds["name"]
             nas_output = nas_output_root / ds_name
             remaining = cpu_queue.qsize()
@@ -2013,8 +2016,8 @@ def run_pipelined_batch(args) -> None:
         for fut in concurrent.futures.as_completed(gpu_futures):
             fut.result()  # propagate exceptions
 
-        # Signal CPU workers: all GPU work done, they'll drain cpu_queue
-        # (they'll exit when cpu_queue is empty and gpu_futures are done)
+        # Signal CPU workers: put sentinel in queue (one propagates to all)
+        cpu_queue.put(_CPU_SENTINEL)
 
         for fut in concurrent.futures.as_completed(cpu_futures):
             w_ok, w_fails = fut.result()
