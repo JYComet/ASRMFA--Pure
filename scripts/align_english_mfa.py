@@ -372,10 +372,14 @@ def build_en_dict(en_segments: dict[str, list[dict]],
 
     print(f"  Running G2P for {len(oov_words)} OOV English words...")
     try:
+        # Use local temp dir — SQLite on CIFS/SMB fails with "database is locked"
+        g2p_temp = temp_dir / "g2p_work"
+        g2p_temp.mkdir(parents=True, exist_ok=True)
         rc = subprocess.run(
             [str(mfa_python), "-m", "montreal_forced_aligner.command_line.mfa",
              "g2p", str(oov_file), g2p_model_path, str(g2p_output),
-             "--num_pronunciations", "1", "--clean"],
+             "--num_pronunciations", "1", "--clean",
+             "--temporary_directory", str(g2p_temp)],
             env=get_mfa_env(mfa_python, models_dir),
             timeout=300, capture_output=True, text=True,
         )
