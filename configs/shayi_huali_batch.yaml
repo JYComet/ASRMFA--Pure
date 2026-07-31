@@ -20,6 +20,10 @@ streaming:
   parallel: 8
   num_gpus: 8
 
+# ── Pipelined mode (GPU/CPU 流水线分离) ──
+pipelined:
+  cpu_workers: 48           # CPU MFA workers (可配, 0=auto)
+
 # ── NVASR CTC 预对齐 ──
 ctc_prealign:
   enabled: true

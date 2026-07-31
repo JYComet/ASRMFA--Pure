@@ -868,6 +868,12 @@ Examples:
     parser.add_argument("--mfa-jobs", type=int, default=None,
                         help="MFA num_jobs per worker (default: auto = min(4, cpu_count() // parallel)). "
                              "Set > 1 to utilize multi-core per batch. Requires pre-extracted model.")
+    parser.add_argument("--pipelined", action="store_true",
+                        help="Enable pipelined GPU/CPU mode: NVASR and MFA run in parallel stages. "
+                             "GPU workers process prealign, CPU workers process MFA alignment. "
+                             "Keeps all GPUs busy while all CPU cores run MFA simultaneously.")
+    parser.add_argument("--cpu-workers", type=int, default=0,
+                        help="Number of CPU workers in pipelined mode (default: auto = cpu_count // 8).")
 
     # ── Pipeline config ──
     parser.add_argument("--config", type=Path,
@@ -1264,6 +1270,10 @@ def run_batch(args) -> None:
     models_dir = PROJECT_ROOT / "models" / "mfa"
     print(f"MFA Python: {mfa_python}")
 
+    if args.pipelined:
+        run_pipelined_batch(args)
+        return
+
     if parallel <= 1:
         _run_batch_sequential(args, datasets, cache, ckpt_path, completed_set, failed_set)
         return
@@ -1610,6 +1620,409 @@ def _run_batch_sequential(args, datasets: list, cache: dict,
 
     print(f"\n{'#'*60}")
     print(f"  BATCH COMPLETE: {ok_count}/{len(datasets)} OK")
+    if fail_list:
+        print(f"  Failed: {', '.join(fail_list)}")
+    print(f"{'#'*60}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Pipelined mode — GPU (NVASR) and CPU (MFA) in parallel stages
+# ═══════════════════════════════════════════════════════════════
+
+def _run_gpu_phase(
+    ds: dict, batch_idx: int, batch_stems: list[str],
+    layout_map: dict, wav_index: dict, text_index: dict[str, Path] | None,
+    local_base: Path, config: Path,
+    mfa_python: Path, models_dir: Path,
+    batch_size: int, python_path: str | None,
+    device: str,
+) -> bool:
+    """GPU phase: prefetch WAVs + NVASR prealign + normalize -> CTC output.
+
+    Leaves the local workspace intact for the CPU phase to pick up.
+    Returns True on success.
+    """
+    import concurrent.futures as _cf
+
+    local_dir = local_base / f"batch_{batch_idx:04d}"
+    local_audio = local_dir / "audio"
+    local_ctc = local_dir / "ctc"
+    local_workspace = local_dir / "workspace"
+
+    # ── Prefetch audio files ──
+    local_audio.mkdir(parents=True, exist_ok=True)
+    local_ctc.mkdir(parents=True, exist_ok=True)
+    copy_tasks: list[tuple[Path, Path]] = []
+    for stem in batch_stems:
+        src_wav = wav_index.get(stem) or find_wav(resolve_input_path(ds.get("audio_dir", "")), stem)
+        if src_wav:
+            copy_tasks.append((src_wav, local_audio / f"{stem}.wav"))
+        # Copy .txt if available (for reference text in NVASR)
+        if text_index and stem in text_index:
+            copy_tasks.append((text_index[stem], local_audio / f"{stem}.txt"))
+
+    n_workers = min(8, max(1, len(copy_tasks) // 100))
+    with _cf.ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = [pool.submit(link_or_copy_file, s, d) for s, d in copy_tasks]
+        for f in _cf.as_completed(futures):
+            try: f.result()
+            except Exception: pass
+
+    # ── Run NVASR prealign + normalize (GPU-intensive) ──
+    cmd = [
+        str(mfa_python),
+        str(PROJECT_ROOT / "scripts" / "run_pipeline.py"),
+        "--config", str(config),
+        "--mode", "nvrasr_fallback",
+        "--data-dir", str(local_audio),
+        "--workspace", str(local_workspace),
+        "--python", str(mfa_python),
+        "--stop-after", "normalize_en",
+        "--overwrite", "--force",
+    ]
+    if device:
+        cmd += ["--device", "cuda:0"]  # CUDA_VISIBLE_DEVICES remaps this
+    env = get_mfa_env(mfa_python, models_dir)
+    if device:
+        gpu_idx = device.replace("cuda:", "")
+        if gpu_idx.isdigit():
+            env["CUDA_VISIBLE_DEVICES"] = gpu_idx
+
+    try:
+        rc = subprocess.run(cmd, env=env, timeout=7200, capture_output=False).returncode
+    except subprocess.TimeoutExpired:
+        rc = 1
+
+    if rc != 0:
+        shutil.rmtree(local_dir, ignore_errors=True)
+        return False
+
+    # Persist CTC output to NAS for caching (adjust_ctc output especially)
+    _persist_ctc_adj_cache(local_workspace,
+                           resolve_input_path(ds.get("ctc_dir", "")))
+    return True
+
+
+def _run_cpu_phase(
+    ds: dict, batch_idx: int, batch_stems: list[str],
+    local_base: Path, config: Path,
+    mfa_python: Path, models_dir: Path,
+    nas_output: Path,
+    batch_size: int, python_path: str | None,
+) -> bool:
+    """CPU phase: read CTC from local workspace + run MFA align + postprocess.
+
+    The local workspace must already contain CTC output from the GPU phase.
+    Uploads final output to NAS and cleans up the local directory.
+    """
+    local_dir = local_base / f"batch_{batch_idx:04d}"
+    local_ctc = local_dir / "ctc"
+    local_workspace = local_dir / "workspace"
+    local_output = local_dir / "output"
+
+    # ── Prepare CTC manifest for ctc_ready mode ──
+    manifest = {"stems": batch_stems, "n_stems": len(batch_stems)}
+    local_ctc.mkdir(parents=True, exist_ok=True)
+    (local_ctc / "ctc_ready_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False))
+
+    # ── Restore cached adjust output if available ──
+    _restore_ctc_adj_cache(local_workspace, nas_output)
+
+    # ── Run MFA alignment + postprocess (CPU-intensive) ──
+    cmd = [
+        str(mfa_python),
+        str(PROJECT_ROOT / "scripts" / "run_pipeline.py"),
+        "--config", str(config),
+        "--mode", "ctc_ready",
+        "--ctc-ready", str(local_ctc),
+        "--data-dir", str(local_workspace / "audio"),
+        "--output-dir", str(local_output),
+        "--workspace", str(local_workspace),
+        "--python", str(mfa_python),
+        "--overwrite", "--force",
+    ]
+    env = get_mfa_env(mfa_python, models_dir)
+    try:
+        rc = subprocess.run(cmd, env=env, timeout=7200, capture_output=False).returncode
+    except subprocess.TimeoutExpired:
+        rc = 1
+
+    if rc != 0:
+        # Preserve CTC cache even on failure
+        _persist_ctc_adj_cache(local_workspace, nas_output)
+        shutil.rmtree(local_dir, ignore_errors=True)
+        return False
+
+    # ── Upload results to NAS ──
+    for local_src, nas_rel in [
+        (local_output, nas_output / "output"),
+        (local_workspace / "filtered", nas_output / "filtered"),
+        (local_workspace / "ctc_pretg_adj", nas_output / "ctc_pretg_adj"),
+    ]:
+        if not local_src.exists() or not any(local_src.iterdir()):
+            continue
+        nas_rel.mkdir(parents=True, exist_ok=True)
+        rsync = shutil.which("rsync")
+        if rsync:
+            subprocess.run([rsync, "-a", str(local_src) + "/", str(nas_rel) + "/"],
+                           capture_output=True, text=True, timeout=600)
+        else:
+            for f in local_src.rglob("*"):
+                if f.is_file():
+                    rel = f.relative_to(local_src)
+                    tgt = nas_rel / rel
+                    tgt.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(f), str(tgt))
+
+    # Cleanup
+    shutil.rmtree(local_dir, ignore_errors=True)
+    return True
+
+
+def run_pipelined_batch(args) -> None:
+    """Pipelined GPU/CPU mode: NVASR and MFA run in parallel stages.
+
+    GPU workers:  prefetch WAVs → NVASR prealign + normalize → CTC output
+    CPU workers:  read CTC → MFA align + postprocess → upload to NAS
+
+    Batches flow through two queues — GPU workers consume from gpu_queue
+    and produce to cpu_queue, while CPU workers consume from cpu_queue.
+    This keeps all 8 GPUs busy with NVASR while all CPU cores run MFA,
+    without either resource waiting for the other.
+    """
+    import concurrent.futures
+    import queue as _queue
+
+    cache_path = args.batch_cache
+    if not cache_path.exists():
+        print(f"ERROR: Batch cache not found: {cache_path}")
+        sys.exit(1)
+
+    with open(cache_path, 'r', encoding='utf-8') as f:
+        cache = json.load(f)
+
+    all_datasets = cache.get("datasets", [])
+    if not all_datasets:
+        print("ERROR: No datasets in cache!")
+        sys.exit(1)
+
+    # ── Config ──
+    _cfg = getattr(args, '_config', {})
+    pipeline_cfg = _cfg.get("pipelined", {}) if _cfg else {}
+    n_gpu_workers = args.gpus  # 1 GPU per GPU worker
+    n_cpu_workers = args.parallel_datasets or pipeline_cfg.get("cpu_workers", 0)
+    if n_cpu_workers <= 0:
+        cpu_count = os.cpu_count() or 32
+        n_cpu_workers = max(2, cpu_count // 8)  # e.g. 48 on 384-core
+
+    # ── Resume ──
+    ckpt_path = cache_path.with_name(cache_path.stem + ".checkpoint.json")
+    completed_set = _load_checkpoint(ckpt_path)
+    failed_set: set[str] = set()
+
+    # ── Resolve drives ──
+    _drives = getattr(args, '_local_work_drives', (args.local_work,))
+    usable_drives = list(_drives)
+
+    # ── MFA Python ──
+    if args.python:
+        mfa_python = Path(args.python)
+    else:
+        mfa_python = find_mfa_python()
+    models_dir = PROJECT_ROOT / "models" / "mfa"
+    _ensure_mfa_model_extracted()
+
+    # ── Pre-scan datasets → build all batches ──
+    print(f"\n  Pre-scanning {len(all_datasets)} datasets ...")
+    all_gpu_batches: list[tuple] = []  # (ds, batch_idx, batch_stems, layout_map, wav_index, text_index)
+    for ds in all_datasets:
+        ds_name = ds["name"]
+        if ds_name in completed_set:
+            continue
+        nas_ctc = resolve_input_path(ds.get("ctc_dir", ""))
+        nas_audio = resolve_input_path(ds.get("audio_dir", ""))
+        if not nas_audio.exists():
+            print(f"  SKIP {ds_name}: audio dir not found")
+            continue
+        if not nas_ctc.exists():
+            nas_ctc.mkdir(parents=True, exist_ok=True)
+
+        # Discover stems — honour explicit stems override (test/limit mode)
+        if "stems" in ds:
+            all_stems = list(ds["stems"])
+            layout_map = {s: "flat" for s in all_stems}
+            wav_index = {}
+            for s in all_stems:
+                w = find_wav(nas_audio, s)
+                if w:
+                    wav_index[s] = w
+            all_stems = [s for s in all_stems if s in wav_index]
+            print(f"  {ds_name}: {len(all_stems)} stems (from override)")
+        else:
+            _ctc_flat, _ctc_nested = build_ctc_presence(nas_ctc)
+            if _ctc_flat or _ctc_nested:
+                complete_stems, incomplete_stems, layout_map, wav_index = \
+                    discover_stems_separated(nas_ctc, nas_audio, require_all=True)
+                all_stems = complete_stems + incomplete_stems
+            else:
+                # Raw audio: discover all WAVs
+                all_stems = []
+                layout_map = {}
+                wav_index = {}
+                for entry in sorted(os.scandir(str(nas_audio)), key=lambda e: e.name):
+                    if entry.is_file() and entry.name.endswith(".wav"):
+                        s = entry.name[:-4]
+                        wav_index[s] = Path(entry.path)
+                        all_stems.append(s)
+                        layout_map[s] = "flat"
+                print(f"  {ds_name}: {len(all_stems)} stems (raw → all need GPU phase)")
+
+        # Apply limit
+        if args.limit > 0 and args.limit < len(all_stems):
+            all_stems = all_stems[:args.limit]
+            print(f"  {ds_name}: limited to {len(all_stems)} stems")
+
+        # Build text_index for reference text (optional)
+        text_index: dict[str, Path] = {}
+        for s in all_stems:
+            txt = nas_audio / f"{s}.txt"
+            if txt.exists():
+                text_index[s] = txt
+
+        # Split into batches
+        bs = args.batch_size
+        for bi in range(0, len(all_stems), bs):
+            batch_stems = all_stems[bi:bi + bs]
+            all_gpu_batches.append((ds, len(all_gpu_batches), batch_stems,
+                                     layout_map, wav_index, text_index))
+
+    if not all_gpu_batches:
+        print("No batches to process!")
+        return
+
+    total_batches = len(all_gpu_batches)
+    print(f"\n  Pipelined mode: {n_gpu_workers} GPU workers, {n_cpu_workers} CPU workers")
+    print(f"  Total batches: {total_batches}")
+    print(f"{'#'*60}")
+
+    # ── Queues ──
+    gpu_queue: _queue.Queue = _queue.Queue()
+    cpu_queue: _queue.Queue = _queue.Queue()
+    for item in all_gpu_batches:
+        gpu_queue.put(item)
+
+    # ── Tracking ──
+    ok_count = 0
+    fail_list: list[str] = []
+    ckpt_lock = threading.Lock()
+    ds_tracker: dict[str, dict] = {}  # {ds_name: {total, done, fail}}
+    for ds_item in all_gpu_batches:
+        ds_name = ds_item[0]["name"]
+        if ds_name not in ds_tracker:
+            ds_tracker[ds_name] = {"total": 0, "done": 0, "fail": 0}
+        ds_tracker[ds_name]["total"] += 1
+
+    nas_output_root = resolve_input_path(
+        cache.get("output_root", "").rstrip("/"), PROJECT_ROOT)
+
+    # ── GPU worker ──
+    def gpu_worker(wid: int) -> None:
+        drive = usable_drives[wid % len(usable_drives)]
+        local_base = drive / f"gpu_{wid}"
+        gpu_id = wid % n_gpu_workers
+        device_str = f"cuda:{gpu_id}"
+        while True:
+            try:
+                ds, batch_idx, batch_stems, layout_map, wav_index, text_index = \
+                    gpu_queue.get_nowait()
+            except _queue.Empty:
+                break
+            ds_name = ds["name"]
+            remaining = gpu_queue.qsize()
+            print(f"\n  [GPU{device_str}] [{total_batches - remaining}/{total_batches}]"
+                  f" {ds_name}/{batch_idx:04d} ({len(batch_stems)} stems)")
+
+            ok = _run_gpu_phase(
+                ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
+                layout_map=layout_map, wav_index=wav_index, text_index=text_index,
+                local_base=local_base, config=args.config,
+                mfa_python=mfa_python, models_dir=models_dir,
+                batch_size=args.batch_size, python_path=args.python,
+                device=device_str,
+            )
+            if ok:
+                cpu_queue.put((ds, batch_idx, batch_stems, local_base))
+                print(f"  [GPU{device_str}] {ds_name}/{batch_idx:04d} → CPU queue")
+            else:
+                with ckpt_lock:
+                    tracker = ds_tracker[ds_name]
+                    tracker["fail"] += 1
+                    if tracker["done"] + tracker["fail"] >= tracker["total"]:
+                        failed_set.add(ds_name)
+                        _save_checkpoint(ckpt_path, completed_set, failed_set)
+
+    # ── CPU worker ──
+    def cpu_worker(wid: int) -> tuple[int, list[str]]:
+        w_ok = 0
+        w_fails: list[str] = []
+        while True:
+            try:
+                ds, batch_idx, batch_stems, local_base = cpu_queue.get(timeout=5)
+            except _queue.Empty:
+                break
+            ds_name = ds["name"]
+            nas_output = nas_output_root / ds_name
+            remaining = cpu_queue.qsize()
+            print(f"\n  [CPU{ wid}] [q:{remaining}]"
+                  f" {ds_name}/{batch_idx:04d} ({len(batch_stems)} stems)")
+
+            ok = _run_cpu_phase(
+                ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
+                local_base=local_base, config=args.config,
+                mfa_python=mfa_python, models_dir=models_dir,
+                nas_output=nas_output,
+                batch_size=args.batch_size, python_path=args.python,
+            )
+            with ckpt_lock:
+                tracker = ds_tracker[ds_name]
+                if ok:
+                    tracker["done"] += 1
+                else:
+                    tracker["fail"] += 1
+                if tracker["done"] + tracker["fail"] >= tracker["total"]:
+                    if tracker["fail"] == 0:
+                        w_ok += 1
+                        completed_set.add(ds_name)
+                    else:
+                        w_fails.append(ds_name)
+                        failed_set.add(ds_name)
+                    _save_checkpoint(ckpt_path, completed_set, failed_set)
+                    status = "DONE" if tracker["fail"] == 0 else "FAIL"
+                    print(f"  [CPU{wid}] {ds_name} — {status} "
+                          f"({tracker['done']}/{tracker['total']} batches)")
+        return w_ok, w_fails
+
+    # ── Launch both pools ──
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_gpu_workers) as gpu_pool, \
+         concurrent.futures.ThreadPoolExecutor(max_workers=n_cpu_workers) as cpu_pool:
+        gpu_futures = [gpu_pool.submit(gpu_worker, wid) for wid in range(n_gpu_workers)]
+        cpu_futures = [cpu_pool.submit(cpu_worker, wid) for wid in range(n_cpu_workers)]
+
+        # Wait for GPU workers to finish producing
+        for fut in concurrent.futures.as_completed(gpu_futures):
+            fut.result()  # propagate exceptions
+
+        # Signal CPU workers: all GPU work done, they'll drain cpu_queue
+        # (they'll exit when cpu_queue is empty and gpu_futures are done)
+
+        for fut in concurrent.futures.as_completed(cpu_futures):
+            w_ok, w_fails = fut.result()
+            ok_count += w_ok
+            fail_list.extend(w_fails)
+
+    print(f"\n{'#'*60}")
+    print(f"  PIPELINED BATCH COMPLETE: {ok_count}/{len(all_datasets)} OK")
     if fail_list:
         print(f"  Failed: {', '.join(fail_list)}")
     print(f"{'#'*60}")

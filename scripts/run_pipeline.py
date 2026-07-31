@@ -191,6 +191,7 @@ DEFAULT_CFG: dict = {
         "target_edge_silence_sec": 0.5,
         "silence_threshold": 0.001,
         "frame_length": 1024,
+        "output_audio": False,        # write padded WAVs to output/ (default off)
     },
     "prepare": {"copy_wav": False, "keep_punctuation": True},
     "ctc_prealign": {
@@ -1629,15 +1630,17 @@ def step_pad_silence(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
 
     ctc_dir = ctx["ctc_pretg"]
     padded_audio_dir = ctx["workspace"] / "padded_audio"
-    output_audio_dir = ctx["output_dir"] / "padded_audio"
 
     pad_args = [
         "--ctc-dir", str(ctc_dir),
         "--audio-dir", str(ctx["audio_dir"]),
         "--padded-audio-dir", str(padded_audio_dir),
-        "--output-audio-dir", str(output_audio_dir),
         "--target-silence-sec", str(target_silence_sec),
     ]
+    # Optional: also write padded audio to output dir (default off)
+    if pc.get("output_audio", False):
+        output_audio_dir = ctx["output_dir"] / "padded_audio"
+        pad_args += ["--output-audio-dir", str(output_audio_dir)]
 
     # Pass pre-built wav index if available (avoids slow glob on deeply nested CIFS)
     cr = cfg.get("ctc_ready", {})
@@ -1719,6 +1722,9 @@ def main():
                         help="Force re-scan, ignore cache and config setting.")
     parser.add_argument("--scan-only", action="store_true",
                         help="Pre-scan only: discover + validate + write cache, then exit.")
+    parser.add_argument("--stop-after", type=str, default=None, metavar="STEP",
+                        choices=["prealign", "normalize_en", "resample", "adjust", "align", "align_en"],
+                        help="Stop pipeline after completing this step (for pipelined GPU/CPU split).")
     parser.add_argument("--dataset-offset", type=int, default=0,
                         help="Skip first N datasets (for multi-GPU slicing in batch mode).")
     parser.add_argument("--dataset-limit", type=int, default=0,
@@ -2137,6 +2143,9 @@ def main():
                     print(f"    {issue}")
             else:
                 print(f"  [VALIDATE] {step_name} — OK")
+        if args.stop_after and step_name == args.stop_after:
+            print(f"\n  Stopped after '{step_name}' (--stop-after). Pipeline partial complete.")
+            break
 
     # Clean up temporary 16kHz audio (default keep, configurable via keep_16k_audio)
     keep_16k = cfg.get("keep_16k_audio", True)
