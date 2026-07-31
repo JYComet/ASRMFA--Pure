@@ -441,10 +441,11 @@ def run_en_mfa(corpus_dir: Path, dict_path: Path, acoustic_model: str,
         "--no_tokenization",
         "--beam", str(beam),
         "--retry_beam", str(retry_beam),
-        "--fine_tune", str(fine_tune).lower(),
         "--clean",
         "--overwrite",
     ]
+    if fine_tune:
+        mfa_args.append("--fine_tune")
 
     print(f"  Running English MFA align ({len(list(corpus_dir.glob('*.wav')))} segments)...")
     try:
@@ -706,9 +707,8 @@ def main():
                         help="MFA Viterbi beam width for English alignment")
     parser.add_argument("--retry-beam", type=int, default=40,
                         help="MFA retry beam width for English alignment")
-    parser.add_argument("--fine-tune", type=str, default="false",
-                        choices=["true", "false"],
-                        help="Enable MFA fine-tuning pass (default: false)")
+    parser.add_argument("--fine-tune", action="store_true",
+                        help="Enable MFA extra fine-tuning pass (default: disabled)")
     parser.add_argument("--python", type=str, default=None,
                         help="Python interpreter with MFA installed")
     args = parser.parse_args()
@@ -806,7 +806,7 @@ def main():
         en_aligned_dir, temp_dir / "en_mfa_work",
         mfa_python, models_dir, args.num_jobs,
         beam=args.beam, retry_beam=args.retry_beam,
-        fine_tune=(args.fine_tune == "true"),
+        fine_tune=args.fine_tune,
     )
 
     if not success:
