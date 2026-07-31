@@ -1,0 +1,64 @@
+# ─────────────────────────────────────────────────────────────────
+# 纱依 + 花礼 — 批量流式管线 (nvrasr_fallback)
+# ─────────────────────────────────────────────────────────────────
+# 数据源:  //RS3621/Research_TTS/Data/Raw/shayi_huali_wav/{纱依,花礼}
+# 输出:    //RS3621/Research_TTS/Data/Raw/shayi_huali/{纱依,花礼}
+# 音频已补全静音 → 跳过 trim, NVASR 从零生成 CTC
+# 总量:    ~84,788 WAV
+# ─────────────────────────────────────────────────────────────────
+
+mode: nvrasr_fallback
+workspace: shayi_huali
+
+# ── 本地临时目录 (避免 CIFS SQLite 锁) ──
+temp_dir: /tmp/shayi_huali_temp
+
+# ── Streaming (NAS → 本地 → NAS) ──
+streaming:
+  batch_cache: cache/shayi_huali_batch.cache.json
+  batch_size: 500
+  parallel: 8
+  num_gpus: 8
+
+# ── NVASR CTC 预对齐 ──
+ctc_prealign:
+  enabled: true
+  python: /home/user/miniconda3/envs/asr/bin/python
+  model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
+  device: cuda:0
+  limit: 0
+
+# ── MFA 中文对齐 ──
+mfa:
+  num_jobs: 0                 # 0 = cpu_count() (384 核全用)
+  single_speaker: true
+  output_format: long_textgrid
+  clean: false
+  fine_tune: false
+  skip_validate: true
+
+# ── MFA 英文对齐 ──
+mfa_en:
+  enabled: true
+  num_jobs: 4
+  beam: 10
+  retry_beam: 40
+  fine_tune: false
+
+# ── CTC 边界能量修正 ──
+ctc_adjust:
+  enabled: true
+
+# ── 后处理 ──
+postprocess:
+  merge_silence: true
+  min_sil_merge_sec: 0.2
+  fix_short_word: true
+  short_word_max_sec: 0.25
+  flank_silence_sec: 0.4
+  detect_bgm: true
+  filter_suspicious: true
+  filter_min_phone_coverage: 0.35
+  enable_text_correction: true
+  handle_unexpected_sil: true
+  workers: 0                   # 0 = auto

@@ -1017,10 +1017,12 @@ def run_single_dataset(
     nas_audio_dir = resolve_input_path(nas_audio)
     nas_output_root = resolve_input_path(nas_output)
 
-    if not nas_ctc_dir.exists():
-        print(f"ERROR: NAS CTC dir not found: {nas_ctc_dir}")
-        print(f"  (translated from: {nas_ctc})")
-        return False
+    # CTC dir may not pre-exist for nvrasr_fallback mode (raw audio,
+    # no prior NVASR run).  Create it so the pipeline can write CTC output.
+    _has_pre_ctc = nas_ctc_dir.exists()
+    if not _has_pre_ctc:
+        nas_ctc_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  Note: CTC dir created (nvrasr_fallback): {nas_ctc_dir}")
     if not nas_audio_dir.exists():
         print(f"ERROR: NAS audio dir not found: {nas_audio_dir}")
         print(f"  (translated from: {nas_audio})")
@@ -1355,8 +1357,37 @@ def run_batch(args) -> None:
                     info += f", {missing_ctc} incomplete → fallback"
                 print(info)
         else:
-            complete_stems, incomplete_stems, layout_map, wav_index = \
-                discover_stems_separated(nas_ctc, nas_audio, require_all=True)
+            # Check if dataset has ANY pre-existing CTC output
+            _ctc_flat, _ctc_nested = build_ctc_presence(nas_ctc)
+            _has_ctc = bool(_ctc_flat or _ctc_nested)
+            if _has_ctc:
+                complete_stems, incomplete_stems, layout_map, wav_index = \
+                    discover_stems_separated(nas_ctc, nas_audio, require_all=True)
+            else:
+                # Raw audio: no pre-existing CTC at all → discover from WAVs only
+                complete_stems = []
+                incomplete_stems = []
+                layout_map = {}
+                wav_index = {}
+                incomplete_wav_index_nested = {}
+                for entry in os.scandir(str(nas_audio)):
+                    if entry.is_file() and entry.name.endswith(".wav"):
+                        s = entry.name[:-4]
+                        wav_index[s] = Path(entry.path)
+                        incomplete_stems.append(s)
+                        layout_map[s] = "flat"
+                    elif entry.is_dir():
+                        sub_wavs = list(Path(entry.path).glob("*.wav"))
+                        if sub_wavs:
+                            for sw in sub_wavs:
+                                s = sw.stem
+                                incomplete_wav_index_nested[s] = sw
+                                incomplete_stems.append(s)
+                                layout_map[s] = "nested"
+                if incomplete_wav_index_nested:
+                    wav_index.update(incomplete_wav_index_nested)
+                incomplete_stems.sort()
+                print(f"  {ds_name}: {len(incomplete_stems)} stems (raw audio, all → nvrasr_fallback)")
             # Build incomplete wav_index from wav_index (same stems)
             for s in incomplete_stems:
                 if s in wav_index:
