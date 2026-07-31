@@ -1298,9 +1298,12 @@ def run_batch(args) -> None:
         ds_name = ds["name"]
         nas_ctc = resolve_input_path(ds.get("ctc_dir", ""))
         nas_audio = resolve_input_path(ds.get("audio_dir", ""))
-        if not nas_ctc.exists() or not nas_audio.exists():
-            print(f"  SKIP {ds_name}: CTC or audio dir not found")
+        if not nas_audio.exists():
+            print(f"  SKIP {ds_name}: audio dir not found")
             continue
+        # CTC dir may not exist for nvrasr_fallback (raw audio, no prior NVASR run)
+        if not nas_ctc.exists():
+            nas_ctc.mkdir(parents=True, exist_ok=True)
 
         complete_stems: list[str] = []
         incomplete_stems: list[str] = []
