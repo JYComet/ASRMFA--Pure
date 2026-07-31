@@ -129,10 +129,23 @@ def find_mfa_python(cfg_python: str = "") -> Optional[Path]:
     return None
 
 
-def get_mfa_env(mfa_python: Path, models_dir: Path) -> dict[str, str]:
-    """Build environment dict for MFA subprocess calls."""
+def get_mfa_env(mfa_python: Path, models_dir: Path,
+                 blas_num_threads: str = "1") -> dict[str, str]:
+    """Build environment dict for MFA subprocess calls.
+
+    *blas_num_threads* controls BLAS threading per Kaldi worker.
+    Default ``"1"`` prevents oversubscription: with N MFA workers on
+    an M-core machine, each OpenBLAS/MKL call would otherwise spawn
+    M threads internally, creating N×M total threads and catastrophic
+    contention.  Single-threaded BLAS + process-level parallelism
+    (MFA's ``--num_jobs``) gives near-linear scaling.
+    """
     env = os.environ.copy()
     env["MFA_ROOT_DIR"] = str(models_dir)
+    # Pin BLAS threads per worker — critical for multi-core scaling
+    for ev in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+               "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        env[ev] = blas_num_threads
     lib_bin = mfa_python.parent / "Library" / "bin"
     paths = [str(mfa_python.parent)]
     if lib_bin.exists():

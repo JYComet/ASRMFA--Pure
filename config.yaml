@@ -46,9 +46,9 @@
 # ── CTC 预对齐 ──────────────────────────────────────────────────────────
 # ctc_prealign:
 #   enabled: true
-#   model_path: "models/Multilingual-NVASR"
+#   model_path: "/mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR"  # NVASR model (symlink not supported on CIFS)
 #   device: cuda:0
-#   python: ""
+#   python: "/home/user/miniconda3/envs/asr/bin/python"  # Python env with funasr+torch (mfa-dev doesn't have funasr)
 #   limit: 0
 #   timeout: 3600
 

@@ -195,9 +195,9 @@ DEFAULT_CFG: dict = {
     "prepare": {"copy_wav": False, "keep_punctuation": True},
     "ctc_prealign": {
         "enabled": True,
-        "model_path": "models/Multilingual-NVASR",
+        "model_path": "/mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR",
         "device": "cuda:0",
-        "python": "",
+        "python": "/home/user/miniconda3/envs/asr/bin/python",
         "limit": 0,
         "timeout": 3600,
     },
@@ -315,11 +315,21 @@ def resolve_path(base: Path, value: str | None) -> Path | None:
     return p if p.is_absolute() else base / p
 
 
-def resolve_num_jobs(cfg_val: int) -> int:
-    """Resolve *num_jobs* config value (0 = auto -> os.cpu_count())."""
+def resolve_num_jobs(cfg_val: int, n_stems: int = 0) -> int:
+    """Resolve *num_jobs* config value for MFA ``--num_jobs``.
+
+    *  ``0`` or negative → ``os.cpu_count()``
+    *  *n_stems* optional hint: caps at ``n_stems`` (can't parallelize
+       beyond utterances).
+    *  BLAS threading is pinned to 1 per worker by :func:`get_mfa_env`,
+       so ``num_jobs = cpu_count`` → each worker uses 1 BLAS thread →
+       near-linear scaling without oversubscription.
+    """
     if cfg_val <= 0:
         import multiprocessing as mp
         return mp.cpu_count()
+    if n_stems > 0:
+        return min(cfg_val, n_stems)
     return cfg_val
 
 
@@ -614,7 +624,7 @@ def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         "--output-dir", str(ctc_out),
         "--model-path", str(resolve_path(PROJECT_ROOT,
                                         pc.get("model_path", "models/Multilingual-NVASR"))),
-        "--device", pc.get("device", "cuda:0"),
+        "--device", getattr(args, "device", None) or pc.get("device", "cuda:0"),
         "--dict-path", str(ctx["mfa_dict"]),
     ]
     if pc.get("nvv_bias", 0) > 0:
@@ -1685,6 +1695,10 @@ def main():
                         help="Override workspace root (default: <project>/output/<workspace_name>).")
     parser.add_argument("--python", type=str, default=None,
                         help="Override Python path from config.")
+    parser.add_argument("--device", type=str, default=None,
+                        help="GPU device for NVASR CTC pre-alignment (e.g. cuda:0, cuda:1). "
+                             "Overrides ctc_prealign.device in config. "
+                             "Use with streaming --gpus for multi-GPU scheduling.")
     parser.add_argument("--validate", action="store_true",
                         help="Validate output structure after each step (uses output_spec in config).")
     parser.add_argument("--mode", type=str, default=None,
@@ -1698,6 +1712,11 @@ def main():
                         help="Force re-scan, ignore cache and config setting.")
     parser.add_argument("--scan-only", action="store_true",
                         help="Pre-scan only: discover + validate + write cache, then exit.")
+    parser.add_argument("--dataset-offset", type=int, default=0,
+                        help="Skip first N datasets (for multi-GPU slicing in batch mode).")
+    parser.add_argument("--dataset-limit", type=int, default=0,
+                        help="Process at most N datasets (0=all). "
+                             "Use with --dataset-offset for multi-GPU slicing.")
     parser.add_argument("--cache-dir", type=str, default=None,
                         help="Custom cache directory (default: <project>/cache/).")
     args = parser.parse_args()
@@ -1807,8 +1826,17 @@ def main():
             print("ERROR: No datasets found!")
             sys.exit(1)
 
-        # Optional limit for testing
+        # Limit: config > CLI override (0 = all)
         limit = bc.get("limit", 0)
+        if args.dataset_limit > 0:
+            limit = args.dataset_limit
+        # Apply CLI offset first, then limit
+        if args.dataset_offset > 0:
+            if args.dataset_offset >= len(datasets):
+                print(f"ERROR: --dataset-offset={args.dataset_offset} >= {len(datasets)} datasets")
+                sys.exit(1)
+            datasets = datasets[args.dataset_offset:]
+            print(f"  Offset {args.dataset_offset} → {len(datasets)} remaining")
         if limit > 0:
             datasets = datasets[:limit]
             print(f"  Limited to first {limit}")

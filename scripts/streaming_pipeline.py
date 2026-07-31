@@ -110,6 +110,7 @@ def run_single_batch(
     batch_size: int, python_path: str | None = None,
     mode: str = "ctc_ready",
     text_index: dict[str, Path] | None = None,
+    device: str = "",
 ) -> bool:
     """Process a single batch (one set of stems) end-to-end.
 
@@ -215,10 +216,22 @@ def run_single_batch(
         pass
     else:
         cmd += ["--ctc-ready", str(local_ctc)]
+    # GPU device assignment for NVASR CTC pre-alignment
+    if device:
+        # When CUDA_VISIBLE_DEVICES=N is set (below), physical GPU N
+        # appears as device 0 inside the subprocess.  Pass cuda:0 so
+        # the remapped index matches the visible device.
+        cmd += ["--device", "cuda:0"]
     t1 = time.time()
+    env = get_mfa_env(mfa_python, models_dir)
+    if device:
+        # Isolate worker to its assigned GPU only
+        gpu_idx = device.replace("cuda:", "")
+        if gpu_idx.isdigit():
+            env["CUDA_VISIBLE_DEVICES"] = gpu_idx
     try:
         rc = subprocess.run(
-            cmd, env=get_mfa_env(mfa_python, models_dir),
+            cmd, env=env,
             timeout=7200, capture_output=False,
         ).returncode
     except subprocess.TimeoutExpired:
@@ -849,6 +862,12 @@ Examples:
                         help="Limit number of datasets in batch mode (0=all).")
     parser.add_argument("--parallel-datasets", type=int, default=None,
                         help="Number of datasets to process in parallel (default: from config or 1).")
+    parser.add_argument("--gpus", type=int, default=None,
+                        help="Number of GPUs to distribute workers across (default: auto-detect via torch). "
+                             "Each worker is assigned --device cuda:{worker_id %% num_gpus}.")
+    parser.add_argument("--mfa-jobs", type=int, default=None,
+                        help="MFA num_jobs per worker (default: auto = min(4, cpu_count() // parallel)). "
+                             "Set > 1 to utilize multi-core per batch. Requires pre-extracted model.")
 
     # ── Pipeline config ──
     parser.add_argument("--config", type=Path,
@@ -896,6 +915,26 @@ Examples:
     if args.batch_size is None:
         cfg_val = streaming_cfg.get("batch_size", 0)
         args.batch_size = cfg_val if cfg_val > 0 else 500
+
+    # --gpus: CLI > config > auto-detect
+    if args.gpus is None:
+        args.gpus = streaming_cfg.get("num_gpus", 0)
+    if args.gpus <= 0:
+        # Auto-detect GPU count
+        try:
+            import torch as _torch
+            args.gpus = _torch.cuda.device_count()
+        except ImportError:
+            try:
+                result = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                    capture_output=True, text=True, timeout=10)
+                args.gpus = len([l for l in result.stdout.splitlines() if l.strip()])
+            except Exception:
+                args.gpus = 1  # safe default
+    if args.gpus < 1:
+        args.gpus = 1
+    print(f"  GPUs detected: {args.gpus}")
 
     # --batch-cache: CLI > config > auto-derive from config path (only if
     # no single-dataset paths are given, to avoid hijacking single-dataset mode)
@@ -1004,7 +1043,8 @@ def run_single_dataset(
         stems = [s for s in stems if s in wav_index]
         print(f"  Using {len(stems)} stems (override)")
     else:
-        stems, layout_map, wav_index = discover_stems(nas_ctc_dir, nas_audio_dir, require_all=True)
+        stems, _, layout_map, wav_index = discover_stems_separated(
+            nas_ctc_dir, nas_audio_dir, require_all=True)
     if limit > 0:
         stems = stems[:limit]
     print(f"  Found {len(stems)} valid stems"
@@ -1077,6 +1117,25 @@ def _save_checkpoint(ckpt_path: Path, completed: set[str], failed: set[str]) -> 
     tmp.replace(ckpt_path)
 
 
+def _save_batch_progress(ckpt_path: Path, ds_name: str,
+                         done: int, fail: int, total: int) -> None:
+    """Atomically write per-dataset batch progress (non-blocking best-effort)."""
+    progress_path = ckpt_path.with_name(ckpt_path.stem + ".batch_progress.json")
+    try:
+        data = {}
+        if progress_path.exists():
+            try:
+                data = json.loads(progress_path.read_text(encoding='utf-8'))
+            except Exception:
+                pass
+        data[ds_name] = {"done": done, "fail": fail, "total": total}
+        tmp = progress_path.with_suffix(progress_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        tmp.replace(progress_path)
+    except Exception:
+        pass  # best-effort, don't block on I/O
+
+
 def run_batch(args) -> None:
     """Iterate over all datasets from batch cache with checkpoint/resume support."""
     import concurrent.futures
@@ -1133,26 +1192,45 @@ def run_batch(args) -> None:
         print("ERROR: No usable local work drives!")
         sys.exit(1)
 
-    # Auto-adjust MFA num_jobs per dataset when running parallel:
-    # Each dataset's MFA align spawns num_jobs processes internally.
-    # With N parallel datasets, total MFA workers = N * num_jobs.
-    # IMPORTANT: num_jobs > 1 causes a race condition inside MFA's
-    # setup_acoustic_model() (os.rename without locking on phones.txt /
-    # graphemes.txt).  We cap at 1 — batch-level parallelism already
-    # provides enough throughput and avoids the race entirely.
+    # MFA num_jobs per worker.
+    # Pre-extracted acoustic models (_ensure_mfa_model_extracted) avoid the
+    # TOCTOU race. BLAS threading is pinned to 1 per worker (get_mfa_env sets
+    # OMP/MKL/OPENBLAS/NUMEXPR_NUM_THREADS=1), so process-level parallelism
+    # scales near-linearly without oversubscription.
+    #
+    # Default: cpu_count // max(parallel, 1), capped by batch_size / 10
+    # (at least 10 stems per job to amortize Kaldi startup overhead).
+    # Use --mfa-jobs N to override (e.g. --mfa-jobs 1 for max safety).
     import os as _os
     cpu_count = _os.cpu_count() or 32
-    _mfa_jobs = _cfg.get("mfa", {}).get("num_jobs", 32) if _cfg else 32
-    if _mfa_jobs <= 0:
-        _mfa_jobs = cpu_count
-    # Force num_jobs=1: MFA's setup_acoustic_model() has a TOCTOU race
-    # on phones.txt/graphemes.txt rename when multiple workers share a
-    # temp directory. Batch-level parallelism (12 workers) already gives
-    # enough throughput.
-    _effective_mfa_jobs = 1
-    if _effective_mfa_jobs < _mfa_jobs:
-        print(f"  Note: Reducing MFA num_jobs from {_mfa_jobs} to {_effective_mfa_jobs} "
-              f"(parallel={parallel}, CPUs={cpu_count})")
+    config_mfa_jobs = _cfg.get("mfa", {}).get("num_jobs", 0) if _cfg else 0
+    if config_mfa_jobs <= 0:
+        config_mfa_jobs = cpu_count  # default: use all cores
+    if args.mfa_jobs is None:
+        # Auto-scale to batch: at least 10 stems per job
+        _cap_by_batch = max(1, args.batch_size // 10)
+        _cap_by_parallel = max(1, cpu_count // max(parallel, 1))
+        _effective_mfa_jobs = max(1, min(config_mfa_jobs, _cap_by_parallel, _cap_by_batch))
+    else:
+        _effective_mfa_jobs = max(1, args.mfa_jobs)
+    print(f"  MFA num_jobs/worker: {_effective_mfa_jobs}"
+          f" (config={config_mfa_jobs}, parallel={parallel},"
+          f" batch={args.batch_size}, CPUs={cpu_count})")
+    # Memory estimate: each MFA Kaldi worker ≈ 500-1500 MB (model + features + lattice)
+    _total_mfa_procs = parallel * _effective_mfa_jobs
+    _est_gb_low = _total_mfa_procs * 0.5
+    _est_gb_high = _total_mfa_procs * 1.5
+    print(f"  Est. MFA memory: {_est_gb_low:.0f}-{_est_gb_high:.0f} GB"
+          f" ({_total_mfa_procs} total: {parallel} workers x {_effective_mfa_jobs} jobs)")
+    try:
+        import psutil as _psutil
+        _avail_gb = _psutil.virtual_memory().available / (1024**3)
+        if _est_gb_high > _avail_gb * 0.7:
+            _rec_jobs = max(1, int(_avail_gb * 0.7 / (1.5 * parallel)))
+            print(f"  ⚠  WARNING: est {_est_gb_high:.0f} GB > 70% of {_avail_gb:.0f} GB RAM!")
+            print(f"     Use --mfa-jobs {_rec_jobs} for safe memory (~{_rec_jobs * parallel * 1.5:.0f} GB)")
+    except ImportError:
+        pass
     # Update config for child processes
     if _cfg:
         _cfg.setdefault("mfa", {})["num_jobs"] = _effective_mfa_jobs
@@ -1359,6 +1437,9 @@ def run_batch(args) -> None:
         w_fails: list[str] = []
         drive = usable_drives[worker_id % len(usable_drives)]
         local_base = drive / f"worker_{worker_id}"
+        # GPU assignment: round-robin across available GPUs
+        gpu_id = worker_id % args.gpus
+        device_str = f"cuda:{gpu_id}"
         while True:
             try:
                 batch_global_idx, (batch_mode, ds, batch_idx, batch_stems,
@@ -1373,19 +1454,26 @@ def run_batch(args) -> None:
             remaining = batch_queue.qsize()
 
             mode_tag = f" [{batch_mode}]" if batch_mode != "ctc_ready" else ""
-            print(f"\n  [W{worker_id}] [{batch_global_idx+1}/{total_batches}]"
+            print(f"\n  [W{worker_id}:{device_str}] [{batch_global_idx+1}/{total_batches}]"
                   f" {batch_label} ({len(batch_stems)} stems){mode_tag}"
                   f" [{remaining} left]")
 
-            ok = run_single_batch(
-                ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
-                layout_map=layout_map, wav_index=wav_index,
-                local_base=local_base, config=args.config,
-                mfa_python=mfa_python, models_dir=models_dir,
-                nas_output_root=nas_output_root,
-                batch_size=args.batch_size, python_path=args.python,
-                mode=batch_mode, text_index=text_index,
-            )
+            try:
+                ok = run_single_batch(
+                    ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
+                    layout_map=layout_map, wav_index=wav_index,
+                    local_base=local_base, config=args.config,
+                    mfa_python=mfa_python, models_dir=models_dir,
+                    nas_output_root=nas_output_root,
+                    batch_size=args.batch_size, python_path=args.python,
+                    mode=batch_mode, text_index=text_index,
+                    device=device_str,
+                )
+            except Exception as _exc:
+                print(f"  [W{worker_id}] CRASH processing {batch_label}: {_exc}")
+                import traceback as _tb
+                _tb.print_exc()
+                ok = False
 
             with ckpt_lock:
                 tracker = ds_batch_tracker[ds_name]
@@ -1393,6 +1481,9 @@ def run_batch(args) -> None:
                     tracker["done"] += 1
                 else:
                     tracker["fail"] += 1
+                # Save per-batch progress for more granular resume
+                _save_batch_progress(ckpt_path, ds_name,
+                                     tracker["done"], tracker["fail"], tracker["total"])
                 # Dataset complete when all batches done
                 if tracker["done"] + tracker["fail"] >= tracker["total"]:
                     if tracker["fail"] == 0:
