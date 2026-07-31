@@ -1025,14 +1025,15 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     # energy analysis; MFA fine_tune floats boundaries toward its acoustic
     # model (trained on clean speech) and degrades alignment on NVV, BGM,
     # English tokens, and short function words.  See Regression Case 16.
-    # NOTE: --fine_tune is a FLAG (presence = on).  MFA 3.3.9 with
-    # --textgrid_directory (CTC anchors) always does a default fine-tuning
-    # pass regardless of this flag.  This flag controls an EXTRA pass.
+    # NOTE: --fine_tune is a FLAG (presence = on).  MFA 3.3.9
+    # pretrained.py:92 has a typo bug (fine_tune overwritten by
+    # fine_tune_boundary_tolerance) — patched in this env.
+    # See Regression Case 16 for why fine_tune defaults to off.
     if mc.get("fine_tune", False):
         mfa_args.append("--fine_tune")
-    fine_tune_tolerance = mc.get("fine_tune_boundary_tolerance", 0.02)
-    if fine_tune_tolerance is not None and fine_tune_tolerance > 0:
-        mfa_args += ["--fine_tune_boundary_tolerance", str(fine_tune_tolerance)]
+        fine_tune_tolerance = mc.get("fine_tune_boundary_tolerance", 0.02)
+        if fine_tune_tolerance is not None and fine_tune_tolerance > 0:
+            mfa_args += ["--fine_tune_boundary_tolerance", str(fine_tune_tolerance)]
     return run_mfa(mfa_args, mfa_python, ctx["models_dir"],
                    "Step 6: MFA Align" + (" (NVASR corpus + CTC anchors)" if use_nvasr_corpus and use_anchors else ""))
 
