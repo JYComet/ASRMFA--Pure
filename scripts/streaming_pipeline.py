@@ -1726,6 +1726,42 @@ def _run_cpu_phase(
     (local_ctc / "ctc_ready_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False))
 
+    # ── Link CTC output from GPU phase → CPU phase expects in local_ctc/ ──
+    # GPU phase (nvrasr_fallback) writes to workspace/ctc_pretg/.
+    # If adjust ran, also workspace/ctc_pretg_adj/ (better quality).
+    # Search priority: ctc_pretg_adj > ctc_pretg > (already in local_ctc)
+    _ctc_sources = [
+        local_workspace / "ctc_pretg_adj",
+        local_workspace / "ctc_pretg",
+    ]
+    _linked = 0
+    for _src in _ctc_sources:
+        if not _src.exists():
+            continue
+        for _stem in batch_stems:
+            # Flat layout: ctc_pretg/{stem}.TextGrid
+            # Nested layout: ctc_pretg/{stem}/{stem}.TextGrid
+            for _layout_dir in (_src, _src / _stem):
+                if not _layout_dir.exists():
+                    continue
+                for _suffix in CTC_SUFFIXES:
+                    _f = _layout_dir / f"{_stem}{_suffix}"
+                    if not _f.is_file():
+                        continue
+                    _tgt = local_ctc / _f.name
+                    if _tgt.exists():
+                        continue
+                    try:
+                        os.link(str(_f), str(_tgt))
+                    except OSError:
+                        shutil.copy2(str(_f), str(_tgt))
+                    _linked += 1
+        if _linked:
+            break  # found files, stop searching lower-priority dirs
+    if not _linked:
+        print(f"  WARNING: no CTC files found for {len(batch_stems)} stems "
+              f"in {[str(s) for s in _ctc_sources]} — CPU phase will fail")
+
     # ── Restore cached adjust output if available ──
     _restore_ctc_adj_cache(local_workspace, nas_output)
 
