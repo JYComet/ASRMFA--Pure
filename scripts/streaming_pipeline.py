@@ -64,17 +64,23 @@ def _persist_ctc_adj_cache(local_workspace: Path, nas_speaker: Path) -> None:
     nas_adj.mkdir(parents=True, exist_ok=True)
     rsync = shutil.which("rsync")
     if rsync:
-        subprocess.run(
-            [rsync, "-a",
-             str(local_adj) + "/", str(nas_adj) + "/"],
-            capture_output=True, text=True, timeout=600)
+        try:
+            subprocess.run(
+                [rsync, "-a",
+                 str(local_adj) + "/", str(nas_adj) + "/"],
+                capture_output=True, text=True, timeout=60)
+        except Exception:
+            pass  # non-critical: CTC cache upload failed, adjust will re-run next time
     else:
-        for f in local_adj.rglob("*"):
-            if f.is_file():
-                rel = f.relative_to(local_adj)
-                tgt = nas_adj / rel
-                tgt.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(f), str(tgt))
+        try:
+            for f in local_adj.rglob("*"):
+                if f.is_file():
+                    rel = f.relative_to(local_adj)
+                    tgt = nas_adj / rel
+                    tgt.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(f), str(tgt))
+        except Exception:
+            pass
 
 
 def _restore_ctc_adj_cache(local_workspace: Path, nas_speaker: Path) -> bool:
@@ -86,19 +92,24 @@ def _restore_ctc_adj_cache(local_workspace: Path, nas_speaker: Path) -> bool:
     local_adj.mkdir(parents=True, exist_ok=True)
     rsync = shutil.which("rsync")
     if rsync:
-        rc = subprocess.run(
-            [rsync, "-a",
-             str(nas_adj) + "/", str(local_adj) + "/"],
-            capture_output=True, text=True, timeout=600).returncode
-        return rc == 0
+        try:
+            rc = subprocess.run(
+                [rsync, "-a", str(nas_adj) + "/", str(local_adj) + "/"],
+                capture_output=True, text=True, timeout=60).returncode
+            return rc == 0
+        except (subprocess.TimeoutExpired, Exception):
+            return False  # CIFS can be slow; skip restore, adjust will re-run
     else:
-        for f in nas_adj.rglob("*"):
-            if f.is_file():
-                rel = f.relative_to(nas_adj)
-                tgt = local_adj / rel
-                tgt.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(f), str(tgt))
-        return True
+        try:
+            for f in nas_adj.rglob("*"):
+                if f.is_file():
+                    rel = f.relative_to(nas_adj)
+                    tgt = local_adj / rel
+                    tgt.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(f), str(tgt))
+            return True
+        except Exception:
+            return False
 
 
 def run_single_batch(
@@ -1716,6 +1727,7 @@ def _run_cpu_phase(
     Uploads final output to NAS and cleans up the local directory.
     """
     local_dir = local_base / f"batch_{batch_idx:04d}"
+    local_audio = local_dir / "audio"        # where GPU phase put WAVs
     local_ctc = local_dir / "ctc"
     local_workspace = local_dir / "workspace"
     local_output = local_dir / "output"
@@ -1758,9 +1770,16 @@ def _run_cpu_phase(
                     _linked += 1
         if _linked:
             break  # found files, stop searching lower-priority dirs
-    if not _linked:
+    if _linked:
+        print(f"  [CPU] Linked {_linked} CTC files → ctc/")
+    else:
+        # Debug: list what's actually in the source dirs
+        for _src in _ctc_sources:
+            _n = len(list(_src.glob("*"))) if _src.exists() else -1
+            print(f"  [CPU] {_src}: {'exists' if _src.exists() else 'MISSING'}"
+                  f" ({_n} items)" if _n >= 0 else "")
         print(f"  WARNING: no CTC files found for {len(batch_stems)} stems "
-              f"in {[str(s) for s in _ctc_sources]} — CPU phase will fail")
+              f"— CPU phase will fail")
 
     # ── Restore cached adjust output if available ──
     _restore_ctc_adj_cache(local_workspace, nas_output)
@@ -1772,7 +1791,7 @@ def _run_cpu_phase(
         "--config", str(config),
         "--mode", "ctc_ready",
         "--ctc-ready", str(local_ctc),
-        "--data-dir", str(local_workspace / "audio"),
+        "--data-dir", str(local_audio),
         "--output-dir", str(local_output),
         "--workspace", str(local_workspace),
         "--python", str(mfa_python),
@@ -1847,7 +1866,7 @@ def run_pipelined_batch(args) -> None:
     _cfg = getattr(args, '_config', {})
     pipeline_cfg = _cfg.get("pipelined", {}) if _cfg else {}
     n_gpu_workers = args.gpus  # 1 GPU per GPU worker
-    n_cpu_workers = args.parallel_datasets or pipeline_cfg.get("cpu_workers", 0)
+    n_cpu_workers = args.cpu_workers or pipeline_cfg.get("cpu_workers", 0)
     if n_cpu_workers <= 0:
         cpu_count = os.cpu_count() or 32
         n_cpu_workers = max(2, cpu_count // 8)  # e.g. 48 on 384-core
