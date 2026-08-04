@@ -234,7 +234,7 @@ def main():
     import multiprocessing as _mp
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    _n_workers = min(_mp.cpu_count(), 16, len(stems))
+    _n_workers = min(_mp.cpu_count(), 64, len(stems))
     print(f"  并行 workers: {_n_workers}")
 
     results = []

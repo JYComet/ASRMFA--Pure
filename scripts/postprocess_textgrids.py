@@ -598,23 +598,32 @@ def build_pinyin_phones_tier(phones_tier: Tier,
             continue
 
         if dict_phones and len(dict_phones) >= 1:
-            # Initial + final from fullpinyin dict
+            # ── Separate non-silence phones for boundary decisions ──
+            # The leakage filter above (line 490) may leave only silence/spn
+            # entries in word_phones.  Using silence boundaries for the
+            # initial–final split produces garbage timing.  Filter them out
+            # so the MFA-precise branch only fires when real phone boundaries
+            # are available.  When real phones are insufficient the
+            # proportional-split fallback is used instead.
+            non_sil_phones = [(s, e, t) for s, e, t in word_phones
+                              if not is_silence(t)]
+
             if len(dict_phones) == 1:
                 # Zero-initial (e.g. 'a5'): single dict phone for entire interval
                 new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, dict_phones[0]))
-            elif len(word_phones) >= 2:
-                # Normal: MFA provides enough phones to split initial + final.
+            elif len(non_sil_phones) >= 2:
+                # Normal: MFA provides enough real phones to split initial + final.
                 # Snap initial start to word start to prevent gaps
                 # (MFA fine_tune may shift word boundary earlier than phone onset,
                 #  e.g. at NVV→word transitions).  See Regression Case 7.
-                new_intervals.append(Interval(w_iv.xmin, word_phones[0][1], dict_phones[0]))
+                new_intervals.append(Interval(w_iv.xmin, non_sil_phones[0][1], dict_phones[0]))
                 # Final: remaining MFA phones combined -> dict final
-                final_start = word_phones[1][0]
+                final_start = non_sil_phones[1][0]
                 final_end = w_iv.xmax
                 final_label = " ".join(dict_phones[1:]) if len(dict_phones) > 2 else dict_phones[1]
                 new_intervals.append(Interval(final_start, final_end, final_label))
             else:
-                # dict_phones >= 2 but word_phones <= 1: MFA under-produced
+                # dict_phones >= 2 but non_sil_phones <= 1: MFA under-produced
                 # phones for this syllable (common with zh/ch/sh initials).
                 # Split proportionally so the final isn't lost entirely.
                 # Regression Case 26 (MISSING_FINAL).

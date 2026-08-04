@@ -766,6 +766,15 @@ def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                       timeout=pc.get("timeout", 3600))
 
 
+def _skip_if_ctc_normalized(ctx: dict) -> bool:
+    """Return True if ctc_prealign already ran normalize_* steps."""
+    _marker = ctx.get("ctc_pretg", Path()) / ".ctc_normalized"
+    if _marker.exists():
+        print(f"  Skipping: ctc_prealign already normalized (marker: {_marker})")
+        return True
+    return False
+
+
 def step_normalize_punct(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     """Normalize punctuation in CTC output text and sync with punct.json anchors.
 
@@ -774,6 +783,8 @@ def step_normalize_punct(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     3. Merge adjacent punctuation — no two puncts side by side;
        timestamps in _punct.json are merged to span the combined range.
     """
+    if _skip_if_ctc_normalized(ctx):
+        return 0
     import json
 
     ALLOWED_PUNCT = frozenset("，。！？、；：…")
@@ -914,6 +925,8 @@ def step_normalize_punct(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
 
 def step_normalize_text(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     """Normalize Arabic numerals to Chinese in CTC output text and .lab files."""
+    if _skip_if_ctc_normalized(ctx):
+        return 0
     try:
         import cn2an
     except ImportError:
@@ -953,6 +966,8 @@ def step_normalize_ria(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     ctc_prealign (align_text gets CJK→ria before tokenizer).
     Does NOT modify _text_cn.txt / _text_raw.txt (ASR archive).
     """
+    if _skip_if_ctc_normalized(ctx):
+        return 0
     import json, re
 
     ctc_dir = ctx["ctc_pretg"]
@@ -1018,6 +1033,8 @@ def step_normalize_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     (e.g. "ria"->"rui4"+"ya4").  This step merges them back into the
     canonical spelling before MFA alignment.
     """
+    if _skip_if_ctc_normalized(ctx):
+        return 0
     ctc_dir = ctx["ctc_pretg"]
     if not ctc_dir or not ctc_dir.exists():
         return 0

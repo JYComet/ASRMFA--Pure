@@ -1213,6 +1213,12 @@ def main():
 
             print(f"  Merged {len(_merged)} manifest entries, {_merged_entries} files")
             print(f"\n{_summary}")
+
+            # ── Write normalization marker ──
+            # Tells run_pipeline.py that normalize_* steps were already done
+            # by ctc_prealign. pad_silence only shifts timestamps, doesn't
+            # change token content, so re-normalizing is redundant.
+            (args.output_dir / ".ctc_normalized").touch()
             print(f"完成! 输出: {args.output_dir}")
             sys.exit(0)
 
@@ -1767,6 +1773,8 @@ def main():
         _normalize_numerals(args.output_dir)
         _normalize_ria(args.output_dir)
         _normalize_english(args.output_dir, args.dict_path)
+        # Marker: downstream pipeline steps can skip re-normalization
+        (args.output_dir / ".ctc_normalized").touch()
 
     # ── 恢复模型 ──
     model.model.inference = orig_inf
