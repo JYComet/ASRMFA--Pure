@@ -43,6 +43,12 @@
 #   target_sr: null
 #   workers: 8
 
+# ── 静音补全 ────────────────────────────────────────────────────────────
+# pad_silence:
+#   enabled: true            # set false to skip edge silence padding entirely
+#   target_edge_silence_sec: 0.5
+#   output_audio: false      # write padded WAVs to output/ (default off)
+
 # ── CTC 预对齐 ──────────────────────────────────────────────────────────
 # ctc_prealign:
 #   enabled: true

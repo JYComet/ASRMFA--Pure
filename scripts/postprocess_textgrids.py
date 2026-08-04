@@ -4250,6 +4250,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # --- A. Snap MFA word boundaries to CTC anchors ---
     tokens_path = txt_dir / f"{stem}_tokens.jsonl"
     punct_path = txt_dir / f"{stem}_punct.json"
+    _punct_boundary_hits: list[dict] = []
     punct_entries = []
     if punct_path.exists():
         punct_entries = json.loads(punct_path.read_text(encoding="utf-8"))
@@ -4261,7 +4262,6 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         words_tier = tier_by_name(new_tg, "words")
         pp_tier = tier_by_name(new_tg, "pinyin_phones")
         if words_tier and ctc_tokens:
-            _punct_boundary_hits: list[dict] = []
             words_tier, pp_tier = _snap_to_ctc(words_tier, pp_tier, ctc_tokens,
                                                    punct_entries=punct_entries,
                                                    audio=wav_audio, sr=wav_sr or 16000,

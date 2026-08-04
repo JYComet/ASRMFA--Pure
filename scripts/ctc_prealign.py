@@ -921,6 +921,8 @@ def main():
                         help="MFA 词典路径 (用于过滤标点等非词条)")
     parser.add_argument("--limit", type=int, default=0,
                         help="限制处理数量, 0=全部")
+    parser.add_argument("--offset", type=int, default=0,
+                        help="跳过前 N 个文件 (配合 --limit 实现多 GPU 分片)")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--nvv-bias", type=float, default=NVV_BIAS_DEFAULT,
                         help=f"NVV blank-frame bias (default: {NVV_BIAS_DEFAULT}).")
@@ -931,6 +933,8 @@ def main():
     # ── 扫描音频文件 ──
     audio_dir = args.audio_dir or args.data_dir
     wav_files = sorted(audio_dir.rglob("*.wav"))
+    if args.offset > 0:
+        wav_files = wav_files[args.offset:]
     if args.limit > 0:
         wav_files = wav_files[:args.limit]
     print(f"扫描到 {len(wav_files)} 个 WAV 文件")

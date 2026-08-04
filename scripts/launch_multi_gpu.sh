@@ -226,9 +226,8 @@ launch_gpu() {
     (
         export CUDA_VISIBLE_DEVICES="$gpu_id"
         export MFA_ROOT_DIR="${MFA_ROOT_DIR:-$PROJECT_ROOT/models/mfa}"
-        echo "PID: $$" > "$pid_file"
-        echo "Started: $(date -Iseconds)" >> "$pid_file"
-        echo "Command: ${cmd[@]}" >> "$pid_file"
+        echo "Started: $(date -Iseconds)" >> "$log_file"
+        echo "Command: ${cmd[@]}" >> "$log_file"
         exec "${cmd[@]}" >> "$log_file" 2>> "$err_file"
     ) &
     local pid=$!
@@ -282,7 +281,7 @@ if $STREAMING; then
         export CUDA_VISIBLE_DEVICES=""
         export MFA_ROOT_DIR="${MFA_ROOT_DIR:-$PROJECT_ROOT/models/mfa}"
         echo "PID: $$" > "$LOG_DIR/main.pid"
-        echo "Started: $(date -Iseconds)" > "$LOG_DIR/main.pid"
+        echo "Started: $(date -Iseconds)" >> "$LOG_DIR/main.log"
         exec "${SINGLE_CMD[@]}" >> "$LOG_DIR/main.log" 2>> "$LOG_DIR/main.err"
     fi
 else

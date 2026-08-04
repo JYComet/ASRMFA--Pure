@@ -10,8 +10,11 @@
 mode: nvrasr_fallback
 workspace: shayi_huali
 
-# ── 本地临时目录 (避免 CIFS SQLite 锁) ──
-temp_dir: /tmp/shayi_huali_temp
+# temp_dir 不设绝对路径, 自动用 workspace/temp (每 batch 隔离, 避免 MFA 并发冲突)
+
+# ── 静音补全 (音频已处理过, 跳过) ──
+pad_silence:
+  enabled: false
 
 # ── Streaming (NAS → 本地 → NAS) ──
 streaming:

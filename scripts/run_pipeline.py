@@ -188,6 +188,7 @@ DEFAULT_CFG: dict = {
         "workers": 8,
     },
     "pad_silence": {
+        "enabled": True,              # set false to skip edge silence padding entirely
         "target_edge_silence_sec": 0.5,
         "silence_threshold": 0.001,
         "frame_length": 1024,
@@ -633,6 +634,8 @@ def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         prealign_args += ["--nvv-bias", str(pc["nvv_bias"])]
     if pc.get("limit", 0) > 0:
         prealign_args += ["--limit", str(pc["limit"])]
+    if pc.get("offset", 0) > 0:
+        prealign_args += ["--offset", str(pc["offset"])]
     if args.overwrite:
         prealign_args.append("--overwrite")
 
@@ -950,7 +953,10 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     anchors, so MFA uses every CTC word boundary for phone-level refinement.
     """
     mc = cfg["mfa"]
-    ctc_dir = ctx.get("ctc_pretg_adj", ctx["ctc_pretg"])  # use adjusted if available
+    # Use adjusted CTC if available, fall back to raw CTC output
+    ctc_dir = ctx.get("ctc_pretg_adj", ctx["ctc_pretg"])
+    if not ctc_dir.exists():
+        ctc_dir = ctx["ctc_pretg"]
 
     # Check for NVASR corpus (.lab files)
     use_nvasr_corpus = ctc_dir.exists() and any(ctc_dir.glob("*.lab"))
@@ -1053,6 +1059,8 @@ def step_mfa_align_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         return 0
 
     ctc_dir = ctx.get("ctc_pretg_adj", ctx["ctc_pretg"])
+    if not ctc_dir.exists():
+        ctc_dir = ctx["ctc_pretg"]
     audio_dir = ctx["mfa_audio_dir"]
     output_dir = ctx["workspace"] / "en_phones"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1117,6 +1125,8 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     """
     pc = cfg["postprocess"]
     ctc_dir = ctx.get("ctc_pretg_adj", ctx["ctc_pretg"])  # use adjusted if available
+    if not ctc_dir.exists():
+        ctc_dir = ctx["ctc_pretg"]
     aligned_dir = ctx["aligned_dir"]
 
     pp_args = [
@@ -1626,6 +1636,9 @@ def step_pad_silence(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     by the net head change so downstream steps see consistent alignment.
     """
     pc = cfg.get("pad_silence", {})
+    if not pc.get("enabled", True):
+        print("  pad_silence disabled in config. Skipping.")
+        return 0
     target_silence_sec = pc.get("target_edge_silence_sec", 0.5)
 
     ctc_dir = ctx["ctc_pretg"]

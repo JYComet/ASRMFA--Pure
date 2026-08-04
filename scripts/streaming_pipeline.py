@@ -1647,6 +1647,7 @@ def _run_gpu_phase(
     mfa_python: Path, models_dir: Path,
     batch_size: int, python_path: str | None,
     device: str,
+    nas_output_dir: Path | None = None,
 ) -> bool:
     """GPU phase: prefetch WAVs + NVASR prealign + normalize -> CTC output.
 
@@ -1708,9 +1709,13 @@ def _run_gpu_phase(
         shutil.rmtree(local_dir, ignore_errors=True)
         return False
 
-    # Persist CTC output to NAS for caching (adjust_ctc output especially)
+    # Persist CTC output to NAS for caching.
+    # Save to BOTH ctc_dir (GPU phase default) and nas_output_dir (CPU phase reads from here),
+    # so the restore in _run_cpu_phase always finds the cache regardless of which path it checks.
     _persist_ctc_adj_cache(local_workspace,
                            resolve_input_path(ds.get("ctc_dir", "")))
+    if nas_output_dir:
+        _persist_ctc_adj_cache(local_workspace, nas_output_dir)
     return True
 
 
@@ -1797,6 +1802,10 @@ def _run_cpu_phase(
         "--python", str(mfa_python),
         "--overwrite", "--force",
     ]
+    # GPU phase already did pad_silence → skip to avoid double I/O.
+    # If GPU didn't run (e.g. standalone ctc_ready), padded_audio won't exist → keep it.
+    if (local_workspace / "padded_audio").exists():
+        cmd.append("--skip-pad_silence")
     env = get_mfa_env(mfa_python, models_dir)
     try:
         rc = subprocess.run(cmd, env=env, timeout=7200, capture_output=False).returncode
@@ -1820,15 +1829,26 @@ def _run_cpu_phase(
         nas_rel.mkdir(parents=True, exist_ok=True)
         rsync = shutil.which("rsync")
         if rsync:
-            subprocess.run([rsync, "-a", str(local_src) + "/", str(nas_rel) + "/"],
-                           capture_output=True, text=True, timeout=600)
+            try:
+                rc = subprocess.run(
+                    [rsync, "-a", str(local_src) + "/", str(nas_rel) + "/"],
+                    capture_output=True, text=True, timeout=300).returncode
+                if rc != 0:
+                    print(f"  WARNING: rsync failed (rc={rc}) for {local_src} → {nas_rel}")
+            except subprocess.TimeoutExpired:
+                print(f"  WARNING: rsync timed out for {local_src} → {nas_rel}")
+            except Exception as e:
+                print(f"  WARNING: rsync error for {local_src}: {e}")
         else:
-            for f in local_src.rglob("*"):
-                if f.is_file():
-                    rel = f.relative_to(local_src)
-                    tgt = nas_rel / rel
-                    tgt.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(str(f), str(tgt))
+            try:
+                for f in local_src.rglob("*"):
+                    if f.is_file():
+                        rel = f.relative_to(local_src)
+                        tgt = nas_rel / rel
+                        tgt.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(str(f), str(tgt))
+            except Exception as e:
+                print(f"  WARNING: upload copy error for {local_src}: {e}")
 
     # Cleanup
     shutil.rmtree(local_dir, ignore_errors=True)
@@ -1920,8 +1940,8 @@ def run_pipelined_batch(args) -> None:
                 complete_stems, incomplete_stems, layout_map, wav_index = \
                     discover_stems_separated(nas_ctc, nas_audio, require_all=True)
                 all_stems = complete_stems + incomplete_stems
-            else:
-                # Raw audio: discover all WAVs
+            if not (_ctc_flat or _ctc_nested) or not all_stems:
+                # Raw audio: discover all WAVs (CTC dir empty or no .lab files found)
                 all_stems = []
                 layout_map = {}
                 wav_index = {}
@@ -2005,6 +2025,7 @@ def run_pipelined_batch(args) -> None:
                 mfa_python=mfa_python, models_dir=models_dir,
                 batch_size=args.batch_size, python_path=args.python,
                 device=device_str,
+                nas_output_dir=nas_output_root / ds_name,
             )
             if ok:
                 cpu_queue.put((ds, batch_idx, batch_stems, local_base))
@@ -2068,11 +2089,13 @@ def run_pipelined_batch(args) -> None:
         cpu_futures = [cpu_pool.submit(cpu_worker, wid) for wid in range(n_cpu_workers)]
 
         # Wait for GPU workers to finish producing
-        for fut in concurrent.futures.as_completed(gpu_futures):
-            fut.result()  # propagate exceptions
-
-        # Signal CPU workers: put sentinel in queue (one propagates to all)
-        cpu_queue.put(_CPU_SENTINEL)
+        try:
+            for fut in concurrent.futures.as_completed(gpu_futures):
+                fut.result()  # propagate exceptions
+        finally:
+            # Always signal CPU workers — even if a GPU worker crashed.
+            # Without this, CPU workers block forever on cpu_queue.get().
+            cpu_queue.put(_CPU_SENTINEL)
 
         for fut in concurrent.futures.as_completed(cpu_futures):
             w_ok, w_fails = fut.result()
