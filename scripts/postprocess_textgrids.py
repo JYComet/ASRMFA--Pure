@@ -598,32 +598,23 @@ def build_pinyin_phones_tier(phones_tier: Tier,
             continue
 
         if dict_phones and len(dict_phones) >= 1:
-            # ── Separate non-silence phones for boundary decisions ──
-            # The leakage filter above (line 490) may leave only silence/spn
-            # entries in word_phones.  Using silence boundaries for the
-            # initial–final split produces garbage timing.  Filter them out
-            # so the MFA-precise branch only fires when real phone boundaries
-            # are available.  When real phones are insufficient the
-            # proportional-split fallback is used instead.
-            non_sil_phones = [(s, e, t) for s, e, t in word_phones
-                              if not is_silence(t)]
-
+            # Initial + final from fullpinyin dict
             if len(dict_phones) == 1:
                 # Zero-initial (e.g. 'a5'): single dict phone for entire interval
                 new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, dict_phones[0]))
-            elif len(non_sil_phones) >= 2:
-                # Normal: MFA provides enough real phones to split initial + final.
+            elif len(word_phones) >= 2:
+                # Normal: MFA provides enough phones to split initial + final.
                 # Snap initial start to word start to prevent gaps
                 # (MFA fine_tune may shift word boundary earlier than phone onset,
                 #  e.g. at NVV→word transitions).  See Regression Case 7.
-                new_intervals.append(Interval(w_iv.xmin, non_sil_phones[0][1], dict_phones[0]))
+                new_intervals.append(Interval(w_iv.xmin, word_phones[0][1], dict_phones[0]))
                 # Final: remaining MFA phones combined -> dict final
-                final_start = non_sil_phones[1][0]
+                final_start = word_phones[1][0]
                 final_end = w_iv.xmax
                 final_label = " ".join(dict_phones[1:]) if len(dict_phones) > 2 else dict_phones[1]
                 new_intervals.append(Interval(final_start, final_end, final_label))
             else:
-                # dict_phones >= 2 but non_sil_phones <= 1: MFA under-produced
+                # dict_phones >= 2 but word_phones <= 1: MFA under-produced
                 # phones for this syllable (common with zh/ch/sh initials).
                 # Split proportionally so the final isn't lost entirely.
                 # Regression Case 26 (MISSING_FINAL).
@@ -5463,6 +5454,50 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         filter_reasons.append("init_only_phone")
         report["init_only_phone"] = {"count": _init_only_count,
                                       "examples": _init_only_examples}
+
+    # ── Case 26-E: silence_boundary_split — initial-final boundary from silence ──
+    # When the leakage filter (line 490) strips all real phones from word_phones,
+    # only silence/spn entries may remain.  If >= 2 silence entries survive, the
+    # MFA-precise branch (len(word_phones) >= 2) fires and uses silence boundaries
+    # for the initial–final split, producing garbage timing (e.g. a 5 ms "ch"
+    # followed by a 355 ms "ang4" for a 360 ms word).
+    #
+    # Detect from output: a multi-phone dict word whose first pinyin_phones
+    # interval is shorter than 10 ms.  This is below the shortest physically
+    # possible Chinese initial (~15–20 ms for stop consonants) and indicates
+    # the split point came from a silence fragment rather than a real phone
+    # boundary.  The 10 ms floor is deliberately conservative to avoid
+    # flagging genuinely short initials in fast speech.
+    _silence_split_count = 0
+    _silence_split_examples: list[str] = []
+    _SILENCE_SPLIT_FLOOR_S = 0.010  # seconds — physically impossible for any initial
+    if words_tier is not None and pp_tier is not None and pinyin_dict is not None:
+        for _wi, _w_iv in enumerate(words_tier.intervals):
+            _wt = _w_iv.text.strip()
+            if not re.match(r'^[a-z]+[1-5]$', _wt) or len(_wt) <= 2:
+                continue
+            _dict_phones = pinyin_dict.get(_wt) or pinyin_dict.get(_wt.lower())
+            if not _dict_phones or len(_dict_phones) < 2:
+                continue
+            # Collect non-silence phones in this word's range, in order
+            _w_phones = sorted(
+                [p for p in pp_tier.intervals
+                 if p.xmax > _w_iv.xmin + 0.001
+                 and p.xmin < _w_iv.xmax - 0.001
+                 and not is_silence(p.text)],
+                key=lambda p: p.xmin)
+            if len(_w_phones) >= 2:
+                _first_dur = _w_phones[0].xmax - _w_phones[0].xmin
+                if _first_dur < _SILENCE_SPLIT_FLOOR_S:
+                    _silence_split_count += 1
+                    if len(_silence_split_examples) < 5:
+                        _silence_split_examples.append(
+                            f"{_wt}→{_w_phones[0].text.strip()}[{_first_dur*1000:.0f}ms]"
+                            f" +{_w_phones[1].text.strip()}")
+    if _silence_split_count > 0:
+        filter_reasons.append("silence_boundary_split")
+        report["silence_boundary_split"] = {"count": _silence_split_count,
+                                             "examples": _silence_split_examples}
 
     # ── Case 27-B: overlapping_words — unresolved interval overlaps ──
     _overlap_count = 0

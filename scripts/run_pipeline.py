@@ -478,7 +478,7 @@ def run_python(script: Path, script_args: list[str], mfa_python: Path,
 
 
 def run_mfa(mfa_args: list[str], mfa_python: Path, models_dir: Path,
-            desc: str = "", timeout: int = 1800) -> int:
+            desc: str = "", timeout: int | None = None) -> int:
     print(f"\n{'='*60}\n  {desc or 'MFA: ' + ' '.join(mfa_args)}\n{'='*60}\n")
     try:
         return subprocess.run(
@@ -1091,9 +1091,10 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     anchors, so MFA uses every CTC word boundary for phone-level refinement.
     """
     mc = cfg["mfa"]
-    # Use adjusted CTC if available, fall back to raw CTC output
+    # Use adjusted CTC if available (must exist AND contain .lab files),
+    # fall back to raw CTC output
     ctc_dir = ctx.get("ctc_pretg_adj", ctx["ctc_pretg"])
-    if not ctc_dir.exists():
+    if not ctc_dir.exists() or not any(ctc_dir.glob("*.lab")):
         ctc_dir = ctx["ctc_pretg"]
 
     # Check for NVASR corpus (.lab files)

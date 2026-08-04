@@ -97,6 +97,7 @@ mfa:
   fine_tune: false
   beam: 20
   retry_beam: 80
+  timeout: 7200   # 54k 文件 MFCC+对齐需 ~40-60 min
 
 # ── 英文 MFA 子词对齐 ─────────────────────────────────────────────────────
 mfa_en:
