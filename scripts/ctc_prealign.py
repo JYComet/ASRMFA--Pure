@@ -1211,15 +1211,7 @@ def main():
                             _shutil.move(str(_f), str(_dest))
                             _merged_entries += 1
 
-                # Clean up shard dir
-                try:
-                    for _leftover in _shard_dir.iterdir():
-                        _leftover.unlink()
-                    _shard_dir.rmdir()
-                except OSError:
-                    pass
-
-            # ── Merge manifests with path rewriting ──
+            # ── Merge manifests with path rewriting (BEFORE shard cleanup) ──
             import json as _json
             _merged = []
             for _shard_dir, _m in sorted(_all_manifests, key=lambda p: p[1].parent.name):
@@ -1282,6 +1274,15 @@ def main():
                             for t in _new_tokens:
                                 _f.write(f"{t} {t}\n")
                         print(f"  Added {len(_new_tokens)} English tokens to dict")
+
+            # ── Clean up shard dirs (AFTER manifest merge) ──
+            for _gpu_id, _, _shard_dir in _procs:
+                try:
+                    for _leftover in _shard_dir.iterdir():
+                        _leftover.unlink()
+                    _shard_dir.rmdir()
+                except OSError:
+                    pass
 
             print(f"  Merged {len(_merged)} manifest entries, {_merged_entries} files")
             print(f"\n{_summary}")
