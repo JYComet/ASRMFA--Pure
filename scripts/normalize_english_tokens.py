@@ -28,10 +28,25 @@ from pipeline_utils import (
     is_word_like, is_punct, extract_word_chars,
 )
 
-try:
-    from pypinyin import lazy_pinyin, Style
-except ModuleNotFoundError:
-    raise SystemExit("pypinyin is not installed. Run: pip install pypinyin")
+# Lazy import — only needed for CJK pinyin fragments in mixed text.
+# Pure English processing can proceed without pypinyin.
+_pypinyin_available = False
+_lazy_pinyin = None
+_Style = None
+
+
+def _ensure_pypinyin():
+    global _pypinyin_available, _lazy_pinyin, _Style
+    if not _pypinyin_available:
+        try:
+            from pypinyin import lazy_pinyin as _lp, Style as _st  # noqa: F811
+            _lazy_pinyin = _lp
+            _Style = _st
+            _pypinyin_available = True
+        except ModuleNotFoundError:
+            print("  [normalize_en] pypinyin not installed — English-only mode")
+            _pypinyin_available = False  # mark as tried
+    return _pypinyin_available
 
 
 # ---------------------------------------------------------------------------
@@ -60,9 +75,11 @@ def _is_alpha_group(s: str) -> bool:
 
 
 def _pinyin_for_cjk(ch: str) -> str | None:
+    if not _ensure_pypinyin():
+        return None
     try:
-        py = lazy_pinyin(ch, style=Style.TONE3,
-                        neutral_tone_with_five=True, errors="default")
+        py = _lazy_pinyin(ch, style=_Style.TONE3,
+                          neutral_tone_with_five=True, errors="default")
         return py[0] if py else None
     except Exception:
         return None
@@ -79,12 +96,14 @@ def _token_matches_ref(tok: str, ref: str) -> bool:
     r = ref.lower()
 
     if is_cjk(ref):
-        try:
-            py = lazy_pinyin(ref, style=Style.TONE3,
-                            neutral_tone_with_five=True, errors="default")
-            return py is not None and len(py) > 0 and py[0] == t
-        except Exception:
-            return False
+        if _ensure_pypinyin():
+            try:
+                py = _lazy_pinyin(ref, style=_Style.TONE3,
+                                  neutral_tone_with_five=True, errors="default")
+                return py is not None and len(py) > 0 and py[0] == t
+            except Exception:
+                return False
+        return False
 
     if not r.isascii():
         return False

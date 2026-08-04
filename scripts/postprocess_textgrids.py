@@ -491,16 +491,40 @@ def build_pinyin_phones_tier(phones_tier: Tier,
                                    if is_silence(t) and s >= w_iv.xmin - 0.001
                                    and e <= w_iv.xmax + 0.001]
 
-        if not word_phones:
-            new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, word))
-            continue
-
-        # Look up dict entry for this word
+        # ── Look up dict entry for this word (before empty-phone check
+        #     so we can fall back to a proportional split even when MFA
+        #     produced zero or only one phone for a multi-phone syllable).
+        #     Regression Case 26. ──
         dict_phones = None
         for key in pinyin_dict:
             if key.lower() == word:
                 dict_phones = pinyin_dict[key]
                 break
+
+        if not word_phones:
+            # No MFA phones in this word interval.
+            # When the dict has initial+final, split the interval
+            # proportionally instead of using the whole word as a
+            # single phone (which would lose the initial–final split).
+            # Regression Case 26 (FULL_WORD_AS_PHONE).
+            if (dict_phones and len(dict_phones) >= 2
+                    and not is_punct(w_iv.text)
+                    and not is_nvv_token(w_iv.text)
+                    and not is_english_token(w_iv.text)):
+                word_dur = w_iv.xmax - w_iv.xmin
+                _init_frac = 0.35       # typical init:final ratio
+                _min_seg = 0.030        # floor per segment
+                if word_dur >= _min_seg * 2:
+                    split = w_iv.xmin + max(_min_seg, word_dur * _init_frac)
+                    split = min(split, w_iv.xmax - _min_seg)
+                else:
+                    split = w_iv.xmin + word_dur * 0.5
+                new_intervals.append(Interval(w_iv.xmin, split, dict_phones[0]))
+                final_label = " ".join(dict_phones[1:]) if len(dict_phones) > 2 else dict_phones[1]
+                new_intervals.append(Interval(split, w_iv.xmax, final_label))
+            else:
+                new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, word))
+            continue
 
         # Punctuation: pass through as-is
         if is_punct(w_iv.text):
@@ -559,20 +583,36 @@ def build_pinyin_phones_tier(phones_tier: Tier,
 
         if dict_phones and len(dict_phones) >= 1:
             # Initial + final from fullpinyin dict
-            if len(dict_phones) == 1 or len(word_phones) <= 1:
-                # Zero-initial or single phone: entire interval = dict phone
+            if len(dict_phones) == 1:
+                # Zero-initial (e.g. 'a5'): single dict phone for entire interval
                 new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, dict_phones[0]))
-            else:
-                # Initial: first MFA phone -> dict initial
+            elif len(word_phones) >= 2:
+                # Normal: MFA provides enough phones to split initial + final.
                 # Snap initial start to word start to prevent gaps
                 # (MFA fine_tune may shift word boundary earlier than phone onset,
                 #  e.g. at NVV→word transitions).  See Regression Case 7.
                 new_intervals.append(Interval(w_iv.xmin, word_phones[0][1], dict_phones[0]))
                 # Final: remaining MFA phones combined -> dict final
-                final_start = word_phones[1][0] if len(word_phones) > 1 else word_phones[0][1]
+                final_start = word_phones[1][0]
                 final_end = w_iv.xmax
                 final_label = " ".join(dict_phones[1:]) if len(dict_phones) > 2 else dict_phones[1]
                 new_intervals.append(Interval(final_start, final_end, final_label))
+            else:
+                # dict_phones >= 2 but word_phones <= 1: MFA under-produced
+                # phones for this syllable (common with zh/ch/sh initials).
+                # Split proportionally so the final isn't lost entirely.
+                # Regression Case 26 (MISSING_FINAL).
+                word_dur = w_iv.xmax - w_iv.xmin
+                _init_frac = 0.35       # typical init:final ratio
+                _min_seg = 0.030        # floor per segment
+                if word_dur >= _min_seg * 2:
+                    split = w_iv.xmin + max(_min_seg, word_dur * _init_frac)
+                    split = min(split, w_iv.xmax - _min_seg)
+                else:
+                    split = w_iv.xmin + word_dur * 0.5
+                new_intervals.append(Interval(w_iv.xmin, split, dict_phones[0]))
+                final_label = " ".join(dict_phones[1:]) if len(dict_phones) > 2 else dict_phones[1]
+                new_intervals.append(Interval(split, w_iv.xmax, final_label))
         else:
             # Fallback: 1:1 IPA->pinyin
             for s, e, txt in word_phones:

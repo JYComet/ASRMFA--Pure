@@ -34,6 +34,7 @@
 | 23 | 2026-07-29 | run_pipeline.py | step_normalize_punct 缺少 NVV 连字符保护 → QUESTION-EI 被拆成 QUESTION，EI |
 | 24 | 2026-07-29 | ctc_prealign.py | ASR 空输出先写 TextGrid 再检测 → 留下孤立的空 TextGrid |
 | 25 | 2026-07-29 | postprocess_textgrids.py | _inject_punctuation 重叠判断 + _punct_before 范围 + 恢复匹配策略 |
+| 26 | 2026-08-04 | postprocess_textgrids.py | pinyin_phones 声母独占→韵母消失 (ch/zh/sh → 缺 final) |
 
 ---
 
@@ -2752,6 +2753,131 @@ words/hanzi tier 不受影响（只在 `_finalise_textgrid` 中包裹一次）�
 
 已包裹的 token 不再被匹配，未包裹的仍正常包裹。`build_pinyin_phones_tier` 的 `strip('<>')` 负责修复已有双重包裹数据。
 
+
+## Case 26: pinyin_phones 声母独占总时长 → 韵母消失 (ch/zh/sh → 缺 final)
+
+**日期**: 2026-08-04
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `build_pinyin_phones_tier`
+**触发样本**: shayi_huali/纱依/output/ ~15.5% 的 zh/ch/sh 声母词受影响
+
+### 现象
+
+words tier 中拼音词为 `chang4`，但 pinyin_phones tier 只有声母 `ch` 占据整词时长，
+韵母 `ang4` 完全消失：
+
+```
+words tier:       chang4  [8.850s - 9.210s]  dur=360ms
+pinyin_phones:    ch      [8.850s - 9.210s]  dur=360ms  ← ang4 丢失!
+```
+
+同样问题影响所有 zh/ch/sh 声母词：`zhi3`→只有 `zh`、`shi4`→只有 `sh`、`zhong4`→只有 `zh`。
+
+还存在另一种表现 FULL_WORD_AS_PHONE：当 MFA 完全没产出任何音素时，
+整词作为单个 phone 写入（如 `chang4 [全区间]`），也失去了声母/韵母拆分。
+
+### 范围
+
+对 shayi_huali/纱依/output/ 2894 个文件的采样扫描（每 3 取 1，共 965 文件）：
+
+| 类型 | 数量 | 占比 |
+|------|------|------|
+| MISSING_FINAL（声母独占，韵母消失） | 601 | 8.7% |
+| FULL_WORD_AS_PHONE（整词作为单音素） | 454 | 6.5% |
+| 正常拆分 | 5861 | 84.5% |
+
+按声母: `sh` 538 > `zh` 380 > `ch` 156。
+
+### 根因链
+
+两种子类型共享同一个根因 — MFA 对该音节的音素产出不足，而代码在音素不足时
+只取字典第一个条目（声母）覆盖全区间：
+
+**子类型 A — MISSING_FINAL** (原 line 562-564):
+
+1. MFA 对齐 `chang4` 时只产出 **1 个** IPA 音素（声母 IPA），未将韵母区分为独立音素
+2. 代码查字典 `fullpinyin_enword.dict` → `dict_phones = ['ch', 'ang4']`（2 个）
+3. `word_phones` 只有 1 个 MFA 音素 → 条件 `len(word_phones) <= 1` 为 True
+4. 旧代码: `dict_phones[0]` (`'ch'`) 分配给整词区间 → `'ang4'` 彻底丢失
+
+**子类型 B — FULL_WORD_AS_PHONE** (原 line 494-496):
+
+1. MFA 对该词完全没产出音素（`word_phones` 为空），或被泄漏音素过滤清空
+2. 旧代码: 直接用词文本 `'chang4'` 作为单音素兜底，未查字典拆分
+3. 损失了声母/韵母的时间分辨率（对于 TTS 训练，单音素 `chang4` 不如 `ch` + `ang4`）
+
+### 修改点
+
+**BA. `build_pinyin_phones_tier` — 字典查前移 + 空音素时按比例拆分 (~line 494-527)**
+
+字典查询从原 line 498 移至 `word_phones` 空检查之前，使空音素场景也能利用字典信息。
+当 `dict_phones >= 2` 且 `word_phones` 为空时，按 35:65 比例拆分词区间为声母+韵母，
+每段地板 30ms。NVV/English/punct 不进入此分支（保留旧兜底行为）。
+
+**BB. `build_pinyin_phones_tier` — 单音素场景按比例拆分 (~line 584-616)**
+
+原代码 `len(dict_phones) == 1 or len(word_phones) <= 1` 将"零声母"和"音素不足"
+混为一谈。修复后拆分为三个分支：
+- `len(dict_phones) == 1`: 零声母 → 单音素覆盖全区间（保留旧行为）
+- `len(word_phones) >= 2`: MFA 足量音素 → 用 MFA 边界精确拆分（保留旧行为）
+- 否则（`dict_phones >= 2` 但 `word_phones <= 1`）: MFA 音素不足 → 按比例拆分
+
+### 修改前
+
+```python
+# (原 line 494) 空音素 → 整词兜底，不查字典
+if not word_phones:
+    new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, word))
+    continue
+
+# ... 字典查询在下方的 line 498 ...
+
+# (原 line 562-564) 零声母和音素不足混为一谈
+if len(dict_phones) == 1 or len(word_phones) <= 1:
+    new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, dict_phones[0]))
+```
+
+### 修改后
+
+```python
+# 字典查询已移至 word_phones 空检查之前
+
+# 空音素 → 字典有 2+ 条目时按比例拆分
+if not word_phones:
+    if dict_phones and len(dict_phones) >= 2 and not punct/NVV/English:
+        word_dur = w_iv.xmax - w_iv.xmin
+        _init_frac = 0.35; _min_seg = 0.030
+        split = w_iv.xmin + max(_min_seg, word_dur * _init_frac)
+        split = min(split, w_iv.xmax - _min_seg)
+        new_intervals.append(Interval(w_iv.xmin, split, dict_phones[0]))
+        new_intervals.append(Interval(split, w_iv.xmax, dict_phones[1]))
+    else:
+        new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, word))
+    continue
+
+# 三分支: 零声母 | MFA足量 | MFA不足→比例拆分
+if len(dict_phones) == 1:
+    new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, dict_phones[0]))
+elif len(word_phones) >= 2:
+    # MFA 边界精确拆分（不变）
+    ... 
+else:
+    # dict_phones >= 2 但 word_phones <= 1 → 比例拆分（同上）
+    ...
+```
+
+### 比例选择依据
+
+- 35:65 是汉语声母:韵母的典型时长比（塞擦音 ch/zh ~30-40%，擦音 sh ~25-35%）
+- 30ms 地板防止极短音节出现零时长段
+- 音节 < 60ms 时退化为 50:50 均分
+
+### 关联样本
+
+- `直播回放_3D初披露--_2024年2月29日20点场_97187255_clip0012_clip0000.TextGrid`:
+  `chang4` [8.850-9.210] pinyin_phones 只有 `ch`，缺 `ang4`
+- `直播回放_zzZ_2026年06月07日20点场_1341f0ea_clip0012_clip0013.TextGrid`:
+  4 个 `chang4` 中 2 个异常（1 个 MISSING_FINAL + 1 个 FULL_WORD_AS_PHONE）
 
 ## 模板 (新 Case 用)
 

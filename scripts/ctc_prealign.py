@@ -940,6 +940,29 @@ def main():
             import shutil as _shutil
 
             num_gpus = torch.cuda.device_count()
+
+            # Detect the correct Python for subprocesses.
+            # sys.executable might be a base conda Python without pypinyin/cn2an.
+            # Prefer the Python that has torch + ctc_prealign dependencies.
+            _child_python = sys.executable
+            try:
+                import pypinyin  # noqa: F401
+            except ImportError:
+                # Current Python lacks pypinyin — try common ASR env paths
+                _candidates = [
+                    Path.home() / "miniconda3/envs/asr/bin/python",
+                    Path.home() / "miniconda3/envs/asr/bin/python3",
+                ]
+                for _c in _candidates:
+                    if _c.exists():
+                        _child_python = str(_c)
+                        print(f"  Note: using {_child_python} for subprocesses"
+                              f" (current Python lacks pypinyin)")
+                        break
+                else:
+                    print("  WARNING: pypinyin not available. English token"
+                          " normalization may be skipped.")
+
             audio_dir = args.audio_dir or args.data_dir
             all_wavs = sorted(audio_dir.rglob("*.wav"))
             total = len(all_wavs)
@@ -950,7 +973,7 @@ def main():
 
             # Build base argv from parsed namespace
             _base_argv = [
-                sys.executable, __file__,
+                _child_python, __file__,
                 "--data-dir", str(args.data_dir),
                 "--pinyin-dir", str(args.pinyin_dir),
                 "--model-path", str(args.model_path),
