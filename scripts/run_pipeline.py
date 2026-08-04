@@ -1083,6 +1083,161 @@ def step_adjust_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     return rc
 
 
+def _run_mfa_sharded(
+    stems: list[str],
+    corpus_dir: Path,
+    audio_dir: Path,
+    anchors_dir: Path | None,
+    dict_path: Path,
+    acoustic_model: str,
+    aligned_dir: Path,
+    workspace: Path,
+    mfa_python: Path,
+    models_dir: Path,
+    num_jobs: int,
+    single_speaker: bool,
+    no_tokenization: bool,
+    beam: int,
+    retry_beam: int,
+    boost_silence: float,
+    clean: bool,
+    overwrite: bool,
+    output_format: str = "long_textgrid",
+    desc: str = "MFA Align",
+    **extra_args,
+) -> int:
+    """Run MFA align in parallel shards to accelerate MFCC extraction.
+
+    MFA's MFCC phase uses limited internal parallelism (~2 cores).  By
+    splitting the corpus into N independent shards, each with its own
+    MFA instance, we achieve N× MFCC throughput.
+
+    CMVN: with --single_speaker, each shard computes its own per-speaker
+    statistics.  For TTS synthetic data (same voice), subset statistics
+    are near-identical to global — negligible alignment impact.
+    """
+    import multiprocessing as _mp
+
+    _n = len(stems)
+    _n_shards = min(8, _mp.cpu_count() // 4, max(1, _n // 1000))
+    if _n_shards <= 1:
+        return None  # signal: caller should run single MFA
+
+    _per_shard = (_n + _n_shards - 1) // _n_shards
+    _jobs_per_shard = max(1, num_jobs // _n_shards)
+    print(f"  MFA sharding: {_n_shards}× ({_per_shard} stems,"
+          f" {_jobs_per_shard} jobs each)")
+
+    # ── Prepare shard directories ──
+    _shard_dirs: list[Path] = []
+    _shard_stems: list[list[str]] = []
+    _t0 = time.time()
+    _total_links = 0
+
+    for _si in range(_n_shards):
+        _ss = stems[_si * _per_shard : (_si + 1) * _per_shard]
+        if not _ss:
+            break
+        _shard_stems.append(_ss)
+        _sd = workspace / f"_mfa_shard_{_si}"
+        _sd.mkdir(parents=True, exist_ok=True)
+        _shard_dirs.append(_sd)
+
+        for _sub in ("corpus", "audio", "anchors", "output", "temp"):
+            (_sd / _sub).mkdir(parents=True, exist_ok=True)
+
+        for _stem in _ss:
+            _src = corpus_dir / f"{_stem}.lab"
+            if _src.exists():
+                (_sd / "corpus" / f"{_stem}.lab").symlink_to(_src)
+                _total_links += 1
+            _src = audio_dir / f"{_stem}.wav"
+            if _src.exists():
+                (_sd / "audio" / f"{_stem}.wav").symlink_to(_src)
+                _total_links += 1
+            if anchors_dir:
+                _src = anchors_dir / f"{_stem}.TextGrid"
+                if _src.exists():
+                    (_sd / "anchors" / f"{_stem}.TextGrid").symlink_to(_src)
+                    _total_links += 1
+
+    _elapsed = time.time() - _t0
+    print(f"  Symlinked {_total_links} files in {_elapsed:.1f}s")
+
+    # ── Launch parallel MFA instances ──
+    _procs: list[tuple[int, subprocess.Popen, Path]] = []
+    for _si, _ss in enumerate(_shard_stems):
+        _sd = _shard_dirs[_si]
+        _mfa_args = [
+            "align", str(_sd / "corpus"), str(dict_path),
+            acoustic_model, str(_sd / "output"),
+            "--audio_directory", str(_sd / "audio"),
+            "--temporary_directory", str(_sd / "temp"),
+            "--output_format", output_format,
+            "--num_jobs", str(_jobs_per_shard),
+            "--overwrite", "--no_textgrid_cleanup",
+        ]
+        if anchors_dir:
+            _mfa_args += ["--textgrid_directory", str(_sd / "anchors")]
+        if single_speaker:
+            _mfa_args.append("--single_speaker")
+        if no_tokenization:
+            _mfa_args.append("--no_tokenization")
+        if clean:
+            _mfa_args.append("--clean")
+        _mfa_args += ["--beam", str(beam)]
+        _mfa_args += ["--retry_beam", str(retry_beam)]
+        _mfa_args += ["--boost_silence", str(boost_silence)]
+        for _k, _v in extra_args.items():
+            if _v is not None:
+                _mfa_args += [f"--{_k}", str(_v)]
+
+        _cmd = [str(mfa_python), "-m",
+                "montreal_forced_aligner.command_line.mfa"] + _mfa_args
+        print(f"  [shard {_si}/{_n_shards}] {len(_ss)} stems,"
+              f" {_jobs_per_shard} jobs")
+        _proc = subprocess.Popen(
+            _cmd,
+            env=get_mfa_env(mfa_python, models_dir),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _procs.append((_si, _proc, _sd))
+
+    # ── Wait for all shards ──
+    _failed: list[int] = []
+    for _si, _proc, _sd in _procs:
+        _rc = _proc.wait()
+        if _rc != 0:
+            _failed.append(_si)
+            print(f"  [shard {_si}] FAILED (rc={_rc})")
+        else:
+            print(f"  [shard {_si}] DONE")
+
+    if _failed:
+        print(f"  ERROR: {len(_failed)}/{_n_shards} shards failed")
+        return 1
+
+    # ── Merge aligned TextGrids ──
+    _merged = 0
+    for _sd in _shard_dirs:
+        for _tg in (_sd / "output").glob("*.TextGrid"):
+            _dest = aligned_dir / _tg.name
+            if overwrite or not _dest.exists():
+                import shutil as _shutil
+                _shutil.copy2(str(_tg), str(_dest))
+                _merged += 1
+
+    # ── Cleanup ──
+    for _sd in _shard_dirs:
+        import shutil as _shutil
+        _shutil.rmtree(str(_sd), ignore_errors=True)
+
+    print(f"  Sharded MFA: {_merged} TextGrids merged,"
+          f" {_n_shards} shards completed")
+    return 0
+
+
 def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     """MFA align — uses NVASR .lab as corpus + CTC TextGrid as anchors.
 
@@ -1180,6 +1335,45 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         fine_tune_tolerance = mc.get("fine_tune_boundary_tolerance", 0.02)
         if fine_tune_tolerance is not None and fine_tune_tolerance > 0:
             mfa_args += ["--fine_tune_boundary_tolerance", str(fine_tune_tolerance)]
+
+    # ── Try sharded MFA (parallel MFCC extraction) ──
+    _mfa_audio_dir = ctx["mfa_audio_dir"]
+    _stems = sorted(
+        p.stem for p in corpus_dir.glob("*.lab")
+        if (_mfa_audio_dir / f"{p.stem}.wav").exists()
+    )
+    _extra = {}
+    if mc.get("acoustic_scale") is not None:
+        _extra["acoustic_scale"] = mc["acoustic_scale"]
+    if mc.get("transition_scale") is not None:
+        _extra["transition_scale"] = mc["transition_scale"]
+
+    _rc = _run_mfa_sharded(
+        stems=_stems,
+        corpus_dir=corpus_dir,
+        audio_dir=_mfa_audio_dir,
+        anchors_dir=ctc_dir if use_anchors else None,
+        dict_path=ctx["mfa_dict"],
+        acoustic_model=acoustic_model_arg2,
+        aligned_dir=ctx["aligned_dir"],
+        workspace=ctx["workspace"],
+        mfa_python=mfa_python,
+        models_dir=ctx["models_dir"],
+        num_jobs=resolve_num_jobs(mc.get("num_jobs", 0)),
+        single_speaker=mc.get("single_speaker", False),
+        no_tokenization=mc.get("no_tokenization", False),
+        beam=mc.get("beam", 20),
+        retry_beam=mc.get("retry_beam", 80),
+        boost_silence=mc.get("boost_silence", 1.0),
+        clean=mc.get("clean", False),
+        overwrite=args.overwrite,
+        output_format=mc.get("output_format", "long_textgrid"),
+        desc="Step 6: MFA Align (sharded)",
+        **_extra,
+    )
+    if _rc is not None:
+        return _rc
+    # Fallback: single MFA instance
     return run_mfa(mfa_args, mfa_python, ctx["models_dir"],
                    "Step 6: MFA Align" + (" (NVASR corpus + CTC anchors)" if use_nvasr_corpus and use_anchors else ""))
 
