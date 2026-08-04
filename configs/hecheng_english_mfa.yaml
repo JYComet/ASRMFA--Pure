@@ -78,6 +78,7 @@ ctc_prealign:
   python: /home/user/miniconda3/envs/asr/bin/python
   limit: 0
   timeout: 14400
+  nvv_enabled: false   # 关闭 NVV 标签检测, 仅用 CTC 锚点给参考文本做时间戳
 
 ctc_adjust:
   enabled: false
@@ -100,7 +101,7 @@ mfa:
 # ── 英文 MFA 子词对齐 ─────────────────────────────────────────────────────
 mfa_en:
   enabled: true
-  num_jobs: 4
+  num_jobs: 16
   padding_ms: 50
   min_segment_dur_ms: 200
   max_gap_merge_s: 0.35

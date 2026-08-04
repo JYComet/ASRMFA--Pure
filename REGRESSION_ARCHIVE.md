@@ -3762,6 +3762,56 @@ def _protect_ria(tokens: list[dict], lab_tokens: list[str]) -> tuple[list, list]
 - 测试集: `/tmp/test_en_ctc/ctc_pretg/` (10 条)
 - 数据集: `/mnt/Raw/新版合成英文数据` (54000 条)
 
+### 实施记录 (2026-08-04)
+
+**已实施的修改**:
+
+| ID | 文件 | 行号 | 修改 | 状态 |
+|----|------|------|------|------|
+| **Fix-4a** | `ctc_prealign.py` | ~796 | `ya[0-5]` → `(ya\|a)[0-5]` 扩展 `_merge_ria_tokens` | ✅ |
+| **Fix-4b** | `ctc_prealign.py` | ~42-45, ~1357-1364 | `_SINGLE_LETTER_LOWERCASE_NAMES` 常量 + 单字母合并后强制小写 | ✅ |
+| **Fix-4d** | `ctc_prealign.py` | ~824-880, ~1480 | `_protect_ria()` 函数 + 单字母合并/NVV去重后调用 | ✅ |
+| **Fix-4d** | `normalize_english_tokens.py` | — | (ria 保护由 ctc_prealign 层覆盖, normalize_en 不再额外处理) | ✅ |
+| **Fix-2b** | `normalize_english_tokens.py` | ~124-129 | `_token_matches_ref` 拼音→英文增加 ≥2 元音约束 | ✅ |
+| **Fix-3a** | `ctc_prealign.py` | ~986-1050 | `_reclaim_nvv_pinyin()` 函数 (保留作为安全网) | ✅ |
+| **Fix-3a** | `normalize_english_tokens.py` | ~289 | NVV token 排除出 `en_ref_positions` (防 normalize_en 把拼音合并到 NVV) | ✅ |
+| **Fix-3a** | `normalize_english_tokens.py` | ~311-316 | NVV pre-reclaim: 短 NVV + 邻接拼音 → 还原为原始拼音 | ✅ |
+| **Fix-1** | `normalize_english_tokens.py` | ~63-130, ~453-490 | `_reclaim_fragments()` Pass 2 + `normalize_stem` 末尾调用 | ✅ |
+| **Fix-NEW** | `ctc_prealign.py` | ~154-168, ~228-232 | `make_patched_inference` 增加 `enable_nvv` 参数, False 时跳过 blank-frame NVV bias | ✅ |
+| **Fix-NEW** | `ctc_prealign.py` | ~1089-1090 | `--no-nvv` CLI 开关 | ✅ |
+| **Fix-NEW** | `ctc_prealign.py` | ~1145 | `--all-gpus` 子进程转发 `--no-nvv` | ✅ |
+| **Fix-NEW** | `run_pipeline.py` | ~754-755 | `nvv_enabled: false` 配置 → `--no-nvv` 转发 | ✅ |
+| **Fix-NEW** | `hecheng_english_mfa.yaml` | ~80 | `nvv_enabled: false` 配置项 | ✅ |
+
+**实测验证 (10 条样本, `--no-nvv`)**:
+
+| 指标 | 修复前 | 修复后 |
+|------|--------|--------|
+| NVV token 误判 | 2 个 (`zan2`/`jin1` → BREATHING) | **0** ✅ |
+| 英文碎片残留 | "SOS"+"OS" 两个独立 token | "SOS" 合并为 600ms ✅ |
+| ria 完整性 | 依赖 normalize_en 链式修正 | 单字母合并 + 小写 + `_protect_ria` ✅ |
+| fragment reclaim | 无 | 2 文件各吸收 1 碎片 ✅ |
+| `f`+`an` → `fan` | 未合并 | **仍残留** (短碎片相邻但无长英文词可吸收) ⚠ |
+
+**已知剩余问题**:
+
+1. `f`(60ms) + `an`(60ms) → 应合并为 `fan`, 但 `_reclaim_fragments` 当前仅在短碎片邻接**长英文词**时吸收。两短碎片相邻时不会互相合并。后续可在 `_reclaim_fragments` 中增加"短碎片互相合并"分支。
+
+2. `_reclaim_nvv_pinyin` 函数逻辑正确但时序敏感 — 在 pipeline 中运行需确保 `.lab` 文件未被 `_normalize_english` 污染。当前通过在 `normalize_english_tokens.py` 内部做 NVV pre-reclaim 来绕过此问题。
+
+**`--no-nvv` 方案说明**:
+
+`--no-nvv` 是解决 NVV 误判的**首选方案**。设置后 `make_patched_inference` 跳过 blank-frame NVV bias, 模型完全不会检测 NVV token, 仅用 CTC 锚点给参考文本做时间戳。相比后处理还原 (`_reclaim_nvv_pinyin`), 这是从源头消除问题。
+
+```bash
+# 命令行
+python ctc_prealign.py ... --no-nvv
+
+# 配置文件
+ctc_prealign:
+  nvv_enabled: false
+```
+
 ---
 
 ## 模板 (新 Case 用)

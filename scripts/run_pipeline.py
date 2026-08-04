@@ -751,6 +751,8 @@ def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     ]
     if pc.get("nvv_bias", 0) > 0:
         prealign_args += ["--nvv-bias", str(pc["nvv_bias"])]
+    if not pc.get("nvv_enabled", True):
+        prealign_args.append("--no-nvv")
     if pc.get("limit", 0) > 0:
         prealign_args += ["--limit", str(pc["limit"])]
     if pc.get("offset", 0) > 0:

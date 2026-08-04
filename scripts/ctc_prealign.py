@@ -153,7 +153,8 @@ def preprocess_asr_for_mfa(text: str) -> str:
 
 def make_patched_inference(ref_texts: dict[str, str],
                            bias_value: float = NVV_BIAS_DEFAULT,
-                           pause_threshold: int = PAUSE_FRAMES_DEFAULT):
+                           pause_threshold: int = PAUSE_FRAMES_DEFAULT,
+                           enable_nvv: bool = True):
     """
     创建打了补丁的 inference 方法.
 
@@ -163,6 +164,7 @@ def make_patched_inference(ref_texts: dict[str, str],
     - 同样做 blank-frame NVV bias + 停顿检测 + 省略号注入
 
     ref_texts: {stem: chinese_text}  — 键为音频文件 stem (无扩展名)
+    enable_nvv: 若 False, 关闭 blank-frame NVV bias, 模型不会检测 NVV token.
     """
     try:
         import cn2an as _cn2an
@@ -225,7 +227,8 @@ def make_patched_inference(ref_texts: dict[str, str],
             # ── Blank-frame NVV bias ──
             top_pred = x.argmax(dim=-1)
             is_blank = (top_pred == BLANK_ID)
-            x[is_blank, NVV_START:NVV_END + 1] += bias_value
+            if enable_nvv:
+                x[is_blank, NVV_START:NVV_END + 1] += bias_value
 
             raw_y = x.argmax(dim=-1).tolist()
 
@@ -983,7 +986,7 @@ def _normalize_english(ctc_dir: Path, dict_path: Path | None = None) -> int:
     return changed
 
 
-def _reclaim_nvv_pinyin(ctc_dir: Path) -> int:
+def _reclaim_nvv_pinyin(ctc_dir: Path, pinyin_dir: Path | None = None) -> int:
     """Revert NVV tokens that are actually misclassified pinyin syllables.
 
     NVASR's blank-frame NVV bias (NVV_BIAS_DEFAULT=4.0) can cause short
@@ -993,12 +996,17 @@ def _reclaim_nvv_pinyin(ctc_dir: Path) -> int:
     A NVV token is reverted to pinyin when ALL of:
       - Duration < 400ms  (true NVV like BREATHING/LAUGHTER > 500ms)
       - Adjacent tokens are pinyin syllables (not English / other NVV)
-      - The .lab file has a pinyin syllable at this position
-      - The NVV token text is NOT a known NVV in reference text
+      - The ORIGINAL .lab from pinyin_dir has a pinyin syllable at this
+        position (NOT the output .lab which may already be contaminated)
 
     Regression Case 31 Fix-3a.
     """
     reverted = 0
+    # Use pinyin_dir for original .lab; fall back to ctc_dir.
+    # The output .lab is already contaminated by CTC NVV tokens,
+    # so we must read the original pinyin from the prepare step.
+    lab_source_dir = pinyin_dir if pinyin_dir and pinyin_dir.exists() else ctc_dir
+
     for tokens_path in sorted(ctc_dir.glob("*_tokens.jsonl")):
         stem = tokens_path.stem.replace("_tokens", "")
         try:
@@ -1008,8 +1016,10 @@ def _reclaim_nvv_pinyin(ctc_dir: Path) -> int:
         except Exception:
             continue
 
-        # Read .lab for original pinyin reference
-        lab_path = ctc_dir / f"{stem}.lab"
+        # Read ORIGINAL .lab from pinyin_dir (before CTC processing)
+        lab_path = lab_source_dir / f"{stem}.lab"
+        if not lab_path.exists():
+            lab_path = ctc_dir / f"{stem}.lab"
         lab_tokens: list[str] = []
         if lab_path.exists():
             lab_tokens = lab_path.read_text(encoding="utf-8").strip().split()
@@ -1032,15 +1042,12 @@ def _reclaim_nvv_pinyin(ctc_dir: Path) -> int:
             if not (prev_pinyin or next_pinyin):
                 continue
 
-            # Check 3: .lab has a pinyin syllable at this position
+            # Check 3: ORIGINAL .lab has a pinyin syllable at this position
             if i < len(lab_tokens) and is_pinyin_syllable(lab_tokens[i]):
                 old_word = tok["word"]
                 tok["word"] = lab_tokens[i]
                 changed = True
                 reverted += 1
-                if reverted <= 10:
-                    print(f"  [nvv_reclaim] {stem}: {old_word} → {tok['word']} "
-                          f"({int(dur*1000)}ms)")
 
         if changed:
             tokens_path.write_text(
@@ -1077,6 +1084,8 @@ def main():
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--nvv-bias", type=float, default=NVV_BIAS_DEFAULT,
                         help=f"NVV blank-frame bias (default: {NVV_BIAS_DEFAULT}).")
+    parser.add_argument("--no-nvv", action="store_true",
+                        help="禁用 NVV 标签检测, 仅用 CTC 锚点给参考文本做时间戳.")
     args = parser.parse_args()
 
     # ── --all-gpus: auto-detect GPUs, split files, launch parallel subprocesses ──
@@ -1130,6 +1139,8 @@ def main():
             ]
             if args.audio_dir:
                 _base_argv += ["--audio-dir", str(args.audio_dir)]
+            if args.no_nvv:
+                _base_argv += ["--no-nvv"]
 
             for gpu_id in range(num_gpus):
                 offset = gpu_id * per_gpu
@@ -1320,7 +1331,8 @@ def main():
     from funasr import AutoModel
     model = AutoModel(model=args.model_path, device=args.device, disable_update=True)
     orig_inf = model.model.inference
-    patched = make_patched_inference(ref_texts, args.nvv_bias)
+    patched = make_patched_inference(ref_texts, args.nvv_bias,
+                                      enable_nvv=not args.no_nvv)
     model.model.inference = patched.__get__(model.model, type(model.model))
 
     # ── 处理所有音频文件 (有参考文本用参考, 无则纯靠 ASR) ──
@@ -1826,7 +1838,7 @@ def main():
         _normalize_punct(args.output_dir)
         _normalize_numerals(args.output_dir)
         _normalize_ria(args.output_dir)
-        _reclaim_nvv_pinyin(args.output_dir)
+        _reclaim_nvv_pinyin(args.output_dir, args.pinyin_dir)
         _normalize_english(args.output_dir, args.dict_path)
 
     # ── 恢复模型 ──

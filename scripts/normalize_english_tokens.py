@@ -283,10 +283,12 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
 
     # English words in reference — auto-detect ASCII-alpha words (len >= 2)
     # as candidates for fragment merging.
+    # Exclude NVV tokens (BREATHING, LAUGHTER, etc.) — they have no acoustic
+    # model and should never consume pinyin fragments.
+    # Regression Case 31 Fix-3a (NVV guard).
     en_ref_positions: dict[int, str] = {}  # ref_unit_idx → word
     for ri, (ci, u) in enumerate(ref_units):
-        # Auto-detect: pure ASCII alpha, length >= 2 → almost certainly English
-        if u.isascii() and u.isalpha() and len(u) >= 2:
+        if u.isascii() and u.isalpha() and len(u) >= 2 and not is_nvv_token(u):
             en_ref_positions[ri] = u
 
     if not en_ref_positions:
@@ -305,6 +307,14 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
         for line in tokens_path.read_text(encoding="utf-8").strip().split("\n"):
             if line:
                 ctc_tokens.append(json.loads(line))
+
+    # ── NVV pre-reclaim: revert short NVV tokens that are actually
+    # misclassified pinyin syllables BEFORE the main merge pass.
+    # Regression Case 31 Fix-3a.
+    for i, ct in enumerate(ctc_tokens):
+        if is_nvv_token(ct["word"]) and (ct["end_s"] - ct["start_s"]) <= 0.400:
+            if i < len(lab_tokens) and is_pinyin_syllable(lab_tokens[i]):
+                ct["word"] = lab_tokens[i]
 
     # Align .lab tokens → reference word units
     ref_texts = [u for _, u in ref_units]
@@ -376,44 +386,56 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
 
         changes.append((en_word, indices))
 
-    if not changes:
-        return False
-
     if dry_run:
         for en_word, indices in changes:
             old = " + ".join(lab_tokens[i] for i in indices)
             print(f"  [{stem}] {old}  →  {en_word}  (indices {indices})")
         return False
 
-    # Apply
-    to_delete: set[int] = set()
-    replacements: dict[int, tuple[str, float, float]] = {}
-    for en_word, indices in changes:
-        first, last = indices[0], indices[-1]
-        s = ctc_tokens[first]["start_s"] if first < len(ctc_tokens) else 0.0
-        e = ctc_tokens[last]["end_s"] if last < len(ctc_tokens) else 0.0
-        replacements[first] = (en_word, s, e)
-        for i in indices[1:]:
-            to_delete.add(i)
+    # ── Apply Pass 1 merges ──
+    if changes:
+        to_delete: set[int] = set()
+        replacements: dict[int, tuple[str, float, float]] = {}
+        for en_word, indices in changes:
+            first, last = indices[0], indices[-1]
+            s = ctc_tokens[first]["start_s"] if first < len(ctc_tokens) else 0.0
+            e = ctc_tokens[last]["end_s"] if last < len(ctc_tokens) else 0.0
+            replacements[first] = (en_word, s, e)
+            for i in indices[1:]:
+                to_delete.add(i)
 
-    new_lab = []
-    for i, t in enumerate(lab_tokens):
-        if i in to_delete: continue
-        new_lab.append(replacements[i][0] if i in replacements else t)
+        new_lab = []
+        for i, t in enumerate(lab_tokens):
+            if i in to_delete: continue
+            new_lab.append(replacements[i][0] if i in replacements else t)
 
-    new_ctc = []
-    for i, ct in enumerate(ctc_tokens):
-        if i in to_delete: continue
-        if i in replacements:
-            en_word, s, e = replacements[i]
-            new_ctc.append({"word": en_word, "start_ms": round(s * 1000),
-                           "end_ms": round(e * 1000), "start_s": s, "end_s": e, "type": "word"})
-        else:
-            new_ctc.append(ct)
+        new_ctc = []
+        for i, ct in enumerate(ctc_tokens):
+            if i in to_delete: continue
+            if i in replacements:
+                en_word, s, e = replacements[i]
+                new_ctc.append({"word": en_word, "start_ms": round(s * 1000),
+                               "end_ms": round(e * 1000), "start_s": s, "end_s": e,
+                               "type": "word"})
+            else:
+                new_ctc.append(ct)
+    else:
+        new_lab = list(lab_tokens)
+        new_ctc = list(ctc_tokens)
 
-    lab_path.write_text(" ".join(new_lab) + "\n", encoding="utf-8")
+    # ── Pass 2: Fragment reclamation (always runs, even if Pass 1 had no changes) ──
+    # Handles orphan fragments that Pass 1 missed: two short fragments
+    # adjacent to each other (e.g. "f"+"an"→"fan") or fragments not
+    # matched to any reference word by NW alignment.
+    # Regression Case 31 Fix-1.
+    new_lab2, new_ctc2, frag_merged = _reclaim_fragments(new_lab, new_ctc)
+
+    if not changes and not frag_merged:
+        return False
+
+    lab_path.write_text(" ".join(new_lab2) + "\n", encoding="utf-8")
     tokens_path.write_text(
-        "\n".join(json.dumps(t, ensure_ascii=False) for t in new_ctc) + "\n",
+        "\n".join(json.dumps(t, ensure_ascii=False) for t in new_ctc2) + "\n",
         encoding="utf-8")
 
     # Also update the CTC TextGrid anchors to match the corrected tokens.
@@ -432,7 +454,7 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
                 in_words = True
                 lines_out.append(line)
             elif in_words and stripped.startswith("intervals: size"):
-                lines_out.append(f"        intervals: size = {len(new_ctc)}")
+                lines_out.append(f"        intervals: size = {len(new_ctc2)}")
             elif in_words and stripped.startswith("intervals ["):
                 # Skip old interval blocks, will be replaced below
                 pass
@@ -441,7 +463,7 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
                 pass
             elif in_words and 'name = "' in stripped and 'pauses' in stripped.lower():
                 # End of words tier — insert new intervals before pauses tier
-                for idx, t in enumerate(new_ctc):
+                for idx, t in enumerate(new_ctc2):
                     lines_out.append(f"        intervals [{idx}]:")
                     lines_out.append(f"            xmin = {t['start_s']:.6f}")
                     lines_out.append(f"            xmax = {t['end_s']:.6f}")
