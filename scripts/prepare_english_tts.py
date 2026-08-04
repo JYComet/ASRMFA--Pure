@@ -105,6 +105,8 @@ def process_folders(
     jsonl_data: list[dict],
     output_dir: Path,
     limit: int = 0,
+    write_ref_txt: bool = False,
+    overwrite: bool = False,
 ) -> dict:
     """Scan audio folders, create .lab and _text_cn.txt files.
 
@@ -178,9 +180,9 @@ def process_folders(
                 raw_path.write_text(raw_text + "\n", encoding="utf-8")
 
                 # Also write {stem}.txt alongside audio for NVASR reference-text mode
-                if args.write_ref_txt:
+                if write_ref_txt:
                     ref_txt_path = wav_path.with_suffix('.txt')
-                    if not ref_txt_path.exists() or args.overwrite:
+                    if not ref_txt_path.exists() or overwrite:
                         ref_txt_path.write_text(raw_text + "\n", encoding="utf-8")
 
                 stats["created"] += 1
@@ -254,7 +256,9 @@ def main():
             if not fp.is_dir():
                 print(f"WARNING: folder not found: {fp}")
 
-    stats = process_folders(audio_root, jsonl_data, output_dir, args.limit)
+    stats = process_folders(audio_root, jsonl_data, output_dir, args.limit,
+                            write_ref_txt=args.write_ref_txt,
+                            overwrite=args.overwrite)
 
     print(f"\n{'='*50}")
     print(f"  Done! total={stats['total']}, created={stats['created']}, "

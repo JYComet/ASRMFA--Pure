@@ -352,28 +352,36 @@ _TEMP_CACHE_ROOT = Path("/tmp/mfa_audio_cache")
 
 
 def _resolve_nvme_cache(data_dir: Path,
-                        nvme_override: str | None = None
+                        nvme_override: str | None = None,
+                        auto_cache: bool = False,
                         ) -> tuple[Path | None, bool]:
     """Detect and optionally create an NVMe-local mirror of the audio data.
 
     Resolution order:
-    1. If *nvme_override* is given, use that path verbatim (not auto-cleaned).
+    1. If *nvme_override* is given, use that path verbatim.
     2. If ``/mnt/nvme3/mfa_audio_cache/cache_manifest.json`` exists and its
        ``source`` field matches *data_dir*, use it (permanent, keep).
-    3. Otherwise, create a temp mirror under ``/tmp/mfa_audio_cache/``,
-       copy speaker subdirectories, and mark for auto-cleanup.
+    3. If *auto_cache* is True, create a temp mirror under
+       ``/tmp/mfa_audio_cache/``, copy speaker subdirectories,
+       and mark for auto-cleanup.
+    4. Otherwise, print setup instructions and return None (fall back to NAS).
 
     Returns ``(cache_dir, is_temp)`` where *is_temp* means the caller should
     delete the directory when done.
     """
     import json as _json
 
-    # 1. Explicit override
+    # 1. Explicit override (from --nvme-cache or config nvme_cache)
     if nvme_override:
         _p = Path(nvme_override)
         if _p.exists():
-            return _p, False
-        print(f"  WARNING: --nvme-cache path not found: {_p}")
+            # Verify it has the right structure before trusting it
+            if (_p / _NVME_MANIFEST_NAME).exists() or any(
+                d.is_dir() and any(d.glob("*.wav"))
+                for d in _p.iterdir()
+            ):
+                return _p, False
+        print(f"  NVMe cache not ready: {_p}")
 
     # 2. Permanent cache check
     _manifest = _NVME_CACHE_ROOT / _NVME_MANIFEST_NAME
@@ -382,7 +390,6 @@ def _resolve_nvme_cache(data_dir: Path,
             _m = _json.loads(_manifest.read_text(encoding="utf-8"))
             _m_src = Path(_m.get("source", ""))
             if _m_src == data_dir.resolve():
-                # Verify at least one speaker dir exists
                 if any(
                     (d.is_dir() and any(d.glob("*.wav")))
                     for d in _NVME_CACHE_ROOT.iterdir()
@@ -391,45 +398,57 @@ def _resolve_nvme_cache(data_dir: Path,
         except Exception:
             pass
 
-    # 3. Temp cache: mirror speaker subdirs from NAS to /tmp
-    print(f"  Creating temp audio cache: {_TEMP_CACHE_ROOT}")
-    _t0 = time.time()
-    _copied = 0
-    _bytes_copied = 0
-    try:
-        _TEMP_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        for _entry in sorted(data_dir.iterdir()):
-            if not _entry.is_dir():
-                continue
-            _wavs = sorted(_entry.glob("*.wav"))
-            if not _wavs:
-                continue
-            _speaker_dst = _TEMP_CACHE_ROOT / _entry.name
-            _speaker_dst.mkdir(exist_ok=True)
-            _n = len(_wavs)
-            for _i, _src in enumerate(_wavs):
-                _dst = _speaker_dst / _src.name
-                if not _dst.exists():
-                    import shutil as _shutil
-                    _shutil.copy2(str(_src), str(_dst))
-                    _copied += 1
-                    _bytes_copied += _src.stat().st_size
-                if (_i + 1) % 1000 == 0 or _i == _n - 1:
-                    _pct = (_i + 1) / _n * 100
-                    _elapsed = time.time() - _t0
-                    _gb = _bytes_copied / 1024**3
-                    _spd = _gb / _elapsed * 1024 if _elapsed > 0 else 0
-                    print(f"\r    [{_entry.name}] {_i+1}/{_n} ({_pct:.0f}%)"
-                          f" | {_gb:.1f} GB | {_spd:.0f} MB/s", end="")
-            print()  # newline after speaker
-        _elapsed = time.time() - _t0
-        _gb = _bytes_copied / 1024**3
-        print(f"  Temp cache ready: {_copied} files ({_gb:.1f} GB)"
-              f" in {_elapsed:.0f}s")
-        return _TEMP_CACHE_ROOT, True
-    except Exception as _e:
-        print(f"  WARNING: Temp cache creation failed: {_e}")
-        return None, False
+    # 3. Auto-create temp cache (only with explicit --auto-cache flag)
+    if auto_cache:
+        print(f"  Creating temp audio cache: {_TEMP_CACHE_ROOT}")
+        _t0 = time.time()
+        _copied = 0
+        _bytes_copied = 0
+        try:
+            _TEMP_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+            for _entry in sorted(data_dir.iterdir()):
+                if not _entry.is_dir():
+                    continue
+                _wavs = sorted(_entry.glob("*.wav"))
+                if not _wavs:
+                    continue
+                _speaker_dst = _TEMP_CACHE_ROOT / _entry.name
+                _speaker_dst.mkdir(exist_ok=True)
+                _n = len(_wavs)
+                for _i, _src in enumerate(_wavs):
+                    _dst = _speaker_dst / _src.name
+                    if not _dst.exists():
+                        import shutil as _shutil
+                        _shutil.copy2(str(_src), str(_dst))
+                        _copied += 1
+                        _bytes_copied += _src.stat().st_size
+                    if (_i + 1) % 1000 == 0 or _i == _n - 1:
+                        _pct = (_i + 1) / _n * 100
+                        _elapsed = time.time() - _t0
+                        _gb = _bytes_copied / 1024**3
+                        _spd = _gb / _elapsed * 1024 if _elapsed > 0 else 0
+                        print(f"\r    [{_entry.name}] {_i+1}/{_n} ({_pct:.0f}%)"
+                              f" | {_gb:.1f} GB | {_spd:.0f} MB/s", end="")
+                print()
+            _elapsed = time.time() - _t0
+            _gb = _bytes_copied / 1024**3
+            print(f"  Temp cache ready: {_copied} files ({_gb:.1f} GB)"
+                  f" in {_elapsed:.0f}s")
+            return _TEMP_CACHE_ROOT, True
+        except Exception as _e:
+            print(f"  WARNING: Temp cache creation failed: {_e}")
+            return None, False
+
+    # 4. No cache found — print instructions, fall back to NAS
+    print(f"  ═══════════════════════════════════════════════════════════")
+    print(f"  NVMe audio cache not found.")
+    print(f"  Run once to eliminate NAS I/O (~30 min, one-time):")
+    print(f"    python scripts/cache_audio_to_nvme.py \\")
+    print(f"        --source {data_dir}")
+    print(f"  Or use --auto-cache to create a temp cache for this run.")
+    print(f"  Falling back to NAS audio (slower).")
+    print(f"  ═══════════════════════════════════════════════════════════")
+    return None, False
 
 
 def _cleanup_nvme_cache(cache_dir: Path, is_temp: bool) -> None:
@@ -1824,8 +1843,10 @@ def main():
                              "Use with streaming --gpus for multi-GPU scheduling.")
     parser.add_argument("--nvme-cache", type=str, default=None, metavar="DIR",
                         help="Path to NVMe audio cache (default: auto-detect"
-                             " /mnt/nvme3/mfa_audio_cache)."
-                             " If not found, a temp cache is created under /tmp.")
+                             " /mnt/nvme3/mfa_audio_cache).")
+    parser.add_argument("--auto-cache", action="store_true",
+                        help="Auto-create temp audio cache on NVMe if permanent"
+                             " cache not found (cleaned after pipeline completes).")
     parser.add_argument("--validate", action="store_true",
                         help="Validate output structure after each step (uses output_spec in config).")
     parser.add_argument("--mode", type=str, default=None,
@@ -2122,9 +2143,13 @@ def main():
     # Check for a pre-populated audio cache on local NVMe (created by
     # scripts/cache_audio_to_nvme.py).  If found, use it as the audio
     # source to eliminate NAS I/O contention.
+    # Priority: CLI --nvme-cache > config nvme_cache > auto-detect
+    _nvme_override = getattr(args, "nvme_cache", None) or cfg.get("nvme_cache")
+    _auto_cache = getattr(args, "auto_cache", False)
     _nvme_cache_dir, _nvme_is_temp = _resolve_nvme_cache(
         data_dir,
-        getattr(args, "nvme_cache", None),
+        nvme_override=None if _nvme_override is None else str(_nvme_override),
+        auto_cache=_auto_cache,
     )
     if _nvme_cache_dir:
         print(f"  NVMe audio cache: {_nvme_cache_dir}"

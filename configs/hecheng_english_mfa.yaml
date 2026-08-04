@@ -1,51 +1,76 @@
-# 新版合成英文数据 — ASR + MFA 对齐 (参考文本模式, 支持八卡并行)
+# 新版合成英文数据 — ASR + MFA 对齐 (参考文本模式, 全 NVMe 链路)
 #
 # ═══════════════════════════════════════════════════════════════════════════
 # 准备 (只需执行一次):
+#   # 初始化 NVMe 音频缓存 (≈30 min, 只需一次)
+#   python scripts/cache_audio_to_nvme.py --source /mnt/Raw/新版合成英文数据
+#
 #   # 生成 .lab / _text_cn.txt / {stem}.txt 参考文本
+#   # (参考文本已存在于 data_dir 各 speaker 子目录, 通常无需重跑)
 #   python scripts/prepare_english_tts.py \
-#       --jsonl /mnt/project/Voxcpm/output/generated_scripts.jsonl \
+#       --jsonl /mnt/local_E/Voxcpm/output/generated_scripts.jsonl \
 #       --audio-root /mnt/Raw/新版合成英文数据 \
-#       --output-dir output/hecheng_en_mfa/ctc_pretg \
+#       --output-dir /mnt/nvme3/mfa_workspace/ctc_pretg \
 #       --write-ref-txt
 #
 # ═══════════════════════════════════════════════════════════════════════════
-# 单卡运行:
-#   python scripts/run_pipeline.py --config configs/hecheng_english_mfa.yaml \
-#       --workspace /mnt/project/MFA_Pause/repo/output/hecheng_en_mfa \
-#       --skip-normalize_punct --skip-normalize \
-#       --skip-normalize_ria --skip-normalize_en --skip-adjust \
-#       --python /home/devuser/miniconda3/envs/mfa_chinese/bin/python3 \
+# 运行:
+#   # 全管线 (单卡, 测试用)
+#   python3 scripts/run_pipeline.py --config configs/hecheng_english_mfa.yaml \
+#       --python /home/user/miniconda3/envs/mfa-dev/bin/python \
 #       --overwrite --force
 #
-# ═══════════════════════════════════════════════════════════════════════════
-# 八卡并行 (自动切分 54000 stems → 8×6750, 每 GPU 独立运行):
-#   python scripts/launch_8gpu.py --dry-run          # 预览分片
-#   python scripts/launch_8gpu.py                    # 启动八卡
-#   python scripts/launch_8gpu.py --gpus 0,1,2,3     # 只用前四卡
-#   python scripts/launch_8gpu.py --total-stems 40   # 测试 40 条
+#   # 单独预对齐 (八卡并行)
+#   /home/user/miniconda3/envs/asr/bin/python scripts/ctc_prealign.py \
+#       --data-dir /mnt/Raw/新版合成英文数据 \
+#       --audio-dir /mnt/nvme3/mfa_audio_cache \
+#       --pinyin-dir /mnt/nvme3/mfa_workspace/pinyin \
+#       --output-dir /mnt/nvme3/mfa_workspace/ctc_pretg \
+#       --model-path /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR \
+#       --dict-path dict/mfa_ipa.dict \
+#       --device cuda:0 --all-gpus --overwrite
 #
 # ═══════════════════════════════════════════════════════════════════════════
-# 说明:
-#   - ASR 参考文本模式: ctc_prealign.py 自动查找 {stem}.txt 做 forced alignment
-#   - 无参考文本时回退到 NVASR 自由解码
-#   - 八卡模式下, launch_8gpu.py 自动生成 per-GPU 配置 (ctc_prealign.offset/limit)
-#   - 每 GPU 处理不重叠的 stem 区间, 输出汇入同一 NAS 目录
-#   - 输入: /mnt/Raw/新版合成英文数据/{ria,花礼,雪狐桑}/
-#   - 输出: /mnt/Raw/新版合成英文数据对齐/
+# 数据流 (全 NVMe, 零 NAS I/O):
+#
+#   NAS (data_dir)         NVMe (nvme_cache)       NVMe (workspace)         NAS (output_dir)
+#   ─────────────          ─────────────────       ────────────────         ───────────────
+#   txt 参考文本 ─┐
+#                ├─→ prealign ──→ ctc_pretg/
+#   WAV ─→ nvme_cache/ ─┘                   ┌─→ aligned/
+#                                            ├─→ en_phones/
+#   nvme_cache/WAV ──→ resample ──→ audio_16k/
+#                                            ├─→ postprocess ──→ /mnt/Raw/...对齐/
+#                                            └─→ filtered/
+#
+#   所有中间文件在 NVMe, 只有最终 TextGrid 输出到 NAS.
+# ═══════════════════════════════════════════════════════════════════════════
 
 mode: nvrasr_fallback
-workspace: hecheng_en_mfa
 
-# 输入: 三个子目录下的合成音频
+# ── 路径配置 ──────────────────────────────────────────────────────────────
+
+# 输入: NAS 原始数据 (仅用于 txt 参考文本查找, WAV 从 NVMe 缓存读取)
 data_dir: /mnt/Raw/新版合成英文数据
 
-# 保留 16k 音频
+# NVMe 音频缓存 (由 cache_audio_to_nvme.py 初始化)
+# 管线启动时自动检测; 若不存在则创建 /tmp 临时缓存, 任务完成后清除
+nvme_cache: /mnt/nvme3/mfa_audio_cache
+
+# 工作目录: 所有中间文件 (ctc_pretg, audio_16k, aligned, filtered 等)
+# 放在 NVMe 以消除全链路 NAS I/O
+workspace: /mnt/nvme3/mfa_workspace
+
+# 最终对齐结果输出到 NAS
+output_dir: /mnt/Raw/新版合成英文数据对齐
+
+# 保留 16k 音频 (供后续调试/重跑)
 keep_16k_audio: true
 
-# ── CTC/ASR 预处理: 启用 (参考文本模式) ──
-# 有参考文本 ({stem}.txt) → CTC forced alignment 生成字符级锚点
-# 无参考文本 → 回退到 ASR 解码文本
+# MFA 临时目录 (本地 NVMe 避免 CIFS SQLite 锁死)
+temp_dir: /tmp/mfa_temp
+
+# ── CTC/ASR 预对齐 ───────────────────────────────────────────────────────
 ctc_prealign:
   enabled: true
   model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
@@ -57,10 +82,10 @@ ctc_prealign:
 ctc_adjust:
   enabled: false
 
-# MFA 模型目录 (必须本地路径, CIFS 上 SQLite 锁死)
+# ── MFA 模型目录 ──────────────────────────────────────────────────────────
 models_dir: /mnt/local_E/MFA_Pause/repo/models/mfa
 
-# MFA 中文对齐
+# ── MFA 中文对齐 ──────────────────────────────────────────────────────────
 mfa:
   num_jobs: 32
   single_speaker: true
@@ -72,7 +97,7 @@ mfa:
   beam: 20
   retry_beam: 80
 
-# 英文 MFA 子词对齐
+# ── 英文 MFA 子词对齐 ─────────────────────────────────────────────────────
 mfa_en:
   enabled: true
   num_jobs: 4
@@ -86,7 +111,7 @@ mfa_en:
   dictionary: dict/cmudict.dict
   g2p_model: /mnt/local_E/MFA_Pause/pretrained_models/g2p/english_us_arpa.zip
 
-# 后处理 (关闭过滤 — 无 ASR CTC 时英文词 OOV 会导致过度过滤)
+# ── 后处理 ────────────────────────────────────────────────────────────────
 postprocess:
   merge_silence: true
   min_sil_merge_sec: 0.2
@@ -96,12 +121,6 @@ postprocess:
   enable_text_correction: true
   handle_unexpected_sil: true
 
-# MFA 临时目录 (使用本地路径避免 CIFS SQLite 锁死)
-temp_dir: /tmp/mfa_temp
-
-# 静音补全
+# ── 静音补全 ──────────────────────────────────────────────────────────────
 pad_silence:
   target_edge_silence_sec: 0.5
-
-# 输出到 NAS
-output_dir: /mnt/Raw/新版合成英文数据对齐

@@ -52,8 +52,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 BASE_CONFIG = PROJECT_ROOT / "configs" / "hecheng_english_mfa.yaml"
 DEFAULT_WORKSPACE = PROJECT_ROOT / "output" / "hecheng_en_mfa"
-DEFAULT_MFA_PYTHON = "/home/devuser/miniconda3/envs/mfa_chinese/bin/python3"
-DEFAULT_NVASR_PYTHON = "/usr/bin/python3"
+DEFAULT_MFA_PYTHON = "/home/user/miniconda3/envs/mfa-dev/bin/python3"
 
 TOTAL_STEMS = 54000
 DEFAULT_NUM_GPUS = 8

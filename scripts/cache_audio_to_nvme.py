@@ -66,31 +66,6 @@ def scan_speaker_dirs(source: Path) -> dict[str, list[Path]]:
     return speakers
 
 
-def build_manifest(cache_root: Path, speakers: dict[str, list[Path]],
-                   source: Path) -> dict:
-    """Build cache manifest metadata."""
-    total_files = 0
-    total_bytes = 0
-    speaker_info = {}
-    for name, wavs in speakers.items():
-        n = len(wavs)
-        size = sum(w.stat().st_size for w in wavs if w.exists())
-        speaker_info[name] = {"files": n, "size_bytes": size}
-        total_files += n
-        total_bytes += size
-
-    return {
-        "version": 1,
-        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "source": str(source.resolve()),
-        "cache_root": str(cache_root.resolve()),
-        "total_files": total_files,
-        "total_size_bytes": total_bytes,
-        "total_size_gb": round(total_bytes / 1024**3, 2),
-        "speakers": speaker_info,
-    }
-
-
 def copy_speaker(speaker_name: str, wavs: list[Path],
                  cache_root: Path, source: Path) -> tuple[int, int]:
     """Copy one speaker's WAVs to cache. Returns (copied, skipped)."""
@@ -199,21 +174,23 @@ def cmd_create(args: argparse.Namespace) -> int:
 
     total_wavs = sum(len(v) for v in speakers.values())
     print(f"Found {len(speakers)} speaker(s):")
+
+    # Stat once, reuse for display + disk-check + manifest
+    speaker_sizes: dict[str, int] = {}
+    total_needed = 0
     for name, wavs in speakers.items():
-        size_gb = sum(w.stat().st_size for w in wavs) / 1024**3
-        print(f"  {name}: {len(wavs)} WAVs, ~{size_gb:.1f} GB")
+        size = sum(w.stat().st_size for w in wavs)
+        speaker_sizes[name] = size
+        total_needed += size
+        print(f"  {name}: {len(wavs)} WAVs, ~{size/1024**3:.1f} GB")
     print(f"Total: {total_wavs} WAVs")
     print(f"Cache: {cache_root}")
 
     # Check disk space
     cache_root.mkdir(parents=True, exist_ok=True)
     usage = shutil.disk_usage(str(cache_root))
-    needed = sum(
-        sum(w.stat().st_size for w in wavs)
-        for wavs in speakers.values()
-    )
-    if usage.free < needed:
-        print(f"ERROR: Not enough space. Need {needed/1024**3:.1f} GB,"
+    if usage.free < total_needed:
+        print(f"ERROR: Not enough space. Need {total_needed/1024**3:.1f} GB,"
               f" have {usage.free/1024**3:.1f} GB")
         return 1
 
@@ -226,8 +203,20 @@ def cmd_create(args: argparse.Namespace) -> int:
         total_copied += copied
         total_skipped += skipped
 
-    # Write manifest
-    manifest = build_manifest(cache_root, speakers, source)
+    # Write manifest (use pre-computed sizes from source stat)
+    manifest = {
+        "version": 1,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "source": str(source.resolve()),
+        "cache_root": str(cache_root.resolve()),
+        "total_files": total_wavs,
+        "total_size_bytes": total_needed,
+        "total_size_gb": round(total_needed / 1024**3, 2),
+        "speakers": {
+            name: {"files": len(wavs), "size_bytes": speaker_sizes[name]}
+            for name, wavs in speakers.items()
+        },
+    }
     manifest_path = cache_root / MANIFEST_NAME
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),

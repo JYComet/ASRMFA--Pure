@@ -35,6 +35,11 @@
 | 24 | 2026-07-29 | ctc_prealign.py | ASR 空输出先写 TextGrid 再检测 → 留下孤立的空 TextGrid |
 | 25 | 2026-07-29 | postprocess_textgrids.py | _inject_punctuation 重叠判断 + _punct_before 范围 + 恢复匹配策略 |
 | 26 | 2026-08-04 | postprocess_textgrids.py | pinyin_phones 声母独占→韵母消失 (ch/zh/sh → 缺 final) |
+| 27 | 2026-08-04 | postprocess_textgrids.py | words tier 区间重叠 — 相邻词时间边界交叉 |
+| 28 | 2026-08-04 | postprocess_textgrids.py | 倒置 interval — xmin > xmax |
+| 29 | 2026-08-04 | postprocess_textgrids.py | 极短内容词 (< 30ms) 物理不可能 |
+| 30 | 2026-08-04 | postprocess_textgrids.py, adjust_ctc_boundaries.py, pipeline_utils.py | 参考文本模糊子串匹配 — 纯英文 CTC 锚点标定风险分析 |
+| 31 | 2026-08-04 | normalize_english_tokens.py, ctc_prealign.py | 英文 CTC 锚点三重修复 — 碎片化 / 合并错误 / NVV 误判 |
 
 ---
 
@@ -322,6 +327,14 @@ scripts/streaming_pipeline.py    — 流式批处理（NAS→本地SSD→回传�
 | AX | `postprocess_textgrids.py` ~3028-3051 | **Case 25-G**: `_refine_boundaries_by_energy` 标点边界保护：标点起点与词尾重叠 <100ms 且主体在词尾之后 → 阻止 dead silence 延伸 |
 | AY | `run_pipeline.py` ~1049-1059, `align_english_mfa.py` ~382-393 | **Case 25-H**: 英文 MFA 词典/G2P 路径修复：pretrained_models fallback 到 PROJECT_ROOT.parent + G2P 失败时写 base dict 兜底 |
 | AZ | `postprocess_textgrids.py` ~87-91 | **Case 25-I**: `_NVV_PATTERN` lookbehind/ahead 加 `<>` 排斥，防已包裹 NVV token 被 `_finalise_textgrid` 再次包裹 → pinyin_phones 出现 `<<TOKEN>>` |
+| BA | `build_pinyin_phones_tier` ~510-527 | **Case 26-A**: dict 查询前移 + `word_phones` 空时按比例拆分 |
+| BB | `build_pinyin_phones_tier` ~600-616 | **Case 26-B**: 三分支替代 `len(dict_phones)==1 or len(word_phones)<=1` |
+| BC | `_INIT_FRAC` ~434 | **Case 26-C**: 按声母类型细化拆分比例 (塞音0.20/鼻边0.22/擦音0.28/塞擦0.35) |
+| BD | `process_one` QC 段 | **Case 26-D**: 质检过滤 `init_only_phone` — pinyin_phones 仍残留纯声母 |
+| CA | `_fix_overlapping_boundaries` (新增) | **Case 27-A**: 轻度边界重叠修复 (内容词split_overlap / punct clip_punct) |
+| CB | `process_one` QC 段 | **Case 27-B**: 质检过滤 `overlapping_words` — 修复后仍重叠的进入 filtered/ |
+| DA | `process_one` QC 段 | **Case 28**: 质检过滤 `inverted_interval` — xmin > xmax 倒置检测 |
+| EA | `process_one` QC 段 | **Case 29**: 质检过滤 `short_word` — 内容词 < 30ms 检测 |
 
 ---
 
@@ -2878,6 +2891,878 @@ else:
   `chang4` [8.850-9.210] pinyin_phones 只有 `ch`，缺 `ang4`
 - `直播回放_zzZ_2026年06月07日20点场_1341f0ea_clip0012_clip0013.TextGrid`:
   4 个 `chang4` 中 2 个异常（1 个 MISSING_FINAL + 1 个 FULL_WORD_AS_PHONE）
+
+### 补充修改 (2026-08-04): 按声母类型细化拆分比例
+
+原修复使用统一 35% 拆分声母:韵母。对塞音 (b/p/d/t/g/k, ~15-25%) 和鼻音/边音
+(m/n/l, ~15-25%) 偏高。新增模块级 `_INIT_FRAC` 字典 (~line 434)，按声母类型返回
+对应比例：塞音 0.20、鼻音/边音 0.22、擦音 0.28、塞擦音 0.35 (默认)。
+
+### 关联修改点
+
+| 修改 | 位置 | 作用 |
+|------|------|------|
+| BA  | `build_pinyin_phones_tier` ~line 510-527 | FULL_WORD_AS_PHONE: 字典前移 + 比例拆分 |
+| BB  | `build_pinyin_phones_tier` ~line 600-616 | MISSING_FINAL: 三分支替代 OR 条件 |
+| BC  | 模块级 `_INIT_FRAC` ~line 434 | 按声母类型细化拆分比例 |
+| BD  | `process_one` ~line 5350 前 (新增) | 质检过滤: `init_only_phone` 残留检测 |
+
+---
+
+## Case 27: words tier 区间重叠 — 相邻词时间边界交叉
+
+**日期**: 2026-08-04
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `_fix_overlapping_boundaries` (新增), `process_one` (过滤)
+**触发样本**: shayi_huali/纱依/output/ ~9.7% 文件存在不同程度的重叠
+
+### 现象
+
+words tier 中相邻 interval 的 xmax > 下一 interval 的 xmin，即时间区间重叠：
+
+```
+轻度 (< 20ms):
+  ye3 [7.349-7.554] ↔ yi3 [7.537-7.657]  overlap=17ms
+
+中度 (标点侵入词):
+  ，[3.990-4.740] ↔ zuo2 [4.600-4.740]    overlap=140ms
+
+重度 (双重标点):
+  ，[4.850-9.360] ↔ ，[5.100-9.360]       overlap=4260ms
+  ，[5.100-9.360] ↔ y   [5.455-5.610]     overlap=3905ms
+```
+
+### 根因链
+
+**子类型 A1 — 轻度边界重叠 (< 30ms)**:
+1. MFA 帧精度 (10ms) + `_snap_to_ctc` 将不同词 snap 到不同 CTC 锚点
+2. 相邻词的 MFA 边界和 CTC 锚点来自独立的决策，未做连续性校验
+3. 结果：prev.xmax (来自 MFA/CTC 决策 A) > next.xmin (来自决策 B)
+
+**子类型 A2 — 标点重叠**:
+1. `_inject_punctuation` 注入标点时使用了过宽的区间范围
+2. 连续标点未做去重或裁剪，导致多个标点 interval 使用相同或高度重叠的范围
+3. 标点 xmax 延伸到后续内容词内部
+
+**子类型 A3 — 极短词挤压**（与 Case 29 同源）:
+1. 极短词 (< 30ms) 挤在两个正常词之间
+2. 因为太短，其 xmin < prev.xmax（物理上必然重叠）
+
+### 修改点
+
+**CA. `_fix_overlapping_boundaries` — 新增函数，修复轻度边界重叠** (~line 新增)
+
+对 words tier 扫描相邻 interval 重叠：
+- 两内容词重叠 < 30ms → 取中点分界 (`split_overlap`)
+- 内容词与标点重叠 → 标点裁短 (`clip_punct`)
+- 重叠 ≥ 30ms 或涉及静音/多重重叠 → 不修复，交给过滤
+
+修复后调用 `_sync_derived_tiers` 同步 hanzi + pinyin_phones。
+
+**CB. `process_one` — 过滤: `overlapping_words`** (~line 5350 前)
+
+修复后仍存在重叠的 → 添加 `overlapping_words` 过滤原因，文件进 `filtered/`。
+
+### 关联样本
+
+- `0-_杂谈_月夜下的魔法絮语_5058f1af_clip0002_clip0005.TextGrid`:
+  3 处重叠 (17ms/103ms/7ms)
+- `0-_杂谈_月夜下的魔法絮语_5058f1af_clip0002_clip0012.TextGrid`:
+  3 处重度重叠 (140ms/424ms/596ms)
+
+---
+
+## Case 28: 倒置 interval — xmin > xmax
+
+**日期**: 2026-08-04
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `process_one` (过滤，不修复根因)
+**触发样本**: shayi_huali/纱依/output/ 个别文件
+
+### 现象
+
+三个 tier 同时出现 xmin > xmax 的倒置 interval：
+
+```
+hanzi:          '这'  [1.0283-1.0200]  dur=-8.3ms
+words:          'zhe4' [1.0283-1.0200]  dur=-8.3ms
+pinyin_phones:  'zhe4' [1.0283-1.0200]  dur=-8.3ms
+```
+
+相邻词正常：`ge4 [1.0200-1.1100] dur=90ms`。
+
+### 根因链
+
+1. `_refine_boundaries_by_energy` 或 `_inject_punctuation` 将 `zhe4.xmin` 推到 1.0283
+2. `zhe4.xmax` 被锚定为 `ge4.xmin = 1.0200`（下一词的起点）
+3. 词首前推 + 词尾被后邻词锚定 → xmin > xmax 倒置
+4. Case 12 的修复 AC 只覆盖 `_snap_to_ctc` 重叠路径的倒置，此处的倒置走另一条路径
+5. 倒置 interval 通过 `_sync_derived_tiers` 同步到三个 tier
+
+### 修改点
+
+**DA. `process_one` — 过滤: `inverted_interval`** (~line 5350 前)
+
+扫描所有 tier 的所有 interval，检测 `xmin > xmax + 0.001`。
+存在倒置 → 添加 `inverted_interval` 过滤原因。
+
+不修复根因：涉及能量调整和标点注入的深层交互，风险较高。
+修复线索：在 `_refine_boundaries_by_energy` 词首前拉逻辑中添加 xmin ≤ xmax - 40ms 约束。
+
+### 关联样本
+
+- `直播回放_三周年纪念直播_2025年11月25日21点场_c2ad2c62_clip0010_clip0018.TextGrid`:
+  zhe4/这 xmin=1.0283 > xmax=1.0200
+
+---
+
+## Case 29: 极短内容词 — (< 30ms) 物理不可能
+
+**日期**: 2026-08-04
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `process_one` (过滤，不修复根因)
+**触发样本**: shayi_huali/纱依/output/ ~91/414 文件存在极短词
+
+### 现象
+
+words tier 中存在 < 30ms 的内容词（非标点、非静音）：
+
+```
+ke3  [7.554-7.564]  dur=10ms   ← 物理上不可能
+shi2 [10.174-10.184] dur=10ms
+ting2 [4.979-5.017]  dur=38ms  ← 边界值
+doing [4.480-4.510]  dur=30ms  ← 英文词
+```
+
+30ms 以下的音节在生理上不可能 — 汉语单音节最短约 60-80ms，英语最短约 80-100ms。
+
+### 根因链
+
+1. `_snap_to_ctc` 将相邻词边界向 CTC 锚点靠拢
+2. 中间词被挤压到剩余空间 → 可能被压缩到 < 30ms
+3. 极短词引发 Case 27 的子类型 A3（重叠），产生连锁问题
+4. 英文词 `doing` 30ms 可能是 ASR 误检 + MFA 无法对齐
+
+### 修改点
+
+**EA. `process_one` — 过滤: `short_word`** (~line 5350 前)
+
+扫描 words tier，检测内容词（非 punct/NVV/silence）时长 < 30ms。
+存在极短词 → 添加 `short_word` 过滤原因。
+
+不修复根因：涉及 `_snap_to_ctc` 边界压缩逻辑和 CTC 锚点质量，
+简单合并到相邻词可能引入新问题。建议作为后续优化通过改进边界调整逻辑来根治。
+
+### 关联样本
+
+- `0-_杂谈_月夜下的魔法絮语_5058f1af_clip0002_clip0005.TextGrid`:
+  ke3 10ms, shi2 10ms
+- `0-_杂谈_月夜下的魔法絮语_5058f1af_clip0005_clip0021.TextGrid`:
+  doing 30ms
+
+## Case 30: 参考文本模糊子串匹配 — 纯英文/混杂英文 CTC 锚点标定风险分析
+
+**日期**: 2026-08-04
+**涉及文件**: `scripts/postprocess_textgrids.py`, `scripts/adjust_ctc_boundaries.py`, `scripts/pipeline_utils.py`
+**涉及函数**: `_word_matches`, `_alpha_text_matches`, `_align_word_sequences`, `_snap_to_ctc`, `_normalize_word_spellings`, `_build_hanzi_tier`, `align_sequences`
+**触发条件**: 参考文本含英文单词（纯英文或中英混杂），且英文词长度 ≤3 字符或为其他词的子串
+
+### 现象
+
+Post-MFA 参考文本匹配链路中，存在两套不同的对齐策略用于英文 token：
+
+| 阶段 | 函数 | 匹配策略 | 使用位置 |
+|------|------|---------|---------|
+| CTC 锚点边界对齐 | `align_sequences` (pipeline_utils.py:963) | **精确匹配** (`a==b`) | `_snap_to_ctc` (postprocess_textgrids.py:3460) |
+| 拼写规范化 + hanzi 构建 | `_word_matches` / `_alpha_text_matches` (postprocess_textgrids.py:1347/1450) | **模糊子串** (`c in r or r in c`) | `_normalize_word_spellings` (postprocess_textgrids.py:1657), `_build_hanzi_tier` (postprocess_textgrids.py:1571) |
+
+这两套策略在英文 token 上的行为不一致：
+
+```
+# align_sequences (精确匹配):
+CTC "Pop" vs MFA "Pop" → match ✓
+CTC "Pop" vs MFA "K-Pop" → NO match ✗  (子串但不等)
+CTC "Up"  vs MFA "Up"  → match ✓
+
+# _word_matches (模糊子串):
+CTC "Pop" vs ref "K-Pop" → match ✓  (子串包含)
+CTC "Up"  vs ref "V-Up"  → match ✓  (子串包含)
+CTC "a"   vs ref "cat"   → match ✓  (单字母=任意包含)
+CTC "he"  vs ref "the"   → match ✓  (子串包含)
+```
+
+### 根因链
+
+**A. 精确匹配层 (`_snap_to_ctc`) 的问题:**
+
+1. `align_sequences`(pipeline_utils.py:981) 仅接受 `cost=0 if a[i-1]==b[j-1] else 1`
+2. 英文词在 CTC 输出中常以原词出现（如 `Pop`, `Up`），但若 MFA 将其视为 OOV 输出 `<unk>`，精确匹配失败
+3. 若 CTC token 计数 ≠ MFA token 计数 → 进入 NW 对齐（postprocess_textgrids.py:3456-3460）→ 精确匹配找不到对应 → 英文 token 无 CTC 锚点 → 回退到 MFA 边界（postprocess_textgrids.py:3500）
+4. **英文 token 无条件信任 CTC**（postprocess_textgrids.py:3534-3535: `use_mfa=False`），但若 CTC token 已因精确匹配失败被标记为 `None`，则 MFA 边界被保留——产生矛盾
+
+**B. 模糊子串层 (`_word_matches` / `_alpha_text_matches`) 的问题:**
+
+1. **核心**: 子串包含 `c in r or r in c`（postprocess_textgrids.py:1370）过于宽松
+   - `"Pop"` in `"K-Pop"`? `"Pop"` 不在 `"k-pop"` 中！——不匹配 ✗
+   - `"Pop"` in `"Pop"`? 自身包含 ✓
+   - 实际上 `"Pop" in "K-Pop"` → False (因为 `-Pop` 不包含不含连字符的 Pop)... 
+
+   等等，`"pop" in "k-pop"` → True! 因为 lowercase 后 `"k-pop"` 包含 `"pop"`。所以 `-` 不干扰子串匹配。
+   
+   真正的风险在于短词:
+   - `"a"` 匹配任何含 `a` 的英文词（`"cat"`, `"day"`, `"and"` 等）
+   - `"he"` 匹配 `"the"`, `"there"`, `"where"` 等
+   - `"or"` 匹配 `"for"`, `"more"`, `"word"` 等
+   - `"in"` 匹配 `"win"`, `"within"`, `"inside"` 等
+
+2. **单字母 CTC token 显式允许**（postprocess_textgrids.py:1374-1375）:
+   ```python
+   if len(c) == 1 and c.isalpha():
+       return c in r     # 单字母匹配任意含该字母的参考词
+   ```
+
+3. **NW gap-first 回溯**（postprocess_textgrids.py:1426-1431）: 当多个模糊匹配代价相同时（均为 0），优先丢弃 CTC token（gap），保留参考词。这在英文碎片化场景中是正确的（CTC token 更多），但在短词歧义场景中可能丢弃正确的 CTC token。
+
+4. **贪婪 alpha 消费**（postprocess_textgrids.py:1576-1582）: `continue_match` 使用相同子串逻辑，可能过度消费参考 alpha 单元。
+
+**C. CTC 锚点标定 (`adjust_ctc_boundaries`) 层面：无参考文本参与**
+
+`adjust_ctc_boundaries.py` 的 `adjust_boundaries()` (adjust_ctc_boundaries.py:121) 纯能量驱动:
+- 英文词通过 `_is_nvv` 过滤（adjust_ctc_boundaries.py:127）— 仅跳过 NVV token
+- 普通英文词仍会被 `_search_energy_rise` / `_search_energy_fall` 修正边界
+- **不涉及参考文本，不存在文本混乱风险** ✅
+
+### 针对当前数据集 (hecheng_english_mfa) 的实际风险评估
+
+数据集特征（`/mnt/local_E/Voxcpm/output/generated_scripts.jsonl`）:
+- 54000 条中英混杂文本
+- 英文词: 仅 1021 条含英文，绝大多数 1 个英文词/条
+- 英文词长: 仅 2-3 字符（Pop, Up, PV, MV, AI, SOS, BGM, GPT, ...）
+- 无 ≥5 字母的英文词，无 3+ 英文词的条目
+- 英文词以品牌名/缩写为主，非自然语言句子
+
+**针对此数据集的结论**:
+1. 英文词均为短缩写/品牌名 → 子串匹配风险较低（词形独特，不太可能嵌套）
+2. 但 `"Up"` 匹配 `"V-Up"` 中的 `"up"` 子串 ✓ 正确，但也匹配 `"Upload"`, `"Popup"` 等 —— 当前数据集不含这些词
+3. 单字母 token 不会出现（CTC 模型不会把 "K-Pop" 拆成单字母）
+4. **主要风险**: CTC 中文模型对英文词的边界标定本身不准（duration 偏长/偏短），而非文本匹配问题
+
+**普遍性纯英文文本的风险**（若后续扩展数据集）:
+1. 短词子串歧义: high risk
+2. NW gap-first 可能丢弃正确 CTC token: medium risk
+3. `_snap_to_ctc` 精确匹配 + 无条件 CTC 的矛盾: needs attention
+4. `adjust_ctc_boundaries` 能量修正无风险: safe ✅
+
+### 修改点
+
+暂无代码修改。此 Case 为风险分析记录，供后续纯英文文本扩展时参考。
+
+**潜在改进方向**:
+- `_word_matches`: 对纯英文参考文本，可将 `c in r or r in c` 改为优先精确匹配，仅在不匹配时 fallback 到子串
+- `_snap_to_ctc`: 当 `ctc_aligned[idx] is None` 且 `is_english_token(mfa_iv.text)` 时，应警告而非静默使用 MFA 边界
+- 可增加 QC 规则: 检测英文词的 CTC 时长是否在合理范围 (80ms-2000ms)
+
+### 验证方法
+
+```python
+# 测试 1: 检查英文词的 CTC-MFA 边界偏差
+for tok in ctc_tokens:
+    if is_english_token(tok["word"]):
+        dur = tok["end_s"] - tok["start_s"]
+        assert 0.08 <= dur <= 2.0, \
+            f"English word {tok['word']} CTC duration {dur:.3f}s out of range"
+
+# 测试 2: 检查 _word_matches 子串假阳性
+# 构造 (ctc_token, ref_unit) 对照表，检查匹配结果
+test_cases = [
+    ("he", "the", True, "substring — 可接受的假阳性"),
+    ("a", "cat", True, "单字母 — 当 CTC 碎片化时正确，否则假阳性"),
+    ("or", "for", True, "substring — 假阳性"),
+    ("in", "win", True, "substring — 假阳性"),
+]
+for ctc, ref, expected, note in test_cases:
+    actual = _word_matches(ctc, ref)
+    if actual != expected:
+        print(f"MISMATCH: _word_matches({ctc!r}, {ref!r}) = {actual} (expected {expected}) — {note}")
+```
+
+### 关联样本
+
+- 数据集: `/mnt/Raw/新版合成英文数据` (54000 条, 1021 条含英文)
+- JSONL: `/mnt/local_E/Voxcpm/output/generated_scripts.jsonl`
+
+### 实测结果 (2026-08-04, 10 条样本 CTC prealign)
+
+**测试命令**:
+```bash
+python3 scripts/prepare_english_tts.py \
+  --jsonl /mnt/local_E/Voxcpm/output/generated_scripts.jsonl \
+  --audio-root /tmp/test_en_ctc/audio_data \
+  --output-dir /tmp/test_en_ctc/ctc_pretg --limit 10
+
+python ctc_prealign.py \
+  --data-dir /tmp/test_en_ctc/audio_data \
+  --pinyin-dir /tmp/test_en_ctc/ctc_pretg \
+  --output-dir /tmp/test_en_ctc/ctc_pretg \
+  --model-path .../Multilingual-NVASR --device cuda:0 --limit 10
+```
+
+**10 条样本: 全部通过** — 无词序错位、无 token 重叠、无时间戳倒序。
+
+**发现的真实问题（非参考文本混淆，而是 CTC 分词器行为）**:
+
+| 问题 | 样本 | 详情 |
+|------|------|------|
+| 英文词碎片化 | 000021 | `"SOS"` → CTC 输出 `"SOS"` (180ms) + `"OS"` (420ms)，normalize_en 未合并残留 `"OS"` |
+| 英文词碎片化 | 000135 | `"fan"` → CTC 输出 `"f"` (60ms) + `"an"` (60ms)，极短碎片 |
+| 英文词碎片化 | 000248 | `"show"` → CTC 输出 `"s"` (60ms) + `"how"` (360ms) |
+| 英文词碎片化 | 000352 | `"fan"` → CTC 输出 `"f"` (60ms) + `"an"` (300ms) |
+| normalize_en 过度合并 | 000044 | `"In"+"s"+"ta"+"gram"` → `"Instagramsta"` (多出 `"sta"`) |
+| normalize_en 误合并 | 000021 | `"li"+"ve"` → `"leave"` (应为 `"live"`) |
+| 拼音误判为 NVV | 000021 | `"zan2"` → `"BREATHING"` (240ms) |
+| 拼音误判为 NVV | 000248 | `"jin1"` → `"BREATHING"` (180ms) |
+
+**结论**: 对于此数据集（中英混杂，英文为 2-3 字母品牌名），CTC 锚点标定的参考文本匹配**没有导致错位**。实际风险在于：
+1. **CTC 分词器碎片化** — 中文 CTC 模型将英文词拆成碎片，normalize_en 无法全部修复
+2. **拼音→NVV 误判** — 短拼音音节被 NVASR 误识别为 NVV token
+3. **纯英文场景的子串匹配风险**在本数据集中未触发（英文词太少太短），但仍需关注
+
+---
+
+## Case 31: 英文 CTC 锚点三重修复 — 碎片化 / 合并错误 / NVV 误判
+
+**日期**: 2026-08-04
+**涉及文件**: `scripts/normalize_english_tokens.py`, `scripts/ctc_prealign.py`
+**涉及函数**: `_token_matches_ref`, `normalize_stem`, `make_patched_inference`
+**触发样本**: 实测 10 条样本中发现 3 类共性问题
+
+### 问题全景
+
+```
+                    ┌──────────────────────────┐
+                    │ NVASR ASR (SenseVoice)   │
+                    │ tokenizer: 中文词表为主    │
+                    │ OOV English → 碎片化       │
+                    └──────────┬───────────────┘
+                               │
+            ┌──────────────────┼──────────────────┐
+            ▼                  ▼                  ▼
+      ┌──────────┐     ┌────────────┐     ┌──────────────┐
+      │ 碎片化    │     │ ASR 幻觉    │     │ NVV 误判     │
+      │ fan→f+an │     │ Instagram  │     │ zan2→BREATH  │
+      │ SOS→SOS+ │     │ →Instagra │     │ jin1→BREATH  │
+      │    OS    │     │   msta     │     │              │
+      └────┬─────┘     └─────┬──────┘     └──────┬───────┘
+           │                 │                   │
+           ▼                 ▼                   ▼
+    normalize_en       normalize_en         CTC logits
+    合并碎片          用错误参考合并        blank bias=4.0
+    f+an→fan          In+s+ta+gram        → NVV token
+    SOS+OS→???        →Instagramsta
+```
+
+### 根因分析 (逐问题)
+
+---
+
+### 问题 1: 英文词碎片化 — CTC tokenizer OOV 拆字
+
+**现象**:
+
+| 样本 | 参考英文词 | CTC 碎片 | normalize_en 结果 | 状态 |
+|------|-----------|---------|-------------------|------|
+| 000021 | SOS | `SOS`(180ms) + `OS`(420ms) | 残留 `OS` | ❌ 未修复 |
+| 000135 | fan | `f`(60ms) + `an`(60ms) | 残留 `f`+`an` | ❌ 未修复 |
+| 000248 | show | `s`(60ms) + `how`(360ms) | 残留 `s`+`how` | ❌ 未修复 |
+| 000352 | fan | `f`(60ms) + `an`(300ms) | 残留 `f`+`an` | ❌ 未修复 |
+| 000021 | live | `li`(180ms) + `ve`(→leave) | `leave` | ❌ 错误合并 |
+| 000125 | live | `li` + `ve` | `live` | ✅ 正确 |
+| 000223 | deadline | `de` + `ad` + `line` | `deadline` | ✅ 正确 |
+| 000223 | live | `li` + `ve` | `live` | ✅ 正确 |
+
+**根因链**:
+
+1. SenseVoice tokenizer 词表以中文为主，OOV 英文词无对应 token
+2. CTC 解码时将英文词拆成 BPE 级子词碎片（`fan` → `f` + `an`、`show` → `s` + `how`）
+3. `normalize_english_tokens.py` 通过 NW 对齐 + 参考文本匹配合并碎片
+4. 但合并依赖两个条件同时满足：
+   - **条件 A**: `_token_matches_ref` 返回 True（子串包含或拼音→英文）
+   - **条件 B**: `all_fragments` 检查通过（每个碎片至少与目标词共享一个字母）
+5. 条件 A 的拼音→英文匹配（normalize_english_tokens.py:126）无条件 `return True`，过于宽松
+6. 当碎片是英文子串（如 `f` 在 `fan` 中）时条件 A 通过，但 `an` 也是独立英文词（`is_english_token("an")=True`），`an in "fan"` → True
+7. **关键缺陷**: `all_fragments` 检查（normalize_english_tokens.py:264-265）将已经是完整英文词的 fragment 当作"substring of target"放行:
+   ```python
+   elif is_english_token(t) and t.lower() in en_lower:
+       pass  # substring of target (e.g. "play" in "cosplay")
+   ```
+   但 `"OS"` 是英文词且 `"os" in "sos"` → True → 被当作 target 的子串放行
+   然而 `"SOS"` 才是参考词，`"OS"` 是残留碎片——这个逻辑仅检查"fragment 是否是 target 的子串"，不检查"reference word 是否完整"
+
+8. 对于 `fan` → `f` + `an`：`"f" in "fan"` ✓, `"an" in "fan"` ✓ → 理论上能合并为 `fan`，但 normalize_en 没有触发。排查：`extract_word_chars("今天天气超好，心情也超好，作为一个fan老用户...")` → `["今","天","天","气","超","好"，"心","情","也","超","好"，"作","为","一","个","fan","老","用","户",...]` → `fan` 被识别为英文参考词 ✓。但 `_token_matches_ref("an", "fan")` 返回 True（`"an" in "fan"`），`all_fragments` 检查 `"f" in "fan"` ✓，`is_english_token("an") and "an" in "fan"` ✓ → 应该触发合并。
+
+   **实际未触发的原因**: NW 对齐时，`fan` 参考词与 `.lab` tokens 的 DP 匹配可能将 `f` 和 `an` 分别对齐到了不同的参考词位置。`.lab` 中 `fan` 位置前后是 `ge4 f an lao3`，而参考词序列是 `[..., "fan", ...]`。`f` 可能和前面的 pinyin 对齐了（pinyin→English 无条件 `return True`），导致 `f` 没有被分配到 `fan` 的 ref 索引下。
+
+**设计修复 — Fix 1: `normalize_english_tokens.py` 增加碎片回收 Pass**:
+
+在 `normalize_stem` 末尾增加 **Pass 2: 碎片回收** — 对 normalize_en 后仍然残留的英文碎片进行二次回收:
+
+```python
+# Pass 2: Fragment reclamation (NEW)
+# After Pass 1 merge, check for orphan fragments: single-letter ASCII
+# tokens or short English tokens (< 3 chars) adjacent to merged English
+# words.  Absorb them into the nearest English token.
+def _reclaim_fragments(lab_tokens, ctc_tokens):
+    """Merge orphan English fragments into adjacent English tokens."""
+    # Identify English tokens and their fragments
+    # Rule: if a fragment is a substring of an adjacent English word,
+    # merge it into that word's time range.
+    ...
+```
+
+**实现要点**:
+1. 扫描 `.lab` tokens，找到所有 `is_english_token(t)` 的 token
+2. 对于每个长度 ≤2 的英文 token，检查其前后邻接是否有长度 ≥3 的英文 token
+3. 如果短 token 是长 token 的子串 → 合并
+4. 如果两个相邻的短 token 可以拼成完整英文词 → 合并
+5. 同步更新 `_tokens.jsonl` 的时间戳（start=min, end=max）
+
+**涉及文件**: `scripts/normalize_english_tokens.py`
+**涉及函数**: `normalize_stem` (新增 `_reclaim_fragments` 调用)
+
+---
+
+### 问题 2: normalize_en 合并错误 — 参考文本污染 + 过度宽松匹配
+
+**现象**:
+
+| 样本 | ASR 原始输出 (_text_raw.txt) | 参考词 | normalize_en 结果 |
+|------|---------------------------|--------|-------------------|
+| 000044 | `搭配 Instagramsta效果满分` | `Instagramsta` (错误!) | `In`+`s`+`ta`+`gram` → `Instagramsta` |
+| 000021 | `leave走起` | `leave` (应为 `live`) | `li`+`ve` → `leave` |
+
+**000044 "Instagramsta" 根因链**:
+
+1. NVASR ASR 模型听 "Instagram" → 输出 "Instagramsta"（幻觉，多出 "sta"）
+2. `_text_cn.txt` 被写为 ASR 输出文本（含 "Instagramsta"）
+3. CTC forced alignment 将 "Instagramsta" 拆成 BPE 碎片: `In` + `s` + `ta` + `gram`
+4. `normalize_stem` 读 `_text_cn.txt` → `extract_word_chars` → 参考英文词 = `Instagramsta`
+5. NW 对齐: 碎片 ↔ `Instagramsta` → 合并 → `.lab` 写入 `Instagramsta`
+6. **最终结果**: 参考文本被 ASR 幻觉污染，经 normalize_en 固化到 `.lab` 和 tokens
+
+**根本原因**: `_text_cn.txt` 的内容来自 ASR 输出而非原始 JSONL 参考文本。`prepare_english_tts.py` 写入的原始 `_text_cn.txt` 是正确的（来自 JSONL），但 `ctc_prealign.py` 的 `make_patched_inference` 将 ASR 文本写入了 `_text_cn.txt`，覆盖了原始文本。
+
+**000021 "leave" vs "live" 根因链**:
+
+1. ASR 输出 "leave" (误听)
+2. CTC 碎片: `li` + `ve`
+3. 参考词: `leave` → normalize_en 合并 = `leave`
+4. 实际应该是 `live`
+
+这两个案例的共同根因: **参考文本来自 ASR 输出而非原始标注**。
+
+**设计修复 — Fix 2: 参考文本源头保护 + 匹配约束**:
+
+**2a. `ctc_prealign.py` 保护原始 `_text_cn.txt`**:
+
+`make_patched_inference` (ctc_prealign.py:279-281) 在有关联文本时使用 `ref_texts[stem]`:
+```python
+if stem in ref_texts:
+    align_text = ref_texts[stem].strip()
+```
+
+但 `ref_texts` 来自 `_text_cn.txt` 文件，而这些文件在 pipeline 启动时可能已被之前的运行污染。
+
+**修改**: 在 `make_patched_inference` 中，当 ref_texts 可用时，ASR 解码结果应**仅用于 NVV/标点检测**，英文词应**保留 ref_texts 中的原始英文词**:
+
+```python
+# NEW: Cross-check ASR English tokens against reference text
+# If ref_text has an English word at the same position, use ref version
+ref_eng_words = re.findall(r'[a-zA-Z]{2,}', ref_text)
+asr_eng_words = re.findall(r'[a-zA-Z]{2,}', asr_text)
+if set(asr_eng_words) != set(ref_eng_words):
+    # ASR hallucinated English → revert to reference
+    ...
+```
+
+**2b. `normalize_english_tokens.py` 拼音→英文匹配增加元音约束**:
+
+`_token_matches_ref` (normalize_english_tokens.py:126-127):
+```python
+# Before (unconditional):
+if len(t) >= 2 and t[-1].isdigit() and t[:-1].isalpha():
+    return True
+
+# After (with vowel guard, same as Case 10 fix):
+if len(t) >= 2 and t[-1].isdigit() and t[:-1].isalpha():
+    vowel_count = sum(1 for ch in r if ch in 'aeiou')
+    return vowel_count >= 2
+```
+
+这防止短英文词（`OH`, `OP`, `Up`, `in` 等 ≤1 元音）被 pinyin 音节错误匹配。
+
+**2c. `normalize_english_tokens.py` 增加合并结果验证**:
+
+在 `normalize_stem` 末尾增加验证:
+```python
+# NEW: Verify merged result matches reference
+for en_word, indices in changes:
+    current = [lab_tokens[i] for i in indices]
+    merged = "".join(current)
+    # If merged letters don't form the reference word, warn
+    if sorted(merged.lower()) != sorted(en_word.lower()):
+        print(f"  [WARN] {stem}: merged '{merged}' vs ref '{en_word}' — possible hallucination")
+```
+
+**涉及文件**: `scripts/normalize_english_tokens.py` (2b, 2c), `scripts/ctc_prealign.py` (2a)
+
+---
+
+### 问题 3: 拼音→NVV 误判 — blank-frame bias 过度激进
+
+**现象**:
+
+| 样本 | CTC 片段 | NVV 分类 | 实际应为 | 时长 |
+|------|---------|---------|---------|------|
+| 000021 | `zan2` | `BREATHING` | 拼音 `zan2` (咱) | 240ms |
+| 000248 | `jin1` | `BREATHING` | 拼音 `jin1` (今) | 180ms |
+
+**根因链**:
+
+1. SenseVoice 模型有 30 类 NVV token (Breathing, Laughter, Crying, ...) 位于 token ID 25025-25054
+2. `make_patched_inference` (ctc_prealign.py:218-221) 对 CTC blank 帧施加 NVV bias:
+   ```python
+   top_pred = x.argmax(dim=-1)
+   is_blank = (top_pred == BLANK_ID)
+   x[is_blank, NVV_START:NVV_END + 1] += bias_value  # default 4.0
+   ```
+3. NVV_BIAS_DEFAULT = 4.0 → logit 加 4.0 → softmax 后概率 ≈ 0.98
+4. 当短拼音音节（如 `zan2` 240ms）前后有 silence/blank 帧时：
+   - 拼音音节本身被正确解码
+   - **但**周围的 blank 帧被 biased → NVV token 概率飙升
+   - CTC greedy decoding 选择了 NVV token 而非 blank → 在音节边界插入 NVV
+5. 更关键的是: NVV bias 作用于 **所有 blank 帧**，不区分"真正的 silence"（数百ms静音）和"音节间的短暂 blank"（60-120ms 间隔）
+6. `zan2` [9.27-9.51] 后的空白帧在 `pause_threshold` (8帧≈480ms) 内被检测为 NVV
+
+**为什么 `zan2` → BREATHING 而不是其他 NVV**:
+- CTC blank 帧被 bias 后，NVVS_START..NVV_END 范围内 BREATHING token 的原始 logit 最高（预训练权重偏差）
+- 即使原始 logit 差异很小，+4.0 后 softmax 将其推到接近 1.0
+
+**设计修复 — Fix 3: NVV 后处理还原 + bias 策略调整**:
+
+**3a. `ctc_prealign.py` 新增 NVV→拼音还原 Pass**:
+
+在 `_normalize_english` 之后增加 `_reclaim_nvv_pinyin`:
+
+```python
+def _reclaim_nvv_pinyin(ctc_dir: Path, pinyin_dir: Path) -> int:
+    """Revert NVV tokens that are actually misclassified pinyin syllables.
+    
+    A NVV token is likely pinyin if ALL of:
+      - Word matches pinyin syllable pattern: [a-z]+[1-5]  (has tone digit)
+      - Duration < 400ms (true NVV like BREATHING > 500ms)
+      - Adjacent tokens are pinyin syllables (not English / other NVV)
+      - Position in sentence is mid-sentence (not at a natural pause)
+      - The .lab file has the original pinyin at this position
+    """
+    reverted = 0
+    for tokens_path in sorted(ctc_dir.glob("*_tokens.jsonl")):
+        stem = tokens_path.stem.replace("_tokens", "")
+        tokens = [...]  # load
+        lab_path = pinyin_dir / f"{stem}.lab"
+        lab_tokens = lab_path.read_text().strip().split() if lab_path.exists() else []
+        
+        for i, tok in enumerate(tokens):
+            if not is_nvv_token(tok["word"]):
+                continue
+            dur = tok["end_s"] - tok["start_s"]
+            
+            # Check 1: Duration fits pinyin syllable range
+            if dur > 0.400:
+                continue
+            
+            # Check 2: Look up original pinyin from .lab
+            if i < len(lab_tokens):
+                lab_tok = lab_tokens[i]
+                if is_pinyin_syllable(lab_tok):
+                    # Revert NVV → original pinyin
+                    tok["word"] = lab_tok
+                    reverted += 1
+                    print(f"  [nvv_reclaim] {stem}: {tok['word']} ← NVV")
+        
+        # Write back...
+    return reverted
+```
+
+**3b. (可选) `make_patched_inference` 中 NVV bias 条件化**:
+
+当前 bias 对所有 blank 帧生效。改为仅对**连续 blank 帧**中段施加 bias:
+
+```python
+# Before: all blank frames get bias
+x[is_blank, NVV_START:NVV_END + 1] += bias_value
+
+# After: only sustained blank runs (≥3 consecutive blank frames ≈ 180ms)
+blank_runs = []
+j = 0
+while j < len(is_blank):
+    if is_blank[j]:
+        s = j
+        while j < len(is_blank) and is_blank[j]:
+            j += 1
+        if j - s >= 3:  # sustained silence
+            blank_runs.append((s, j))
+    else:
+        j += 1
+
+biased_mask = torch.zeros_like(is_blank)
+for s, e in blank_runs:
+    # Bias only middle frames (avoid edge frames near speech)
+    mid_start = s + 1
+    mid_end = e - 1
+    if mid_end > mid_start:
+        biased_mask[mid_start:mid_end] = True
+
+x[biased_mask, NVV_START:NVV_END + 1] += bias_value
+```
+
+这确保 NVV bias 仅在持续静音段（≥180ms）生效，不在音节边界触发。
+
+**涉及文件**: `scripts/ctc_prealign.py` (3a, 3b), `scripts/pipeline_utils.py` (无修改)
+
+---
+
+### 修改点汇总
+
+| ID | 文件 | 函数 | 修改 | 优先级 |
+|----|------|------|------|--------|
+| **Fix-1** | `normalize_english_tokens.py` | `normalize_stem` (新增) | **Pass 2 碎片回收**: 合并残留单字母/短英文碎片到相邻英文词 | **P0** |
+| **Fix-2a** | `ctc_prealign.py` | `make_patched_inference` | **参考文本保护**: ASR 英文词与 ref_text 不一致时回退到 ref | **P1** |
+| **Fix-2b** | `normalize_english_tokens.py` | `_token_matches_ref` | **元音约束**: pinyin→English 仅当 ref ≥2 元音 (对齐 Case 10) | **P0** |
+| **Fix-2c** | `normalize_english_tokens.py` | `normalize_stem` (新增) | **合并验证**: 合并后字母组成与参考词不一致时告警 | **P1** |
+| **Fix-3a** | `ctc_prealign.py` | `_reclaim_nvv_pinyin` (新增) | **NVV 还原**: pinyin 模式 + <400ms → 还原为拼音 | **P0** |
+| **Fix-3b** | `ctc_prealign.py` | `make_patched_inference` | **NVV bias 条件化**: 仅 ≥3 帧连续 blank 中段 bias | **P2** (可选优化) |
+
+### 预期修复效果
+
+| 问题样本 | 修复前 | Fix-1 | Fix-2a/b | Fix-3a | 修复后 |
+|---------|--------|-------|----------|--------|--------|
+| 000021 SOS+OS | `SOS`(180ms) + `OS`(420ms) | ✅→SOS(600ms) | — | — | `SOS` 合并 |
+| 000135 f+an | `f`(60ms) + `an`(60ms) | ✅→fan(120ms) | — | — | `fan` 合并 |
+| 000248 s+how | `s`(60ms) + `how`(360ms) | ✅→show(420ms) | — | — | `show` 合并 |
+| 000352 f+an | `f`(60ms) + `an`(300ms) | ✅→fan(360ms) | — | — | `fan` 合并 |
+| 000044 Instagram→sta | `Instagramsta` | — | ✅→Instagram | — | `Instagram` 修正 |
+| 000021 li+ve→leave | `leave` | — | ✅→live | — | `live` 修正 |
+| 000021 zan2→BREATH | `BREATHING`(240ms) | — | — | ✅→zan2 | `zan2` 还原 |
+| 000248 jin1→BREATH | `BREATHING`(180ms) | — | — | ✅→jin1 | `jin1` 还原 |
+
+### 验证方法
+
+```python
+# Fix-1 验证: 无残留短英文碎片
+for tokens_path in ctc_dir.glob("*_tokens.jsonl"):
+    tokens = json.loads(...)
+    for i, t in enumerate(tokens):
+        if is_english_token(t["word"]) and len(t["word"]) <= 2:
+            dur = t["end_s"] - t["start_s"]
+            if dur < 0.080:
+                # Check if adjacent to longer English word
+                if not ((i>0 and is_english_token(tokens[i-1]["word"]) and len(tokens[i-1]["word"])>=3)
+                     or (i<len(tokens)-1 and is_english_token(tokens[i+1]["word"]) and len(tokens[i+1]["word"])>=3)):
+                    print(f"  ORPHAN: {t['word']} {int(dur*1000)}ms in {tokens_path.stem}")
+
+# Fix-2 验证: 英文词与原始 JSONL 一致
+for stem, orig_text in original_jsonl_texts.items():
+    tokens = load_tokens(stem)
+    orig_eng = set(re.findall(r'[a-zA-Z]{2,}', orig_text))
+    ctc_eng = set(t["word"] for t in tokens if is_english_token(t["word"]))
+    if orig_eng != ctc_eng:
+        print(f"  DRIFT: {stem}: {orig_eng} -> {ctc_eng}")
+
+# Fix-3 验证: 无 pinyin 被误判为 NVV
+for tokens_path in ctc_dir.glob("*_tokens.jsonl"):
+    tokens = json.loads(...)
+    for t in tokens:
+        if is_nvv_token(t["word"]):
+            dur = t["end_s"] - t["start_s"]
+            if dur < 0.400:
+                print(f"  NVV_SUSPECT: {t['word']} {int(dur*1000)}ms in {tokens_path.stem}")
+```
+
+---
+
+### ria 名字完整性专项保护 (Fix-4)
+
+**触发条件**: "ria" 是核心 VTuber 名字，必须保证在任何管线阶段都是完整小写 `ria`，不被碎片化或大小写不一致。
+
+**当前 ria 处理链路及缺口**:
+
+```
+文本级: replace_ria_variants() → "瑞娅/瑞亚/瑞雅/瑞啊" → "ria"  ✅
+                                                ↓
+CTC 分词: NVASR tokenizer 对 OOV "ria" 的 3 种拆分:
+  ├─ Pattern A: "rui4" + "ya4"  (中文音译)
+  ├─ Pattern B: "R" + "I" + "A"  (单字母拆分)  
+  └─ Pattern C: "R" + "ia"      (混合拆分)
+                                                ↓
+Token 合并: 单字母合并 (ctc_prealign.py:1325-1356)
+  ├─ Pattern A: 不适用 (拼音音节非单字母)
+  ├─ Pattern B: "R"+"I"+"A" → "RIA" ✅ (但大写!)
+  └─ Pattern C: "R"+"ia" → "R"+"ia" ❌ 未合并 (ia 是2字符)
+                                                ↓
+_normalize_ria: regex 替换 (ctc_prealign.py:838-839)
+  ├─ Pattern A: "rui4 ya4" → "ria" ✅
+  ├─ Pattern B: "RIA" → 不匹配 ❌ (全大写不匹配 regex)
+  └─ Pattern C: "R ia" → 不匹配 ❌
+                                                ↓
+_merge_ria_tokens: tokens.jsonl 合并 (ctc_prealign.py:795-796)
+  ├─ Pattern A: "ruiN+yaN" → "ria" ✅
+  ├─ Pattern A': "ruiN+aN" → 不合并 ❌ (仅检查 yaN!)
+  ├─ Pattern B: "R"+"I"+"A" → 已合并不适用
+  └─ Pattern C: 不适用
+                                                ↓
+normalize_en: 参考文本匹配
+  ├─ Pattern B: "RIA"→"ria" ✅ (参考文本有 "ria")
+  └─ Pattern C: "R"+"ia"→"ria" ✅ (碎片匹配合并)
+```
+
+**识别出的 3 个缺口**:
+
+| Gap | 位置 | 现象 | 严重度 |
+|-----|------|------|--------|
+| **Gap-A** | `_merge_ria_tokens` line 795-796 | `ruiN + aN` → .lab 修复了但 tokens.jsonl **未合并** | **P0** |
+| **Gap-B** | 单字母合并 line 1347-1348 | `"R"+"I"+"A"` → `"RIA"` 大写，依赖 normalize_en 修正大小写 | **P1** |
+| **Gap-C** | normalize_en `_token_matches_ref` line 126 | `"ria"` 参考词可能被 pinyin→English 无条件匹配污染，导致碎片合入错误的目标词 | **P1** |
+
+**设计修复 — Fix 4a: `_merge_ria_tokens` 增加 `ruiN + aN` 模式**:
+
+`ctc_prealign.py` `_merge_ria_tokens`, line 795-796:
+```python
+# Before:
+if (re.match(r'^rui[0-5]$', w) and i + 1 < len(entries)
+        and re.match(r'^ya[0-5]$', entries[i + 1]["word"])):
+
+# After:
+if (re.match(r'^rui[0-5]$', w) and i + 1 < len(entries)
+        and re.match(r'^(ya|a)[0-5]$', entries[i + 1]["word"])):
+```
+
+**设计修复 — Fix 4b: 单字母合并后强制 ria 小写**:
+
+在单字母合并逻辑 (ctc_prealign.py line 1347-1348) 之后增加规范化:
+
+```python
+# After merged_pinyin.append({"word": "".join(letters), ...})
+# NEW: Force lowercase for known proper names
+_KNOWN_NAMES = frozenset({"ria", "noa", "mila"})
+merged_word = "".join(letters)
+if merged_word.lower() in _KNOWN_NAMES:
+    merged_pinyin[-1]["word"] = merged_word.lower()
+```
+
+**设计修复 — Fix 4c: normalize_en 增加 ria 硬保护**:
+
+在 `normalize_stem` (normalize_english_tokens.py) 中增加 ria 专项检查:
+
+```python
+# normalize_english_tokens.py normalize_stem, before changes loop (~line 271)
+# NEW: Hard protection for "ria" — never merge into another word,
+# never leave as fragments. Ria is always standalone lowercase.
+
+_PROTECTED_NAMES = frozenset({"ria"})
+
+for ri, indices in sorted(ref_to_lab.items()):
+    en_word = en_ref_positions[ri]
+    
+    # [NEW] Protected name: ensure standalone and lowercase
+    if en_word.lower() in _PROTECTED_NAMES:
+        # 1. Gather all fragment indices that form "ria"
+        # 2. Force lowercase in .lab and tokens
+        # 3. Merge timestamps: start=earliest, end=latest
+        # 4. Mark as handled, skip normal merge logic
+        _merge_protected_name(ri, en_word.lower(), indices, ...)
+        continue
+```
+
+**设计修复 — Fix 4d (推荐): 统一 ria 后处理校验函数**:
+
+新增 `_protect_ria` 函数, 在 ctc_prealign.py 和 normalize_english_tokens.py 两处调用:
+
+```python
+# ctc_prealign.py / normalize_english_tokens.py 通用
+def _protect_ria(tokens: list[dict], lab_tokens: list[str]) -> tuple[list, list]:
+    """Ensure "ria" is always a complete, lowercase, standalone token.
+    
+    Handles all known fragmentation patterns:
+    - "R"+"I"+"A" → "ria"  (single-letter split)
+    - "R"+"ia"    → "ria"  (mixed split)
+    - "RIA"       → "ria"  (case normalization)
+    - "ruiN"+"yaN"→ "ria"  (pinyin phonetic, also covered by _normalize_ria)
+    - "ruiN"+"aN" → "ria"  (pinyin variant, Gap-A)
+    
+    Returns (updated_tokens, updated_lab_tokens).
+    """
+    RIA_FRAGMENT_SETS = [
+        frozenset({"r", "i", "a"}),      # single letters
+        frozenset({"r", "ia"}),           # mixed
+        frozenset({"ria"}),               # case fix only
+        frozenset({"rui4", "ya4"}),       # pinyin phonetic
+        frozenset({"rui2", "a1"}),        # pinyin variant
+    ]
+    
+    i = 0
+    new_tokens, new_lab = [], []
+    while i < len(tokens):
+        # Check if tokens[i:i+N] form "ria" fragments
+        matched = None
+        for n in range(1, 4):  # try 1-3 consecutive tokens
+            if i + n > len(tokens):
+                break
+            fragment_set = frozenset(
+                t["word"].lower() if isinstance(t, dict) else t.lower()
+                for t in (tokens[i:i+n] if isinstance(tokens[0], dict) else lab_tokens[i:i+n])
+            )
+            if fragment_set in RIA_FRAGMENT_SETS:
+                matched = n
+                break
+        
+        if matched:
+            # Merge fragments → single "ria" token
+            if isinstance(tokens[0], dict):
+                s = tokens[i]["start_s"]
+                e = tokens[i + matched - 1]["end_s"]
+                new_tokens.append({"word": "ria", "start_s": s, "end_s": e,
+                                   "start_ms": round(s*1000), "end_ms": round(e*1000),
+                                   "type": "word"})
+            new_lab.append("ria")
+            i += matched
+        else:
+            if isinstance(tokens[0], dict):
+                new_tokens.append(tokens[i])
+            new_lab.append(lab_tokens[i] if isinstance(lab_tokens, list) else tokens[i])
+            i += 1
+    
+    return new_tokens, new_lab
+```
+
+**调用点**:
+1. `ctc_prealign.py` `make_patched_inference` → 单字母合并之后调用 `_protect_ria(words_pinyin, lab_tokens)`
+2. `normalize_english_tokens.py` `normalize_stem` → 合并循环之后调用 `_protect_ria(new_ctc, new_lab)`
+
+**修改点汇总 — ria 专项**:
+
+| ID | 文件 | 函数 | 修改 | 优先级 |
+|----|------|------|------|--------|
+| **Fix-4a** | `ctc_prealign.py` | `_merge_ria_tokens` | `ya[0-5]` → `(ya\|a)[0-5]` 扩展 tokens.jsonl 合并 | **P0** |
+| **Fix-4b** | `ctc_prealign.py` | 单字母合并后 (line ~1356) | 已知名称 (ria/noa/mila) 强制小写 | **P0** |
+| **Fix-4c** | `normalize_english_tokens.py` | `normalize_stem` | ria 硬保护: 独立 token + 小写 | **P1** |
+| **Fix-4d** | `ctc_prealign.py` | `_protect_ria` (新增) | **推荐**: 统一 ria 后处理校验，所有 2 个调用点 | **P0** |
+
+### 关联样本
+
+- 测试集: `/tmp/test_en_ctc/ctc_pretg/` (10 条)
+- 数据集: `/mnt/Raw/新版合成英文数据` (54000 条)
+
+---
 
 ## 模板 (新 Case 用)
 

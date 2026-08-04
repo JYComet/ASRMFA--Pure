@@ -426,6 +426,22 @@ def tier_by_name(tg: TextGrid, name: str) -> Tier | None:
     return None
 
 # ---------------------------------------------------------------------------
+# ── Per-initial duration ratios for the proportional-split fallback ──
+# When MFA under-produces phones for a Chinese syllable (Regression Case 26),
+# the word interval is split init:final according to these ratios.  Each value
+# represents the typical fraction of the syllable occupied by the initial
+# consonant.  Fallback default is 0.35 (affricate / general).
+_INIT_FRAC: dict[str, float] = {
+    # Stops — shortest, ~15-25% of syllable
+    'b': 0.20, 'p': 0.20, 'd': 0.20, 't': 0.20, 'g': 0.20, 'k': 0.20,
+    # Nasals / laterals — ~15-25%
+    'm': 0.22, 'n': 0.22, 'l': 0.22,
+    # Fricatives — ~20-35%
+    'f': 0.28, 's': 0.28, 'sh': 0.28, 'x': 0.28, 'h': 0.28, 'r': 0.28,
+    # Affricates — ~25-40% (also serves as the .get() default)
+    'z': 0.35, 'c': 0.35, 'zh': 0.35, 'ch': 0.35, 'j': 0.35, 'q': 0.35,
+}
+
 # IPA -> Pinyin reverse-mapped phone tier
 # ---------------------------------------------------------------------------
 
@@ -512,7 +528,7 @@ def build_pinyin_phones_tier(phones_tier: Tier,
                     and not is_nvv_token(w_iv.text)
                     and not is_english_token(w_iv.text)):
                 word_dur = w_iv.xmax - w_iv.xmin
-                _init_frac = 0.35       # typical init:final ratio
+                _init_frac = _INIT_FRAC.get(dict_phones[0], 0.35)
                 _min_seg = 0.030        # floor per segment
                 if word_dur >= _min_seg * 2:
                     split = w_iv.xmin + max(_min_seg, word_dur * _init_frac)
@@ -603,7 +619,7 @@ def build_pinyin_phones_tier(phones_tier: Tier,
                 # Split proportionally so the final isn't lost entirely.
                 # Regression Case 26 (MISSING_FINAL).
                 word_dur = w_iv.xmax - w_iv.xmin
-                _init_frac = 0.35       # typical init:final ratio
+                _init_frac = _INIT_FRAC.get(dict_phones[0], 0.35)
                 _min_seg = 0.030        # floor per segment
                 if word_dur >= _min_seg * 2:
                     split = w_iv.xmin + max(_min_seg, word_dur * _init_frac)
@@ -919,6 +935,70 @@ def absorb_nvv_trailing(textgrid: TextGrid) -> None:
         if tier:
             tier.intervals = [iv for iv in tier.intervals
                               if iv.duration > 0.001 or not iv.text.strip()]
+
+
+def _fix_overlapping_boundaries(words_tier) -> int:
+    """Resolve mild (<30ms) overlaps between adjacent content-word intervals.
+
+    Operates on *words_tier* intervals in-place.  Returns the number of
+    overlaps that were fixed (so the caller can decide whether to re-sync
+    derived tiers).
+
+    Strategy
+    --------
+    * Two **content words** overlapping < 30 ms → split the overlap evenly
+      (``split_overlap``).
+    * Content word overlapping with **punctuation** → clip the punctuation
+      side (``clip_punct``).
+    * Overlaps ≥ 30 ms, or involving silence / NVV / English tokens, are
+      **left untouched** — they will be caught by the downstream
+      ``overlapping_words`` QC filter (Case 27-B).
+    * Zero-duration remnants are removed after all fixes are applied.
+    """
+    intervals = list(words_tier.intervals)
+    n = len(intervals)
+    fixed = 0
+
+    for i in range(n - 1):
+        cur = intervals[i]
+        nxt = intervals[i + 1]
+        if cur.xmax is None or nxt.xmin is None:
+            continue
+        overlap = cur.xmax - nxt.xmin
+        if overlap <= 0.005:          # negligible (≤ 5 ms)
+            continue
+
+        cur_text = cur.text.strip() if cur.text else ""
+        nxt_text = nxt.text.strip() if nxt.text else ""
+
+        cur_is_content = (cur_text and not is_punct(cur_text)
+                          and not is_silence(cur_text)
+                          and not is_nvv_token(cur_text))
+        nxt_is_content = (nxt_text and not is_punct(nxt_text)
+                          and not is_silence(nxt_text)
+                          and not is_nvv_token(nxt_text))
+
+        # ── Two content words with mild overlap ──
+        if cur_is_content and nxt_is_content and overlap < 0.030:
+            mid = (cur.xmax + nxt.xmin) / 2.0
+            intervals[i] = Interval(cur.xmin, mid, cur.text)
+            intervals[i + 1] = Interval(mid, nxt.xmax, nxt.text)
+            fixed += 1
+
+        # ── Content word followed by punctuation that leaks into it ──
+        elif cur_is_content and is_punct(nxt_text) and overlap < 0.100:
+            intervals[i + 1] = Interval(cur.xmax, nxt.xmax, nxt.text)
+            fixed += 1
+
+        # ── Punctuation leaking into following content word ──
+        elif is_punct(cur_text) and nxt_is_content and overlap < 0.100:
+            intervals[i] = Interval(cur.xmin, nxt.xmin, cur.text)
+            fixed += 1
+
+    # Remove zero-duration remnants
+    intervals[:] = [iv for iv in intervals if iv.xmax - iv.xmin > 0.001]
+    words_tier.intervals = intervals
+    return fixed
 
 
 def _sync_derived_tiers(textgrid: TextGrid, ipa_to_pinyin: dict[str, str],
@@ -4463,6 +4543,21 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # ellipsis left behind when NVASR strips NVV tags.  See Regression Case 17.
     strip_edge_punctuation(new_tg)
 
+    # --- D5. Fix mild overlapping boundaries in words tier ---
+    # Boundary adjustments (snap, refine, inject, absorb) can leave
+    # adjacent word intervals with small overlaps.  Resolve the ones
+    # that are clearly mechanical errors (< 30 ms between content words,
+    # punct leaking into a neighbouring word).  Regression Case 27.
+    _wt = tier_by_name(new_tg, "words")
+    if _wt is not None:
+        _overlaps_fixed = _fix_overlapping_boundaries(_wt)
+        if _overlaps_fixed:
+            # Sync derived tiers so hanzi + pinyin_phones reflect the fixes
+            _sync_derived_tiers(new_tg, ipa_to_pinyin, pinyin_dict,
+                                raw_text=raw_text,
+                                en_mfa_windows=en_mfa_windows,
+                                report_warnings=report.get("warnings", []))
+
     # ── Phase 4 后比对: 哪些标点在 Phase 4 中被吞了 ──
     _swallowed_puncts: list[dict] = []
     if _punct_before:
@@ -5330,6 +5425,89 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             report.setdefault("cjk_details", {})["raw_count"] = len(raw_cjk)
             report["cjk_details"]["hanzi_count"] = len(hanzi_cjk)
             report["cjk_details"]["delta"] = len(raw_cjk) - len(hanzi_cjk)
+
+    # ── Case 26-D: init_only_phone — pinyin_phones still has bare initials ──
+    # After the proportional-split fix (Case 26), a multi-phone dict word
+    # must never appear as its initial-only phone in pinyin_phones.
+    # Detect any residual cases that the fix couldn't cover.
+    _init_only_count = 0
+    _init_only_examples: list[str] = []
+    if words_tier is not None and pp_tier is not None and pinyin_dict is not None:
+        for _wi, _w_iv in enumerate(words_tier.intervals):
+            _wt = _w_iv.text.strip()
+            if not re.match(r'^[a-z]+[1-5]$', _wt) or len(_wt) <= 2:
+                continue
+            _dict_phones = pinyin_dict.get(_wt) or pinyin_dict.get(_wt.lower())
+            if not _dict_phones or len(_dict_phones) < 2:
+                continue  # zero-initial or not in dict
+            # Collect non-silence phones in this word's range
+            _w_phones = [p for p in pp_tier.intervals
+                         if p.xmax > _w_iv.xmin + 0.001
+                         and p.xmin < _w_iv.xmax - 0.001
+                         and not is_silence(p.text)]
+            _phone_texts = [p.text.strip() for p in _w_phones]
+            if len(_phone_texts) == 1 and _phone_texts[0] == _dict_phones[0]:
+                _init_only_count += 1
+                if len(_init_only_examples) < 5:
+                    _init_only_examples.append(f"{_wt}→{_phone_texts}")
+    if _init_only_count > 0:
+        filter_reasons.append("init_only_phone")
+        report["init_only_phone"] = {"count": _init_only_count,
+                                      "examples": _init_only_examples}
+
+    # ── Case 27-B: overlapping_words — unresolved interval overlaps ──
+    _overlap_count = 0
+    _overlap_examples: list[str] = []
+    if words_tier is not None:
+        for _i in range(len(words_tier.intervals) - 1):
+            _ov = words_tier.intervals[_i].xmax - words_tier.intervals[_i + 1].xmin
+            if _ov > 0.005:
+                _overlap_count += 1
+                if len(_overlap_examples) < 5:
+                    _overlap_examples.append(
+                        f"{words_tier.intervals[_i].text.strip()}"
+                        f"↔{words_tier.intervals[_i+1].text.strip()}"
+                        f"({_ov*1000:.0f}ms)")
+    if _overlap_count > 0:
+        filter_reasons.append("overlapping_words")
+        report["overlapping_words"] = {"count": _overlap_count,
+                                        "examples": _overlap_examples}
+
+    # ── Case 28: inverted_interval — xmin > xmax ──
+    _inverted_count = 0
+    _inverted_examples: list[str] = []
+    for _tier in new_tg.tiers:
+        for _iv in _tier.intervals:
+            if _iv.xmin > _iv.xmax + 0.001:
+                _inverted_count += 1
+                if len(_inverted_examples) < 5:
+                    _inverted_examples.append(
+                        f"{_tier.name}:{_iv.text.strip()}"
+                        f"[{_iv.xmin:.3f}>{_iv.xmax:.3f}]")
+    if _inverted_count > 0:
+        filter_reasons.append("inverted_interval")
+        report["inverted_interval"] = {"count": _inverted_count,
+                                        "examples": _inverted_examples}
+
+    # ── Case 29: short_word — content word < 30 ms (physically impossible) ──
+    _short_count = 0
+    _short_examples: list[str] = []
+    _SHORT_FLOOR = 0.030  # seconds
+    if words_tier is not None:
+        for _iv in words_tier.intervals:
+            _text = _iv.text.strip()
+            if (not _text or is_silence(_iv.text) or is_punct(_text)
+                    or is_nvv_token(_text)):
+                continue
+            if _iv.xmax - _iv.xmin < _SHORT_FLOOR:
+                _short_count += 1
+                if len(_short_examples) < 8:
+                    _short_examples.append(
+                        f"{_text}[{(_iv.xmax-_iv.xmin)*1000:.0f}ms]")
+    if _short_count > 0:
+        filter_reasons.append("short_word")
+        report["short_word"] = {"count": _short_count,
+                                 "examples": _short_examples}
 
     # 统一设置过滤状态和输出路径
     if filter_reasons:
