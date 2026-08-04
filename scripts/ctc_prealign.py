@@ -923,10 +923,187 @@ def main():
                         help="限制处理数量, 0=全部")
     parser.add_argument("--offset", type=int, default=0,
                         help="跳过前 N 个文件 (配合 --limit 实现多 GPU 分片)")
+    parser.add_argument("--all-gpus", action="store_true",
+                        help="自动检测所有 GPU 并均匀分片并行处理")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--nvv-bias", type=float, default=NVV_BIAS_DEFAULT,
                         help=f"NVV blank-frame bias (default: {NVV_BIAS_DEFAULT}).")
     args = parser.parse_args()
+
+    # ── --all-gpus: auto-detect GPUs, split files, launch parallel subprocesses ──
+    if args.all_gpus:
+        if not torch.cuda.is_available():
+            print("ERROR: --all-gpus requires CUDA. Falling back to single-GPU mode.")
+            args.all_gpus = False
+        else:
+            import subprocess as _sp
+            import shutil as _shutil
+
+            num_gpus = torch.cuda.device_count()
+            audio_dir = args.audio_dir or args.data_dir
+            all_wavs = sorted(audio_dir.rglob("*.wav"))
+            total = len(all_wavs)
+            per_gpu = (total + num_gpus - 1) // num_gpus
+            print(f"--all-gpus: {num_gpus} GPUs detected, {total} WAVs → ~{per_gpu}/GPU")
+
+            _procs: list[tuple[int, _sp.Popen, Path]] = []
+
+            # Build base argv from parsed namespace
+            _base_argv = [
+                sys.executable, __file__,
+                "--data-dir", str(args.data_dir),
+                "--pinyin-dir", str(args.pinyin_dir),
+                "--model-path", str(args.model_path),
+                "--nvv-bias", str(args.nvv_bias),
+            ]
+            if args.audio_dir:
+                _base_argv += ["--audio-dir", str(args.audio_dir)]
+
+            for gpu_id in range(num_gpus):
+                offset = gpu_id * per_gpu
+                limit = min(per_gpu, total - offset)
+                if limit <= 0:
+                    break
+
+                shard_dir = args.output_dir / f"_shard_gpu{gpu_id}"
+                shard_dir.mkdir(parents=True, exist_ok=True)
+
+                child_argv = list(_base_argv)
+                child_argv += [
+                    "--device", "cuda:0",
+                    "--output-dir", str(shard_dir),
+                    "--offset", str(offset),
+                    "--limit", str(limit),
+                    "--overwrite",
+                ]
+                # Copy dict to shard dir (avoids concurrent write races on shared dict)
+                if args.dict_path:
+                    shard_dict = shard_dir / args.dict_path.name
+                    if not shard_dict.exists():
+                        _shutil.copy2(str(args.dict_path), str(shard_dict))
+                    child_argv += ["--dict-path", str(shard_dict)]
+
+                env = os.environ.copy()
+                env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+                print(f"  GPU {gpu_id}: offset={offset} limit={limit} "
+                      f"→ {shard_dir}")
+                _proc = _sp.Popen(child_argv, env=env, cwd=str(PROJECT_ROOT))
+                _procs.append((gpu_id, _proc, shard_dir))
+
+            # Wait for all GPUs
+            print(f"\n  等待 {len(_procs)} 个 GPU 完成...")
+            failed: list[tuple[int, int]] = []
+            for gpu_id, _proc, _shard_dir in _procs:
+                _rc = _proc.wait()
+                if _rc != 0:
+                    failed.append((gpu_id, _rc))
+                    print(f"  GPU {gpu_id}: FAILED (rc={_rc})")
+                else:
+                    print(f"  GPU {gpu_id}: DONE")
+
+            if failed:
+                print(f"\n  FAILURES: {len(failed)} GPU(s)")
+                for gpu_id, rc in failed:
+                    print(f"    GPU {gpu_id}: rc={rc}")
+                sys.exit(1)
+
+            # ── Merge shard outputs into main output dir ──
+            print(f"\n  合并 {len(_procs)} 个 shard 输出...")
+            _merged_entries = 0
+            _total_files = _total_ok = _total_fail = _total_time = 0
+            _all_manifests: list[tuple[Path, Path]] = []
+            _all_summaries: list[Path] = []
+
+            for _gpu_id, _, _shard_dir in _procs:
+                for _f in _shard_dir.glob("*"):
+                    if _f.name == "manifest.json":
+                        _all_manifests.append((_shard_dir, _f))
+                    elif _f.name == "summary.txt":
+                        _all_summaries.append(_f)
+                    elif args.dict_path and _f.name == args.dict_path.name:
+                        pass  # skip shard-local dict copy
+                    else:
+                        _dest = args.output_dir / _f.name
+                        if not _dest.exists() or args.overwrite:
+                            _shutil.move(str(_f), str(_dest))
+                            _merged_entries += 1
+
+                # Clean up shard dir
+                try:
+                    for _leftover in _shard_dir.iterdir():
+                        _leftover.unlink()
+                    _shard_dir.rmdir()
+                except OSError:
+                    pass
+
+            # ── Merge manifests with path rewriting ──
+            import json as _json
+            _merged = []
+            for _shard_dir, _m in sorted(_all_manifests, key=lambda p: p[1].parent.name):
+                try:
+                    _data = _json.loads(_m.read_text(encoding="utf-8"))
+                    _shard_s = str(_shard_dir)
+                    _main_s = str(args.output_dir)
+                    for _entry in _data:
+                        for _key in ("textgrid", "lab"):
+                            if _key in _entry:
+                                _entry[_key] = _entry[_key].replace(_shard_s, _main_s)
+                    _merged.extend(_data)
+                except Exception as _e:
+                    print(f"  WARNING: Failed to read {_m}: {_e}")
+            with open(args.output_dir / "manifest.json", "w", encoding="utf-8") as _f:
+                _json.dump(_merged, _f, ensure_ascii=False, indent=2)
+
+            # Extract stats from per-shard summaries
+            for _s in _all_summaries:
+                try:
+                    for _line in _s.read_text(encoding="utf-8").splitlines():
+                        if _line.startswith("Files:"):
+                            _p = _line.split()
+                            _total_files += int(_p[1])
+                            _total_ok += int(_p[3])
+                            _total_fail += int(_p[5])
+                        elif _line.startswith("Time:"):
+                            _total_time += float(_line.split()[1].rstrip("s"))
+                except Exception:
+                    pass
+
+            # Write combined summary
+            _summary = (
+                f"CTC Pre-alignment Report (--all-gpus, {num_gpus}x GPU)\n"
+                f"{'=' * 40}\n"
+                f"Files: {_total_files} total, {_total_ok} OK, {_total_fail} failed\n"
+                f"Time: {_total_time:.1f}s (wall-clock total)\n\n"
+                f"Output: {args.output_dir}\n"
+            )
+            (args.output_dir / "summary.txt").write_text(_summary, encoding="utf-8")
+
+            # ── Collect English tokens from merged manifest → shared dict ──
+            if args.dict_path and args.dict_path.exists():
+                _english_tokens: set[str] = set()
+                for _entry in _merged:
+                    for _w in _entry.get("_words", []):
+                        _token = _w["word"]
+                        if is_english_token(_token):
+                            _english_tokens.add(_token)
+                if _english_tokens:
+                    _existing: set[str] = set()
+                    with open(args.dict_path, encoding='utf-8-sig') as _f:
+                        for _line in _f:
+                            _line = _line.strip()
+                            if _line:
+                                _existing.add(_line.split()[0])
+                    _new_tokens = sorted(t for t in _english_tokens if t not in _existing)
+                    if _new_tokens:
+                        with open(args.dict_path, 'a', encoding='utf-8') as _f:
+                            for t in _new_tokens:
+                                _f.write(f"{t} {t}\n")
+                        print(f"  Added {len(_new_tokens)} English tokens to dict")
+
+            print(f"  Merged {len(_merged)} manifest entries, {_merged_entries} files")
+            print(f"\n{_summary}")
+            print(f"完成! 输出: {args.output_dir}")
+            sys.exit(0)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -991,7 +1168,12 @@ def main():
         if device == "cpu" or not device.startswith("cuda"):
             return 4
         try:
-            mem_gb = torch.cuda.get_device_properties(device).total_mem / 1024**3
+            # Parse numeric index from "cuda:N" string; PyTorch 2.9+
+            # renamed total_mem → total_memory
+            idx = int(device.split(":", 1)[1]) if ":" in device else 0
+            props = torch.cuda.get_device_properties(idx)
+            mem_bytes = getattr(props, "total_memory", getattr(props, "total_mem", 0))
+            mem_gb = mem_bytes / 1024**3
             if mem_gb >= 40:   return 64   # A100, RTX 6000 Ada
             if mem_gb >= 24:   return 32   # RTX 3090/4090
             if mem_gb >= 16:   return 24   # RTX 3080/4080, A4000

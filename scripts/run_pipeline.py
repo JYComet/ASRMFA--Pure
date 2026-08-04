@@ -24,6 +24,7 @@ import os
 import platform
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -339,6 +340,105 @@ def resolve_num_jobs(cfg_val: int, n_stems: int = 0) -> int:
 # ---------------------------------------------------------------------------
 # MFA environment — imported from pipeline_utils (find_mfa_python, get_mfa_env)
 # ---------------------------------------------------------------------------
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NVMe audio cache — transparent NAS → local SSD acceleration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_NVME_CACHE_ROOT = Path("/mnt/nvme3/mfa_audio_cache")
+_NVME_MANIFEST_NAME = "cache_manifest.json"
+_TEMP_CACHE_ROOT = Path("/tmp/mfa_audio_cache")
+
+
+def _resolve_nvme_cache(data_dir: Path,
+                        nvme_override: str | None = None
+                        ) -> tuple[Path | None, bool]:
+    """Detect and optionally create an NVMe-local mirror of the audio data.
+
+    Resolution order:
+    1. If *nvme_override* is given, use that path verbatim (not auto-cleaned).
+    2. If ``/mnt/nvme3/mfa_audio_cache/cache_manifest.json`` exists and its
+       ``source`` field matches *data_dir*, use it (permanent, keep).
+    3. Otherwise, create a temp mirror under ``/tmp/mfa_audio_cache/``,
+       copy speaker subdirectories, and mark for auto-cleanup.
+
+    Returns ``(cache_dir, is_temp)`` where *is_temp* means the caller should
+    delete the directory when done.
+    """
+    import json as _json
+
+    # 1. Explicit override
+    if nvme_override:
+        _p = Path(nvme_override)
+        if _p.exists():
+            return _p, False
+        print(f"  WARNING: --nvme-cache path not found: {_p}")
+
+    # 2. Permanent cache check
+    _manifest = _NVME_CACHE_ROOT / _NVME_MANIFEST_NAME
+    if _manifest.exists():
+        try:
+            _m = _json.loads(_manifest.read_text(encoding="utf-8"))
+            _m_src = Path(_m.get("source", ""))
+            if _m_src == data_dir.resolve():
+                # Verify at least one speaker dir exists
+                if any(
+                    (d.is_dir() and any(d.glob("*.wav")))
+                    for d in _NVME_CACHE_ROOT.iterdir()
+                ):
+                    return _NVME_CACHE_ROOT, False
+        except Exception:
+            pass
+
+    # 3. Temp cache: mirror speaker subdirs from NAS to /tmp
+    print(f"  Creating temp audio cache: {_TEMP_CACHE_ROOT}")
+    _t0 = time.time()
+    _copied = 0
+    _bytes_copied = 0
+    try:
+        _TEMP_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        for _entry in sorted(data_dir.iterdir()):
+            if not _entry.is_dir():
+                continue
+            _wavs = sorted(_entry.glob("*.wav"))
+            if not _wavs:
+                continue
+            _speaker_dst = _TEMP_CACHE_ROOT / _entry.name
+            _speaker_dst.mkdir(exist_ok=True)
+            _n = len(_wavs)
+            for _i, _src in enumerate(_wavs):
+                _dst = _speaker_dst / _src.name
+                if not _dst.exists():
+                    import shutil as _shutil
+                    _shutil.copy2(str(_src), str(_dst))
+                    _copied += 1
+                    _bytes_copied += _src.stat().st_size
+                if (_i + 1) % 1000 == 0 or _i == _n - 1:
+                    _pct = (_i + 1) / _n * 100
+                    _elapsed = time.time() - _t0
+                    _gb = _bytes_copied / 1024**3
+                    _spd = _gb / _elapsed * 1024 if _elapsed > 0 else 0
+                    print(f"\r    [{_entry.name}] {_i+1}/{_n} ({_pct:.0f}%)"
+                          f" | {_gb:.1f} GB | {_spd:.0f} MB/s", end="")
+            print()  # newline after speaker
+        _elapsed = time.time() - _t0
+        _gb = _bytes_copied / 1024**3
+        print(f"  Temp cache ready: {_copied} files ({_gb:.1f} GB)"
+              f" in {_elapsed:.0f}s")
+        return _TEMP_CACHE_ROOT, True
+    except Exception as _e:
+        print(f"  WARNING: Temp cache creation failed: {_e}")
+        return None, False
+
+
+def _cleanup_nvme_cache(cache_dir: Path, is_temp: bool) -> None:
+    """Remove temp cache directory. No-op for permanent caches."""
+    if not is_temp or not cache_dir or not cache_dir.exists():
+        return
+    import shutil as _shutil
+    print(f"Cleaning temp audio cache: {cache_dir}")
+    _shutil.rmtree(str(cache_dir), ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1722,6 +1822,10 @@ def main():
                         help="GPU device for NVASR CTC pre-alignment (e.g. cuda:0, cuda:1). "
                              "Overrides ctc_prealign.device in config. "
                              "Use with streaming --gpus for multi-GPU scheduling.")
+    parser.add_argument("--nvme-cache", type=str, default=None, metavar="DIR",
+                        help="Path to NVMe audio cache (default: auto-detect"
+                             " /mnt/nvme3/mfa_audio_cache)."
+                             " If not found, a temp cache is created under /tmp.")
     parser.add_argument("--validate", action="store_true",
                         help="Validate output structure after each step (uses output_spec in config).")
     parser.add_argument("--mode", type=str, default=None,
@@ -2014,13 +2118,25 @@ def main():
     # Input: apply UNC->Linux translation, then resolve relative to PROJECT_ROOT
     data_dir = resolve_input_path(args.data_dir) if args.data_dir else resolve_input_path(cfg.get("data_dir", "data_dir"), PROJECT_ROOT)
 
+    # ── NVMe audio cache detection ──
+    # Check for a pre-populated audio cache on local NVMe (created by
+    # scripts/cache_audio_to_nvme.py).  If found, use it as the audio
+    # source to eliminate NAS I/O contention.
+    _nvme_cache_dir, _nvme_is_temp = _resolve_nvme_cache(
+        data_dir,
+        getattr(args, "nvme_cache", None),
+    )
+    if _nvme_cache_dir:
+        print(f"  NVMe audio cache: {_nvme_cache_dir}"
+              f"{' (temp, auto-clean)' if _nvme_is_temp else ' (permanent)'}")
+
     # In ctc_ready mode, audio_dir points to the source data_dir (already trimmed)
     # to avoid copying 100k+ files across SMB mounts
     # Resample reads from here and writes 16k audio locally
     if mode in ("ctc_ready", "nvrasr_fallback"):
-        audio_dir = data_dir  # use source audio in-place, no copy
+        audio_dir = _nvme_cache_dir or data_dir  # prefer NVMe if available
     else:
-        audio_dir = workspace / cfg.get("audio_dir", "audio")
+        audio_dir = _nvme_cache_dir or (workspace / cfg.get("audio_dir", "audio"))
     pinyin_dir = workspace / cfg.get("pinyin_dir", "pinyin")
     aligned_dir = workspace / cfg.get("aligned_dir", "aligned")
     if args.output_dir:
@@ -2196,6 +2312,10 @@ def main():
         if mode == "ctc_ready":
             single_cache["ctc_dir"] = cfg.get("ctc_ready", {}).get("ctc_dir", "")
         save_scan_cache(cache_path, single_cache)
+
+    # ── Clean up temp NVMe cache ──
+    if _nvme_cache_dir and _nvme_is_temp:
+        _cleanup_nvme_cache(_nvme_cache_dir, _nvme_is_temp)
 
     print(f"\n{'#'*60}")
     print(f"  {'FAILED' if failed else 'DONE'}: {', '.join(failed) if failed else 'Success'}")
