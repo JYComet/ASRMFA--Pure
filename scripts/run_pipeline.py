@@ -153,6 +153,7 @@ DEFAULT_CFG: dict = {
     "mode": "full",               # "full" | "ctc_ready"
     "workspace": "workspace",
     "data_dir": "data_dir",
+    "nvme_cache": "",              # NVMe 音频缓存路径 (空=自动检测 /mnt/nvme3/mfa_audio_cache)
     "txt_suffix": "",
     "audio_dir": "audio",
     "pinyin_dir": "pinyin",
@@ -203,6 +204,7 @@ DEFAULT_CFG: dict = {
         "python": "/home/user/miniconda3/envs/asr/bin/python",
         "limit": 0,
         "timeout": 3600,
+        "nvv_enabled": True,           # NVV 标签检测 (默认启用)
     },
     "ctc_adjust": {"enabled": True, "limit": 0},
     "mfa": {
@@ -214,6 +216,8 @@ DEFAULT_CFG: dict = {
         "skip_validate": True,       # MFA align internally validates; standalone validate is redundant
         "fine_tune": False,          # DISABLED: adjust_ctc_boundaries already refines anchors (Regression Case 16)
         "fine_tune_boundary_tolerance": 0.02,  # only used when fine_tune: true
+        "beam": 20,                  # Viterbi beam width
+        "retry_beam": 80,            # beam width for retry on failure
     },
     "mfa_en": {
         "enabled": True,
