@@ -121,10 +121,14 @@ def _token_matches_ref(tok: str, ref: str) -> bool:
     if t_clean in r_clean or r_clean in t_clean:
         return True
 
-    # Pinyin syllable as phonetic rendering of English word — permissive
-    # (DP global optimisation resolves ambiguities)
+    # Pinyin syllable as phonetic rendering of English word.
+    # Only accept when the English reference has ≥2 vowels — prevents
+    # short words like "OH"/"OP"/"in"/"Up" from matching pinyin syllables
+    # (e.g. qie4↔OH cost 0 → NW gap-first picks OH over CJK 切).
+    # Regression Case 10 & 31.
     if len(t) >= 2 and t[-1].isdigit() and t[:-1].isalpha():
-        return True
+        vowel_count = sum(1 for ch in r if ch in 'aeiou')
+        return vowel_count >= 2
 
     return False
 
@@ -155,6 +159,108 @@ def _align_sequences(ctc_seq: list[str],
             pairs.append((i - 1, j - 1)); i -= 1; j -= 1
     pairs.reverse()
     return pairs
+
+
+# ---------------------------------------------------------------------------
+# Fragment reclamation (Pass 2)
+# ---------------------------------------------------------------------------
+
+
+def _reclaim_fragments(lab_tokens: list[str],
+                        ctc_tokens: list[dict]) -> tuple[list[str], list[dict], int]:
+    """Merge orphan English fragments into adjacent English words (Pass 2).
+
+    After NW alignment and merge (Pass 1), some English fragments may
+    remain unmerged: single letters (e.g. "f" 60ms), 2-letter fragments
+    (e.g. "OS" 420ms leftover from "SOS"+"OS"), or mixed-length fragments
+    (e.g. "R"+"ia").  This pass scans for these orphans and absorbs them
+    into adjacent longer English tokens, or merges consecutive fragments
+    into a single token.
+
+    Returns (new_lab, new_ctc, merged_count).
+    Regression Case 31 Fix-1.
+    """
+    if len(lab_tokens) != len(ctc_tokens):
+        return lab_tokens, ctc_tokens, 0
+
+    n = len(lab_tokens)
+    to_delete: set[int] = set()
+    replacements: dict[int, tuple[str, float, float]] = {}
+
+    for i in range(n):
+        if i in to_delete:
+            continue
+        t = lab_tokens[i]
+        if not (t.isascii() and t.isalpha() and 1 <= len(t) <= 2):
+            continue
+        # Skip already-correct single English words at correct duration
+        dur = ctc_tokens[i]["end_s"] - ctc_tokens[i]["start_s"]
+        if len(t) >= 3 and dur >= 0.080:
+            continue
+
+        # Look left: absorb into preceding English word
+        if i > 0 and i - 1 not in to_delete:
+            prev = lab_tokens[i - 1]
+            if (prev.isascii() and prev.isalpha() and len(prev) >= 2
+                    and t.lower() in prev.lower()):
+                # Absorb fragment into previous word, extend its end time
+                if i - 1 in replacements:
+                    _, _, old_e = replacements[i - 1]
+                    new_e = max(old_e, ctc_tokens[i]["end_s"])
+                    replacements[i - 1] = (prev, ctc_tokens[i - 1]["start_s"], new_e)
+                else:
+                    new_e = max(ctc_tokens[i - 1]["end_s"], ctc_tokens[i]["end_s"])
+                    replacements[i - 1] = (prev, ctc_tokens[i - 1]["start_s"], new_e)
+                to_delete.add(i)
+                continue
+
+        # Look right: absorb into following English word
+        if i + 1 < n and i + 1 not in to_delete:
+            nxt = lab_tokens[i + 1]
+            if (nxt.isascii() and nxt.isalpha() and len(nxt) >= 2
+                    and t.lower() in nxt.lower()):
+                if i + 1 in replacements:
+                    _, old_s, _ = replacements[i + 1]
+                    new_s = min(old_s, ctc_tokens[i]["start_s"])
+                    replacements[i + 1] = (nxt, new_s, ctc_tokens[i + 1]["end_s"])
+                else:
+                    new_s = min(ctc_tokens[i + 1]["start_s"], ctc_tokens[i]["start_s"])
+                    replacements[i + 1] = (nxt, new_s, ctc_tokens[i + 1]["end_s"])
+                to_delete.add(i)
+                continue
+
+        # Look right: merge with adjacent fragment
+        if i + 1 < n and i + 1 not in to_delete:
+            nxt = lab_tokens[i + 1]
+            if (nxt.isascii() and nxt.isalpha() and 1 <= len(nxt) <= 2):
+                merged = t + nxt
+                s = ctc_tokens[i]["start_s"]
+                e = ctc_tokens[i + 1]["end_s"]
+                replacements[i] = (merged, s, e)
+                to_delete.add(i + 1)
+
+    if not to_delete and not replacements:
+        return lab_tokens, ctc_tokens, 0
+
+    new_lab = []
+    for i, t in enumerate(lab_tokens):
+        if i in to_delete:
+            continue
+        new_lab.append(replacements[i][0] if i in replacements else t)
+
+    new_ctc = []
+    for i, ct in enumerate(ctc_tokens):
+        if i in to_delete:
+            continue
+        if i in replacements:
+            word, s, e = replacements[i]
+            new_ctc.append({"word": word, "start_ms": round(s * 1000),
+                           "end_ms": round(e * 1000), "start_s": s, "end_s": e,
+                           "type": ct.get("type", "word")})
+        else:
+            new_ctc.append(ct)
+
+    return new_lab, new_ctc, len(to_delete)
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +455,45 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
     for en_word, indices in changes:
         old = " + ".join(lab_tokens[i] for i in indices)
         print(f"  [{stem}] {old}  →  {en_word}")
+
+    # ── Pass 2: Fragment reclamation ──
+    # Absorb orphan short English fragments into adjacent English words.
+    # Regression Case 31 Fix-1.
+    new_lab2, new_ctc2, frag_merged = _reclaim_fragments(new_lab, new_ctc)
+    if frag_merged:
+        lab_path.write_text(" ".join(new_lab2) + "\n", encoding="utf-8")
+        tokens_path.write_text(
+            "\n".join(json.dumps(t, ensure_ascii=False) for t in new_ctc2) + "\n",
+            encoding="utf-8")
+        # Update TextGrid if fragments were reclaimed
+        tg_path2 = txt_dir / f"{stem}.TextGrid"
+        if tg_path2.exists():
+            raw = tg_path2.read_text(encoding="utf-8")
+            lines_out = []
+            in_words = False
+            for line in raw.split("\n"):
+                stripped = line.strip()
+                if 'name = "words"' in stripped:
+                    in_words = True
+                    lines_out.append(line)
+                elif in_words and stripped.startswith("intervals: size"):
+                    lines_out.append(f"        intervals: size = {len(new_ctc2)}")
+                elif in_words and stripped.startswith("intervals ["):
+                    pass
+                elif in_words and (stripped.startswith("xmin =") or stripped.startswith("xmax =") or stripped.startswith("text =")):
+                    pass
+                elif in_words and 'name = "' in stripped:
+                    for idx, t in enumerate(new_ctc2):
+                        lines_out.append(f"        intervals [{idx}]:")
+                        lines_out.append(f"            xmin = {t['start_s']:.6f}")
+                        lines_out.append(f"            xmax = {t['end_s']:.6f}")
+                        lines_out.append(f'            text = "{t["word"]}"')
+                    in_words = False
+                    lines_out.append(line)
+                else:
+                    lines_out.append(line)
+            tg_path2.write_text("\n".join(lines_out), encoding="utf-8")
+        print(f"  [{stem}] fragment reclaim: {frag_merged} fragments absorbed")
 
     return True
 

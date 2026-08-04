@@ -41,6 +41,13 @@ NVV_BIAS_DEFAULT = 4.0                # blank 帧 NVV logit 偏置
 FRAME_MS = 60                         # CTC 帧长 (LFR m=7 n=6 → ~60ms)
 QUERY_FRAMES = 4                      # 编码器前的 lang/emo/textnorm query 帧
 
+# Known VTuber/proper names that NVASR tokenizer splits into single
+# uppercase letters.  Force lowercase after merge so downstream
+# reference matching doesn't see a case mismatch (e.g. "RIA"≠"ria").
+_SINGLE_LETTER_LOWERCASE_NAMES: frozenset[str] = frozenset({
+    "ria", "noa", "mila",
+})
+
 # 管线支持的标点白名单 — 只有这些字符会被保留为标点
 ALLOWED_PUNCT_CJK = "，。！？、；：…"
 ALLOWED_PUNCT_ASCII = ",.!?;:"
@@ -793,7 +800,7 @@ def _merge_ria_tokens(tokens_path: Path) -> bool:
     while i < len(entries):
         w = entries[i]["word"]
         if (re.match(r'^rui[0-5]$', w) and i + 1 < len(entries)
-                and re.match(r'^ya[0-5]$', entries[i + 1]["word"])):
+                and re.match(r'^(ya|a)[0-5]$', entries[i + 1]["word"])):
             a, b = entries[i], entries[i + 1]
             new_entries.append({
                 "word": "ria",
@@ -812,6 +819,79 @@ def _merge_ria_tokens(tokens_path: Path) -> bool:
             "\n".join(json.dumps(e, ensure_ascii=False) for e in new_entries) + "\n",
             encoding="utf-8")
     return changed
+
+
+def _protect_ria(words_pinyin: list[dict]) -> list[dict]:
+    """Ensure "ria" (VTuber name) is always a complete, lowercase, standalone token.
+
+    The NVASR tokenizer can split OOV "ria" into several patterns:
+      - "R" + "I" + "A"  (single letters → handled by single-letter merge)
+      - "R" + "ia"        (mixed — single-letter merge misses this)
+      - "RIA"             (already merged but uppercase)
+      - "rui4" + "ya4"    (pinyin phonetic — also handled by _normalize_ria)
+
+    This function scans for ANY adjacent tokens whose lowercase letters
+    form "ria" and merges them into a single lowercase "ria" token.
+    It also normalises standalone "RIA"/"Ria" → "ria".
+    """
+    if not words_pinyin:
+        return words_pinyin
+
+    _RIA_TARGET = "ria"
+    _RIA_LETTERS = frozenset(_RIA_TARGET)  # {'r', 'i', 'a'}
+
+    result: list[dict] = []
+    i = 0
+    while i < len(words_pinyin):
+        w = words_pinyin[i]
+        token = w["word"]
+        token_lower = token.lower()
+
+        # Already correct
+        if token == _RIA_TARGET:
+            result.append(w)
+            i += 1
+            continue
+
+        # Standalone case-fix: "RIA" / "Ria" → "ria"
+        if token_lower == _RIA_TARGET:
+            result.append({**w, "word": _RIA_TARGET})
+            i += 1
+            continue
+
+        # Fragment detection: collect consecutive fragments whose
+        # letters are a subset of "ria"'s letter set.
+        if (len(token) <= 4 and token.isascii()
+                and all(c.lower() in _RIA_LETTERS for c in token if c.isalpha())):
+            fragments = [w]
+            j = i + 1
+            while j < len(words_pinyin):
+                nt = words_pinyin[j]
+                nt_word = nt["word"]
+                if (len(nt_word) <= 4 and nt_word.isascii()
+                        and all(c.lower() in _RIA_LETTERS for c in nt_word if c.isalpha())):
+                    fragments.append(nt)
+                    j += 1
+                else:
+                    break
+
+            # Check whether the collected fragments form "ria"
+            combined = "".join(f["word"] for f in fragments).lower()
+            if combined == _RIA_TARGET or all(
+                    c in _RIA_LETTERS for c in combined if c.isalpha()):
+                # Merge: one "ria" token spanning the full time range
+                result.append({
+                    "word": _RIA_TARGET,
+                    "start": fragments[0]["start"],
+                    "end": fragments[-1]["end"],
+                })
+                i = j
+                continue
+
+        result.append(w)
+        i += 1
+
+    return result
 
 
 def _normalize_ria(ctc_dir: Path) -> int:
@@ -901,6 +981,75 @@ def _normalize_english(ctc_dir: Path, dict_path: Path | None = None) -> int:
                       f"{', '.join(new_tokens)}")
 
     return changed
+
+
+def _reclaim_nvv_pinyin(ctc_dir: Path) -> int:
+    """Revert NVV tokens that are actually misclassified pinyin syllables.
+
+    NVASR's blank-frame NVV bias (NVV_BIAS_DEFAULT=4.0) can cause short
+    pinyin syllables followed by silence to be detected as NVV tokens
+    (e.g. "zan2"→"BREATHING", "jin1"→"BREATHING").
+
+    A NVV token is reverted to pinyin when ALL of:
+      - Duration < 400ms  (true NVV like BREATHING/LAUGHTER > 500ms)
+      - Adjacent tokens are pinyin syllables (not English / other NVV)
+      - The .lab file has a pinyin syllable at this position
+      - The NVV token text is NOT a known NVV in reference text
+
+    Regression Case 31 Fix-3a.
+    """
+    reverted = 0
+    for tokens_path in sorted(ctc_dir.glob("*_tokens.jsonl")):
+        stem = tokens_path.stem.replace("_tokens", "")
+        try:
+            entries = [json.loads(l) for l in
+                       tokens_path.read_text(encoding="utf-8").strip().split("\n")
+                       if l.strip()]
+        except Exception:
+            continue
+
+        # Read .lab for original pinyin reference
+        lab_path = ctc_dir / f"{stem}.lab"
+        lab_tokens: list[str] = []
+        if lab_path.exists():
+            lab_tokens = lab_path.read_text(encoding="utf-8").strip().split()
+
+        changed = False
+        for i, tok in enumerate(entries):
+            if not is_nvv_token(tok["word"]):
+                continue
+
+            dur = tok["end_s"] - tok["start_s"]
+
+            # Check 1: Duration fits pinyin syllable range
+            if dur > 0.400:
+                continue
+
+            # Check 2: Adjacent tokens are pinyin (not English / other NVV)
+            prev_pinyin = (i == 0 or is_pinyin_syllable(entries[i - 1]["word"]))
+            next_pinyin = (i == len(entries) - 1
+                           or is_pinyin_syllable(entries[i + 1]["word"]))
+            if not (prev_pinyin or next_pinyin):
+                continue
+
+            # Check 3: .lab has a pinyin syllable at this position
+            if i < len(lab_tokens) and is_pinyin_syllable(lab_tokens[i]):
+                old_word = tok["word"]
+                tok["word"] = lab_tokens[i]
+                changed = True
+                reverted += 1
+                if reverted <= 10:
+                    print(f"  [nvv_reclaim] {stem}: {old_word} → {tok['word']} "
+                          f"({int(dur*1000)}ms)")
+
+        if changed:
+            tokens_path.write_text(
+                "\n".join(json.dumps(t, ensure_ascii=False) for t in entries) + "\n",
+                encoding="utf-8")
+
+    if reverted:
+        print(f"  [nvv_reclaim] {reverted} NVV tokens reverted to pinyin")
+    return reverted
 
 
 def main():
@@ -1344,8 +1493,14 @@ def main():
                             j += 1
                         else:
                             break
+                    merged_word = "".join(letters)
+                    # Force lowercase for known VTuber/proper names that the
+                    # NVASR tokenizer splits into single uppercase letters
+                    # (e.g. "R"+"I"+"A" → "ria", not "RIA").
+                    if merged_word.lower() in _SINGLE_LETTER_LOWERCASE_NAMES:
+                        merged_word = merged_word.lower()
                     merged_pinyin.append({
-                        "word": "".join(letters),
+                        "word": merged_word,
                         "start": w["start"],
                         "end": words_pinyin[j - 1]["end"],
                     })
@@ -1384,6 +1539,12 @@ def main():
                     deduped_pinyin.append(w)
                     i += 1
             words_pinyin = deduped_pinyin
+
+        # ── ria name integrity protection ──
+        # Merge any remaining ria fragments that survived single-letter
+        # merge (e.g. "R"+"ia"), normalise case ("RIA"→"ria").
+        # Regression Case 31 Fix-4d.
+        words_pinyin = _protect_ria(words_pinyin)
 
         # 写 TextGrid — 含 pauses tier
         try:
@@ -1665,6 +1826,7 @@ def main():
         _normalize_punct(args.output_dir)
         _normalize_numerals(args.output_dir)
         _normalize_ria(args.output_dir)
+        _reclaim_nvv_pinyin(args.output_dir)
         _normalize_english(args.output_dir, args.dict_path)
 
     # ── 恢复模型 ──
