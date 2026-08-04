@@ -51,14 +51,14 @@ ctc_prealign:
   model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
   device: cuda:0
   python: /home/user/miniconda3/envs/asr/bin/python
-  limit: 5
-  timeout: 3600
+  limit: 0
+  timeout: 14400
 
 ctc_adjust:
   enabled: false
 
 # MFA 模型目录 (必须本地路径, CIFS 上 SQLite 锁死)
-models_dir: /tmp/mfa_root
+models_dir: /mnt/local_E/MFA_Pause/repo/models/mfa
 
 # MFA 中文对齐
 mfa:
