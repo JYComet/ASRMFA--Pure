@@ -3776,7 +3776,7 @@ def _protect_ria(tokens: list[dict], lab_tokens: list[str]) -> tuple[list, list]
 | **Fix-3a** | `ctc_prealign.py` | ~986-1050 | `_reclaim_nvv_pinyin()` 函数 (保留作为安全网) | ✅ |
 | **Fix-3a** | `normalize_english_tokens.py` | ~289 | NVV token 排除出 `en_ref_positions` (防 normalize_en 把拼音合并到 NVV) | ✅ |
 | **Fix-3a** | `normalize_english_tokens.py` | ~311-316 | NVV pre-reclaim: 短 NVV + 邻接拼音 → 还原为原始拼音 | ✅ |
-| **Fix-1** | `normalize_english_tokens.py` | ~63-130, ~453-490 | `_reclaim_fragments()` Pass 2 + `normalize_stem` 末尾调用 | ✅ |
+| **Fix-1** | `normalize_english_tokens.py` | ~63-130, ~389-434 | `_reclaim_fragments()` Pass 2 (始终运行 + 双向碎片合并) + 重构流程 | ✅ |
 | **Fix-NEW** | `ctc_prealign.py` | ~154-168, ~228-232 | `make_patched_inference` 增加 `enable_nvv` 参数, False 时跳过 blank-frame NVV bias | ✅ |
 | **Fix-NEW** | `ctc_prealign.py` | ~1089-1090 | `--no-nvv` CLI 开关 | ✅ |
 | **Fix-NEW** | `ctc_prealign.py` | ~1145 | `--all-gpus` 子进程转发 `--no-nvv` | ✅ |
@@ -3791,13 +3791,13 @@ def _protect_ria(tokens: list[dict], lab_tokens: list[str]) -> tuple[list, list]
 | 英文碎片残留 | "SOS"+"OS" 两个独立 token | "SOS" 合并为 600ms ✅ |
 | ria 完整性 | 依赖 normalize_en 链式修正 | 单字母合并 + 小写 + `_protect_ria` ✅ |
 | fragment reclaim | 无 | 2 文件各吸收 1 碎片 ✅ |
-| `f`+`an` → `fan` | 未合并 | **仍残留** (短碎片相邻但无长英文词可吸收) ⚠ |
+| `f`+`an` → `fan` | 未合并 | **✅ 已修复** (Pass 2 始终运行 + 双向碎片合并) |
 
 **已知剩余问题**:
 
-1. `f`(60ms) + `an`(60ms) → 应合并为 `fan`, 但 `_reclaim_fragments` 当前仅在短碎片邻接**长英文词**时吸收。两短碎片相邻时不会互相合并。后续可在 `_reclaim_fragments` 中增加"短碎片互相合并"分支。
+1. ~~`f`(60ms) + `an`(60ms) → 应合并为 `fan`~~ **已修复 (2026-08-04)**: 根因是 `_reclaim_fragments` (Pass 2) 在 `if not changes: return False` 守卫之后才执行，当 Pass 1 无变更时 Pass 2 被跳过。修复：Pass 2 移至守卫之前始终运行；同时增加对称的 "look left" 碎片合并分支。
 
-2. `_reclaim_nvv_pinyin` 函数逻辑正确但时序敏感 — 在 pipeline 中运行需确保 `.lab` 文件未被 `_normalize_english` 污染。当前通过在 `normalize_english_tokens.py` 内部做 NVV pre-reclaim 来绕过此问题。
+2. `_reclaim_nvv_pinyin` 函数逻辑正确但时序敏感 — 在 pipeline 中运行需确保 `.lab` 文件未被 `_normalize_english` 污染。当前通过在 `normalize_english_tokens.py` 内部做 NVV pre-reclaim 来绕过此问题。`--no-nvv` 从源头消除后此问题影响极小。
 
 **`--no-nvv` 方案说明**:
 

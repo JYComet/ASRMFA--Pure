@@ -229,6 +229,18 @@ def _reclaim_fragments(lab_tokens: list[str],
                 to_delete.add(i)
                 continue
 
+        # Look left: merge with adjacent fragment (symmetric)
+        if i > 0 and i - 1 not in to_delete:
+            prev = lab_tokens[i - 1]
+            if (prev.isascii() and prev.isalpha() and 1 <= len(prev) <= 2
+                    and i - 1 not in to_delete):
+                merged = prev + t
+                s = ctc_tokens[i - 1]["start_s"]
+                e = ctc_tokens[i]["end_s"]
+                replacements[i - 1] = (merged, s, e)
+                to_delete.add(i)
+                continue
+
         # Look right: merge with adjacent fragment
         if i + 1 < n and i + 1 not in to_delete:
             nxt = lab_tokens[i + 1]
@@ -478,43 +490,7 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
         old = " + ".join(lab_tokens[i] for i in indices)
         print(f"  [{stem}] {old}  →  {en_word}")
 
-    # ── Pass 2: Fragment reclamation ──
-    # Absorb orphan short English fragments into adjacent English words.
-    # Regression Case 31 Fix-1.
-    new_lab2, new_ctc2, frag_merged = _reclaim_fragments(new_lab, new_ctc)
     if frag_merged:
-        lab_path.write_text(" ".join(new_lab2) + "\n", encoding="utf-8")
-        tokens_path.write_text(
-            "\n".join(json.dumps(t, ensure_ascii=False) for t in new_ctc2) + "\n",
-            encoding="utf-8")
-        # Update TextGrid if fragments were reclaimed
-        tg_path2 = txt_dir / f"{stem}.TextGrid"
-        if tg_path2.exists():
-            raw = tg_path2.read_text(encoding="utf-8")
-            lines_out = []
-            in_words = False
-            for line in raw.split("\n"):
-                stripped = line.strip()
-                if 'name = "words"' in stripped:
-                    in_words = True
-                    lines_out.append(line)
-                elif in_words and stripped.startswith("intervals: size"):
-                    lines_out.append(f"        intervals: size = {len(new_ctc2)}")
-                elif in_words and stripped.startswith("intervals ["):
-                    pass
-                elif in_words and (stripped.startswith("xmin =") or stripped.startswith("xmax =") or stripped.startswith("text =")):
-                    pass
-                elif in_words and 'name = "' in stripped:
-                    for idx, t in enumerate(new_ctc2):
-                        lines_out.append(f"        intervals [{idx}]:")
-                        lines_out.append(f"            xmin = {t['start_s']:.6f}")
-                        lines_out.append(f"            xmax = {t['end_s']:.6f}")
-                        lines_out.append(f'            text = "{t["word"]}"')
-                    in_words = False
-                    lines_out.append(line)
-                else:
-                    lines_out.append(line)
-            tg_path2.write_text("\n".join(lines_out), encoding="utf-8")
         print(f"  [{stem}] fragment reclaim: {frag_merged} fragments absorbed")
 
     return True
