@@ -48,10 +48,10 @@ keep_16k_audio: true
 # 无参考文本 → 回退到 ASR 解码文本
 ctc_prealign:
   enabled: true
-  model_path: /mnt/project/nvvasr_standalone/models/Multilingual-NVASR
+  model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
   device: cuda:0
-  python: /usr/bin/python3
-  limit: 0
+  python: /home/user/miniconda3/envs/asr/bin/python
+  limit: 5
   timeout: 3600
 
 ctc_adjust:
@@ -82,9 +82,9 @@ mfa_en:
   beam: 10
   retry_beam: 40
   fine_tune: false
-  acoustic_model: /mnt/project/MFA_Pause/pretrained_models/acoustic/english_us_arpa.zip
+  acoustic_model: /mnt/local_E/MFA_Pause/pretrained_models/acoustic/english_us_arpa.zip
   dictionary: dict/cmudict.dict
-  g2p_model: /mnt/project/MFA_Pause/pretrained_models/g2p/english_us_arpa.zip
+  g2p_model: /mnt/local_E/MFA_Pause/pretrained_models/g2p/english_us_arpa.zip
 
 # 后处理 (关闭过滤 — 无 ASR CTC 时英文词 OOV 会导致过度过滤)
 postprocess:
