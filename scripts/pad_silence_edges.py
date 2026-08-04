@@ -227,9 +227,18 @@ def main():
                         stems.append(p.name)
         stems.sort()
 
-    results = []
-    for stem in stems:
-        r = process_one(
+    # ── Parallel processing with ThreadPoolExecutor ──
+    # The work is I/O-bound (NVMe read/write) + CPU (numpy silence detection,
+    # which releases the GIL).  ThreadPoolExecutor gives ~8x speedup since
+    # multiple files can be serviced concurrently from NVMe.
+    import multiprocessing as _mp
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    _n_workers = min(_mp.cpu_count(), 32, len(stems))
+    print(f"  并行 workers: {_n_workers}")
+
+    def _process_one(stem):
+        return process_one(
             stem=stem,
             audio_dir=audio_dir,
             ctc_dir=ctc_dir,
@@ -241,6 +250,24 @@ def main():
             dry_run=args.dry_run,
             wav_index=wav_index,
         )
+
+    results = []
+    _done = 0
+    _n = len(stems)
+    if _n_workers <= 1 or _n <= 100:
+        for stem in stems:
+            results.append(_process_one(stem))
+            _done += 1
+            if _done % 1000 == 0:
+                print(f"  进度: {_done}/{_n}")
+    else:
+        with ThreadPoolExecutor(max_workers=_n_workers) as _pool:
+            _futures = {_pool.submit(_process_one, s): s for s in stems}
+            for _fut in as_completed(_futures):
+                results.append(_fut.result())
+                _done += 1
+                if _done % 1000 == 0:
+                    print(f"  进度: {_done}/{_n}")
         results.append(r)
         if "error" in r:
             print(f"  FAIL {stem}: {r['error']}")
