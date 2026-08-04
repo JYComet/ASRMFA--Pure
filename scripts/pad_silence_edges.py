@@ -227,55 +227,49 @@ def main():
                         stems.append(p.name)
         stems.sort()
 
-    # ── Parallel processing with ThreadPoolExecutor ──
-    # The work is I/O-bound (NVMe read/write) + CPU (numpy silence detection,
-    # which releases the GIL).  ThreadPoolExecutor gives ~8x speedup since
-    # multiple files can be serviced concurrently from NVMe.
+    # ── Parallel processing with ProcessPoolExecutor ──
+    # ThreadPoolExecutor hangs due to soundfile/libsndfile not being
+    # fully thread-safe across worker threads.  ProcessPoolExecutor
+    # gives each worker its own libsndfile context, avoiding deadlocks.
     import multiprocessing as _mp
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    _n_workers = min(_mp.cpu_count(), 32, len(stems))
+    _n_workers = min(_mp.cpu_count(), 16, len(stems))
     print(f"  并行 workers: {_n_workers}")
-
-    def _process_one(stem):
-        return process_one(
-            stem=stem,
-            audio_dir=audio_dir,
-            ctc_dir=ctc_dir,
-            padded_audio_dir=padded_dir,
-            output_audio_dir=output_dir,
-            target_silence_sec=args.target_silence_sec,
-            silence_threshold=args.silence_threshold,
-            frame_length=args.frame_length,
-            dry_run=args.dry_run,
-            wav_index=wav_index,
-        )
 
     results = []
     _done = 0
     _n = len(stems)
     if _n_workers <= 1 or _n <= 100:
         for stem in stems:
-            results.append(_process_one(stem))
+            r = process_one(stem=stem, audio_dir=audio_dir, ctc_dir=ctc_dir,
+                          padded_audio_dir=padded_dir, output_audio_dir=output_dir,
+                          target_silence_sec=args.target_silence_sec,
+                          silence_threshold=args.silence_threshold,
+                          frame_length=args.frame_length,
+                          dry_run=args.dry_run, wav_index=wav_index)
+            results.append(r)
             _done += 1
             if _done % 1000 == 0:
                 print(f"  进度: {_done}/{_n}")
     else:
-        with ThreadPoolExecutor(max_workers=_n_workers) as _pool:
-            _futures = {_pool.submit(_process_one, s): s for s in stems}
+        with ProcessPoolExecutor(max_workers=_n_workers) as _pool:
+            _futures = []
+            for s in stems:
+                _fut = _pool.submit(
+                    process_one, s, audio_dir, ctc_dir, padded_dir, output_dir,
+                    args.target_silence_sec, args.silence_threshold,
+                    args.frame_length, args.dry_run, wav_index)
+                _futures.append(_fut)
             for _fut in as_completed(_futures):
-                results.append(_fut.result())
+                try:
+                    r = _fut.result()
+                    results.append(r)
+                except Exception as _e:
+                    print(f"  ERROR: {_e}")
                 _done += 1
                 if _done % 1000 == 0:
                     print(f"  进度: {_done}/{_n}")
-        results.append(r)
-        if "error" in r:
-            print(f"  FAIL {stem}: {r['error']}")
-        else:
-            print(f"  OK   {stem}: head={r['head_sil_before']:.3f}s→{args.target_silence_sec:.1f}s, "
-                  f"tail={r['tail_sil_before']:.3f}s→{args.target_silence_sec:.1f}s, "
-                  f"offset={r['time_offset']:+.3f}s, "
-                  f"dur={r['original_dur']:.3f}s→{r['new_dur']:.3f}s")
 
     ok = sum(1 for r in results if "error" not in r)
     fail = len(results) - ok

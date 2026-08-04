@@ -320,14 +320,6 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
             if line:
                 ctc_tokens.append(json.loads(line))
 
-    # ── NVV pre-reclaim: revert short NVV tokens that are actually
-    # misclassified pinyin syllables BEFORE the main merge pass.
-    # Regression Case 31 Fix-3a.
-    for i, ct in enumerate(ctc_tokens):
-        if is_nvv_token(ct["word"]) and (ct["end_s"] - ct["start_s"]) <= 0.400:
-            if i < len(lab_tokens) and is_pinyin_syllable(lab_tokens[i]):
-                ct["word"] = lab_tokens[i]
-
     # Align .lab tokens → reference word units
     ref_texts = [u for _, u in ref_units]
     aligned = _align_sequences(lab_tokens, ref_texts)

@@ -3773,9 +3773,9 @@ def _protect_ria(tokens: list[dict], lab_tokens: list[str]) -> tuple[list, list]
 | **Fix-4d** | `ctc_prealign.py` | ~824-880, ~1480 | `_protect_ria()` 函数 + 单字母合并/NVV去重后调用 | ✅ |
 | **Fix-4d** | `normalize_english_tokens.py` | — | (ria 保护由 ctc_prealign 层覆盖, normalize_en 不再额外处理) | ✅ |
 | **Fix-2b** | `normalize_english_tokens.py` | ~124-129 | `_token_matches_ref` 拼音→英文增加 ≥2 元音约束 | ✅ |
-| **Fix-3a** | `ctc_prealign.py` | ~986-1050 | `_reclaim_nvv_pinyin()` 函数 (保留作为安全网) | ✅ |
-| **Fix-3a** | `normalize_english_tokens.py` | ~289 | NVV token 排除出 `en_ref_positions` (防 normalize_en 把拼音合并到 NVV) | ✅ |
-| **Fix-3a** | `normalize_english_tokens.py` | ~311-316 | NVV pre-reclaim: 短 NVV + 邻接拼音 → 还原为原始拼音 | ✅ |
+| **Fix-3a** | `ctc_prealign.py` | ~989-1059 | ~~`_reclaim_nvv_pinyin()`~~ **已删除**: 时序缺陷, `--no-nvv` 从源头阻断后不需要 | 🗑 |
+| **Fix-3a** | `normalize_english_tokens.py` | ~303 | NVV token 排除出 `en_ref_positions` (防 normalize_en 把拼音合并到 NVV) | ✅ |
+| **Fix-3a** | `normalize_english_tokens.py` | ~323-329 | ~~NVV pre-reclaim~~ **已删除**: 同时序缺陷, 读取已被污染的 output .lab | 🗑 |
 | **Fix-1** | `normalize_english_tokens.py` | ~63-130, ~389-434 | `_reclaim_fragments()` Pass 2 (始终运行 + 双向碎片合并) + 重构流程 | ✅ |
 | **Fix-NEW** | `ctc_prealign.py` | ~154-168, ~228-232 | `make_patched_inference` 增加 `enable_nvv` 参数, False 时跳过 blank-frame NVV bias | ✅ |
 | **Fix-NEW** | `ctc_prealign.py` | ~1089-1090 | `--no-nvv` CLI 开关 | ✅ |
@@ -3795,9 +3795,30 @@ def _protect_ria(tokens: list[dict], lab_tokens: list[str]) -> tuple[list, list]
 
 **已知剩余问题**:
 
-1. ~~`f`(60ms) + `an`(60ms) → 应合并为 `fan`~~ **已修复 (2026-08-04)**: 根因是 `_reclaim_fragments` (Pass 2) 在 `if not changes: return False` 守卫之后才执行，当 Pass 1 无变更时 Pass 2 被跳过。修复：Pass 2 移至守卫之前始终运行；同时增加对称的 "look left" 碎片合并分支。
+1. ~~`f`(60ms) + `an`(60ms) → 应合并为 `fan`~~ **已修复 (2026-08-04)**
 
-2. `_reclaim_nvv_pinyin` 函数逻辑正确但时序敏感 — 在 pipeline 中运行需确保 `.lab` 文件未被 `_normalize_english` 污染。当前通过在 `normalize_english_tokens.py` 内部做 NVV pre-reclaim 来绕过此问题。`--no-nvv` 从源头消除后此问题影响极小。
+2. ~~`_reclaim_nvv_pinyin` 时序敏感~~ **已清理 (2026-08-04)**: 详细分析见下方。
+
+**NVv 防御架构审查与清理 (2026-08-04)**:
+
+审查结论: `--no-nvv` (enable_nvv=False) 从源头阻断 NVV bias → 模型不输出 NVV token。后处理还原函数存在固有缺陷（需要 pinyin_dir ≠ output_dir 才能访问原始 .lab），且在有 `--no-nvv` 的场景下完全不会触发。
+
+删除的代码:
+
+| 删除位置 | 函数/代码块 | 原因 |
+|---------|------------|------|
+| `ctc_prealign.py` ~989-1059 | `_reclaim_nvv_pinyin()` 完整函数 | 时序缺陷: 依赖 pinyin_dir/.lab，而 pipeline 中 pinyin_dir 可能等于 output_dir |
+| `ctc_prealign.py` ~1835 | `_reclaim_nvv_pinyin(...)` 调用 | 同上 |
+| `normalize_english_tokens.py` ~323-329 | NVV pre-reclaim 代码块 | 同时序缺陷: 读取 output_dir/.lab 已被 CTC 污染，`is_pinyin_syllable("BREATHING")=False` |
+
+保留的防御:
+
+| 层 | 位置 | 机制 | 可靠性 |
+|----|------|------|--------|
+| **Primary** | `ctc_prealign.py:230` | `enable_nvv=False` → 跳过 blank-frame NVV bias | ✅ 源头阻断 |
+| **Secondary** | `normalize_english_tokens.py:303` | `not is_nvv_token(u)` 排除 NVV 参考词 | ✅ 防止 normalize_en 把拼音合并进 NVV |
+
+最终 NVV 防御策略: **单层源头阻断**。`nvv_enabled: false` 配置 → `--no-nvv` → `enable_nvv=False` → blank-frame NVV bias 不执行 → 模型不输出 NVV token。无需任何后处理还原。
 
 **`--no-nvv` 方案说明**:
 

@@ -986,79 +986,6 @@ def _normalize_english(ctc_dir: Path, dict_path: Path | None = None) -> int:
     return changed
 
 
-def _reclaim_nvv_pinyin(ctc_dir: Path, pinyin_dir: Path | None = None) -> int:
-    """Revert NVV tokens that are actually misclassified pinyin syllables.
-
-    NVASR's blank-frame NVV bias (NVV_BIAS_DEFAULT=4.0) can cause short
-    pinyin syllables followed by silence to be detected as NVV tokens
-    (e.g. "zan2"→"BREATHING", "jin1"→"BREATHING").
-
-    A NVV token is reverted to pinyin when ALL of:
-      - Duration < 400ms  (true NVV like BREATHING/LAUGHTER > 500ms)
-      - Adjacent tokens are pinyin syllables (not English / other NVV)
-      - The ORIGINAL .lab from pinyin_dir has a pinyin syllable at this
-        position (NOT the output .lab which may already be contaminated)
-
-    Regression Case 31 Fix-3a.
-    """
-    reverted = 0
-    # Use pinyin_dir for original .lab; fall back to ctc_dir.
-    # The output .lab is already contaminated by CTC NVV tokens,
-    # so we must read the original pinyin from the prepare step.
-    lab_source_dir = pinyin_dir if pinyin_dir and pinyin_dir.exists() else ctc_dir
-
-    for tokens_path in sorted(ctc_dir.glob("*_tokens.jsonl")):
-        stem = tokens_path.stem.replace("_tokens", "")
-        try:
-            entries = [json.loads(l) for l in
-                       tokens_path.read_text(encoding="utf-8").strip().split("\n")
-                       if l.strip()]
-        except Exception:
-            continue
-
-        # Read ORIGINAL .lab from pinyin_dir (before CTC processing)
-        lab_path = lab_source_dir / f"{stem}.lab"
-        if not lab_path.exists():
-            lab_path = ctc_dir / f"{stem}.lab"
-        lab_tokens: list[str] = []
-        if lab_path.exists():
-            lab_tokens = lab_path.read_text(encoding="utf-8").strip().split()
-
-        changed = False
-        for i, tok in enumerate(entries):
-            if not is_nvv_token(tok["word"]):
-                continue
-
-            dur = tok["end_s"] - tok["start_s"]
-
-            # Check 1: Duration fits pinyin syllable range
-            if dur > 0.400:
-                continue
-
-            # Check 2: Adjacent tokens are pinyin (not English / other NVV)
-            prev_pinyin = (i == 0 or is_pinyin_syllable(entries[i - 1]["word"]))
-            next_pinyin = (i == len(entries) - 1
-                           or is_pinyin_syllable(entries[i + 1]["word"]))
-            if not (prev_pinyin or next_pinyin):
-                continue
-
-            # Check 3: ORIGINAL .lab has a pinyin syllable at this position
-            if i < len(lab_tokens) and is_pinyin_syllable(lab_tokens[i]):
-                old_word = tok["word"]
-                tok["word"] = lab_tokens[i]
-                changed = True
-                reverted += 1
-
-        if changed:
-            tokens_path.write_text(
-                "\n".join(json.dumps(t, ensure_ascii=False) for t in entries) + "\n",
-                encoding="utf-8")
-
-    if reverted:
-        print(f"  [nvv_reclaim] {reverted} NVV tokens reverted to pinyin")
-    return reverted
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="CTC Pre-alignment: NVASR → MFA anchor TextGrids (pinyin)")
@@ -1839,7 +1766,6 @@ def main():
         _normalize_punct(args.output_dir)
         _normalize_numerals(args.output_dir)
         _normalize_ria(args.output_dir)
-        _reclaim_nvv_pinyin(args.output_dir, args.pinyin_dir)
         _normalize_english(args.output_dir, args.dict_path)
 
     # ── 恢复模型 ──
