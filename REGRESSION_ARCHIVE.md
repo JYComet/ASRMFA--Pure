@@ -62,6 +62,14 @@
 | 51 | 2026-08-05 | run_pipeline.py | ctc_pretg_adj 空目录未回退 → postprocess 找不到 txt/lab |
 | 52 | 2026-08-05 | postprocess_textgrids.py | CTC 宽跨标点锚点 → _inject_punctuation 碎片喷溅 + _fix_overlapping_boundaries 阈值拒绝 → 词级大重叠 |
 | 53 | 2026-08-05 | postprocess_textgrids.py | 拼音-汉字全局错位 — STT 错误→pypinyin 上下文污染→级联位移 (pinyin_displacement) |
+| 54 | 2026-08-05 | adjust_ctc_boundaries.py | NVV 边界夹制豁免 → 实词边界自由越过 NVV → 标点区间倒置 (nvv_clamp_skip) |
+| 55 | 2026-08-05 | postprocess_textgrids.py | 全静音 phone list → MFA split 用静音边界切分声母/韵母 → 垃圾时间 (all_silence_mfa_split) |
+| 56 | 2026-08-05 | postprocess_textgrids.py | Phase 5 首音素回拉不对称 → 前词末 phone 未延伸 → pp 轨道间隙 (first_phone_snap_asymmetry) |
+| 57 | 2026-08-05 | postprocess_textgrids.py | MFA/CTC 混合决策独立 → 词间空隙 > 20ms → words 轨道间隙 (mixed_decision_word_gap) |
+| 58 | 2026-08-05 | postprocess_textgrids.py | handle_unexpected_silences 标记 <sp1-3> 后不合并 → mid_sp 误报 (sp1_3_flag_not_merge) |
+| 59 | 2026-08-05 | postprocess_textgrids.py | CTC 替换部分成功 → 拼音片段被合并守卫排除 → hanzi 拼音残留 (partial_ctc_merge_guard) |
+| 60 | 2026-08-05 | postprocess_textgrids.py | fix_short_words 仅覆盖虚词 → 实词 < 50ms 不被修复 → short_word 过滤 (content_short_word_unfixed) |
+| 61 | 2026-08-05 | ctc_prealign.py | 参考文本模式英文词被 NVASR tokenizer 拆碎 → 最终 TextGrid 英文变形 (ref_text_english_tokenizer_mangle) |
 
 ---
 
@@ -5047,3 +5055,418 @@ python3 scripts/audit_textgrids_deep.py /mnt/Raw/0805test
 - `036046_弹幕互动_回应吐槽弹幕.TextGrid`: `MAacbook` (STT 驼峰融合)
 - `036038_弹幕互动_回应吐槽弹幕.TextGrid`: `Instagramstagram` (STT 自重复拼接)
 - `036075_弹幕互动_回应吐槽弹幕.TextGrid`: `Instagramsta` + 全局错位
+
+---
+
+## Case 54: NVV 边界夹制豁免 → 实词边界自由越过 NVV → 标点区间倒置 (nvv_clamp_skip)
+
+### 现象
+
+修复前: CTC 边界调整 (`adjust_ctc_boundaries.py`) 对 NVV token 的边界夹制在 4 处被显式跳过：
+- Part 1 推结束边界时，若下一词是 NVV 则不夹制 → 实词 end 可越过 NVV start
+- Part 2 扩展/缩短结束边界时，若下一词/上一词是 NVV 则不夹制 → 同上
+- Part 1 和 Part 2 独立修改 `punct.start_s` / `punct.end_s` 无交叉验证 → 标点 start_s > end_s（倒置区间）
+- 倒置区间被行 320-322 的创可贴修补：`end_s = start_s + 0.060`（盲补 60ms 宽度）
+
+结果：`overlapping_words` 过滤高发。
+
+### 根因链
+
+1. **NVV 声学透明 ≠ 时间透明**: NVV 的 CTC 边界确实不可靠（跳过能量搜索合理），但 NVV 仍占用时间区间——实词不应越过它。
+2. **Part 1/Part 2 独立操作同一标点**: Part 1 回推 `punct.end_s`（跟实词 start），Part 2 前推 `punct.start_s`（跟实词 end），两个循环无交叉验证，可产生 `start_s > end_s`。
+3. **创可贴掩盖根因**: 行 322 的 `p["end_s"] = p["start_s"] + 0.060` 防止崩溃但不修复边界交叉。
+
+### 修改点
+
+**A. `adjust_ctc_boundaries.py` 行 166-167 — Part 1 夹制移除 NVV 豁免**
+
+```python
+# 修改前: NVV 豁免夹制
+if not _is_nvv(next_tok["word"]):
+    pushed_end = min(pushed_end, next_tok["start_s"] - 0.02)
+
+# 修改后: 无条件夹制到下一词起始
+pushed_end = min(pushed_end, next_tok["start_s"] - 0.02)
+```
+
+**B. `adjust_ctc_boundaries.py` 行 205-207 — Part 2 夹制移除 NVV 豁免**
+
+```python
+# 修改前: NVV 豁免夹制
+if next_tok and not _is_nvv(next_tok["word"]):
+    if new_end >= next_tok["start_s"] - 0.02:
+        new_end = next_tok["start_s"] - 0.02
+
+# 修改后: 无条件夹制
+if next_tok:
+    if new_end >= next_tok["start_s"] - 0.02:
+        new_end = next_tok["start_s"] - 0.02
+```
+
+**C. `adjust_ctc_boundaries.py` 行 221-224 — Part 2 缩短分支加 NVV 前向夹制**
+
+```python
+# 修改前: 无 NVV 前向夹制
+elif new_end < old_end - 0.04:
+    if new_end <= tok["start_s"] + 0.04:
+        continue
+    tok["end_s"] = new_end
+
+# 修改后: 前一词是 NVV 时夹制 new_end 不小于 NVV end + 0.02
+elif new_end < old_end - 0.04:
+    if new_end <= tok["start_s"] + 0.04:
+        continue
+    if idx > 0 and _is_nvv(tokens[idx - 1]["word"]):
+        prev_nvv_end = tokens[idx - 1]["end_s"]
+        if new_end < prev_nvv_end + 0.02:
+            new_end = prev_nvv_end + 0.02
+    tok["end_s"] = new_end
+```
+
+**D. `adjust_ctc_boundaries.py` 行 320-322 — 替换创可贴为合理修复**
+
+```python
+# 修改前: 盲补 60ms 右侧宽度
+for p in adj_punct:
+    if p["end_s"] <= p["start_s"]:
+        p["end_s"] = p["start_s"] + 0.060
+
+# 修改后: 信任 Part 2 声学证据 (start_s)，回拉 end_s
+for p in adj_punct:
+    if p["end_s"] <= p["start_s"]:
+        p["start_s"] = round(p["end_s"] - 0.030, 3)
+        if p["start_s"] < 0:
+            p["start_s"] = 0.0
+            p["end_s"] = 0.030
+```
+
+### 验证方法
+
+```python
+# 修复后，实词边界扩展应停在 NVV 边界 - 0.02s
+# adj_punct 中不应再有 end_s <= start_s
+# 完整管线运行后 overlapping_words 计数应下降
+
+# 检查代码:
+all(p["end_s"] > p["start_s"] for p in adj_punct)  # 应全为 True
+```
+
+---
+
+## Case 55: 全静音 phone list → MFA split 用静音边界切分声母/韵母 → 垃圾时间 (all_silence_mfa_split)
+
+### 现象
+
+修复前: 泄漏过滤器（`build_pinyin_phones_tier` 行 516-528）清空词的所有实音素后，`word_phones` 只剩静音/spn 条目。当 `len(word_phones) >= 2` 时，MFA-precise 分支（行 665）用静音时间边界做声母/韵母切分，产出垃圾时间。
+
+典型: `chang4` → `ch[0-5ms] + ang4[5-360ms]`（5ms 的 "ch" 是静音片段残余，非真实声母）。
+
+修复后: 检测到 `word_phones` 全是静音/spn 时，跳过 MFA split，回退到比例切分（行 680 的 `if not use_mfa_split:` 分支），产出合理的声母/韵母分割。
+
+### 根因链
+
+1. **泄漏过滤器** (~line 516): MFA 将 NVV/英语词对齐全为静音/spn → 第一个实音素起始 > 词起始 30% → 裁剪全部实音素 → `word_phones` 只剩静音。
+2. **MFA-precise 分支无守卫** (~line 665): `len(word_phones) >= 2` 未检查 phone 是否为实音素 → 用静音边界做切分。
+3. **检测 (Case 26-E) 只能标不能防**: 行 5845 的 `silence_boundary_split` 检测在 QC 段运行——只能标记不能阻止垃圾时间产生。
+
+### 修改点
+
+**`postprocess_textgrids.py` 行 665 — `build_pinyin_phones_tier`**
+
+```python
+# 修改前: 未检查 phone 是否为实音素
+if len(word_phones) >= 2:
+
+# 修改后: 添加实音素守卫
+_real_phones = [(s, e, t) for s, e, t in word_phones
+                if not is_silence(t) and t != "spn"]
+if len(word_phones) >= 2 and _real_phones:
+```
+
+### 验证方法
+
+```python
+# 找触发 silence_boundary_split 的文件，debug-print word_phones:
+#   修复前: [(0, 0.005, '<sp0>'), (0.005, 0.360, '<sp0>')]  ← 全静音
+#   修复后: word_phones 全静音 → 走比例切分 → silence_boundary_split 不触发
+
+# 确认:
+[len([p for p in word_phones if not is_silence(p[2])]) for w in flagged_words]
+# 修复前: [0, 0, ...] (全 0)
+# 修复后: 比例切分替代 MFA split → split 用 _INIT_FRAC 而非静音边界
+```
+
+---
+
+## Case 56: Phase 5 首音素回拉不对称 → 前词末 phone 未延伸 → pp 轨道间隙 (first_phone_snap_asymmetry)
+
+### 现象
+
+修复前: Phase 5 首音素回拉 (`new_pp_ivs[first].xmin = w_iv.xmin`) 是单向操作——将当前词首音素左拉到词起始，但前一词的末音素不被右推来填补空隙。对比末音素扩展逻辑（行 5068-5101）主动搜索下一词首音素并夹制，首音素回拉完全不对称。
+
+结果: `pp_tier_gaps`（pinyin_phones 轨道间隙 > 10ms）在词边界处频发。
+
+修复后: 首音素回拉执行后，同步搜索前一词的末音素并向前延伸以闭合空隙（与末音素扩展对称，含相同时长上限）。
+
+### 根因链
+
+1. **首音素回拉只拉一侧** (~line 5072): 只有 `new_pp_ivs[first].xmin = w_iv.xmin`，无对应 `new_pp_ivs[prev_last].xmax = w_iv.xmin` 操作。
+2. **末音素扩展有完整对称逻辑** (~line 5068-5101): 搜索下一词、找首音素、夹制 extend_to、含时长上限——为对称修复提供了精确模板。
+3. **微隙吸收阈值盲区** (~line 5121-5154): Phase 5 末端的微隙吸收仅处理 ≤ 10ms 的 gap，首音素回拉产生的 gap 可超过 10ms。
+
+### 修改点
+
+**`postprocess_textgrids.py` 行 5073 之后 — Phase 5 pp rebuild loop**
+
+首音素回拉后添加对称延伸逻辑（~45 行），与前一词末音素对接，相同时长上限（元音 400ms / 辅音 200ms，1.5x 原始时长）。
+
+### 验证方法
+
+```python
+# 找 pp_tier_gaps > 0 的文件
+# 检查空隙是否发生在词边界 (即前一词末 ≠ 当前词首)
+# 修复后: pp_tier_gaps 计数应下降
+
+# 确认修复未引入重叠:
+all(new_pp_ivs[i].xmax <= new_pp_ivs[i+1].xmin + 0.002 for i in range(len(new_pp_ivs)-1))
+```
+
+---
+
+## Case 57: MFA/CTC 混合决策独立 → 词间空隙 > 20ms → words 轨道间隙 (mixed_decision_word_gap)
+
+### 现象
+
+修复前: `_snap_to_ctc` 中每个词独立决定信任 MFA 边界还是快照到 CTC 边界。当词 N 信任 MFA（`xmax = mfa_end`）而词 N+1 快照到 CTC（`xmin = ctc_start`），且 `ctc_start > mfa_end + 0.020`，空隙 > 20ms 打开。
+
+现有的缓解措施（逐词间隙吸收、静音插入、微隙吸收）都有阈值盲区——当空隙超过各阈值时，空隙保留到最终输出。
+
+修复后: 在主循环结束后、Leading silence 处理前，添加后循环连续性遍历——检测相邻实词间 > 20ms 的空隙，吸收进较长的词。
+
+### 根因链
+
+1. **逐词独立决策** (~line 3637-3784): 每个词单独在 MFA/CTC 之间选择，无跨词一致性约束。
+2. **逐词间隙吸收覆盖面不足** (~line 3932-3943): 仅处理 `use_mfa=False` + `gap <= 0.2s` + `extended_dur <= prev_ctc_dur * 2.0` 的特定场景。
+3. **无声插入充填空隙** (~line 3949-3957): 用 `<spN>` 填充而非消除空隙 → 空隙仍在，只是被标记了。
+
+### 修改点
+
+**`postprocess_textgrids.py` 行 4008 之后 — `_snap_to_ctc` 主循环结束**
+
+```python
+# 后循环连续性遍历:
+_WT_GAP_LIMIT = 0.020  # 与 QC 检测阈值一致
+for _gi in range(len(new_word_ivs) - 1):
+    cur, nxt = new_word_ivs[_gi], new_word_ivs[_gi + 1]
+    if cur[3] != "word" or nxt[3] != "word":
+        continue
+    _gap = nxt[0] - cur[1]
+    if _gap > _WT_GAP_LIMIT:
+        # 吸收进较长词
+        if cur[1] - cur[0] >= nxt[1] - nxt[0]:
+            new_word_ivs[_gi] = (cur[0], nxt[0], cur[2], cur[3])
+        else:
+            new_word_ivs[_gi + 1] = (cur[1], nxt[1], nxt[2], nxt[3])
+```
+
+### 验证方法
+
+```python
+# 找 words_tier_gaps > 0 的文件
+# 检查哪对邻接词产生空隙: gap = next.xmin - cur.xmax
+# 修复后: 后循环遍历闭合空隙 → words_tier_gaps 计数下降
+
+# 确认: 空隙 > 20ms 的邻接词对在修复后应连续
+```
+
+---
+
+## Case 58: handle_unexpected_silences 标记 <sp1-3> 后不合并 → mid_sp 误报 (sp1_3_flag_not_merge)
+
+### 现象
+
+修复前: `handle_unexpected_silences` (行 805-813) 对两个普通实词之间的 `<sp1-3>`（无标点匹配）执行的操作是：
+1. `filter_reasons.append("unexpected_silence")` — 标记为异常
+2. `continue` — 跳过合并块
+
+后续吸收遍（`absorb_nvv_trailing`, `absorb_silence_into_punct`）只覆盖 NVV 邻接和标点邻接模式。两个普通实词之间、无标点的 `<sp1-3>` 静音全部漏过，最终触发 `mid_sp` 过滤。
+
+修复后: 标记仍保留（提供诊断信息），但代码不再 `continue`——静音被合并进前一词。`unexpected_silence` 过滤标记保留，`mid_sp` 不再误报。
+
+### 根因链
+
+1. **标记但不修复** (行 810-813): `filter_reasons.append` + `continue` — 异常被记录但问题不被解决。
+2. **四道吸收工序覆盖盲区**: `<sp1-3>` 在两个普通实词之间、无标点、无 NVV → 四道全都跳过。
+3. **mid_sp 是下游级联后果**: 静音仍在 tier 中 → `mid_sp` 检测触发 → 文件被双重标记。
+
+### 修改点
+
+**`postprocess_textgrids.py` 行 805-813 — `handle_unexpected_silences`**
+
+```python
+# 修改前: 标记后 continue → 跳过合并
+elif sil_label in ("<sp1>", "<sp2>", "<sp3>"):
+    if not (is_english_token(prev_text) or ...):
+        filter_reasons.append("unexpected_silence")
+    continue
+
+# 修改后: 标记后落入合并块; English/NVV 邻接仍跳过
+elif sil_label in ("<sp1>", "<sp2>", "<sp3>"):
+    if not (is_english_token(prev_text) or ...):
+        filter_reasons.append("unexpected_silence")
+        # Fall through to merge block below
+    else:
+        continue
+```
+
+### 验证方法
+
+```python
+# 找同时有 mid_sp 和 unexpected_silence 的文件
+# 检查词层中是否有: [实词] <sp1/2/3> [实词] (无标点)
+# 修复后: mid_sp 不再触发，unexpected_silence 仍记录
+```
+
+---
+
+## Case 59: CTC 替换部分成功 → 拼音片段被合并守卫排除 → hanzi 拼音残留 (partial_ctc_merge_guard)
+
+### 现象
+
+修复前: 当 MFA 把英语词拆成拼音近音片段（如 "roughly" → "ru4" + "fei1"），CTC 替换（行 4464-4468）只替换了 "ru4"（有重叠）而未替换 "fei1"（无重叠）。合并逻辑（行 4528-4530）要求 `is_english_token(iv.text)` 同时为真，"fei1" 是拼音音节→`is_english_token` 返回 False → 合并被阻止。
+
+未合并的 "fei1" 进入 `_build_hanzi_tier` 消费一个 CJK 字符 → 游标漂移 → 后续拼音 token 回退到原始拼音 → `hanzi_pinyin` + `cjk_mismatch` 双触发。
+
+修复后: 合并条件扩展为同时接受 `is_english_token` 和 `is_pinyin_syllable`，允许未替换的拼音片段在与前一个已替换英语 token 重叠同一 CTC token 时被合并。
+
+### 根因链
+
+1. **CTC 替换只按时间重叠匹配** (~line 4473-4478): `best_overlap > 0` 阈值——MFA 片段时间与 CTC 锚点无重叠时不被替换。
+2. **合并守卫过于严格** (~line 4530): `is_english_token(iv.text)` 排除所有拼音音节——合理防止合并独立中文词，但也排除了未替换的英语碎片。
+3. **合并内部有 CTC 重叠验证** (~line 4487-4491): 已确认两个区间重叠同一 CTC token——此检查天然排除独立中文词，合并守卫的严格限制是多余的。
+
+### 修改点
+
+**`postprocess_textgrids.py` 行 4530 — 合并守卫条件**
+
+```python
+# 修改前: 仅接受英语 token
+and is_english_token(iv.text.strip())):
+
+# 修改后: 同时接受英语 token 和拼音音节（未替换的英语碎片）
+and (is_english_token(iv.text.strip())
+     or is_pinyin_syllable(iv.text.strip()))):
+```
+
+合并结果文本来自 `prev.text`（已替换的英语 token），不受影响。CTC 重叠检查验证同一 token，防止误合并独立中文词。
+
+### 验证方法
+
+```python
+# 找同时有 hanzi_pinyin 且有英语词的文件的
+# 检查英语词附近词层: 应有 pinyin 碎片 (如 "fei1") 紧接在英语词后
+# 修复后: 碎片被合并进英语词 → pinyin_count 下降 → hanzi_pinyin 不触发
+```
+
+---
+
+## Case 60: fix_short_words 仅覆盖虚词 → 实词 < 50ms 不被修复 → short_word 过滤 (content_short_word_unfixed)
+
+### 现象
+
+修复前: `fix_short_words` (行 2203-2254) 只在以下全部条件满足时激活：
+- 词是 `CHINESE_SHORT_WORDS` 集合中的虚词（的、了、着、呢…）
+- 后跟 ≥ 0.4s 静音
+- 词时长 < `fix_short_word_sec`（默认 0.25s）
+
+被挤压在两个非短词之间的实词（如一个二字词的孤立碎片 < 50ms）不被修复，最终被 `short_word` 过滤器捕获。
+
+修复后: 添加实词候选收集（< 50ms、在两个非短词之间），通过双向能量搜索尝试扩展实词边界（有能量证据时延伸，无证据时仍被 filter 捕获）。
+
+### 修改点
+
+**A. `postprocess_textgrids.py` 行 2223 之后 — 实词候选收集**
+
+```python
+content_candidates = []
+for idx, iv in enumerate(words.intervals[1:-1], start=1):
+    if (not is_silence(iv.text) and not is_punct(iv.text)
+            and not is_nvv_token(iv.text)
+            and iv.duration < 0.050
+            and iv.text.strip().lower().rstrip('12345')
+            not in {w.rstrip('12345') for w in CHINESE_SHORT_WORDS}):
+        prev_iv = words.intervals[idx - 1]
+        next_iv = words.intervals[idx + 1]
+        if (not is_silence(prev_iv.text) and not is_silence(next_iv.text)
+                and prev_iv.duration >= 0.050 and next_iv.duration >= 0.050):
+            content_candidates.append(idx)
+```
+
+**B. `postprocess_textgrids.py` 行 2269 之前 — 实词双向能量搜索**
+
+```python
+for word_idx in content_candidates:
+    # 向右搜索: 短词+后邻接词起始区域是否有连续语音能量
+    region = find_speech_in_silence(
+        audio, sr, word_iv.xmin, min(next_iv.xmin + 0.10, next_iv.xmax),
+        search_sec=0.15, frame_ms=args.fix_frame_ms,
+        hop_ms=args.fix_hop_ms, thresh_ratio=args.fix_threshold_ratio,
+        min_region_sec=0.015)
+    if region and sp_end > word_iv.xmax:
+        word_iv.xmax = sp_end    # 扩展短词
+        next_iv.xmin = sp_end    # 缩小邻接词
+```
+
+### 验证方法
+
+```python
+# 找 short_word 过滤中有非 CHINESE_SHORT_WORDS 的实词
+# 检查该词是否在两个较长的非静音词之间
+#   是 → 修复后若能量支持则被扩展 (content_short_word_fix)
+#   否 → 是真正的 MFA artifact，仍被 short_word catch
+```
+
+---
+
+## Case 61: 参考文本模式英文词被 NVASR tokenizer 拆碎 → 最终 TextGrid 英文变形 (ref_text_english_tokenizer_mangle)
+
+### 现象
+
+参考文本模式 (nvv_enabled=false)，原始 txt 含英文专有名词（Claude, kimi, MacBook, PV, K-Pop），最终 TextGrid raw_text 中英文严重变形：
+
+| 原始 txt | lab (拼音) | text_cn | 最终 raw_text |
+|----------|-----------|---------|-------------|
+| Claude | Cla ude | Cud | Cudude / RIA |
+| PV | PV | PV | 保留但错位 |
+| ria | ria | RIA | RIA 了爱 |
+
+### 根因链
+
+1. `ctc_prealign.py:284`: 参考文本正确赋值 `align_text = ref_texts[stem].strip()`
+2. `replace_ria_variants()` / `normalize_punct_inline()` 处理（对中文有益，英文基本无损）
+3. **关键**: NVASR `tokenizer.text2tokens(align_text)` — 中文 tokenizer 将英文词拆为字母碎片（Claude → Cla + ude），每个碎片作为独立 token
+4. CTC forced alignment 将碎片映射到音频帧 → 碎片之间的时间边界被 CTC blank 帧或低置信帧填充
+5. normalize_en 步骤试图合并碎片但无完整上下文 → 输出 Cudude / RIA 等
+6. postprocess `enable_text_correction: true` 只修正标点/静音，不修复被 tokenizer 损坏的词
+
+### 影响
+
+- 受影响的 token 类型: 英文专有名词、品牌名、缩写（Claude, kimi, MacBook, PV, BGM, K-Pop 等）
+- 中文部分基本不受影响
+- 无法在 postprocess 阶段修复（原始词已被 tokenizer 拆分且无保留的完整英文原文索引）
+
+### 可能的修复方向
+
+1. **预处理**: 在 `make_patched_inference` 中，tokenizer 之前用占位符保护英文词，对齐后再还原
+2. **后处理**: postprocess 阶段用原始 `.txt` 覆盖 `raw_text` tier 中的英文片段（需英文词边界检测）
+3. **词典注入**: 将高频英文专有名词加入 NVASR tokenizer 词表（需重新训练/微调 tokenizer）
+
+### 验证方法
+
+```python
+# 在 ria 数据集中搜索含英文词的段，对比原始 txt 和最终 raw_text
+stem = "036001_弹幕互动_回应吐槽弹幕"
+# 原始: "Claude的推送"
+# 预期 raw_text 含 "Claude"
+# 实际: "Cudude的推送" / "RIA"
+```

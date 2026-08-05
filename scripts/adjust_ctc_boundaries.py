@@ -163,8 +163,10 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
             pushed_end = onset + min_dur
             if idx + 1 < len(tokens):
                 next_tok = tokens[idx + 1]
-                if not _is_nvv(next_tok["word"]):
-                    pushed_end = min(pushed_end, next_tok["start_s"] - 0.02)
+                # Always clamp to next token's start regardless of type.
+                # NVV boundaries are acoustically unreliable, but the NVV
+                # still occupies time — content word cannot cross into it.
+                pushed_end = min(pushed_end, next_tok["start_s"] - 0.02)
             if pushed_end > tok["end_s"]:
                 tok["end_s"] = round(pushed_end, 3)
                 tok["end_ms"] = round(pushed_end * 1000, 1)
@@ -202,7 +204,8 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
         new_end = round(offset, 3)
 
         if new_end > old_end:
-            if next_tok and not _is_nvv(next_tok["word"]):
+            if next_tok:
+                # Always clamp to next token's start regardless of type.
                 if new_end >= next_tok["start_s"] - 0.02:
                     new_end = next_tok["start_s"] - 0.02
             if new_end <= old_end + 0.02:
@@ -218,6 +221,12 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
         elif new_end < old_end - 0.04:
             if new_end <= tok["start_s"] + 0.04:
                 continue
+            # Clamp to previous NVV's end: when the previous token is NVV,
+            # content word's end should not retreat past the NVV's interval.
+            if idx > 0 and _is_nvv(tokens[idx - 1]["word"]):
+                prev_nvv_end = tokens[idx - 1]["end_s"]
+                if new_end < prev_nvv_end + 0.02:
+                    new_end = prev_nvv_end + 0.02
             tok["end_s"] = new_end
             tok["end_ms"] = round(new_end * 1000, 1)
             stats["end_shorten"] += 1
@@ -315,11 +324,18 @@ def process_one(stem: str, ctc_dir: Path, audio_dir: Path,
 
     adj_tokens, adj_punct, stats = adjust_boundaries(tokens, punct, audio, sr)
 
-    # Guard: fix invalid intervals from CTC token overlap (e.g. NVV
-    # overlapping adjacent word causes punct end_s < start_s).
+    # Guard: fix invalid intervals where Part 1 and Part 2 independently
+    # adjusted punct start_s / end_s into a crossing state (NVV between
+    # content words obscures the punct position check).
+    # Trust Part 2's start_s (acoustic evidence from energy fall) over
+    # Part 1's end_s (which may have been pulled backward by NVV adjacency)
+    # and shrink from the left rather than blindly extending the right.
     for p in adj_punct:
         if p["end_s"] <= p["start_s"]:
-            p["end_s"] = p["start_s"] + 0.060
+            p["start_s"] = round(p["end_s"] - 0.030, 3)
+            if p["start_s"] < 0:
+                p["start_s"] = 0.0
+                p["end_s"] = 0.030
 
     # Dedup: remove ellipsis that overlaps with real punctuation (comma,
     # period, etc.).  Boundary adjustment can shift punct times and create

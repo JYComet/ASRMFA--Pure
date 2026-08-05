@@ -662,7 +662,14 @@ def build_pinyin_phones_tier(phones_tier: Tier,
 
                 # ── Try MFA phone boundary first ──
                 use_mfa_split = False
-                if len(word_phones) >= 2:
+                # Guard: when the leakage filter (line 516-528) stripped all
+                # real phones and only silence/spn entries remain, do NOT use
+                # silence boundaries for the initial/final split — that produces
+                # garbage timing (e.g. 5ms "ch" + 355ms "ang4").  Fall back to
+                # the proportional split below (Regr. Case 26/43).
+                _real_phones = [(s, e, t) for s, e, t in word_phones
+                                if not is_silence(t) and t != "spn"]
+                if len(word_phones) >= 2 and _real_phones:
                     _init_end = word_phones[0][1]
                     _init_frac_mfa = (_init_end - w_iv.xmin) / max(word_dur, 0.001)
                     # Regr. Case 44: phonetically-motivated upper bound on
@@ -796,14 +803,20 @@ def handle_unexpected_silences(textgrid: TextGrid, pinyin_text: str) -> list[str
         elif has_punct:
             continue  # <sp1-3> + punct: skip (handled by absorb phase later)
         elif sil_label in ("<sp1>", "<sp2>", "<sp3>"):
-            # Skip gaps adjacent to English/NVV tokens — these are MFA
-            # artifacts (MFA can't model English phones, inserts spn).
             prev_text = word_items[tg_word_idx[k - 1]][0]
             next_text = word_items[tg_word_idx[k]][0]
             if not (is_english_token(prev_text) or is_english_token(next_text)
                     or is_nvv_token(prev_text) or is_nvv_token(next_text)):
+                # Regular Chinese words: flag the unexpected silence
+                # but still merge it into the previous word.  The silence
+                # IS unexpected (hence the filter flag), but leaving it
+                # in the words tier creates a mid_sp hit downstream.
                 filter_reasons.append("unexpected_silence")
-            continue
+                # Fall through to the merge block below.
+            else:
+                # English/NVV-adjacent gaps: MFA artifacts (MFA can't
+                # model English phones, inserts spn).  Skip.
+                continue
 
         # <sp0>: merge into previous word (or adjacent punctuation).
         prev_word_idx = tg_word_idx[k - 1]
@@ -2207,7 +2220,22 @@ def fix_short_words(textgrid: TextGrid, wav_path: Path | None, args,
                 and is_silence(next_iv.text)
                 and next_iv.duration >= args.fix_min_silence_sec):
             candidates.append(idx)
-    if not candidates:
+    # Extension: very short content words (< 50 ms) between two non-short,
+    # non-silence words.  These are MFA artifacts (squeezed words) or
+    # incorrect splits — try to extend using energy-based boundary search.
+    content_candidates = []
+    for idx, iv in enumerate(words.intervals[1:-1], start=1):
+        if (not is_silence(iv.text) and not is_punct(iv.text)
+                and not is_nvv_token(iv.text)
+                and iv.duration < 0.050
+                and iv.text.strip().lower().rstrip('12345')
+                not in {w.rstrip('12345') for w in CHINESE_SHORT_WORDS}):
+            prev_iv = words.intervals[idx - 1]
+            next_iv = words.intervals[idx + 1]
+            if (not is_silence(prev_iv.text) and not is_silence(next_iv.text)
+                    and prev_iv.duration >= 0.050 and next_iv.duration >= 0.050):
+                content_candidates.append(idx)
+    if not candidates and not content_candidates:
         return textgrid, fixes
     for word_idx in candidates:
         word_iv = words.intervals[word_idx]
@@ -2238,6 +2266,32 @@ def fix_short_words(textgrid: TextGrid, wav_path: Path | None, args,
             if pi + 1 < len(phones.intervals):
                 phones.intervals[pi + 1].xmin = sp_end
         fixes.append({"rule": "short_word_fix", "word": word_iv.text})
+    # ── Content word candidates: bidirectional energy search ──
+    for word_idx in content_candidates:
+        word_iv = words.intervals[word_idx]
+        prev_iv = words.intervals[word_idx - 1]
+        next_iv = words.intervals[word_idx + 1]
+        # Search rightward: check if the short word + next word's onset
+        # region has continuous speech energy.
+        region = find_speech_in_silence(
+            audio, sr, word_iv.xmin,
+            min(next_iv.xmin + 0.10, next_iv.xmax),
+            search_sec=0.15, frame_ms=args.fix_frame_ms,
+            hop_ms=args.fix_hop_ms, thresh_ratio=args.fix_threshold_ratio,
+            min_region_sec=0.015,
+        )
+        if region:
+            sp_start, sp_end = region
+            if sp_end > word_iv.xmax and sp_end <= next_iv.xmin + 0.01:
+                old_xmax = word_iv.xmax
+                word_iv.xmax = sp_end
+                next_iv.xmin = sp_end
+                for pi in [i for i, p in enumerate(phones.intervals)
+                           if not is_silence(p.text) and abs(p.xmax - old_xmax) < 0.02]:
+                    phones.intervals[pi].xmax = sp_end
+                    if pi + 1 < len(phones.intervals):
+                        phones.intervals[pi + 1].xmin = sp_end
+                fixes.append({"rule": "content_short_word_fix", "word": word_iv.text})
     return textgrid, fixes
 
 
@@ -3999,6 +4053,32 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
         prev_ctc_start = ctc_start
         prev_ctc_end = ctc_end
 
+    # ── Post-loop contiguity pass ──
+    # Adjacent words may independently choose MFA vs CTC boundaries.
+    # When word N trusts MFA (xmax = mfa_end) and word N+1 snaps to CTC
+    # (xmin = ctc_start), a gap > 20 ms can open.  This pass catches
+    # remaining gaps between adjacent content words that the per-word
+    # gap absorption (above) missed.  Threshold matches the QC filter
+    # at _WT_GAP_THRESHOLD_S = 0.020.
+    _WT_GAP_LIMIT = 0.020
+    for _gi in range(len(new_word_ivs) - 1):
+        cur = new_word_ivs[_gi]
+        nxt = new_word_ivs[_gi + 1]
+        if cur[3] != "word" or nxt[3] != "word":
+            continue
+        _gap = nxt[0] - cur[1]
+        if _gap > _WT_GAP_LIMIT:
+            # Absorb into the longer word
+            if cur[1] - cur[0] >= nxt[1] - nxt[0]:
+                new_word_ivs[_gi] = (cur[0], nxt[0], cur[2], cur[3])
+            else:
+                new_word_ivs[_gi + 1] = (cur[1], nxt[1], nxt[2], nxt[3])
+        elif _gap < 0 and _gap > -0.005:
+            # Tiny overlap: split at midpoint
+            mid = (cur[1] + nxt[0]) / 2.0
+            new_word_ivs[_gi] = (cur[0], mid, cur[2], cur[3])
+            new_word_ivs[_gi + 1] = (mid, nxt[1], nxt[2], nxt[3])
+
     # Leading silence — from 0 to first word start (mirrors trailing silence)
     if new_word_ivs and new_word_ivs[0][0] > 0.005:
         dur_label = silence_label(new_word_ivs[0][0])
@@ -4488,7 +4568,8 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         for iv in words_tier.intervals:
             if (merged_intervals
                     and is_english_token(merged_intervals[-1].text.strip())
-                    and is_english_token(iv.text.strip())):
+                    and (is_english_token(iv.text.strip())
+                         or is_pinyin_syllable(iv.text.strip()))):
                 prev = merged_intervals[-1]
                 for ct in ctc_token_list:
                     ct_word = ct["word"].strip().strip("<>")
@@ -5064,6 +5145,33 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                         # residual offset after Phase 4 boundary changes.
                         if new_pp_ivs[first].xmin > w_iv.xmin + 0.005:
                             new_pp_ivs[first] = Interval(w_iv.xmin, new_pp_ivs[first].xmax, new_pp_ivs[first].text)
+                            # ── Symmetric extension: when the first phone is
+                            #     snapped backward, extend the previous word's
+                            #     last phone forward to close the gap.  Mirrors
+                            #     the last-phone extension below but in reverse.
+                            _prev_word_idx = None
+                            for __wi in range(len(final_words_tier.intervals) - 1, -1, -1):
+                                _pw = final_words_tier.intervals[__wi]
+                                if _pw.xmax <= w_iv.xmin - 0.005 and not is_silence(_pw.text) and _pw.text.strip():
+                                    _prev_word_idx = __wi
+                                    break
+                            if _prev_word_idx is not None:
+                                _pw_iv = final_words_tier.intervals[_prev_word_idx]
+                                for __pi in range(len(new_pp_ivs) - 1, -1, -1):
+                                    _pp = new_pp_ivs[__pi]
+                                    if (_pp.xmin >= _pw_iv.xmin - 0.005
+                                            and _pp.xmax <= _pw_iv.xmax + 0.005
+                                            and not is_silence(_pp.text)):
+                                        if _pp.xmax < w_iv.xmin - 0.002:
+                                            _last_orig_dur = _pp.xmax - _pp.xmin
+                                            _is_vowel = not bool(re.match(
+                                                r'^[bpmfdtnlgkhjqxrzcs]$|^[zcs]h$', _pp.text))
+                                            _max_dur = 0.400 if _is_vowel else 0.200
+                                            _capped_dur = min(_max_dur, _last_orig_dur * 1.5)
+                                            _extend_to = min(w_iv.xmin, _pp.xmin + max(_capped_dur, _last_orig_dur))
+                                            if _extend_to > _pp.xmax:
+                                                new_pp_ivs[__pi] = Interval(_pp.xmin, _extend_to, _pp.text)
+                                        break
                         # Extend last phone to word end (Regr. Case 45).
                         # Apply a phonetically-motivated maximum duration
                         # so the tail phone is not inflated when the word
