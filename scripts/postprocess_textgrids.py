@@ -1815,7 +1815,7 @@ def _frame_rms_vec(audio, sr: int, frame_ms: float = 5.0
     import numpy as _np
     fs = max(1, int(frame_ms / 1000.0 * sr))
     n_frames = max(0, (len(audio) - fs) // fs + 1)
-    if n_frames == 0:
+    if n_frames == 0 or n_frames * fs > len(audio):
         return _np.array([], dtype=_np.float32), 0.0
     frames = audio[:n_frames * fs].reshape(n_frames, fs)
     rms = _np.sqrt(_np.mean(frames.astype(_np.float64) ** 2, axis=1) + 1e-12)
@@ -2251,7 +2251,7 @@ def detect_bgm_suspect(textgrid: TextGrid, wav_path: Path | None, args,
             continue
         # Vectorised frame RMS
         n_frames = max(0, (len(seg) - frame_size) // hop_size + 1)
-        if n_frames <= 0:
+        if n_frames <= 0 or n_frames * hop_size > len(seg):
             continue
         frames = seg[:n_frames * hop_size].reshape(n_frames, -1)[:, :frame_size]
         frms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1) + 1e-12)
@@ -3044,7 +3044,10 @@ def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
         n_frames = (e_sample - s_sample) // frame_s
         if n_frames <= 0:
             continue
-        frames = audio[s_sample:s_sample + n_frames * frame_s].reshape(n_frames, frame_s)
+        end_s = s_sample + n_frames * frame_s
+        if end_s > len(audio):
+            continue
+        frames = audio[s_sample:end_s].reshape(n_frames, frame_s)
         frame_rms_arr = _np.mean(_np.abs(frames), axis=1)
         above = _np.where(frame_rms_arr > threshold)[0]
         if len(above) == 0:
@@ -3506,7 +3509,10 @@ def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
         n_frames = (w_end_s - w_start_s) // frame_s
         if n_frames <= 0:
             continue
-        frames = audio[w_start_s:w_start_s + n_frames * frame_s].reshape(n_frames, frame_s)
+        end_s = w_start_s + n_frames * frame_s
+        if end_s > len(audio):
+            continue
+        frames = audio[w_start_s:end_s].reshape(n_frames, frame_s)
         frame_rms_arr = _np.mean(_np.abs(frames), axis=1)
         last_above = -1
         for fi in range(n_frames - 1, -1, -1):
@@ -5280,7 +5286,11 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     _pinyin_hits: list[str] = []
     if _raw_tier is not None:
         for _iv in _raw_tier.intervals:
-            _pinyin_hits.extend(_re.findall(r'\b[a-z]+[1-5]\b', _iv.text))
+            # Exclude <spN> silence markers (sp1, sp2, sp3) — they are not
+            # pinyin leakage but legitimate silence interval labels embedded
+            # in the raw_text tier to mark sentence-initial pauses.
+            _raw_text = _re.sub(r'<sp\d+>', '', _iv.text)
+            _pinyin_hits.extend(_re.findall(r'\b(?!sp\d\b)[a-z]+[1-5]\b', _raw_text))
     if _pinyin_hits:
         filter_reasons.append("pinyin_in_text")
         report["pinyin_in_text"] = sorted(set(_pinyin_hits))
@@ -5784,9 +5794,9 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             __pi = _pp_idx
             while __pi < len(pp_tier.intervals) and pp_tier.intervals[__pi].xmin < _we - 0.001:
                 _p = pp_tier.intervals[__pi]
-                if (_p.xmax > _ws + 0.001 and _p.mark
-                        and not is_silence(_p.mark.strip())):
-                    _w_phones.append(_p.mark.strip())
+                if (_p.xmax > _ws + 0.001 and getattr(_p, 'mark', None)
+                        and not is_silence(getattr(_p, 'mark', '').strip())):
+                    _w_phones.append(getattr(_p, 'mark', _p.text if hasattr(_p, 'text') else '').strip())
                 __pi += 1
             if len(_w_phones) == 1 and _w_phones[0] in (_wt, _wt.lower(), _wt.upper()):
                 _en_single_count += 1
@@ -5824,9 +5834,9 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             __pi = _pp_idx
             while __pi < len(pp_tier.intervals) and pp_tier.intervals[__pi].xmin < _we - 0.001:
                 _p = pp_tier.intervals[__pi]
-                if (_p.xmax > _ws + 0.001 and _p.mark
-                        and not is_silence(_p.mark.strip())):
-                    _w_phones.append(_p.mark.strip())
+                if (_p.xmax > _ws + 0.001 and getattr(_p, 'mark', None)
+                        and not is_silence(getattr(_p, 'mark', '').strip())):
+                    _w_phones.append(getattr(_p, 'mark', _p.text if hasattr(_p, 'text') else '').strip())
                 __pi += 1
             _n_got = len(_w_phones)
             _n_exp = len(_dp)

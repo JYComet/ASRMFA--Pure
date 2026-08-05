@@ -50,6 +50,7 @@
 | 39 | 2026-08-05 | postprocess_textgrids.py | MFA 帧精度间隙 5-30ms → words/hanzi/pp 三轨道间隙 |
 | 40 | 2026-08-05 | postprocess_textgrids.py | English phone 边界未 snap → phone 与 word 不对齐 |
 | 41 | 2026-08-05 | postprocess_textgrids.py | CTC 锚点膨胀 → 异常长词 (le5 5.6s) + 无检测 |
+| 42 | 2026-08-05 | postprocess_textgrids.py | pinyin_in_text 误报 — <sp1> 被正则 \b[a-z]+[1-5]\b 匹配为拼音 |
 
 ---
 
@@ -4193,6 +4194,52 @@ le5 从正常 0.2s 被拉到 5.6s（在 hao3 和 。 之间吞掉大段静音/�
 
 - 新版合成英文数据对齐 → hao3→le5→。
 - 新版合成英文数据中可能有更多同类 case
+
+---
+
+## Case 42: pinyin_in_text 误报 — `<sp1>` 被正则匹配为拼音 (sp1_false_positive)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `process_one` (QC section)
+**触发样本**: `shayi_huali_new` — 纱依/花礼 300 文件 100% 命中
+
+### 现象
+
+`shayi_huali_new` 数据集的 filtered 目录中，100% 的文件都有 `pinyin_in_text` 过滤原因。
+实际情况是 raw_text tier 以 `<sp1>` 开头，正则 `\b[a-z]+[1-5]\b` 将 `sp1` 误判为拼音音节。
+
+```
+raw_text:  "<sp1>好久不见你个riaRIA..."
+regex hit: "sp1"        ← 误报：这是 silence marker，不是 pinyin
+真实拼音:  (无)           ← 没有任何真正的拼音泄漏
+```
+
+### 根因链
+
+1. `_finalise_textgrid` (Phase 2) 在 `final_text` 前追加 `<sp1>`（raw_text 需要保留 `<sp1>`——这是设计要求）
+2. QC 正则 `\b[a-z]+[1-5]\b` 在未经 strip 的 raw_text 上运行，将 `sp1` 匹配为拼音音节：
+   - `\b` 在 `<`（非 word char）和 `s`（word char）之间匹配
+   - `[a-z]+` 匹配 `sp`，`[1-5]` 匹配 `1`
+   - `\b` 在 `1`（word char）和 `>`（非 word char）之间匹配
+3. `<sp2>`, `<sp3>` 同理会被匹配为 `sp2`, `sp3`
+
+### 修改点
+
+**QC 正则双保险** (~line 5289-5293) — 仅修改检查侧，不修改 raw_text 内容：
+
+- Layer 1: `_re.sub(r'<sp\d+>', '', _iv.text)` — 检查前 strip 所有 `<spN>` 标签
+- Layer 2: `(?!sp\d\b)` 负向预查 — 即使标签残留也不匹配
+
+### 影响范围
+
+修复前：`shayi_huali_new` 100% 文件被标记 `pinyin_in_text`，纱依 8730 + 花礼 11034 = 19764 文件被过滤
+修复后：`pinyin_in_text` 回归真实语义（真正的拼音泄漏才触发），过滤数大幅下降
+
+### 关联样本
+
+- `shayi_huali_new` — 纱依 8730 filtered, 花礼 11034 filtered
+- 新版合成英文数据对齐 — 同样受影响
 
 ---
 

@@ -1146,7 +1146,9 @@ def _run_mfa_sharded(
     _shard_dirs: list[Path] = []
     _shard_stems: list[list[str]] = []
     _t0 = time.time()
-    _total_links = 0
+
+    # Phase 1: create directories + collect symlink pairs (sequential, cheap)
+    _link_tasks: list[tuple[Path, Path]] = []  # (src, dst)
 
     for _si in range(_n_shards):
         _ss = stems[_si * _per_shard : (_si + 1) * _per_shard]
@@ -1163,20 +1165,41 @@ def _run_mfa_sharded(
         for _stem in _ss:
             _src = corpus_dir / f"{_stem}.lab"
             if _src.exists():
-                (_sd / "corpus" / f"{_stem}.lab").symlink_to(_src)
-                _total_links += 1
+                _link_tasks.append((_src, _sd / "corpus" / f"{_stem}.lab"))
             _src = audio_dir / f"{_stem}.wav"
             if _src.exists():
-                (_sd / "audio" / f"{_stem}.wav").symlink_to(_src)
-                _total_links += 1
+                _link_tasks.append((_src, _sd / "audio" / f"{_stem}.wav"))
             if anchors_dir:
                 _src = anchors_dir / f"{_stem}.TextGrid"
                 if _src.exists():
-                    (_sd / "anchors" / f"{_stem}.TextGrid").symlink_to(_src)
-                    _total_links += 1
+                    _link_tasks.append((_src, _sd / "anchors" / f"{_stem}.TextGrid"))
+
+    # Phase 2: parallel symlink creation (each symlink is an independent
+    # filesystem metadata operation — threads are the right fit)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    _total_links = 0
+    _link_failures = 0
+    _n_threads = min(32, len(_link_tasks))
+    with ThreadPoolExecutor(max_workers=_n_threads) as _executor:
+        _futures = {
+            _executor.submit(os.symlink, str(_src), str(_dst)): (_src, _dst)
+            for _src, _dst in _link_tasks
+        }
+        for _future in as_completed(_futures):
+            _src, _dst = _futures[_future]
+            try:
+                _future.result()
+                _total_links += 1
+            except FileExistsError:
+                _total_links += 1  # already linked (e.g. re-run)
+            except Exception:
+                _link_failures += 1
 
     _elapsed = time.time() - _t0
-    print(f"  Symlinked {_total_links} files in {_elapsed:.1f}s")
+    _msg = f"  Symlinked {_total_links} files in {_elapsed:.1f}s"
+    if _link_failures:
+        _msg += f" ({_link_failures} failures)"
+    print(_msg)
 
     # ── Launch parallel MFA instances ──
     _procs: list[tuple[int, subprocess.Popen, Path]] = []

@@ -112,58 +112,54 @@ def _restore_ctc_adj_cache(local_workspace: Path, nas_speaker: Path) -> bool:
             return False
 
 
-def run_single_batch(
+# ═══════════════════════════════════════════════════════════════
+# Composable batch operations — Stage / Process / Upload / Cleanup
+# ═══════════════════════════════════════════════════════════════
+
+def _stage_one_batch(
     ds: dict, batch_idx: int, batch_stems: list[str],
     layout_map: dict, wav_index: dict,
-    local_base: Path, config: Path,
-    mfa_python: Path, models_dir: Path,
-    nas_output_root: Path,
-    batch_size: int, python_path: str | None = None,
-    mode: str = "ctc_ready",
+    local_base: Path, mode: str = "ctc_ready",
     text_index: dict[str, Path] | None = None,
-    device: str = "",
-) -> bool:
-    """Process a single batch (one set of stems) end-to-end.
+) -> tuple[Path, float, int]:
+    """Phase 1: NAS → NVMe. Copy WAV + CTC files for one batch.
 
-    Prefetch → run_pipeline → upload → cleanup.  Synchronous; designed
-    to be called from a ThreadPoolExecutor worker for batch-level parallelism.
-
-    Args:
-        mode: "ctc_ready" (pre-existing CTC, fast) or "nvrasr_fallback"
-              (no/incomplete CTC, runs NVASR from scratch).
-        text_index: {stem: txt_path} for NVASR reference text (fallback only).
+    Returns:
+        (local_dir, elapsed_seconds, missing_audio_count).
+        Never raises — missing files are logged, not fatal.
     """
     local_dir = local_base / f"batch_{batch_idx:04d}"
     local_audio = local_dir / "audio"
     local_ctc = local_dir / "ctc"
-    local_output = local_dir / "output"
-    local_workspace = local_dir / "workspace"
 
     nas_ctc_dir = resolve_input_path(ds.get("ctc_dir", ""))
     nas_audio_dir = resolve_input_path(ds.get("audio_dir", ""))
-    nas_output = nas_output_root / ds["name"]
-
     is_fallback = (mode == "nvrasr_fallback")
 
-    # ── 1. Prefetch: NAS → local NVMe ──
     t0 = time.time()
     local_audio.mkdir(parents=True, exist_ok=True)
+    if not is_fallback:
+        local_ctc.mkdir(parents=True, exist_ok=True)
 
     import concurrent.futures as _cf2
     copy_tasks: list[tuple[Path, Path]] = []
+    missing_audio = 0
+
     for stem in batch_stems:
         src_wav = wav_index.get(stem)
         if src_wav is None:
             src_wav = find_wav(nas_audio_dir, stem)
         if src_wav:
             copy_tasks.append((src_wav, local_audio / f"{stem}.wav"))
+        else:
+            missing_audio += 1
+
         if is_fallback:
             # Copy .txt reference text alongside audio for NVASR
             txt_src = None
             if text_index and stem in text_index:
                 txt_src = text_index[stem]
             else:
-                # Try flat, then nested layout
                 for txt_path in (nas_audio_dir / f"{stem}.txt",
                                  nas_audio_dir / stem / f"{stem}.txt"):
                     if txt_path.exists():
@@ -173,8 +169,6 @@ def run_single_batch(
                 copy_tasks.append((txt_src, local_audio / f"{stem}.txt"))
         else:
             # ctc_ready: copy CTC files
-            if not is_fallback:
-                local_ctc.mkdir(parents=True, exist_ok=True)
             layout = layout_map.get(stem, "flat")
             ctc_base = nas_ctc_dir / stem if layout == "nested" else nas_ctc_dir
             for suffix in CTC_SUFFIXES:
@@ -182,6 +176,12 @@ def run_single_batch(
                     (ctc_base / f"{stem}{suffix}",
                      local_ctc / f"{stem}{suffix}")
                 )
+
+    if not copy_tasks:
+        elapsed = time.time() - t0
+        print(f"  [STAGE {batch_idx:04d}] WARNING: no files to copy "
+              f"(missing_audio={missing_audio})")
+        return local_dir, elapsed, missing_audio
 
     n_workers = min(8, max(1, len(copy_tasks) // 100))
     failed_copies = 0
@@ -193,9 +193,10 @@ def run_single_batch(
                     failed_copies += 1
             except Exception:
                 failed_copies += 1
+
     if failed_copies:
-        print(f"  [BATCH {batch_idx:04d}] WARNING: {failed_copies}/{len(copy_tasks)} "
-              f"prefetch copies failed (source files missing on NAS?)")
+        print(f"  [STAGE {batch_idx:04d}] WARNING: {failed_copies}/{len(copy_tasks)} "
+              f"copies failed (source files missing on NAS?)")
 
     # Write manifest for run_pipeline.py (ctc_ready only)
     if not is_fallback:
@@ -203,14 +204,51 @@ def run_single_batch(
         (local_ctc / "ctc_ready_manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False))
 
-    prefetch_elapsed = time.time() - t0
+    elapsed = time.time() - t0
+    return local_dir, elapsed, missing_audio
 
-    # ── 1.5 Restore cached adjust output (skip expensive adjust_ctc step) ──
-    adj_cached = _restore_ctc_adj_cache(local_workspace, nas_output)
-    if adj_cached:
-        print(f"  [BATCH {batch_idx:04d}] Restored ctc_pretg_adj from NAS cache")
 
-    # ── 2. Process: run_pipeline.py ──
+def _process_one_batch(
+    ds: dict, batch_idx: int, batch_stems: list[str],
+    local_base: Path, config: Path,
+    mfa_python: Path, models_dir: Path,
+    nas_output_root: Path,
+    batch_size: int, python_path: str | None = None,
+    mode: str = "ctc_ready",
+    device: str = "",
+    restore_cache: bool = True,
+    persist_cache_on_failure: bool = True,
+) -> bool:
+    """Phase 2: NVMe → NVMe. Run run_pipeline.py on locally-staged data.
+
+    All reads and writes are on local NVMe — zero CIFS/NAS I/O during
+    processing (unless *restore_cache* is True, which does one NAS read
+    to fetch cached CTC adjust output).
+
+    Args:
+        restore_cache: If True, attempt to restore ctc_pretg_adj from NAS
+                       before processing (saves re-running adjust_ctc).
+                       Set False in staged mode (adjust runs fast on NVMe).
+        persist_cache_on_failure: If True, upload CTC cache to NAS on failure.
+                                  Set False in staged mode (upload happens in Phase 3).
+    """
+    local_dir = local_base / f"batch_{batch_idx:04d}"
+    local_audio = local_dir / "audio"
+    local_ctc = local_dir / "ctc"
+    local_output = local_dir / "output"
+    local_workspace = local_dir / "workspace"
+
+    nas_output = nas_output_root / ds["name"]
+    is_fallback = (mode == "nvrasr_fallback")
+
+    # ── Restore cached adjust output (optional NAS read) ──
+    if restore_cache:
+        adj_cached = _restore_ctc_adj_cache(local_workspace, nas_output)
+        if adj_cached:
+            print(f"  [PROC  {batch_idx:04d}] Restored ctc_pretg_adj from NAS cache")
+
+    # ── Run pipeline ──
+    local_workspace.mkdir(parents=True, exist_ok=True)
     cmd = [
         str(mfa_python),
         str(PROJECT_ROOT / "scripts" / "run_pipeline.py"),
@@ -222,24 +260,18 @@ def run_single_batch(
         "--python", str(mfa_python),
         "--overwrite", "--force",
     ]
-    if is_fallback:
-        # nvrasr_fallback: no --ctc-ready, NVASR generates CTC from scratch
-        pass
-    else:
+    if not is_fallback:
         cmd += ["--ctc-ready", str(local_ctc)]
-    # GPU device assignment for NVASR CTC pre-alignment
     if device:
-        # When CUDA_VISIBLE_DEVICES=N is set (below), physical GPU N
-        # appears as device 0 inside the subprocess.  Pass cuda:0 so
-        # the remapped index matches the visible device.
         cmd += ["--device", "cuda:0"]
-    t1 = time.time()
+
+    t0 = time.time()
     env = get_mfa_env(mfa_python, models_dir)
     if device:
-        # Isolate worker to its assigned GPU only
         gpu_idx = device.replace("cuda:", "")
         if gpu_idx.isdigit():
             env["CUDA_VISIBLE_DEVICES"] = gpu_idx
+
     try:
         rc = subprocess.run(
             cmd, env=env,
@@ -247,19 +279,35 @@ def run_single_batch(
         ).returncode
     except subprocess.TimeoutExpired:
         rc = 1
-    process_elapsed = time.time() - t1
+
+    elapsed = time.time() - t0
 
     if rc != 0:
-        print(f"  [BATCH {batch_idx:04d}] {ds['name']} FAIL (rc={rc}) "
-              f"(prefetch={prefetch_elapsed:.0f}s process={process_elapsed:.0f}s)")
-        # Even on failure, preserve ctc_pretg_adj (expensive adjust output) to NAS
-        _persist_ctc_adj_cache(local_workspace, nas_output)
-        shutil.rmtree(local_dir, ignore_errors=True)
+        print(f"  [PROC  {batch_idx:04d}] {ds['name']} FAIL (rc={rc}) "
+              f"({elapsed:.0f}s)")
+        if persist_cache_on_failure:
+            _persist_ctc_adj_cache(local_workspace, nas_output)
+        _cleanup_one_batch_dir(local_dir)
         return False
 
-    # ── 3. Upload: local NVMe → NAS ──
-    t2 = time.time()
+    print(f"  [PROC  {batch_idx:04d}] {ds['name']} OK ({elapsed:.0f}s)")
+    return True
+
+
+def _upload_one_batch(
+    local_dir: Path, nas_output_root: Path, ds_name: str,
+) -> bool:
+    """Phase 3: NVMe → NAS. rsync batch results to NAS.
+
+    Returns True on success, False if any upload failed.
+    """
+    local_output = local_dir / "output"
+    local_workspace = local_dir / "workspace"
+    nas_output = nas_output_root / ds_name
+
+    t0 = time.time()
     upload_ok = True
+
     for local_src, nas_rel in [
         (local_output, nas_output / "output"),
         (local_workspace / "filtered", nas_output / "filtered"),
@@ -279,7 +327,7 @@ def run_single_batch(
                     print(f"    rsync warning: rc={rc_up} for {local_src}")
             except subprocess.TimeoutExpired:
                 print(f"    rsync TIMEOUT for {local_src}, falling back to copy")
-                rsync = None  # fall through to manual copy
+                rsync = None
         if not rsync:
             try:
                 for f in local_src.rglob("*"):
@@ -292,16 +340,68 @@ def run_single_batch(
                 print(f"    Upload copy error: {e}")
                 upload_ok = False
 
-    upload_elapsed = time.time() - t2
+    elapsed = time.time() - t0
+    if upload_ok:
+        print(f"  [UPLOAD] {ds_name} batch done ({elapsed:.1f}s)")
+    else:
+        print(f"  [UPLOAD] {ds_name} batch FAILED")
+    return upload_ok
 
-    # ── 4. Cleanup ──
-    shutil.rmtree(local_dir, ignore_errors=True)
 
-    total = time.time() - t0
-    print(f"  [BATCH {batch_idx:04d}] {ds['name']} OK "
-          f"(prefetch={prefetch_elapsed:.0f}s process={process_elapsed:.0f}s "
-          f"upload={upload_elapsed:.0f}s total={total:.0f}s)")
-    return True
+def _cleanup_one_batch_dir(local_dir: Path) -> None:
+    """Remove one batch directory from NVMe."""
+    if local_dir.exists():
+        shutil.rmtree(local_dir, ignore_errors=True)
+
+
+# ── Convenience: all-in-one batch (original streaming behavior) ──
+
+def run_single_batch(
+    ds: dict, batch_idx: int, batch_stems: list[str],
+    layout_map: dict, wav_index: dict,
+    local_base: Path, config: Path,
+    mfa_python: Path, models_dir: Path,
+    nas_output_root: Path,
+    batch_size: int, python_path: str | None = None,
+    mode: str = "ctc_ready",
+    text_index: dict[str, Path] | None = None,
+    device: str = "",
+) -> bool:
+    """Process a single batch end-to-end (original streaming behavior).
+
+    Stage → Process → Upload → Cleanup.  Kept for backward compatibility
+    with pipelined mode and direct callers.  For the new staged model,
+    use _stage_one_batch / _process_one_batch / _upload_one_batch directly.
+    """
+    t_start = time.time()
+    local_dir, prefetch_elapsed, _missing = _stage_one_batch(
+        ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
+        layout_map=layout_map, wav_index=wav_index,
+        local_base=local_base, mode=mode, text_index=text_index,
+    )
+
+    ok = _process_one_batch(
+        ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
+        local_base=local_base, config=config,
+        mfa_python=mfa_python, models_dir=models_dir,
+        nas_output_root=nas_output_root,
+        batch_size=batch_size, python_path=python_path,
+        mode=mode, device=device,
+        restore_cache=True, persist_cache_on_failure=True,
+    )
+    if not ok:
+        return False
+
+    upload_ok = _upload_one_batch(
+        local_dir=local_dir, nas_output_root=nas_output_root,
+        ds_name=ds["name"],
+    )
+    _cleanup_one_batch_dir(local_dir)
+
+    total = time.time() - t_start
+    print(f"  [BATCH {batch_idx:04d}] {ds['name']} "
+          f"{'OK' if upload_ok else 'UPLOAD FAIL'} ({total:.0f}s)")
+    return upload_ok
 
 
 def _merge_to_nas(src: Path, dst: Path) -> bool:
@@ -897,6 +997,18 @@ Examples:
                         help="Max completed batches awaiting NAS upload (0=auto: 4). "
                              "Backpressure prevents NVMe exhaustion when NAS is slow.")
 
+    # ── Staged execution mode ──
+    parser.add_argument("--stage-all", action="store_true", default=True,
+                        help="Stage all data to NVMe before processing (default). "
+                             "Phase 1: NAS→NVMe, Phase 2: NVMe→NVMe (zero CIFS), "
+                             "Phase 3: NVMe→NAS bulk upload.")
+    parser.add_argument("--no-stage-all", "--streaming", action="store_false",
+                        dest="stage_all",
+                        help="Streaming mode: interleave prefetch/process/upload per batch. "
+                             "Use when NVMe space is limited.")
+    parser.add_argument("--force-stage", action="store_true",
+                        help="Force stage-all even if NVMe space appears insufficient.")
+
     # ── Pipeline config ──
     parser.add_argument("--config", type=Path,
                         default=PROJECT_ROOT / "config.yaml")
@@ -1016,7 +1128,9 @@ Examples:
     use_streaming = (not args.direct and args.local_work is not None and remote)
 
     if use_streaming:
-        print(f"Mode:      STREAMING (remote fs → prefetch to {args.local_work})")
+        _staged = getattr(args, 'stage_all', True)
+        _mode_label = "STAGED" if _staged else "STREAMING"
+        print(f"Mode:      {_mode_label} (remote fs → prefetch to {args.local_work})")
         ok = run_single_dataset(
             nas_ctc=str(ctc_dir), nas_audio=str(data_dir),
             nas_output=str(output_dir or (ctc_dir.parent / "mfa_output")),
@@ -1025,6 +1139,7 @@ Examples:
             python_path=args.python,
             prefetch_buffer=args.prefetch_buffer,
             upload_buffer=args.upload_buffer,
+            staged=_staged,
         )
         if not ok:
             sys.exit(1)
@@ -1045,8 +1160,19 @@ def run_single_dataset(
     stems_override: list[str] | None = None,
     prefetch_buffer: int = 4,
     upload_buffer: int = 4,
+    staged: bool = True,
+    mfa_num_jobs: int = 0,
+    device: str = "",
+    parallel_batches: int = 4,
 ) -> bool:
-    """Run streaming pipeline for a single dataset.  Returns True on success."""
+    """Run pipeline for a single dataset.  Returns True on success.
+
+    Args:
+        staged: If True (default), use Stage All → Process All → Upload All.
+                If False, use streaming (interleaved prefetch/process/upload).
+    """
+    import concurrent.futures as _cf3
+
     # ── Ensure MFA model is pre-extracted before subprocess starts ──
     _ensure_mfa_model_extracted()
 
@@ -1105,8 +1231,6 @@ def run_single_dataset(
     print(f"MFA Python: {mfa_python}")
 
     models_dir = PROJECT_ROOT / "models" / "mfa"
-
-    # ── Setup batch manager ──
     local_work.mkdir(parents=True, exist_ok=True)
 
     batch_mgr = BatchManager(
@@ -1119,18 +1243,131 @@ def run_single_dataset(
         wav_index=wav_index,
     )
 
-    # ── Run ──
-    pipeline = StreamingPipeline(
-        batch_mgr=batch_mgr,
-        pipeline_script=PROJECT_ROOT / "scripts" / "run_pipeline.py",
-        config_path=config,
-        mfa_python=mfa_python,
-        models_dir=models_dir,
-        nas_output_root=nas_output_root,
-        prefetch_buffer=prefetch_buffer,
-        upload_buffer=upload_buffer,
-    )
-    return pipeline.run()
+    if not staged:
+        # ── Streaming mode (original behavior) ──
+        pipeline = StreamingPipeline(
+            batch_mgr=batch_mgr,
+            pipeline_script=PROJECT_ROOT / "scripts" / "run_pipeline.py",
+            config_path=config,
+            mfa_python=mfa_python,
+            models_dir=models_dir,
+            nas_output_root=nas_output_root,
+            prefetch_buffer=prefetch_buffer,
+            upload_buffer=upload_buffer,
+        )
+        return pipeline.run()
+
+    # ═══════════════════════════════════════════════════════════
+    # Staged mode: Stage All → Process All → Upload All
+    # ═══════════════════════════════════════════════════════════
+    print(f"\n  Mode: STAGED — {len(batch_mgr)} batches, "
+          f"{batch_size} stems/batch")
+
+    ds = {"name": nas_output_root.name,
+          "ctc_dir": str(nas_ctc_dir),
+          "audio_dir": str(nas_audio_dir)}
+
+    # ── Phase 1: Stage all batches NAS→NVMe ──
+    print(f"\n  PHASE 1: Staging {len(batch_mgr)} batches NAS → NVMe ...")
+    staged_dirs: dict[int, Path] = {}
+    stage_failures: set[int] = set()
+    t_stage = time.time()
+
+    for bi in range(len(batch_mgr)):
+        bstems = batch_mgr.batches[bi]
+        try:
+            local_dir, elapsed, missing = _stage_one_batch(
+                ds=ds, batch_idx=bi, batch_stems=bstems,
+                layout_map=layout_map, wav_index=wav_index,
+                local_base=local_work, mode="ctc_ready",
+            )
+            staged_dirs[bi] = local_dir
+        except Exception as exc:
+            print(f"  [STAGE] FAIL batch {bi}: {exc}")
+            stage_failures.add(bi)
+
+    print(f"  PHASE 1 DONE: {len(staged_dirs)}/{len(batch_mgr)} staged "
+          f"({time.time() - t_stage:.0f}s)")
+
+    # ── Phase 2: Process all batches NVMe→NVMe ──
+    import concurrent.futures as _cf4
+    print(f"\n  PHASE 2: Processing {len(staged_dirs)} batches on NVMe "
+          f"(zero CIFS I/O, {parallel_batches} workers) ...")
+    t_proc = time.time()
+    proc_ok = 0
+    proc_fail = 0
+    proc_lock = threading.Lock()
+
+    def _proc_one(bi: int) -> bool:
+        bstems = batch_mgr.batches[bi]
+        return _process_one_batch(
+            ds=ds, batch_idx=bi, batch_stems=bstems,
+            local_base=local_work, config=config,
+            mfa_python=mfa_python, models_dir=models_dir,
+            nas_output_root=nas_output_root,
+            batch_size=batch_size, python_path=python_path,
+            mode="ctc_ready", device=device,
+            restore_cache=False,
+            persist_cache_on_failure=False,
+        )
+
+    n_proc = min(parallel_batches, len(staged_dirs))
+    if n_proc <= 1:
+        for bi in sorted(staged_dirs.keys()):
+            ok = _proc_one(bi)
+            if ok:
+                proc_ok += 1
+            else:
+                proc_fail += 1
+    else:
+        with _cf4.ThreadPoolExecutor(max_workers=n_proc) as pool:
+            futures = {pool.submit(_proc_one, bi): bi for bi in staged_dirs}
+            for fut in _cf4.as_completed(futures):
+                try:
+                    if fut.result():
+                        with proc_lock:
+                            proc_ok += 1
+                    else:
+                        with proc_lock:
+                            proc_fail += 1
+                except Exception as exc:
+                    bi = futures[fut]
+                    print(f"  [PROC] CRASH batch {bi}: {exc}")
+                    with proc_lock:
+                        proc_fail += 1
+
+    print(f"  PHASE 2 DONE: {proc_ok} OK, {proc_fail} FAIL "
+          f"({time.time() - t_proc:.0f}s)")
+
+    # ── Phase 3: Upload all results NVMe→NAS ──
+    print(f"\n  PHASE 3: Uploading {proc_ok} batches NVMe → NAS ...")
+    t_up = time.time()
+    up_ok = 0
+    up_fail = 0
+
+    for bi in sorted(staged_dirs.keys()):
+        local_dir = staged_dirs[bi]
+        if _upload_one_batch(
+            local_dir=local_dir,
+            nas_output_root=nas_output_root,
+            ds_name=ds["name"],
+        ):
+            up_ok += 1
+        else:
+            up_fail += 1
+        _cleanup_one_batch_dir(local_dir)
+
+    # Cleanup any remaining staged dirs
+    for local_dir in staged_dirs.values():
+        if local_dir.exists():
+            _cleanup_one_batch_dir(local_dir)
+
+    total_elapsed = time.time() - t_stage
+    print(f"  PHASE 3 DONE: {up_ok} uploaded, {up_fail} FAIL "
+          f"({time.time() - t_up:.0f}s)")
+    print(f"  SINGLE DATASET TOTAL: {total_elapsed:.0f}s")
+
+    return proc_fail == 0 and up_fail == 0
 
 
 def _load_checkpoint(ckpt_path: Path) -> set[str]:
@@ -1176,6 +1413,293 @@ def _save_batch_progress(ckpt_path: Path, ds_name: str,
         tmp.replace(progress_path)
     except Exception:
         pass  # best-effort, don't block on I/O
+
+
+def _execute_staged(
+    args, all_batches: list, cache: dict, ckpt_path: Path,
+    completed_set: set, failed_set: set,
+    usable_drives: list, mfa_python: Path, models_dir: Path,
+    parallel: int, ds_batch_tracker: dict,
+    batch_size: int,
+) -> tuple[int, list[str]]:
+    """Three-phase staged execution: Stage All → Process All → Upload All.
+
+    Phase 1: Copy ALL data NAS→NVMe (parallel, CIFS-optimized).
+    Phase 2: Process ALL batches NVMe→NVMe (zero CIFS I/O).
+    Phase 3: Upload ALL results NVMe→NAS (sequential per-dataset).
+
+    Returns (ok_count, fail_list) for dataset-level accounting.
+    """
+    import concurrent.futures
+    import queue as _queue
+
+    total_batches = len(all_batches)
+    nas_output_root = resolve_input_path(
+        cache.get("output_root", "").rstrip("/"), PROJECT_ROOT)
+    ckpt_lock = threading.Lock()
+
+    # ═══════════════════════════════════════════════════════════
+    # Phase 1 — STAGE ALL: NAS → NVMe
+    # ═══════════════════════════════════════════════════════════
+    print(f"\n{'='*60}")
+    print(f"  PHASE 1: STAGE ALL — {total_batches} batches NAS → NVMe")
+    print(f"{'='*60}")
+
+    # Build staging task list with pre-assigned drives
+    stage_tasks: list[tuple] = []  # (global_idx, batch_tuple, drive, local_base)
+    staged_dirs: dict[int, Path] = {}  # global_idx → local_dir
+    for gidx, item in enumerate(all_batches):
+        drive = usable_drives[gidx % len(usable_drives)]
+        local_base = drive / f"staged_worker_{gidx % parallel}"
+        stage_tasks.append((gidx, item, local_base))
+    # Shuffle so large datasets don't all land on same drive
+    # (already interleaved by round-robin above)
+
+    stage_failures: set[int] = set()
+    stage_lock = threading.Lock()
+    stage_completed = 0
+
+    def stage_worker(wid: int) -> None:
+        nonlocal stage_completed
+        while True:
+            with stage_lock:
+                if not stage_tasks:
+                    break
+                gidx, (batch_mode, ds, batch_idx, batch_stems,
+                       layout_map, wav_index, text_index), local_base = stage_tasks.pop(0)
+            ds_name = ds["name"]
+            try:
+                local_dir, elapsed, missing = _stage_one_batch(
+                    ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
+                    layout_map=layout_map, wav_index=wav_index,
+                    local_base=local_base, mode=batch_mode, text_index=text_index,
+                )
+                staged_dirs[gidx] = local_dir
+            except Exception as exc:
+                print(f"  [STAGE] FAIL {ds_name}/{batch_idx:04d}: {exc}")
+                import traceback as _tb
+                _tb.print_exc()
+                stage_failures.add(gidx)
+            with stage_lock:
+                stage_completed += 1
+                if stage_completed % max(1, total_batches // 20) == 0:
+                    print(f"  [STAGE] {stage_completed}/{total_batches} batches "
+                          f"({stage_completed * 100 // total_batches}%)")
+
+    n_stage_workers = min(parallel, 8, total_batches)
+    t_stage_start = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_stage_workers) as pool:
+        futures = [pool.submit(stage_worker, wid) for wid in range(n_stage_workers)]
+        for f in concurrent.futures.as_completed(futures):
+            f.result()  # propagate exceptions (though we catch internally)
+    stage_elapsed = time.time() - t_stage_start
+
+    n_staged = total_batches - len(stage_failures)
+    print(f"\n  PHASE 1 DONE: {n_staged}/{total_batches} batches staged "
+          f"({stage_elapsed:.0f}s)")
+    if stage_failures:
+        print(f"  WARNING: {len(stage_failures)} batches failed staging — "
+              f"they will be skipped in Phase 2")
+
+    # ═══════════════════════════════════════════════════════════
+    # Phase 2 — PROCESS ALL: NVMe → NVMe (ZERO CIFS I/O)
+    # ═══════════════════════════════════════════════════════════
+    print(f"\n{'='*60}")
+    print(f"  PHASE 2: PROCESS ALL — {n_staged} batches on NVMe")
+    print(f"  (Zero CIFS I/O — all reads/writes on local SSD)")
+    print(f"{'='*60}")
+
+    # Build process queue: only successfully-staged batches
+    # Format: (global_idx, batch_mode, ds, batch_idx, batch_stems,
+    #          layout_map, wav_index, text_index)
+    proc_items: list[tuple] = []
+    for gidx, (batch_mode, ds, batch_idx, batch_stems,
+               layout_map, wav_index, text_index) in enumerate(all_batches):
+        if gidx in stage_failures:
+            ds_name = ds["name"]
+            ds_batch_tracker[ds_name]["fail"] += 1
+            continue
+        proc_items.append((gidx, batch_mode, ds, batch_idx, batch_stems,
+                           layout_map, wav_index, text_index))
+
+    n_to_process = len(proc_items)
+    proc_queue: _queue.Queue = _queue.Queue()
+    for item in proc_items:
+        proc_queue.put(item)
+
+    def process_worker(wid: int) -> tuple[int, list[str]]:
+        w_ok = 0
+        w_fails: list[str] = []
+        gpu_id = wid % args.gpus
+        device_str = f"cuda:{gpu_id}"
+
+        while True:
+            try:
+                (gidx, batch_mode, ds, batch_idx, batch_stems,
+                 layout_map, wav_index, text_index) = proc_queue.get_nowait()
+            except _queue.Empty:
+                break
+
+            # Derive local_base from the BATCH's gidx (not worker wid) so
+            # staged files are found at the same path used during Phase 1.
+            drive = usable_drives[gidx % len(usable_drives)]
+            local_base = drive / f"staged_worker_{gidx % parallel}"
+
+            ds_name = ds["name"]
+            remaining = proc_queue.qsize()
+            mode_tag = f" [{batch_mode}]" if batch_mode != "ctc_ready" else ""
+            print(f"\n  [W{wid}:{device_str}] [{gidx+1}/{total_batches}]"
+                  f" {ds_name}/{batch_idx:04d} ({len(batch_stems)} stems){mode_tag}"
+                  f" [{remaining} left]")
+
+            try:
+                ok = _process_one_batch(
+                    ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
+                    local_base=local_base, config=args.config,
+                    mfa_python=mfa_python, models_dir=models_dir,
+                    nas_output_root=nas_output_root,
+                    batch_size=batch_size, python_path=args.python,
+                    mode=batch_mode, device=device_str,
+                    restore_cache=False,           # NO NAS I/O
+                    persist_cache_on_failure=False, # upload in Phase 3
+                )
+            except Exception as _exc:
+                print(f"  [W{wid}] CRASH {ds_name}/{batch_idx:04d}: {_exc}")
+                import traceback as _tb
+                _tb.print_exc()
+                ok = False
+
+            with ckpt_lock:
+                tracker = ds_batch_tracker[ds_name]
+                if ok:
+                    tracker["done"] += 1
+                else:
+                    tracker["fail"] += 1
+                _save_batch_progress(ckpt_path, ds_name,
+                                     tracker["done"], tracker["fail"], tracker["total"])
+                if tracker["done"] + tracker["fail"] >= tracker["total"]:
+                    if tracker["fail"] == 0:
+                        w_ok += 1
+                    else:
+                        w_fails.append(ds_name)
+                    status = "DONE" if tracker["fail"] == 0 else "FAIL"
+                    print(f"  [W{wid}] {ds_name} — {status} "
+                          f"({tracker['done']}/{tracker['total']} batches)")
+
+        return w_ok, w_fails
+
+    t_proc_start = time.time()
+    ok_count = 0
+    fail_list: list[str] = []
+    n_proc_workers = min(parallel, n_to_process)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_proc_workers) as pool:
+        futures = [pool.submit(process_worker, wid) for wid in range(n_proc_workers)]
+        for fut in concurrent.futures.as_completed(futures):
+            w_ok, w_fails = fut.result()
+            ok_count += w_ok
+            fail_list.extend(w_fails)
+    proc_elapsed = time.time() - t_proc_start
+
+    # Checkpoint datasets that completed in Phase 2
+    for ds_name in list(ds_batch_tracker.keys()):
+        t = ds_batch_tracker[ds_name]
+        if t["done"] + t["fail"] >= t["total"]:
+            if t["fail"] == 0:
+                completed_set.add(ds_name)
+            else:
+                failed_set.add(ds_name)
+    _save_checkpoint(ckpt_path, completed_set, failed_set)
+    print(f"\n  PHASE 2 DONE: {ok_count} datasets OK, "
+          f"{n_to_process} batches processed ({proc_elapsed:.0f}s)")
+
+    # ═══════════════════════════════════════════════════════════
+    # Phase 3 — UPLOAD ALL: NVMe → NAS
+    # ═══════════════════════════════════════════════════════════
+    print(f"\n{'='*60}")
+    print(f"  PHASE 3: UPLOAD ALL — results NVMe → NAS")
+    print(f"{'='*60}")
+
+    # Group successfully-processed batches by dataset.
+    # Failed batches were already cleaned up by _process_one_batch,
+    # so they are naturally skipped by local_dir.exists() below.
+    ds_upload_batches: dict[str, list[tuple[int, Path]]] = {}  # {ds_name: [(gidx, local_dir), ...]}
+    for gidx, (batch_mode, ds, batch_idx, batch_stems,
+               layout_map, wav_index, text_index) in enumerate(all_batches):
+        if gidx in stage_failures:
+            continue
+        ds_name = ds["name"]
+        local_dir = staged_dirs.get(gidx)
+        if local_dir and local_dir.exists():
+            ds_upload_batches.setdefault(ds_name, []).append((gidx, local_dir))
+
+    upload_failures: list[str] = []
+    upload_lock = threading.Lock()
+    upload_total = sum(len(v) for v in ds_upload_batches.values())
+    upload_done = 0
+
+    def upload_dataset(ds_name: str, batches: list[tuple[int, Path]]) -> bool:
+        nonlocal upload_done
+        ok = True
+        for gidx, local_dir in batches:
+            if not _upload_one_batch(
+                local_dir=local_dir,
+                nas_output_root=nas_output_root,
+                ds_name=ds_name,
+            ):
+                ok = False
+            _cleanup_one_batch_dir(local_dir)
+            with upload_lock:
+                upload_done += 1
+        return ok
+
+    t_upload_start = time.time()
+    n_upload_workers = min(parallel, 4, len(ds_upload_batches))
+    if ds_upload_batches:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, n_upload_workers)) as pool:
+            upload_futures = {
+                pool.submit(upload_dataset, ds_name, batches): ds_name
+                for ds_name, batches in ds_upload_batches.items()
+            }
+            for fut in concurrent.futures.as_completed(upload_futures):
+                ds_name = upload_futures[fut]
+                try:
+                    if fut.result():
+                        print(f"  [UPLOAD] {ds_name} — DONE")
+                    else:
+                        print(f"  [UPLOAD] {ds_name} — FAILED")
+                        upload_failures.append(ds_name)
+                except Exception as e:
+                    print(f"  [UPLOAD] {ds_name} — CRASH: {e}")
+                    upload_failures.append(ds_name)
+    else:
+        print(f"  No batches to upload.")
+
+    upload_elapsed = time.time() - t_upload_start
+
+    # ── Cleanup any remaining staged dirs ──
+    for local_dir in staged_dirs.values():
+        if local_dir.exists():
+            _cleanup_one_batch_dir(local_dir)
+
+    # Remove failed uploads from completed set
+    for ds_name in upload_failures:
+        completed_set.discard(ds_name)
+        failed_set.add(ds_name)
+    _save_checkpoint(ckpt_path, completed_set, failed_set)
+
+    total_elapsed = time.time() - t_stage_start
+    print(f"\n  PHASE 3 DONE: {upload_done - len(upload_failures)}/{upload_total} "
+          f"batches uploaded ({upload_elapsed:.0f}s)")
+    print(f"  STAGED TOTAL: stage={stage_elapsed:.0f}s + "
+          f"process={proc_elapsed:.0f}s + upload={upload_elapsed:.0f}s "
+          f"= {total_elapsed:.0f}s")
+
+    # Recalculate ok_count excluding upload failures
+    ok_count = len([d for d in completed_set
+                    if d not in upload_failures])
+    fail_list = list(failed_set)
+
+    return ok_count, fail_list
 
 
 def run_batch(args) -> None:
@@ -1487,16 +2011,9 @@ def run_batch(args) -> None:
         print("ERROR: No batches to process!")
         sys.exit(1)
 
-    # Phase 2: put all batches into shared queue
-    batch_queue: _queue.Queue = _queue.Queue()
-    global_batch_idx = 0
-    for item in all_batches:
-        batch_queue.put((global_batch_idx, item))
-        global_batch_idx += 1
-    total_batches = global_batch_idx
-
     # Track per-dataset completion: all batches of a dataset must
     # succeed before marking the dataset as DONE in checkpoint.
+    total_batches = len(all_batches)
     ds_batch_tracker: dict[str, dict] = {}  # {ds_name: {"total": N, "done": n, "fail": n}}
     for ds_item in all_batches:
         # ds_item format: (mode, ds, batch_idx, batch_stems, layout_map, wav_index, text_index)
@@ -1505,90 +2022,121 @@ def run_batch(args) -> None:
             ds_batch_tracker[ds_name] = {"total": 0, "done": 0, "fail": 0}
         ds_batch_tracker[ds_name]["total"] += 1
 
-    ok_count = 0
-    fail_list: list[str] = []
-    ckpt_lock = threading.Lock()
+    # ── NVMe space check for staged mode ──
+    use_staging = getattr(args, 'stage_all', True)
+    if use_staging:
+        _est_gb = total_stems * 1.5 / 1024  # rough: 1.5 MB/stem (WAV + CTC overhead)
+        try:
+            _avail_gb = shutil.disk_usage(usable_drives[0]).free / (1024**3)
+        except Exception:
+            _avail_gb = float('inf')
+        if _est_gb > _avail_gb * 0.7 and not getattr(args, 'force_stage', False):
+            print(f"\n  ⚠  Estimated data ({_est_gb:.0f} GB) > 70% of NVMe free"
+                  f" ({_avail_gb:.0f} GB)")
+            print(f"     Falling back to streaming mode.")
+            print(f"     Use --force-stage to override, or free up NVMe space.")
+            use_staging = False
 
-    def worker(worker_id: int) -> tuple[int, list[str]]:
-        """Pull individual batches from shared queue."""
-        w_ok = 0
-        w_fails: list[str] = []
-        drive = usable_drives[worker_id % len(usable_drives)]
-        local_base = drive / f"worker_{worker_id}"
-        # GPU assignment: round-robin across available GPUs
-        gpu_id = worker_id % args.gpus
-        device_str = f"cuda:{gpu_id}"
-        while True:
-            try:
-                batch_global_idx, (batch_mode, ds, batch_idx, batch_stems,
-                                   layout_map, wav_index, text_index) = batch_queue.get_nowait()
-            except _queue.Empty:
-                break
+    if use_staging:
+        # ── STAGED MODE: Stage All → Process All → Upload All ──
+        ok_count, fail_list = _execute_staged(
+            args=args, all_batches=all_batches, cache=cache,
+            ckpt_path=ckpt_path, completed_set=completed_set,
+            failed_set=failed_set, usable_drives=usable_drives,
+            mfa_python=mfa_python, models_dir=models_dir,
+            parallel=parallel, ds_batch_tracker=ds_batch_tracker,
+            batch_size=args.batch_size,
+        )
+    else:
+        # ── STREAMING MODE: interleave prefetch/process/upload per batch ──
+        if not getattr(args, 'stage_all', True):
+            print(f"\n  Mode: STREAMING (per-batch prefetch/process/upload)")
+        else:
+            print(f"\n  Mode: STREAMING (fallback — NVMe space constrained)")
 
-            ds_name = ds["name"]
-            nas_output_root = resolve_input_path(
-                cache.get("output_root", "").rstrip("/"), PROJECT_ROOT)
-            batch_label = f"{ds_name}/{batch_idx:04d}"
-            remaining = batch_queue.qsize()
+        batch_queue: _queue.Queue = _queue.Queue()
+        for gidx, item in enumerate(all_batches):
+            batch_queue.put((gidx, item))
 
-            mode_tag = f" [{batch_mode}]" if batch_mode != "ctc_ready" else ""
-            print(f"\n  [W{worker_id}:{device_str}] [{batch_global_idx+1}/{total_batches}]"
-                  f" {batch_label} ({len(batch_stems)} stems){mode_tag}"
-                  f" [{remaining} left]")
+        ok_count = 0
+        fail_list: list[str] = []
+        ckpt_lock = threading.Lock()
 
-            try:
-                ok = run_single_batch(
-                    ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
-                    layout_map=layout_map, wav_index=wav_index,
-                    local_base=local_base, config=args.config,
-                    mfa_python=mfa_python, models_dir=models_dir,
-                    nas_output_root=nas_output_root,
-                    batch_size=args.batch_size, python_path=args.python,
-                    mode=batch_mode, text_index=text_index,
-                    device=device_str,
-                )
-            except Exception as _exc:
-                print(f"  [W{worker_id}] CRASH processing {batch_label}: {_exc}")
-                import traceback as _tb
-                _tb.print_exc()
-                ok = False
+        def worker(worker_id: int) -> tuple[int, list[str]]:
+            """Pull individual batches from shared queue."""
+            w_ok = 0
+            w_fails: list[str] = []
+            drive = usable_drives[worker_id % len(usable_drives)]
+            local_base = drive / f"worker_{worker_id}"
+            gpu_id = worker_id % args.gpus
+            device_str = f"cuda:{gpu_id}"
+            while True:
+                try:
+                    batch_global_idx, (batch_mode, ds, batch_idx, batch_stems,
+                                       layout_map, wav_index, text_index) = batch_queue.get_nowait()
+                except _queue.Empty:
+                    break
 
-            with ckpt_lock:
-                tracker = ds_batch_tracker[ds_name]
-                if ok:
-                    tracker["done"] += 1
-                else:
-                    tracker["fail"] += 1
-                # Save per-batch progress for more granular resume
-                _save_batch_progress(ckpt_path, ds_name,
-                                     tracker["done"], tracker["fail"], tracker["total"])
-                # Dataset complete when all batches done
-                if tracker["done"] + tracker["fail"] >= tracker["total"]:
-                    if tracker["fail"] == 0:
-                        w_ok += 1
-                        completed_set.add(ds_name)
+                ds_name = ds["name"]
+                nas_output_root = resolve_input_path(
+                    cache.get("output_root", "").rstrip("/"), PROJECT_ROOT)
+                batch_label = f"{ds_name}/{batch_idx:04d}"
+                remaining = batch_queue.qsize()
+
+                mode_tag = f" [{batch_mode}]" if batch_mode != "ctc_ready" else ""
+                print(f"\n  [W{worker_id}:{device_str}] [{batch_global_idx+1}/{total_batches}]"
+                      f" {batch_label} ({len(batch_stems)} stems){mode_tag}"
+                      f" [{remaining} left]")
+
+                try:
+                    ok = run_single_batch(
+                        ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
+                        layout_map=layout_map, wav_index=wav_index,
+                        local_base=local_base, config=args.config,
+                        mfa_python=mfa_python, models_dir=models_dir,
+                        nas_output_root=nas_output_root,
+                        batch_size=args.batch_size, python_path=args.python,
+                        mode=batch_mode, text_index=text_index,
+                        device=device_str,
+                    )
+                except Exception as _exc:
+                    print(f"  [W{worker_id}] CRASH processing {batch_label}: {_exc}")
+                    import traceback as _tb
+                    _tb.print_exc()
+                    ok = False
+
+                with ckpt_lock:
+                    tracker = ds_batch_tracker[ds_name]
+                    if ok:
+                        tracker["done"] += 1
                     else:
-                        w_fails.append(ds_name)
-                        failed_set.add(ds_name)
-                    _save_checkpoint(ckpt_path, completed_set, failed_set)
-                    status = "DONE" if tracker["fail"] == 0 else "FAIL"
-                    print(f"  [W{worker_id}] {ds_name} — {status} "
-                          f"({tracker['done']}/{tracker['total']} batches)")
+                        tracker["fail"] += 1
+                    _save_batch_progress(ckpt_path, ds_name,
+                                         tracker["done"], tracker["fail"], tracker["total"])
+                    if tracker["done"] + tracker["fail"] >= tracker["total"]:
+                        if tracker["fail"] == 0:
+                            w_ok += 1
+                            completed_set.add(ds_name)
+                        else:
+                            w_fails.append(ds_name)
+                            failed_set.add(ds_name)
+                        _save_checkpoint(ckpt_path, completed_set, failed_set)
+                        status = "DONE" if tracker["fail"] == 0 else "FAIL"
+                        print(f"  [W{worker_id}] {ds_name} — {status} "
+                              f"({tracker['done']}/{tracker['total']} batches)")
 
-        # Cleanup worker dir
-        if local_base.exists():
-            shutil.rmtree(local_base, ignore_errors=True)
-        return w_ok, w_fails
+            if local_base.exists():
+                shutil.rmtree(local_base, ignore_errors=True)
+            return w_ok, w_fails
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as pool:
-        futures = [pool.submit(worker, wid) for wid in range(parallel)]
-        for fut in concurrent.futures.as_completed(futures):
-            w_ok, w_fails = fut.result()
-            ok_count += w_ok
-            fail_list.extend(w_fails)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as pool:
+            futures = [pool.submit(worker, wid) for wid in range(parallel)]
+            for fut in concurrent.futures.as_completed(futures):
+                w_ok, w_fails = fut.result()
+                ok_count += w_ok
+                fail_list.extend(w_fails)
 
-    # end parallel
-
+    # ── Final summary ──
     print(f"\n{'#'*60}")
     print(f"  BATCH COMPLETE: {ok_count}/{len(datasets)} OK")
     if fail_list:
@@ -1639,6 +2187,8 @@ def _run_batch_sequential(args, datasets: list, cache: dict,
             stems_override=stems_ov,
             prefetch_buffer=args.prefetch_buffer,
             upload_buffer=args.upload_buffer,
+            staged=getattr(args, 'stage_all', True),
+            parallel_batches=1,  # sequential batch mode
         )
 
         if ok:
