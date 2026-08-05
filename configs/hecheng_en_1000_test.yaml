@@ -1,0 +1,100 @@
+# ─────────────────────────────────────────────────────────────────
+# 新版合成英文数据 — 1000 条测试 (参考文本模式 + 全流程)
+# ─────────────────────────────────────────────────────────────────
+#
+# 数据源: \\RS3621\Research_TTS\Data\Raw\新版合成英文数据
+#         3 speakers: ria / 花礼 / 雪狐桑
+#   参考文本: {stem}.txt (已存在, NVASR 参考文本模式对齐)
+#   音频布局: flat (WAV + txt 在 speaker 子目录下)
+#
+# 输出: \\RS3621\Research_TTS\Data\Raw\0805test
+#
+# 只处理前 1000 条 (ctc_prealign.limit: 1000)
+#
+# ═══════════════════════════════════════════════════════════════
+# 运行:
+#   python3 scripts/run_pipeline.py \
+#       --config configs/hecheng_en_1000_test.yaml \
+#       --python /home/user/miniconda3/envs/mfa-dev/bin/python \
+#       --overwrite --force
+# ═══════════════════════════════════════════════════════════════
+
+mode: nvrasr_fallback
+
+# ── 路径配置 ──────────────────────────────────────────────────
+
+# 输入: NAS 原始数据 (WAV + 参考文本 .txt)
+data_dir: /mnt/Raw/新版合成英文数据
+
+# 工作目录 (NVMe)
+workspace: /mnt/nvme3/mfa_workspace_1000test
+
+# 最终输出 (NAS)
+output_dir: /mnt/Raw/0805test
+
+# 输出暂存: postprocess 先写 NVMe，完成后 rsync 到 NAS
+output_staging: true
+
+# 保留 16k 音频
+keep_16k_audio: true
+
+# MFA 临时目录
+temp_dir: /tmp/mfa_temp
+
+# NVMe 音频缓存 — 1000 条测试直接走 NAS, 不缓存
+# (当前缓存为纱依/花礼, 若启用会错误匹配)
+# nvme_cache: /mnt/nvme3/mfa_audio_cache
+
+# ── 静音补全 ──────────────────────────────────────────────────
+pad_silence:
+  target_edge_silence_sec: 0.5
+
+# ── CTC/ASR 预对齐 (参考文本模式) ────────────────────────────
+ctc_prealign:
+  enabled: true
+  python: /home/user/miniconda3/envs/asr/bin/python
+  model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
+  device: cuda:0
+  limit: 1000                # 只处理前 1000 条
+  timeout: 14400
+  nvv_enabled: false         # 参考文本模式: 关闭 NVV, CTC 锚点给参考文本做时间戳
+
+# ── CTC 边界能量修正 ─────────────────────────────────────────
+ctc_adjust:
+  enabled: false
+
+# ── MFA 中文对齐 ──────────────────────────────────────────────
+mfa:
+  num_jobs: 64
+  single_speaker: true
+  output_format: long_textgrid
+  clean: false
+  no_tokenization: true
+  skip_validate: true
+  fine_tune: false
+  beam: 20
+  retry_beam: 80
+
+# ── MFA 英文对齐 ──────────────────────────────────────────────
+mfa_en:
+  enabled: true
+  num_jobs: 16
+  padding_ms: 50
+  min_segment_dur_ms: 200
+  max_gap_merge_s: 0.35
+  beam: 10
+  retry_beam: 40
+  fine_tune: false
+  acoustic_model: /mnt/local_E/MFA_Pause/pretrained_models/acoustic/english_us_arpa.zip
+  dictionary: dict/cmudict.dict
+  g2p_model: /mnt/local_E/MFA_Pause/pretrained_models/g2p/english_us_arpa.zip
+
+# ── 后处理 ────────────────────────────────────────────────────
+postprocess:
+  merge_silence: true
+  min_sil_merge_sec: 0.2
+  fix_short_word: false
+  detect_bgm: false
+  filter_suspicious: false
+  enable_text_correction: true
+  handle_unexpected_sil: false

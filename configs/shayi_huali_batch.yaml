@@ -10,7 +10,7 @@
 #
 # 输出:
 #   \\RS3621\Research_TTS\Data\Raw\shayi_huali_new\{纱依,花礼}\
-#     └── output/     → 后处理 TextGrid
+#     └── output/     → 后处理 TextGrid (output_staging: NVMe→NAS rsync)
 #     └── filtered/   → 质检过滤
 #     └── ctc_pretg_adj/ → CTC 缓存 (供后续重跑复用)
 #
@@ -31,15 +31,16 @@
 # ═══════════════════════════════════════════════════════════════
 # 运行:
 #
-#   # Pipelined 模式 (推荐 — GPU/CPU 流水线分离, 效率最高)
-#   # batch cache 已指向 NVMe 路径, prefetch 为本地 NVMe→NVMe 快传
+#   # Pipelined 模式 (推荐 — GPU/CPU 流水线分离)
 #   python scripts/streaming_pipeline.py \
 #       --config configs/shayi_huali_batch.yaml \
+#       --python /home/user/miniconda3/envs/mfa-dev/bin/python \
 #       --pipelined
 #
-#   # 非 Pipelined 模式 (8 worker 并行, GPU+CPU 串行)
+#   # 非 Pipelined 模式 (staged: Stage All → Process All → Upload All)
 #   python scripts/streaming_pipeline.py \
-#       --config configs/shayi_huali_batch.yaml
+#       --config configs/shayi_huali_batch.yaml \
+#       --python /home/user/miniconda3/envs/mfa-dev/bin/python
 #
 #   # 单 speaker 直接模式 (测试/调试用, 自动检测 nvme_cache)
 #   python scripts/run_pipeline.py \
@@ -50,10 +51,11 @@
 #
 # ═══════════════════════════════════════════════════════════════
 # Pipelined 资源分配:
-#   8 GPU workers (每 GPU 一个 NVASR)
+#   8 GPU workers  (每 GPU 一个 NVASR, ~9 file/s)
 #   48 CPU workers (每 worker 一个 MFA 实例)
-#   num_jobs=8 → 48 workers × 8 = 384 MFA job (跑满 384 CPU 核)
-#   每 batch 500 stems → 每 MFA job 处理 ~62 stems
+#   MFA sharding: 每 batch 500 stems → 2 shards (阈值 _n//200)
+#     → 每 shard 4 jobs → 每 batch 8 并发 MFA
+#   num_jobs=8 × 48 CPU workers = 384 总并发 (跑满 384 CPU 核)
 # ═══════════════════════════════════════════════════════════════
 
 mode: nvrasr_fallback
@@ -71,6 +73,13 @@ data_dir: //RS3621/Research_TTS/Data/Raw/shayi_huali_wav
 
 # 保留 16k 重采样音频 (供后续调试/重跑)
 keep_16k_audio: true
+
+# ── 输出暂存 (新功能: 避免 postprocess 逐文件写 NAS) ─────────
+# 将最终输出先写入 workspace/output_staging (NVMe),
+# 管线完成后 rsync 批量回传到 --output-dir.
+# 直接模式: 避免 CIFS 逐文件写延迟 (显著提速)
+# 流式模式: NVMe→NVMe sync, 收益有限但无副作用
+output_staging: true
 
 # ── 静音补全 (音频已处理过, 跳过) ──
 pad_silence:
@@ -125,11 +134,12 @@ ctc_adjust:
 
 # ── MFA 中文对齐 ──────────────────────────────────────────────
 mfa:
-  # num_jobs: 关键参数!
-  #   Pipelined: 48 CPU workers × 8 jobs = 384 并发 (跑满)
-  #   非 Pipelined (parallel=8): 8 workers × 8 jobs = 64 并发 (保守)
-  #   直接模式单 speaker: 手动 --mfa-jobs 覆盖以利用更多核心
-  #   每 batch 500 stems → 每个 job ~62 stems, 摊销 Kaldi 启动开销
+  # num_jobs: 每 MFA 实例的并行 job 数. 每个 job 处理 ~n_stems/num_jobs 条.
+  #   Pipelined: 48 CPU workers, 每 batch 500 stems → 2 MFA shards (阈值 _n//200)
+  #     → 每 shard 4 jobs → 每 batch 8 并发 MFA
+  #     → 48 workers × 8 = 384 总并发 (跑满 384 核)
+  #   非 Pipelined (parallel=8): 8 workers × 8 = 64 并发 (保守)
+  #   直接模式单 speaker: 设置 num_jobs=384 跑满全核
   num_jobs: 8
   single_speaker: true
   output_format: long_textgrid

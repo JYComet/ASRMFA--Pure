@@ -1,0 +1,60 @@
+# 重跑 shayi_huali_new 仍被过滤的 166 个文件 — MFA + postprocess
+# 用法:
+#   python scripts/run_pipeline.py --config configs/rerun_filtered.yaml \
+#       --python /home/user/miniconda3/envs/mfa-dev/bin/python --overwrite
+
+mode: ctc_ready
+
+data_dir: /mnt/nvme0/mfa_rerun_still_filtered/audio
+nvme_cache: /tmp/mfa_rerun_dummy_cache
+workspace: /mnt/nvme0/mfa_rerun_still_filtered/workspace
+output_dir: /mnt/nvme0/mfa_rerun_still_filtered/output
+temp_dir: /tmp/mfa_rerun_temp
+
+ctc_ready:
+  ctc_dir: /mnt/nvme0/mfa_rerun_still_filtered/ctc_pretg
+  require_all: false
+
+models_dir: /mnt/local_E/MFA_Pause/repo/models/mfa
+
+ctc_prealign:
+  enabled: false
+
+ctc_adjust:
+  enabled: false
+
+mfa:
+  num_jobs: 8
+  single_speaker: true
+  output_format: long_textgrid
+  clean: false
+  fine_tune: false
+  skip_validate: true
+  beam: 20
+  retry_beam: 80
+  timeout: 3600
+
+mfa_en:
+  enabled: false
+
+postprocess:
+  merge_silence: true
+  min_sil_merge_sec: 0.2
+  fix_short_word: true
+  detect_bgm: false
+  filter_suspicious: false
+  enable_text_correction: true
+  handle_unexpected_sil: true
+
+pad_silence:
+  enabled: false
+
+# 跳过 normalize 步骤——已有的 CTC 数据不需要再处理
+normalize_punct:
+  enabled: false
+normalize:
+  enabled: false
+normalize_ria:
+  enabled: false
+normalize_en:
+  enabled: false

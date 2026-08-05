@@ -1431,7 +1431,7 @@ def step_mfa_align_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         return 0
 
     ctc_dir = ctx.get("ctc_pretg_adj", ctx["ctc_pretg"])
-    if not ctc_dir.exists():
+    if not ctc_dir.exists() or not any(ctc_dir.iterdir()):
         ctc_dir = ctx["ctc_pretg"]
     audio_dir = ctx["mfa_audio_dir"]
     output_dir = ctx["workspace"] / "en_phones"
@@ -1500,7 +1500,7 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     """
     pc = cfg["postprocess"]
     ctc_dir = ctx.get("ctc_pretg_adj", ctx["ctc_pretg"])  # use adjusted if available
-    if not ctc_dir.exists():
+    if not ctc_dir.exists() or not any(ctc_dir.iterdir()):
         ctc_dir = ctx["ctc_pretg"]
     aligned_dir = ctx["aligned_dir"]
 

@@ -51,6 +51,13 @@
 | 40 | 2026-08-05 | postprocess_textgrids.py | English phone 边界未 snap → phone 与 word 不对齐 |
 | 41 | 2026-08-05 | postprocess_textgrids.py | CTC 锚点膨胀 → 异常长词 (le5 5.6s) + 无检测 |
 | 42 | 2026-08-05 | postprocess_textgrids.py | pinyin_in_text 误报 — <sp1> 被正则 \b[a-z]+[1-5]\b 匹配为拼音 |
+| 43 | 2026-08-05 | dict/cmudict.dict | CMUdict 缺缩写词条目 → English MFA/G2P 无法对齐 → pp 自引用 (数据修复) |
+| 44 | 2026-08-05 | postprocess_textgrids.py | 声母占比异常 — MFA phone boundary 过晚 → 声母>60%词长，韵母被压缩 |
+| 45 | 2026-08-05 | postprocess_textgrids.py | 韵母被词边界拉长 — Phase 5 尾 phone 无条件扩展 → 韵母 900ms+ |
+| 46 | 2026-08-05 | postprocess_textgrids.py | pp tier phone↔punct 结构重叠 — _inject_punctuation 标点与 phone 重叠 |
+| 47 | 2026-08-05 | postprocess_textgrids.py | init_only_phone 检测改进 — 区分零声母/自引用/真缺失韵母 |
+| 48 | 2026-08-05 | postprocess_textgrids.py | silence_boundary_split 误报 — MFA 真 phone 被误判为 silence 分界 |
+| 49 | 2026-08-05 | postprocess_textgrids.py | english_single_phone / english_phone_deficit 用中文拼音词典查英文词 → 误报/死代码 |
 
 ---
 
@@ -3846,38 +3853,55 @@ ctc_prealign:
 
 ---
 
-## Case 32: 英文词自引用单音素 — pp 仅 1 个 phone 但 dict 期望 2+ (english_single_phone)
+## Case 32: 英文词自引用单音素 — pp 仅 1 个 phone (english_single_phone)
 
-**日期**: 2026-08-05
+**日期**: 2026-08-05 (updated 2026-08-05)
 **涉及文件**: `scripts/postprocess_textgrids.py`
 **涉及函数**: `process_one` (QC section)
-**触发场景**: 英文 token 出现在 words tier，pinyin_dict 有 2+ 个 ARPABET 音素，但 English MFA 未产出足够 phone → pinyin_phones 仅含 1 个自引用 phone（整词标签）。
+**触发场景**: 英文 token（非 NVV、非标点）的 pinyin_phones 只有 1 个自引用 phone（整词标签），而非 en:-prefixed ARPABET 音素。
 
 ### 现象
 
 ```
-words:           RIA  [dict 期望: R, IY1, AH0]
-pinyin_phones:   RIA  [全区间]  ← 整词作为单音素, 丢失了声学拆分
+words:           RIA  [dict: R, IY1, AH0]
+pinyin_phones:   RIA  [全区间]  ← 自引用整词, 未拆分为 ARPABET
+
+words:           vup  [不在任何 dict]
+pinyin_phones:   vup  [全区间]  ← 也不在 pinyin_dict, 同样自引用
 ```
 
-英文版 Case 26 FULL_WORD_AS_PHONE。受影响词：RIA (131/200 文件)、AI (18/18)、BGM (11/200)、live 等。
+英文版 Case 26 FULL_WORD_AS_PHONE。受影响词：RIA (59/200)、AI (32/200)、BGM (8/200)、live (6/200) 等。
 
 ### 根因
 
 1. English MFA 对短英文词/缩写产出 phone 不足或未产出
 2. `_apply_en_phones` 在 CMUdict/English MFA 均缺失时回退到自引用
 3. `build_pinyin_phones_tier` 中 `is_english_token` 守卫使英文词走到自引用路径
+4. 旧检查仅覆盖 pinyin_dict 中有 2+ 条目的英文词，漏掉了不在 dict 中的英文词
 
 ### 修改点
 
-**CE. `process_one` QC section — 新增 `english_single_phone` 过滤**
+**CE. `process_one` QC section — `english_single_phone` 过滤（v2 增强）**
 
-扫描 words tier 中每个英文 token，若 pinyin_dict 期望 2+ 个音素但 pinyin_phones 实际只有 1 个自引用 → `filter_reasons.append("english_single_phone")`。
+v1: 只检查 pinyin_dict 中有 2+ 音素的英文词。
+v2: 移除 pinyin_dict 依赖，显式排除 silence/NVV/punct（`is_silence(_wt) or is_punct(_wt) or is_nvv_token(_wt)`），覆盖所有 `is_english_token()` 为 True 但 pinyin_phones 只有 1 个自引用 phone 的词。不在 dict 中的词标注 `(not in dict)`。
+
+```python
+# v2: 跳过 silence/punct/NVV, 只检查英文 token
+if not _wt or is_silence(_wt) or is_punct(_wt) or is_nvv_token(_wt):
+    ... skip ...
+if not is_english_token(_wt):
+    ... skip ...
+# 自引用: 只有 1 个 phone 且等于词本身
+if len(_w_phones) == 1 and _w_phones[0] in (_wt, _wt.lower(), _wt.upper()):
+    _en_single_count += 1
+```
 
 ### 关联样本
 
 - `000004_直播流程_开场介绍.TextGrid`: `AI` → pinyin_phones `AI`
-- `000023_直播流程_开场介绍.TextGrid`: `RIA` → pinyin_phones `RIA` (dict 有 3 phones)
+- `000023_直播流程_开场介绍.TextGrid`: `RIA` → pinyin_phones `RIA`
+- 不在 dict 的词（如 `vup`, `VUp` 等）同样会被检测
 
 ---
 
@@ -3997,7 +4021,7 @@ hanzi(7/51), words(7/51) — 13.7% interval 有间隙
 
 | ID | 位置 | Case | 过滤条件 |
 |------|------|:--:|------|
-| CE | `process_one` QC | 32 | `english_single_phone` — 英文词自引用单音素 |
+| CE | `process_one` QC | 32 | `english_single_phone` — 英文词自引用单音素 (v2: 不限 dict, 排除 NVV/punct) |
 | CF | `process_one` QC | 33 | `english_phone_deficit` — 英文词音素不足 |
 | CG | `process_one` QC | 34 | `pp_tier_gaps` — pinyin_phones 轨道间隙 |
 | CH | `process_one` QC | 35 | `words_tier_gaps` — words 轨道间隙 |
@@ -4243,6 +4267,290 @@ regex hit: "sp1"        ← 误报：这是 silence marker，不是 pinyin
 
 ---
 
+## Case 43: build_pinyin_phones_tier 英文词无 pinyin_dict fallback → 缩写词自引用
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `build_pinyin_phones_tier`
+**触发样本**: 新版合成英文数据对齐 — RIA(59), AI(32), ria(16), BGM(8), live(6)
+
+### 现象
+
+英文缩写词在 pinyin_phones tier 中只有自引用（整词作为单音素），而 pinyin_dict 已有按字母拆好的 ARPABET 音素：
+
+```
+words:         AI   [dict: EY1, AY1]
+pinyin_phones: AI   [全区间]  ← 自引用，未拆分为 EY1 + AY1
+
+words:         BGM  [dict: B, IY1, JH, IY1, EH1, M]
+pinyin_phones: BGM  [全区间]  ← 自引用，丢失全部 6 个 ARPABET
+```
+
+### 根因链
+
+1. **en_phones JSON 目录不存在** → `en_data = None`（未跑 English MFA 或输出路径不匹配）
+2. `_apply_en_phones` (Phase 3.5) 收到 `en_data=None` → 直接 return，不注入任何英文 phone
+3. `build_pinyin_phones_tier` (Phase 5) 处理英文词时：
+   - `is_english_token` → True
+   - `en_mfa_windows` → None
+   - `word_phones` → 空（中文 MFA 无法对齐英文词）
+   - **直接自引用** — 没有检查 pinyin_dict
+4. pinyin_dict 早已包含这些词的 ARPABET 分解（RIA/BGM/AI 等是 pipeline 上一版本留下的固定词条），但代码未使用
+
+### 典型缩写词的 pinyin_dict 映射
+
+| 词 | pinyin_dict ARPABET | 字母拆分 | CMUdict |
+|------|------|------|:--:|
+| AI | `EY1, AY1` | A(EY1)+I(AY1) | ✅ |
+| RIA | `R, IY1, AH0` | R(AA1,R)+I(AY1)+A(EY1) | ✅ |
+| BGM | `B, IY1, JH, IY1, EH1, M` | B+G+M | ❌ |
+| live | `L, AY1, V` | — | ✅ |
+
+AI 的字母拼读恰好等于整词发音（A+I = EY1+AY1），RIA/BGM 按字母拆分。
+
+### 修改点
+
+**CJ. `build_pinyin_phones_tier` — 英文词自引用前增加 pinyin_dict 均匀分布** (~line 633)
+
+修改前：
+```python
+            new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, w_iv.text))
+            continue
+```
+
+修改后：
+```python
+            # pinyin_dict fallback for English words (Case 43)
+            if dict_phones and len(dict_phones) >= 2:
+                n = len(dict_phones)
+                for i, arpa in enumerate(dict_phones):
+                    s = round(w_iv.xmin + (i / n) * word_dur, 4)
+                    e = round(w_iv.xmin + ((i + 1) / n) * word_dur, 4)
+                    new_intervals.append(Interval(s, e, arpa))
+            else:
+                new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, w_iv.text))
+            continue
+```
+
+### 关联样本
+
+- `000004_直播流程_开场介绍.TextGrid`: `AI` → self-reference, dict=`['EY1','AY1']`
+- `000023_直播流程_开场介绍.TextGrid`: `RIA` → self-reference, dict=`['R','IY1','AH0']`
+- `000069_直播流程_开场介绍.TextGrid`: `BGM` → self-reference, dict=`['B','IY1','JH','IY1','EH1','M']`
+
+---
+
+## Case 44: 声母占比异常 — MFA phone boundary 过晚 (init_too_long)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `build_pinyin_phones_tier`
+**触发样本**: `shayi_huali_new` — 10.1% 音节 (142/1404)
+
+### 现象
+
+```
+hao3   总长270ms → h=190ms(70%)   ao3=80ms(30%)     正常: h~80ms(30%)
+shang4 总长180ms → sh=130ms(72%)  ang4=50ms(28%)    正常: sh~60ms(33%)
+de5    总长160ms → d=110ms(69%)   e5=50ms(31%)      正常: d~40ms(25%)
+```
+
+声母占词长的 60-75%，韵母被严重压缩，触发 `long_consonant_phone`。
+
+### 根因链
+
+1. `build_pinyin_phones_tier` 正常分支用 MFA 第一个 phone 的 xmax 作声母→韵母分界点
+2. MFA 在擦音/送气音+元音的模糊过渡处（如 h→ao, sh→ang）把 phone boundary 放得过晚
+3. 代码无条件信任该 boundary，不做比例校验
+4. Case 26 的 proportional split 只在 `word_phones <= 1` 时触发，`>= 2` 时不检查
+
+### 修改点
+
+**A. 新增 `_INIT_MAX_FRAC` 字典** (~line 445)
+- 按语音学规律设定每类声母的最大词长占比上限
+- 不送气塞音 (b/d/g): 35%, 送气塞音 (p/t/k): 40%, 擦音 (h/sh/x/f/s/r): 50%, 塞擦音 (zh/ch/z/c/j/q): 45%
+
+**B. `build_pinyin_phones_tier` 正常分支加比例保护** (~line 668)
+- 当 MFA boundary 给出的声母占比 > `_INIT_MAX_FRAC` 上限时，回退到 proportional split
+- 仅对 > 60ms 的词生效（超短词不受限）
+
+### 关联样本
+
+- `shayi_huali_new` — 纱依/花礼 filtered 文件
+
+---
+
+## Case 45: 韵母被词边界拉长 — Phase 5 尾 phone 无条件扩展 (final_too_long)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `process_one` (Phase 5 pp rebuild)
+**触发样本**: `shayi_huali_new` — ~2% 音节，但极端 case 韵母 900ms+
+
+### 现象
+
+```
+piao4 总长1066ms → p=80ms  iao4=986ms(92%)    MFA原始: p~80ms iao4~290ms
+ming2 总长700ms  → m=70ms  ing2=630ms(90%)    MFA原始: m~70ms ing2~200ms
+```
+
+声母保持 MFA 原始时长（正常），韵母被扩展填满词尾，触发 `long_vowel_phone`。
+
+### 根因链
+
+1. Postprocessing 把词边界拉长（CTC snap / silence absorption / NVV extension）
+2. Phase 5 尾 phone 扩展逻辑无条件把韵母 end 推到 `w_iv.xmax`
+3. 没有时长上限检查 — 词被拉多长，韵母就填多长
+
+### 修改点
+
+**Phase 5 尾 phone 扩展加时长上限** (~line 5057)
+- Vowel/final: max(400ms, orig_dur × 1.5)
+- Consonant/initial: max(200ms, orig_dur × 1.5)
+- Single-phone word: max(500ms, orig_dur × 1.5)
+- 超出部分不填充，保留为自然 silence gap
+
+### 关联样本
+
+- `shayi_huali_new` — `piao4` 986ms, `ming2` 630ms, `huang3` 415ms
+
+---
+
+## Case 46: pp tier phone↔punct 结构重叠 (pp_punct_overlap)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `_inject_punctuation`
+**触发样本**: `shayi_huali_new` — 32.5% 文件 (13/40)
+
+### 现象
+
+pp tier 中不同 label 的 Interval 重叠 10-155ms：
+```
+，[4.000-4.750]  ↔  z[4.610-4.659]    overlap=140ms  (punct↔content)
+。[2.370-2.825]  ↔  …[2.670-2.825]    overlap=155ms  (punct↔punct)
+```
+
+导致 `long_consonant_phone` 和结构异常的误报。
+
+### 根因链
+
+1. `_inject_punctuation` 把 CTC 标点注入 pp tier 时使用 CTC 时间戳
+2. CTC 标点可能落在 content word 内部（帧移 40ms 精度限制）
+3. pp tier 重建时 phone 被 max/min clip 到 word 范围，但未检查 phone↔punct 重叠
+
+### 修改点
+
+**pp tier 重建后增加重叠解决步骤** (~line 2790)
+- Punct→content: punct 保留 ≥60ms，phone 从 punct end 开始
+- Content→punct: content 在 punct start 处截断
+- Punct→punct: 各保留 ≥60ms，后一个从 prev end 开始
+- Content→content: midpoint split
+
+### 关联样本
+
+- `shayi_huali_new` — 纱依 13/40 文件
+
+---
+
+## Case 47: init_only_phone 检测改进 — 单 phone 音节分类 (single_phone_audit)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `process_one` (QC section)
+**触发样本**: `shayi_huali_new` — 2182 个单 phone 音节，0 个真缺失韵母
+
+### 现象
+
+此前分析中 `init_only_phone` 被误报为 99.1% 命中率，实际数据中 0 个真 case。
+原因是 2182 个单 phone 拼音音节全部是零声母音节（`yao2→iao2`、`wan3→uan3`），
+pp tier 正确处理为 1 个 phone（韵母），不是 bug。
+
+### 修改点
+
+**检测逻辑改进** (~line 5748)
+- Type A (init_only): 单 phone = dict initial → **真 bug**，触发过滤
+- Type B (zero_initial): 单 phone ≠ dict initial → 零声母，正确行为，不触发
+- Type C (self_ref): 单 phone = word text → 自引用 fallback，不触发
+- Report 新增 `single_phone_breakdown` 字段：`{init_only_error, zero_initial_ok, self_ref_ok}`
+
+### 关联样本
+
+- `shayi_huali_new` — 纱依 896 + 花礼 1286 = 2182 个零声母（全部正确）
+
+---
+
+## Case 48: silence_boundary_split 误报 — MFA 真 phone 被误判 (sb_false_positive)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `process_one` (QC section — `silence_boundary_split` 检测)
+**触发样本**: `shayi_huali_new` — 重处理后 53.4% 仍过滤文件命中
+
+### 现象
+
+重跑 postprocess 后，`silence_boundary_split` 成为最大剩余过滤原因（62/116 文件）。
+典型 report 示例：
+
+```
+xie4→ɕ[10ms] +j e˥˩
+hou4→x[10ms] +o˥˩ w
+jia1→tɕ[10ms] +j a˥
+nv3→n[10ms] +y˨˩˦
+```
+
+所有 case 的第一个 phone 都恰好 10ms，看起来像 silence 分界。
+
+### 根因链
+
+1. **检测逻辑**（line 5798-5840）：多 phone dict 词的首 phone < 10ms → 判定为 silence 分界
+2. 检测注释假设：首 phone 过短 → 必定来自 MFA silence/spn fragment 的边界
+3. **实际数据**：MFA 源文件的首 phone 是**真实的 IPA phone**（`ɕ`, `x`, `tɕ`, `n`），不是 silence
+
+真实场景分两类：
+
+**A. 连续相同词（~30%）**：
+```
+xie4[8.280-8.410] → xie4[8.410-8.575] → a5[8.575-8.815]
+MFA phones for 2nd xie4: ɕ[8.410-8.420 10ms] j[8.420-8.430] e˥˩[8.430-8.460]
+```
+前一个 `xie4` 的 `e˥˩` 刚结束，后一个 `xie4` 的 `ɕ` 立即开始。MFA 在相同 phone 序列的边界处给出 10ms 的 `ɕ`——这是 MFA 声学模型的自然行为（phone 边界在相同过渡处更精确），不是错误。
+
+**B. 普通短 phone（~70%）**：
+```
+shi2 → hou4[70ms] → gen1
+MFA phones: x[10ms] o˥˩[30ms] w[30ms]
+```
+MFA 给 `x`（擦音声母）仅 10ms。虽然偏短，但仍是真实的 MFA phone，不来自 silence。
+
+**关键证据**：所有 28 个受检 case 的 MFA 源 phone 全部是 `all_real=True`——没有 silence/spn。检测的假设（"来自 silence fragment"）不成立。
+
+### 修改点
+
+**检测逻辑修正** (~line 5829)：在判定为 `silence_boundary_split` 之前，增加检查——首个 pp phone 的**文本 label** 是否匹配 silence/spn 标签。如果是真实 IPA phone label（如 `ɕ`, `x`, `n`, `tɕ`），则不触发。
+
+```python
+# 修改前:
+if len(_w_phones) >= 2:
+    _first_dur = _w_phones[0].xmax - _w_phones[0].xmin
+    if _first_dur < _SILENCE_SPLIT_FLOOR_S:
+        _silence_split_count += 1  # ← 所有短首 phone 都触发
+
+# 修改后:
+if len(_w_phones) >= 2:
+    _first_dur = _w_phones[0].xmax - _w_phones[0].xmin
+    _first_label = _w_phones[0].text.strip()
+    # Only flag when the first "phone" is actually a silence/spn label
+    if _first_dur < _SILENCE_SPLIT_FLOOR_S and is_silence(_first_label):
+        _silence_split_count += 1
+```
+
+### 关联样本
+
+- `shayi_huali_new` — 62/116 重处理后仍过滤文件（53.4%）
+
+---
+
 ## 模板 (新 Case 用)
 
 ```markdown
@@ -4271,4 +4579,175 @@ regex hit: "sp1"        ← 误报：这是 silence marker，不是 pinyin
 ### 关联样本
 
 - [样本]
+```
+
+---
+
+## Case 49: english_single_phone / english_phone_deficit 用中文拼音词典查英文词 → 误报 (wrong_dict_for_english_qc)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `process_one` (QC section)
+
+### 现象
+
+`english_single_phone`（Case 32）和 `english_phone_deficit`（Case 33）两个 QC 检查在诊断消息和期望音素数判断中使用了中文拼音词典 `pinyin_dict`，而非英文 CMUdict：
+
+1. **`english_single_phone`** (Case 32): 自引用检测逻辑本身正确（检查 phone 文本是否等于 word 文本），不依赖 `pinyin_dict`。但示例消息用 `pinyin_dict` 查找期望音素数来丰富诊断信息——对 English token 用中文拼音词典在语义上是错误的。例如 English "di" 在 `pinyin_dict` 为 `['d', 'i4']`（恰好是拼音），但正确的英文期望来自 CMUdict: `['D', 'IY1']`（2 个 ARPABET phones）。
+
+2. **`english_phone_deficit`** (Case 33): **检测逻辑完全依赖 `pinyin_dict`**——对所有 English token 用 `pinyin_dict.get()` 查期望音素数。`pinyin_dict` 条目最多只有 2 个 phone（声母+韵母），条件 `_n_got >= 2 and _n_got < _n_exp` 要求 `_n_exp > 2`，**此条件在 pinyin_dict 上永远不成立**——该检查是死代码。
+
+### 根因链
+
+1. **字典语义错配**: `pinyin_dict` 是中文音节分解字典（如 `mao1 → ['m', 'ao1']`），English token 的正确字典是 CMUdict（如 `hello → ['HH', 'AH0', 'L', 'OW1']`）。
+2. **Case 33 死代码**: `_n_exp = len(_dp) = 2`（最多），`_n_got >= 2 and _n_got < 2` → `_n_got < 2` 永远 False → 整个检查从不触发。
+3. **Case 32 误报风险**: 当 English token 恰好也是合法拼音音节（如 "di" → `pinyin_dict["di"] = ['d', 'i4']`），且 G2P 失败产生自引用 phone，示例消息会显示误导性的 pinyin 期望 `['d', 'i4']` 而非 CMUdict 的真实期望 `['D', 'IY1']`。
+
+### 影响
+
+- **Case 32**: 检测逻辑不受影响（自引用检测独立于字典）。仅诊断消息使用错误字典。
+- **Case 33**: 检查从未触发过——所有 English phone 不足的情况（如 CMUdict 期望 5 个 ARPABET phones 但 MFA 只产出 2 个）被**静默放过**，未进入 `filtered/`。
+
+### 修改点
+
+**A. QC 段加载 CMUdict** (~line 5386)
+
+```python
+# 修改前: 无 CMUdict 加载，QC 检查依赖 pinyin_dict
+filter_reasons = []
+
+# 修改后: 在 QC 开始处 lazy-load CMUdict
+from pipeline_utils import _load_cmudict as _load_cmu
+_cmu = _load_cmu()
+```
+
+**B. `english_single_phone` 诊断消息改用 CMUdict** (~line 5949-5954)
+
+```python
+# 修改前: 用 pinyin_dict 查 English token（语义错误）
+_dp = (pinyin_dict.get(_wt) or pinyin_dict.get(_wt.upper())
+       or pinyin_dict.get(_wt.lower())) if pinyin_dict else None
+_en_single_examples.append(
+    f"{_wt}→{_w_phones[0]!r}" +
+    (f" (dict:{_dp})" if _dp else " (not in dict)"))
+
+# 修改后: 用 _cmu (CMUdict) 查 English token
+_cmu_entry = _cmu.get(_wt.lower())
+_en_single_examples.append(
+    f"{_wt}→{_w_phones[0]!r}" +
+    (f" (cmu:{_cmu_entry})" if _cmu_entry else " (not in CMUdict)"))
+```
+
+**C. `english_phone_deficit` 检测逻辑完全改用 CMUdict** (~line 5965-6003)
+
+```python
+# 修改前: 用 pinyin_dict 查所有 English token（死代码——_n_exp 最大为 2）
+if words_tier is not None and pp_tier is not None and pinyin_dict is not None:
+    ...
+    _dp = (pinyin_dict.get(_wt) or pinyin_dict.get(_wt.upper())
+           or pinyin_dict.get(_wt.lower()))
+    if not _dp or len(_dp) < 2:
+        ...
+
+# 修改后: 用 _cmu (CMUdict) 查 English token（_n_exp 可为 3-15）
+if words_tier is not None and pp_tier is not None:
+    ...
+    _dp = _cmu.get(_wt.lower())  # CMUdict 条目的 phone 数通常 2-15
+    if not _dp or len(_dp) < 2:
+        ...
+```
+
+### 验证方法
+
+```python
+# english_phone_deficit 应对 CMUdict 中的多 phone English 词触发
+# 例如: "hello" → CMUdict expects 4 phones, MFA produces only 2 → flagged
+
+# english_single_phone 示例消息应显示 CMUdict 条目而非 pinyin_dict
+# 修复前: "di→'di' (dict:['d', 'i4'])"    ← 误导：用的是中文拼音 dict
+# 修复后: "di→'di' (cmu:['D', 'IY1'])"    ← 正确：用的是 CMUdict
+```
+
+### 关联样本
+
+- 外部项目: 包含 English "di"/"can"/"tan" 等恰好是拼音音节的 English token 的段
+
+---
+
+## Case 50: Interval.mark 属性不存在 → postprocess 全线崩溃 (interval_mark_attr_mismatch)
+
+### 现象
+
+- 修复前: postprocess 17510/17541 条报 `'Interval' object has no attribute 'mark'`，0 条成功
+- 修复后: 正常产出 TextGrid
+
+### 根因链
+
+1. `Interval` 类定义 (line 58-61) 使用 `.text` 属性名
+2. `_worker_fn` → english QC 检测 (line 5941-5943) 访问 `_p.mark`
+3. `AttributeError` 被 `as_completed` 捕获 (line 6294)，状态记为 `"error"`
+4. 所有含 English token 的段均触发此路径，最终 0 成功
+
+### 修改点
+
+`scripts/postprocess_textgrids.py:5941-5943` — `_p.mark` → `_p.text` (3 处)
+
+```python
+# 修改前
+if (_p.xmax > _ws + 0.001 and _p.mark
+        and not is_silence(_p.mark.strip())):
+    _w_phones.append(_p.mark.strip())
+
+# 修改后
+if (_p.xmax > _ws + 0.001 and _p.text
+        and not is_silence(_p.text.strip())):
+    _w_phones.append(_p.text.strip())
+```
+
+### 验证方法
+
+```bash
+python3 scripts/run_pipeline.py --config configs/hecheng_ria_0805.yaml \
+    --python .../mfa-dev/bin/python --step postprocess --overwrite
+# 预期: 产出 17000+ TextGrid，不再有 AttributeError
+```
+
+---
+
+## Case 51: ctc_pretg_adj 空目录未回退 → postprocess 找不到 txt/lab (empty_ctc_adj_no_fallback)
+
+### 现象
+
+- 修复前: `--step postprocess` 报 17541 条 `Missing txt/lab: .../ctc_pretg_adj/...`
+- 修复后: 正常从 ctc_pretg 读取参考文本
+
+### 根因链
+
+1. `ctx["ctc_pretg_adj"]` 目录始终被创建 (line 2549)，ctc_adjust 禁用时为空
+2. `step_postprocess` (line 1502) 和 `step_align_en` (line 1433) 用 `.get("ctc_pretg_adj", ...)` 取值
+3. 空目录 `.exists()` 返回 True → 被选为 `ctc_dir`
+4. `--txt-dir` / `--raw-text-dir` 指向空目录 → postprocess 找不到任何 `.txt` / `.lab`
+
+### 修改点
+
+`scripts/run_pipeline.py:1434, 1503` — `.exists()` 检查后追加 `not any(ctc_dir.iterdir())`
+
+```python
+# 修改前
+if not ctc_dir.exists():
+    ctc_dir = ctx["ctc_pretg"]
+
+# 修改后
+if not ctc_dir.exists() or not any(ctc_dir.iterdir()):
+    ctc_dir = ctx["ctc_pretg"]
+```
+
+注意: line 1290 (`step_align`) 已有 `.glob("*.lab")` 检查，无需修改。
+
+### 验证方法
+
+```bash
+python3 scripts/run_pipeline.py --config configs/hecheng_ria_0805.yaml \
+    --python .../mfa-dev/bin/python --step postprocess --overwrite
+# 预期: 不再报 Missing txt/lab，正常产出 TextGrid
 ```

@@ -442,6 +442,24 @@ _INIT_FRAC: dict[str, float] = {
     'z': 0.35, 'c': 0.35, 'zh': 0.35, 'ch': 0.35, 'j': 0.35, 'q': 0.35,
 }
 
+# Regr. Case 44: maximum initial fraction per phone class.
+# When MFA places the init→final boundary giving the initial MORE than
+# this fraction of the word, the boundary is rejected and a proportional
+# split is used instead.  Stops and nasals get tighter caps; fricatives
+# and affricates (which have longer acoustic realisations) get more room.
+_INIT_MAX_FRAC: dict[str, float] = {
+    # Stops — shouldn't exceed 35% of syllable in normal speech
+    'b': 0.35, 'd': 0.35, 'g': 0.35,
+    # Aspirated stops — up to 40%
+    'p': 0.40, 't': 0.40, 'k': 0.40,
+    # Nasals / laterals — up to 40%
+    'm': 0.40, 'n': 0.40, 'l': 0.40,
+    # Fricatives — can be sustained, up to 50%
+    'f': 0.50, 's': 0.50, 'sh': 0.50, 'x': 0.50, 'h': 0.50, 'r': 0.50,
+    # Affricates — up to 45% (also default)
+    'z': 0.45, 'c': 0.45, 'zh': 0.45, 'ch': 0.45, 'j': 0.45, 'q': 0.45,
+}
+
 # IPA -> Pinyin reverse-mapped phone tier
 # ---------------------------------------------------------------------------
 
@@ -638,33 +656,41 @@ def build_pinyin_phones_tier(phones_tier: Tier,
             if len(dict_phones) == 1:
                 # Zero-initial (e.g. 'a5'): single dict phone for entire interval
                 new_intervals.append(Interval(w_iv.xmin, w_iv.xmax, dict_phones[0]))
-            elif len(word_phones) >= 2:
-                # Normal: MFA provides enough phones to split initial + final.
-                # Snap initial start to word start to prevent gaps
-                # (MFA fine_tune may shift word boundary earlier than phone onset,
-                #  e.g. at NVV→word transitions).  See Regression Case 7.
-                new_intervals.append(Interval(w_iv.xmin, word_phones[0][1], dict_phones[0]))
-                # Final: remaining MFA phones combined -> dict final
-                final_start = word_phones[1][0]
-                final_end = w_iv.xmax
-                final_label = " ".join(dict_phones[1:]) if len(dict_phones) > 2 else dict_phones[1]
-                new_intervals.append(Interval(final_start, final_end, final_label))
             else:
-                # dict_phones >= 2 but word_phones <= 1: MFA under-produced
-                # phones for this syllable (common with zh/ch/sh initials).
-                # Split proportionally so the final isn't lost entirely.
-                # Regression Case 26 (MISSING_FINAL).
+                # dict_phones >= 2: needs initial + final split
                 word_dur = w_iv.xmax - w_iv.xmin
-                _init_frac = _INIT_FRAC.get(dict_phones[0], 0.35)
-                _min_seg = 0.030        # floor per segment
-                if word_dur >= _min_seg * 2:
-                    split = w_iv.xmin + max(_min_seg, word_dur * _init_frac)
-                    split = min(split, w_iv.xmax - _min_seg)
-                else:
-                    split = w_iv.xmin + word_dur * 0.5
-                new_intervals.append(Interval(w_iv.xmin, split, dict_phones[0]))
-                final_label = " ".join(dict_phones[1:]) if len(dict_phones) > 2 else dict_phones[1]
-                new_intervals.append(Interval(split, w_iv.xmax, final_label))
+
+                # ── Try MFA phone boundary first ──
+                use_mfa_split = False
+                if len(word_phones) >= 2:
+                    _init_end = word_phones[0][1]
+                    _init_frac_mfa = (_init_end - w_iv.xmin) / max(word_dur, 0.001)
+                    # Regr. Case 44: phonetically-motivated upper bound on
+                    # initial fraction.  MFA sometimes places the init→final
+                    # boundary too far into the word (e.g. h→ao at 70%).
+                    _init_max_frac = _INIT_MAX_FRAC.get(dict_phones[0], 0.55)
+                    if _init_frac_mfa <= _init_max_frac or word_dur <= 0.060:
+                        use_mfa_split = True
+                        # Snap initial start to word start (Regression Case 7)
+                        new_intervals.append(Interval(w_iv.xmin, _init_end, dict_phones[0]))
+                        final_start = word_phones[1][0]
+                        final_label = " ".join(dict_phones[1:]) if len(dict_phones) > 2 else dict_phones[1]
+                        new_intervals.append(Interval(final_start, w_iv.xmax, final_label))
+
+                if not use_mfa_split:
+                    # Proportional split fallback: dict_phones >= 2 but
+                    # MFA under-produced or boundary was rejected.
+                    # Regression Case 26 (MISSING_FINAL) + Case 43.
+                    _init_frac = _INIT_FRAC.get(dict_phones[0], 0.35)
+                    _min_seg = 0.030        # floor per segment
+                    if word_dur >= _min_seg * 2:
+                        split = w_iv.xmin + max(_min_seg, word_dur * _init_frac)
+                        split = min(split, w_iv.xmax - _min_seg)
+                    else:
+                        split = w_iv.xmin + word_dur * 0.5
+                    new_intervals.append(Interval(w_iv.xmin, split, dict_phones[0]))
+                    final_label = " ".join(dict_phones[1:]) if len(dict_phones) > 2 else dict_phones[1]
+                    new_intervals.append(Interval(split, w_iv.xmax, final_label))
         else:
             # Fallback: 1:1 IPA->pinyin
             for s, e, txt in word_phones:
@@ -2760,7 +2786,63 @@ def _inject_punctuation(words_tier: Tier, pp_tier: Tier | None,
                     word_phones[-1] = Interval(
                         word_phones[-1].xmin, iv[1], word_phones[-1].text)
                 pp_intervals.extend(word_phones)
-        new_pp_tier = Tier(pp_tier.name, pp_tier.xmin, pp_tier.xmax, pp_intervals)
+
+        # ── Resolve phone↔punct overlaps in pp tier (Regr. Case 46) ──
+        # Punct and content phones can overlap when CTC punct anchors
+        # fall within a word's time range.  Punct keeps ≥ 60 ms;
+        # overlapping phones are clipped.  If a word's phones are
+        # fully covered by punct, they are rebuilt with proportional
+        # timing within the remaining non-punct space.
+        pp_intervals.sort(key=lambda x: x.xmin)
+        _pp_resolved: list[Interval] = []
+        for _piv in pp_intervals:
+            if not _pp_resolved:
+                _pp_resolved.append(_piv)
+                continue
+            _prev = _pp_resolved[-1]
+            _overlap = _prev.xmax - _piv.xmin
+            if _overlap <= 0.002:
+                _pp_resolved.append(_piv)
+                continue
+
+            _prev_is_punct = is_punct(_prev.text) and not is_silence(_prev.text)
+            _cur_is_punct = is_punct(_piv.text) and not is_silence(_piv.text)
+
+            if _prev_is_punct and not _cur_is_punct:
+                # Punct → content: ensure punct keeps ≥ 60 ms
+                _punct_min_end = _prev.xmin + 0.060
+                if _prev.xmax < _punct_min_end:
+                    _prev = Interval(_prev.xmin, _punct_min_end, _prev.text)
+                _piv = Interval(_prev.xmax, _piv.xmax, _piv.text)
+                _pp_resolved[-1] = _prev
+                if _piv.xmax > _piv.xmin + 0.002:
+                    _pp_resolved.append(_piv)
+            elif _cur_is_punct and not _prev_is_punct:
+                # Content → punct: clip content before punct
+                _punct_min_end = _piv.xmin + 0.060
+                _piv_end = max(_piv.xmax, _punct_min_end)
+                _prev = Interval(_prev.xmin, _piv.xmin, _prev.text)
+                _piv = Interval(_piv.xmin, _piv_end, _piv.text)
+                if _prev.xmax > _prev.xmin + 0.002:
+                    _pp_resolved[-1] = _prev
+                else:
+                    _pp_resolved.pop()
+                _pp_resolved.append(_piv)
+            elif _prev_is_punct and _cur_is_punct:
+                # Two puncts overlap — keep both but non-overlapping
+                _punct_min_end = _prev.xmin + 0.060
+                if _prev.xmax < _punct_min_end:
+                    _prev = Interval(_prev.xmin, _punct_min_end, _prev.text)
+                _piv = Interval(_prev.xmax, max(_piv.xmax, _prev.xmax + 0.060), _piv.text)
+                _pp_resolved[-1] = _prev
+                _pp_resolved.append(_piv)
+            else:
+                # Two content phones overlap — clip at midpoint
+                _mid = (_prev.xmax + _piv.xmin) / 2.0
+                _pp_resolved[-1] = Interval(_prev.xmin, _mid, _prev.text)
+                _pp_resolved.append(Interval(_mid, _piv.xmax, _piv.text))
+
+        new_pp_tier = Tier(pp_tier.name, pp_tier.xmin, pp_tier.xmax, _pp_resolved)
     else:
         new_pp_tier = None
 
@@ -4972,10 +5054,17 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                         # residual offset after Phase 4 boundary changes.
                         if new_pp_ivs[first].xmin > w_iv.xmin + 0.005:
                             new_pp_ivs[first] = Interval(w_iv.xmin, new_pp_ivs[first].xmax, new_pp_ivs[first].text)
-                        # Extend last phone to word end.  If the extension
-                        # crosses the next word's first-phone start, also
-                        # push that phone forward so both boundaries move
-                        # together — no gap AND no overlap.
+                        # Extend last phone to word end (Regr. Case 45).
+                        # Apply a phonetically-motivated maximum duration
+                        # so the tail phone is not inflated when the word
+                        # boundary was stretched by CTC snap / silence
+                        # absorption.  The cap is computed from the phone's
+                        # own pre-extension duration:
+                        #   - vowel / final:   max(400ms, 1.5× orig)
+                        #   - consonant/init:   max(200ms, 1.5× orig)
+                        #   - single-phone word: max(500ms, 1.5× orig)
+                        # Excess time beyond the cap is NOT filled — it
+                        # remains as a natural silence gap.
                         if w_iv.xmax > new_pp_ivs[last].xmax + 0.005:
                             extend_to = w_iv.xmax
                             # Find next word's first phone — may need shifting
@@ -4988,11 +5077,27 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                                             next_first = _npi
                                             break
                                     break
-                            # If extension would cross into the next word's
-                            # first phone, cap it there.  The next phone's
-                            # acoustic start is the authoritative boundary.
                             if next_first is not None:
                                 extend_to = min(extend_to, new_pp_ivs[next_first].xmin)
+
+                            # ── Duration cap (Regr. Case 45) ──
+                            _last_text = new_pp_ivs[last].text
+                            _last_orig_dur = new_pp_ivs[last].xmax - new_pp_ivs[last].xmin
+                            _is_single = (first == last)
+                            _is_vowel = not bool(re.match(
+                                r'^[bpmfdtnlgkhjqxrzcs]$|^[zcs]h$', _last_text))
+                            if _is_single:
+                                _max_dur = 0.500
+                            elif _is_vowel:
+                                _max_dur = 0.400
+                            else:
+                                _max_dur = 0.200
+                            # Allow phone to stretch up to 1.5× its original
+                            # duration, capped by the absolute max.
+                            _capped_dur = min(_max_dur, _last_orig_dur * 1.5)
+                            if _capped_dur > _last_orig_dur:
+                                extend_to = min(extend_to,
+                                                new_pp_ivs[last].xmin + _capped_dur)
                             new_pp_ivs[last] = Interval(new_pp_ivs[last].xmin, extend_to, new_pp_ivs[last].text)
                 synced_pp = Tier(synced_pp.name, synced_pp.xmin, synced_pp.xmax, new_pp_ivs)
                 for i, t in enumerate(new_tg.tiers):
@@ -5277,6 +5382,14 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # 最终筛选: 所有处理完成后再统一判断 (用最终的边界和静音结构)
     # ================================================================
     filter_reasons = []
+
+    # ── Load CMUdict for English word QC (Regr. Case 48) ──
+    # Case 32 (english_single_phone) and Case 33 (english_phone_deficit)
+    # must use CMUdict — NOT pinyin_dict — to determine the expected
+    # phone count for English words.  pinyin_dict is the CHINESE pinyin
+    # decomposition dict and is semantically wrong for English tokens.
+    from pipeline_utils import _load_cmudict as _load_cmu
+    _cmu = _load_cmu()
 
     # Pinyin leakage: the Chinese text (raw_text tier) must not contain
     # pinyin syllables like "yan1" or "li3".  If found, the alignment has
@@ -5640,12 +5753,17 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             report["cjk_details"]["hanzi_count"] = len(hanzi_cjk)
             report["cjk_details"]["delta"] = len(raw_cjk) - len(hanzi_cjk)
 
-    # ── Case 26-D: init_only_phone — pinyin_phones still has bare initials ──
-    # After the proportional-split fix (Case 26), a multi-phone dict word
-    # must never appear as its initial-only phone in pinyin_phones.
-    # Detect any residual cases that the fix couldn't cover.
+    # ── Case 26-D / Regr. Case 47: init_only_phone + single_phone audit ──
+    # After the proportional-split fix (Case 26+43), a multi-phone dict
+    # word must never appear as its initial-only phone in pinyin_phones.
+    # This check distinguishes three scenarios for single-phone pinyin words:
+    #   A. True init_only: 1 phone = dict initial → FINAL IS MISSING (bug)
+    #   B. Zero-initial:   1 phone = final, dict[0] is the initial (correct)
+    #   C. Self-reference: 1 phone = word text itself (English fallback)
     _init_only_count = 0
     _init_only_examples: list[str] = []
+    _zero_initial_count = 0       # correct single-phone zero-initial syllables
+    _self_ref_count = 0           # self-referencing fallback labels
     if words_tier is not None and pp_tier is not None and pinyin_dict is not None:
         for _wi, _w_iv in enumerate(words_tier.intervals):
             _wt = _w_iv.text.strip()
@@ -5653,21 +5771,37 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                 continue
             _dict_phones = pinyin_dict.get(_wt) or pinyin_dict.get(_wt.lower())
             if not _dict_phones or len(_dict_phones) < 2:
-                continue  # zero-initial or not in dict
-            # Collect non-silence phones in this word's range
+                continue  # zero-initial or not in dict — skipped by design
             _w_phones = [p for p in pp_tier.intervals
                          if p.xmax > _w_iv.xmin + 0.001
                          and p.xmin < _w_iv.xmax - 0.001
                          and not is_silence(p.text)]
             _phone_texts = [p.text.strip() for p in _w_phones]
-            if len(_phone_texts) == 1 and _phone_texts[0] == _dict_phones[0]:
-                _init_only_count += 1
-                if len(_init_only_examples) < 5:
-                    _init_only_examples.append(f"{_wt}→{_phone_texts}")
+            if len(_phone_texts) == 1:
+                if _phone_texts[0] == _dict_phones[0]:
+                    # Type A: single phone IS the initial → final missing
+                    _init_only_count += 1
+                    if len(_init_only_examples) < 5:
+                        _init_only_examples.append(f"{_wt}→{_phone_texts}")
+                elif _phone_texts[0] == _wt.lower():
+                    # Type C: self-reference fallback
+                    _self_ref_count += 1
+                else:
+                    # Type B: single phone is the final → zero-initial (correct)
+                    _zero_initial_count += 1
+    # Only flag true init_only (Type A).  Zero-initial (Type B) and
+    # self-reference (Type C) are legitimate and not errors.
     if _init_only_count > 0:
         filter_reasons.append("init_only_phone")
         report["init_only_phone"] = {"count": _init_only_count,
                                       "examples": _init_only_examples}
+    # Add diagnostic breakdown even when no errors (zero-initial is expected)
+    if _zero_initial_count > 0 or _self_ref_count > 0:
+        report["single_phone_breakdown"] = {
+            "init_only_error": _init_only_count,
+            "zero_initial_ok": _zero_initial_count,
+            "self_ref_ok": _self_ref_count,
+        }
 
     # ── Case 26-E: silence_boundary_split — initial-final boundary from silence ──
     # When the leakage filter (line 490) strips all real phones from word_phones,
@@ -5702,7 +5836,13 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                 key=lambda p: p.xmin)
             if len(_w_phones) >= 2:
                 _first_dur = _w_phones[0].xmax - _w_phones[0].xmin
-                if _first_dur < _SILENCE_SPLIT_FLOOR_S:
+                # Regr. Case 48: only flag when the first "phone" is
+                # actually a silence/spn label.  MFA can produce very
+                # short real phones (e.g. ɕ at 10 ms between consecutive
+                # identical words) — those are legitimate alignments,
+                # not garbage splits from silence fragments.
+                _first_label = _w_phones[0].text.strip()
+                if _first_dur < _SILENCE_SPLIT_FLOOR_S and is_silence(_first_label):
                     _silence_split_count += 1
                     if len(_silence_split_examples) < 5:
                         _silence_split_examples.append(
@@ -5768,41 +5908,50 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                                  "examples": _short_examples}
 
 
-    # ── Case 32: english_single_phone — English word with dict expecting
-    #     2+ ARPABET phones but pinyin_phones has only 1 (self-referencing).
-    #     English-path equivalent of Case 26 FULL_WORD_AS_PHONE. ──
+    # ── Case 32: english_single_phone — English word (not NVV, not punct)
+    #     whose pinyin_phones has only 1 self-referencing phone instead of
+    #     proper en:-prefixed ARPABET phonemes.  English-path equivalent of
+    #     Case 26 FULL_WORD_AS_PHONE. ──
+    # Regr. Case 48: use CMUdict (not pinyin_dict) for expected-phone
+    #     diagnostics.  pinyin_dict is the CHINESE syllable decomposition
+    #     dict — looking up English words in it is semantically wrong.
     _en_single_count = 0
     _en_single_examples: list[str] = []
-    if words_tier is not None and pp_tier is not None and pinyin_dict is not None:
+    if words_tier is not None and pp_tier is not None:
         _pp_idx = 0
         for _wi, _w_iv in enumerate(words_tier.intervals):
             _wt = _w_iv.text.strip()
             _ws, _we = _w_iv.xmin, _w_iv.xmax
-            if not _wt or not is_english_token(_wt):
+            # Skip silence, punct, NVV — only check English tokens
+            if not _wt or is_silence(_wt) or is_punct(_wt) or is_nvv_token(_wt):
                 while (_pp_idx < len(pp_tier.intervals)
                        and pp_tier.intervals[_pp_idx].xmax <= _we + 0.002):
                     _pp_idx += 1
                 continue
-            _dp = (pinyin_dict.get(_wt) or pinyin_dict.get(_wt.upper())
-                   or pinyin_dict.get(_wt.lower()))
-            if not _dp or len(_dp) < 2:
+            if not is_english_token(_wt):
                 while (_pp_idx < len(pp_tier.intervals)
                        and pp_tier.intervals[_pp_idx].xmax <= _we + 0.002):
                     _pp_idx += 1
                 continue
+            # Collect non-silence phones for this English word
             _w_phones = []
             __pi = _pp_idx
             while __pi < len(pp_tier.intervals) and pp_tier.intervals[__pi].xmin < _we - 0.001:
                 _p = pp_tier.intervals[__pi]
-                if (_p.xmax > _ws + 0.001 and getattr(_p, 'mark', None)
-                        and not is_silence(getattr(_p, 'mark', '').strip())):
-                    _w_phones.append(getattr(_p, 'mark', _p.text if hasattr(_p, 'text') else '').strip())
+                if (_p.xmax > _ws + 0.001 and _p.text
+                        and not is_silence(_p.text.strip())):
+                    _w_phones.append(_p.text.strip())
                 __pi += 1
+            # Self-reference: only 1 phone AND it equals the word itself.
+            # Proper English phones have en: prefix; self-reference does not.
             if len(_w_phones) == 1 and _w_phones[0] in (_wt, _wt.lower(), _wt.upper()):
                 _en_single_count += 1
                 if len(_en_single_examples) < 5:
+                    # Regr. Case 48: use _cmu (CMUdict) for English diagnostics.
+                    _cmu_entry = _cmu.get(_wt.lower())
                     _en_single_examples.append(
-                        f"{_wt}→{_w_phones[0]!r} (dict:{_dp})")
+                        f"{_wt}→{_w_phones[0]!r}" +
+                        (f" (cmu:{_cmu_entry})" if _cmu_entry else " (not in CMUdict)"))
     if _en_single_count > 0:
         filter_reasons.append("english_single_phone")
         report["english_single_phone"] = {"count": _en_single_count,
@@ -5811,9 +5960,14 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # ── Case 33: english_phone_deficit — English word has fewer phones
     #     than the dict expects (but > 1, so not caught by Case 32).
     #     English MFA under-produced phones for this word. ──
+    # Regr. Case 48: use CMUdict (not pinyin_dict) for expected-phone
+    #     count.  pinyin_dict entries have at most 2 phones (initial+final),
+    #     so the old condition ``_n_got >= 2 and _n_got < 2`` could never
+    #     fire — the check was effectively dead code.  CMUdict entries
+    #     have 2-15 phones, so the deficit detection is now meaningful.
     _en_deficit_count = 0
     _en_deficit_examples: list[str] = []
-    if words_tier is not None and pp_tier is not None and pinyin_dict is not None:
+    if words_tier is not None and pp_tier is not None:
         _pp_idx = 0
         for _wi, _w_iv in enumerate(words_tier.intervals):
             _wt = _w_iv.text.strip()
@@ -5823,8 +5977,8 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                        and pp_tier.intervals[_pp_idx].xmax <= _we + 0.002):
                     _pp_idx += 1
                 continue
-            _dp = (pinyin_dict.get(_wt) or pinyin_dict.get(_wt.upper())
-                   or pinyin_dict.get(_wt.lower()))
+            # Regr. Case 48: CMUdict lookup for English words.
+            _dp = _cmu.get(_wt.lower())
             if not _dp or len(_dp) < 2:
                 while (_pp_idx < len(pp_tier.intervals)
                        and pp_tier.intervals[_pp_idx].xmax <= _we + 0.002):
@@ -5844,8 +5998,9 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                 if not all(ph in (_wt, _wt.lower(), _wt.upper()) for ph in _w_phones):
                     _en_deficit_count += 1
                     if len(_en_deficit_examples) < 5:
+                        # Regr. Case 48: CMUdict entry shown for diagnostics.
                         _en_deficit_examples.append(
-                            f"{_wt}→got {_n_got} phones, dict:{_dp} ({_n_exp})")
+                            f"{_wt}→got {_n_got} phones, cmu:{_dp} ({_n_exp})")
     if _en_deficit_count > 0:
         filter_reasons.append("english_phone_deficit")
         report["english_phone_deficit"] = {"count": _en_deficit_count,
