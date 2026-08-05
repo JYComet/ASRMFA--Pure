@@ -58,6 +58,10 @@
 | 47 | 2026-08-05 | postprocess_textgrids.py | init_only_phone 检测改进 — 区分零声母/自引用/真缺失韵母 |
 | 48 | 2026-08-05 | postprocess_textgrids.py | silence_boundary_split 误报 — MFA 真 phone 被误判为 silence 分界 |
 | 49 | 2026-08-05 | postprocess_textgrids.py | english_single_phone / english_phone_deficit 用中文拼音词典查英文词 → 误报/死代码 |
+| 50 | 2026-08-05 | postprocess_textgrids.py | Interval.mark 属性不存在 → postprocess 全线崩溃 |
+| 51 | 2026-08-05 | run_pipeline.py | ctc_pretg_adj 空目录未回退 → postprocess 找不到 txt/lab |
+| 52 | 2026-08-05 | postprocess_textgrids.py | CTC 宽跨标点锚点 → _inject_punctuation 碎片喷溅 + _fix_overlapping_boundaries 阈值拒绝 → 词级大重叠 |
+| 53 | 2026-08-05 | postprocess_textgrids.py | 拼音-汉字全局错位 — STT 错误→pypinyin 上下文污染→级联位移 (pinyin_displacement) |
 
 ---
 
@@ -4751,3 +4755,295 @@ python3 scripts/run_pipeline.py --config configs/hecheng_ria_0805.yaml \
     --python .../mfa-dev/bin/python --step postprocess --overwrite
 # 预期: 不再报 Missing txt/lab，正常产出 TextGrid
 ```
+
+---
+
+## Case 52: CTC 宽跨标点锚点 → _inject_punctuation 碎片喷溅 + _fix_overlapping_boundaries 阈值拒绝 → 词级大重叠 (wide_ctc_punct_fragmentation)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `_inject_punctuation` (line 2537), `_fix_overlapping_boundaries` (line 1002)
+**触发样本**: 036014（,↔ria 859ms / ,↔lai2 1370ms）, 036015（。↔lve4 2135ms）
+
+### 现象
+
+遍历 `filtered/` 输出的 words tier，大量相邻 interval 出现 xmax > 下一个 xmin 超过 5ms 的重叠：
+
+**036014 — 单 CTC 逗号碎片化为 5 个重叠逗号：**
+```
+[2]  1.041-2.620  ，       ← CTC 锚点 start, 覆盖 ria+lai2+bao4+dao4
+[3]  1.761-1.921  ria      ← 重叠 859ms (，xmax 2.620 > ria xmin 1.761)
+[4]  1.921-3.510  ，       ← 从 ria end 延伸到 zuo2 start, 覆盖 lai2+bao4+dao4+la5
+[5]  2.140-2.270  lai2     ← 重叠 1370ms
+[7]  2.270-3.510  ，       ← 从 bao4 start 延伸到 zuo2 start
+[9]  2.400-3.510  ，       ← 从 dao4 start 延伸到 zuo2 start
+[11] 2.620-3.510  ，       ← 与 la5 完全重叠
+```
+
+**036015 — 宽跨句号：**
+```
+[25] 6.730-9.650  。       ← CTC 句号锚点宽 2.92s
+[26] 7.515-8.930  lve4     ← 重叠 2135ms (。xmax 9.650 > lve4 xmin 7.515)
+```
+
+**根本规律**: CTC 标点锚点 `start_s↔end_s` 跨多个词（如 `，` [1.041, 3.321] 跨 2.28s, `。` [6.71, 11.24] 跨 4.53s），经过 `_inject_punctuation` 后不是被裁到下一个词边界，而是**碎裂成多个相互重叠的碎片**，每个碎片的 xmax 都停留在原 CTC end time 并被 step 6 延伸到最近词界。
+
+### 根因链
+
+1. **CTC 模型输出宽跨锚点**: CTC 标点检测在静音段上放置单个标点锚点，但其 `end_s` 往往延伸到下一个大句段开始（而非下一个词的 xmin）。例如 `，` [1.041, **3.321**] 覆盖了 ria、lai2、bao4、dao4、la5 五个词。CTC 给出的是**连续的 token→token 边界**（标点 end == 下一个 token start 在 CTC 层面），但 MFA 处理后词界与 CTC 锚点出现结构性偏移。
+
+2. **`_inject_punctuation` 重叠消解循环使用固定 range** (line 2587):
+   ```python
+   for pi in range(len(resolved)):  # ← len(resolved) 只计算一次！
+   ```
+   当 wide punct 触发 "word inside punct" 分支 (line 2607-2616) 时，`resolved.append(right_part)` 将右半截追加到列表末尾，但 `range` 不会包含新增索引 → **右半截永远不会被重叠消解**。
+
+3. **split 分支不更新 ps/pe** (line 2612-2616):
+   ```python
+   left_part  = (ps, ws, ptext, pkind)
+   right_part = (we, pe, ptext, pkind)
+   resolved[pi] = left_part        # 原地替换
+   if right_part[1] > right_part[0] + 0.001:
+       resolved.append(right_part)
+   # BUG: ps, pe 未更新！下一轮 wi 仍用原始 ps 继续匹配
+   ```
+   导致内层循环对每个后续词都重复 split，每次 `resolved[pi]` 被覆写，**前面的 left_part 全部丢失**。最终只有最后一次 split 的 left_part 存活。
+
+4. **碎片链累积**:
+   - vs ria: split → append right [1.921, 3.321]
+   - vs lai2: split → append right [2.270, 3.321]
+   - vs bao4: split → append right [2.400, 3.321]
+   - vs dao4: split → append right [2.620, 3.321]
+   - vs la5: we≥pe → trim end to 2.620（幸存 left_part: [1.041, 2.620]）
+   
+   结果: 1 个幸存 left_part + 4 个未处理的 right_part = **5 个标点 interval 全部重叠**。
+
+5. **Step 6 右边界延伸** (line 2673-2684): 每个未处理的 right_part 被延伸到 `<500ms` 外的下一个词 `zuo2` start (3.510s) → 所有碎片都伸长到 3.510s。
+
+6. **`_fix_overlapping_boundaries` 阈值拒绝** (line 1068):
+   ```python
+   elif is_punct(cur_text) and nxt_is_content and overlap < 0.100:  # ← 100ms 硬阈值
+   ```
+   碎片产生的重叠均在 700-2000ms → 远超 100ms → 被跳过，留给下游 QC filter 标记（但标记后文件已被归档，不会自动修复）。
+
+7. **`absorb_silence_into_punct` 无法补救** (line 1280): 此函数依赖 `is_punct(cur) and is_silence(next)` 模式——但当标点已经**重叠进下一个词内部**时，标点和词之间没有静音 interval，吸收条件永远不满足。标点直接侵入词内，不是"标点+静音+词"的正常序列。
+
+### 修改点
+
+**A. `_inject_punctuation` — 将 for-range 改为 while 循环** (~line 2587)
+
+```python
+# 修改前 (line 2587)
+for pi in range(len(resolved)):
+
+# 修改后
+pi = 0
+while pi < len(resolved):
+```
+
+**B. `_inject_punctuation` — split 分支更新 ps + 保留 left_part 历史** (~line 2607-2616)
+
+```python
+# 修改前
+else:
+    # word inside punct (ws > ps and we < pe):
+    # split punct into left part (before word) + right part (after word)
+    left_part  = (ps, ws, ptext, pkind)
+    right_part = (we, pe, ptext, pkind)
+    resolved[pi] = left_part
+    if right_part[1] > right_part[0] + 0.001:
+        resolved.append(right_part)
+
+# 修改后
+else:
+    # word inside punct (ws > ps and we < pe):
+    # split punct into left part (before word) + right part (after word)
+    # Regr. Case 52: ps must be advanced past the word so subsequent
+    # word checks use the right part's position.  Left parts are
+    # accumulated in a list and appended after the inner loop to
+    # avoid overwriting resolved[pi].
+    _left_parts = [(ps, ws, ptext, pkind)]
+    ps = we  # advance past this word
+    # Continue inner loop; further overlaps will split against updated ps.
+    # After inner loop, replace resolved[pi] with first fragment and
+    # append the rest (including the final trailing portion).
+```
+
+**C. `_inject_punctuation` — 内层循环结束后提交碎片** (~after line 2616)
+
+在内层 `for wi` 结束后、`pi += 1` 前增加：
+
+```python
+    # After inner word loop: commit accumulated fragments
+    if _left_parts:
+        resolved[pi] = _left_parts[0]
+        for frag in _left_parts[1:]:
+            if frag[1] > frag[0] + 0.001:
+                resolved.append(frag)
+        # Trailing portion after last word
+        trailing = (ps, pe, ptext, pkind)
+        if trailing[1] > trailing[0] + 0.001:
+            resolved.append(trailing)
+```
+
+**D. `_fix_overlapping_boundaries` — 移除/放宽 punct-content 重叠阈值** (~line 1068)
+
+```python
+# 修改前
+elif is_punct(cur_text) and nxt_is_content and overlap < 0.100:
+
+# 修改后: 无条件裁切标点 (标点流进内容词永远不合理)
+elif is_punct(cur_text) and nxt_is_content:
+```
+
+同理 ~line 1063:
+```python
+# 修改前
+elif cur_is_content and is_punct(nxt_text) and overlap < 0.100:
+
+# 修改后
+elif cur_is_content and is_punct(nxt_text):
+```
+
+### 验证方法
+
+```python
+# 用 036014 的 CTC 数据模拟 _inject_punctuation：
+# 修复前: 1 个 CTC "，" → 输出 5 个重叠逗号，最大重叠 1370ms
+# 修复后: 1 个 CTC "，" → 输出 ≤1 个逗号（或按词间间隙分段的多个非重叠逗号），所有 overlap ≤ 5ms
+
+# 批量验证
+python3 scripts/audit_textgrids.py --dir /mnt/nvme3/mfa_workspace_ria_0805/filtered/ \
+    --check overlaps --threshold 0.005
+# 预期修复后: overlap 报告从 ~7000+/7698 文件降至 <100
+```
+
+### 关联样本
+
+- `/mnt/nvme3/mfa_workspace_ria_0805/filtered/036014_*.TextGrid` — 碎片化逗号（5→1）
+- `/mnt/nvme3/mfa_workspace_ria_0805/filtered/036015_*.TextGrid` — 句号侵入 lve4 2135ms
+- 整体统计: 7698 个 filtered 文件中大量出现同模式标点→词重叠
+
+---
+
+## Case 53: 拼音-汉字全局错位 — STT 错误→pypinyin 上下文污染→级联位移 (pinyin_displacement)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `process_one` (QC 段)
+**测试目录**: `\\RS3621\Research_TTS\Data\Raw\0805test` (9,843 文件)
+**影响范围**: 8,098/9,843 (82.3%) 文件存在拼音-汉字不匹配
+**严重程度**: 6,480/9,843 (65.8%) 文件错位率 > 30%
+
+### 现象
+
+MFA 对齐产出的最终 TextGrid 中，words tier 的拼音与 hanzi tier 的汉字之间存在大规模系统性错位。一个汉字被赋予相邻汉字的拼音，导致从错位起点到文件末尾的所有字符全部偏移。
+
+**典型样本** (`036000_弹幕互动_回应吐槽弹幕.TextGrid`):
+
+```
+位置  hanzi  words(实际)  期望pinyin   状态
+ 13   播      he2          bo1          ← 错位起点
+ 14   和      fan4         he2          ← 被传染
+ 15   饭      na3          fan4         ← 继续偏移
+ ...后续 22/31 个字符全部偏移...
+```
+
+**错位类型分布** (7,921 个位移段):
+- SCRAMBLED（STT 错词导致非简单平移）: 4,323
+- LEFT -1 位置偏移: 3,355
+- RIGHT +1 位置偏移: 243
+
+### 根因链
+
+1. **NVASR STT 产生错误文本** (`ctc_prealign.py`): 语音识别在混合中英文、噪声、NVV 环境下产生大量错误:
+   - 字符插入: "AP**播**和饭" 应为 "AP和饭"
+   - 字符替换: "**兽**大家" 应为 "**受**大家"
+   - 英文词碎片化: `Macbook` → `MAacbook`（驼峰融合）、`Instagram` → `Instagramstagram`（自重复拼接）
+   - 词序错乱: "**好**评论区告诉" 应为 "评论区告诉**我**"
+
+2. **pypinyin 逐字转换被污染**: pypinyin 对每个汉字独立做拼音转换。当 STT 多出了 "播" 这个字时，pypinyin 为它生成了正确的拼音 "bo1"——但后续所有字的拼音序列整体错位了一格。
+
+3. **MFA 使用错误拼音做强制对齐**: `.lab` 中的错误拼音序列 → MFA 在音频上做强制对齐 → 相邻 token 边界互相挤占 → 音素边界漂移。
+
+4. **计数一致但映射全错**: words tier 的拼音 token 数量与 hanzi tier 的汉字数量始终相同，所以现有的 `cjk_mismatch` 检查（仅比对整个 CJK 字符串）无法发现错位。
+
+5. **位移无自愈机制**: 一旦偏移开始，后面所有字符都会继续错位，直到文件末尾。
+
+### MAacbook / Instagramstagram 类畸形文本的起源
+
+通过全文检索证实: `MAacbook`、`Instagramstagram`、`Instagramsta`、`Vcocal` 等畸形英文词**来自 NVASR STT 输出**，而非输入源文本:
+
+1. **NVASR SenseVoice-Small 的固有限制** (~200M 参数):
+   - 英文大小写边界区分能力弱 → `Macbook` → `MA` + `acbook` → `MAacbook`（解码器 token 融合错误）
+   - 英文长词自重复拼接 → `Instagram` → `Instagram` + `stagram` → `Instagramstagram`
+   - 英文词被拼音化 → `vocal` → `V` + `cocal` → `Vcocal`
+
+2. **`normalize_english_tokens.py` 未覆盖**: 该步骤仅处理 NVASR 的拼音碎片→英文原词（如 `li ve` → `live`），不处理 ASR 直接输出的畸形英文。
+
+3. **完整路径**:
+```
+原始语音: "用 Macbook 学 PV 真的太方便啦"
+    ▼ NVASR STT
+raw_text: "用MAacbook学PV真的太方便啦"
+    ▼ pypinyin chars_and_pinyin
+.lab: ... MAacbook xue2 PV ...
+    ▼ MFA align (MAacbook 不在中英文词典中 → self-referential phone)
+words tier: MAacbook
+pinyin_phones: MAacbook (单个自引用 phone, 时长异常)
+```
+
+### 修改点
+
+**`scripts/postprocess_textgrids.py` — `process_one` QC 段** (~line 5755, `cjk_mismatch` 检查之后)
+
+新增 `pinyin_displacement` 检查 (~80 行):
+
+对 hanzi tier 中每个 CJK 字符:
+1. 用 `pypinyin.lazy_pinyin(style=TONE3, neutral_tone_with_five=True)` 获取期望拼音
+2. 去除声调数字后与 words tier 的实际拼音对比
+3. 检测连续 ≥3 字符的错位段（displacement runs）
+4. 触发条件: `mismatch_rate ≥ 25%` OR `任一错位段 ≥ 6 字符`
+5. 触发后: `filter_reasons.append("pinyin_displacement")` → 文件写入 `filtered/`
+
+与现有检查的关系:
+| 检查 | 检测什么 | pinyin_displacement 覆盖吗? |
+|------|---------|---------------------------|
+| `hanzi_pinyin` | hanzi tier 中残留的拼音 token（如 "qie4"） | 否 — 互补 |
+| `cjk_mismatch` | raw_text CJK 序列 vs hanzi CJK 序列字面不一致 | 否 — 互补 |
+| **`pinyin_displacement`** | **words tier 拼音 vs hanzi 期望拼音不一致** | **是 — 新增覆盖** |
+
+### 修复方案分析 (四种方向对比)
+
+| 方案 | 阶段 | 策略 | 优点 | 缺点 | 推荐度 |
+|------|------|------|------|------|-------|
+| **A** | ctc_prealign | 拼音一致性验证 + 拦截 | 源头阻止，不浪费 MFA 计算 | 需修改上游，需确定拦截后策略 | ★★★ |
+| **B** (已实现) | postprocess | 检测 + 过滤到 filtered/ | 改动最小，纯防御 | 已浪费 MFA，不修复数据 | ★★☆ |
+| **C** | 全管线 | STT→纠错→重对齐 | 根本修复 | 复杂度高，需纠错模型 | ★☆☆ |
+| **D** | postprocess | pypinyin 原地纠正 words tier | 修复而非丢弃 | 多音字声调不准，可能引入新错误 | ★★☆ |
+
+### 验证方法
+
+```python
+# 已知错位文件 → 应被过滤
+#   036000: 71% mismatch, 3 runs → FILTERED ✓
+# 已知正常文件 → 应通过
+#   036040: 0% mismatch, 0 runs → PASS ✓
+
+# 批量验证:
+python3 scripts/postprocess_textgrids.py --txt-dir ... --textgrid-dir ... \
+    --output-dir ... --filtered-dir ... --pinyin-dict ...
+# 预期: filtered/ 中包含 pinyin_displacement 文件,
+#       report 中包含 "pinyin_displacement" 字段及 mismatch_rate / runs
+
+# 统计分析:
+python3 scripts/audit_textgrids_deep.py /mnt/Raw/0805test
+# 获取全量错位率分布
+```
+
+### 关联样本
+
+- `036000_弹幕互动_回应吐槽弹幕.TextGrid`: 拼音-汉字全局错位 (71% mismatch, 22/31 chars)
+- `036046_弹幕互动_回应吐槽弹幕.TextGrid`: `MAacbook` (STT 驼峰融合)
+- `036038_弹幕互动_回应吐槽弹幕.TextGrid`: `Instagramstagram` (STT 自重复拼接)
+- `036075_弹幕互动_回应吐槽弹幕.TextGrid`: `Instagramsta` + 全局错位

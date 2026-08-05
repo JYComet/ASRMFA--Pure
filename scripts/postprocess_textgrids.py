@@ -1000,7 +1000,7 @@ def absorb_nvv_trailing(textgrid: TextGrid) -> None:
 
 
 def _fix_overlapping_boundaries(words_tier) -> int:
-    """Resolve overlaps between adjacent intervals.  Regr. Case 38.
+    """Resolve overlaps between adjacent intervals.  Regr. Case 38, 52.
 
     Operates on *words_tier* intervals in-place.  Returns the number of
     overlaps that were fixed (so the caller can decide whether to re-sync
@@ -1013,10 +1013,10 @@ def _fix_overlapping_boundaries(words_tier) -> int:
       content word's boundary (they lack MFA acoustic models, so their
       CTC boundaries are less precise).
     * Content word overlapping with **punctuation** → clip the punctuation
-      side (``clip_punct``).
-    * Overlaps ≥ 30 ms (content-content) or ≥ 100 ms (content-punct) are
-      **left untouched** — they will be caught by the downstream
-      ``overlapping_words`` QC filter (Case 27-B).
+      side unconditionally (Regr. Case 52 — punct of any size leaking into
+      content is always wrong).
+    * Content-content overlaps ≥ 30 ms are **left untouched** — they will
+      be caught by the downstream ``overlapping_words`` QC filter (Case 27-B).
     * Zero-duration remnants are removed after all fixes are applied.
     """
     intervals = list(words_tier.intervals)
@@ -1060,12 +1060,14 @@ def _fix_overlapping_boundaries(words_tier) -> int:
             fixed += 1
 
         # ── Content word followed by punctuation that leaks into it ──
-        elif cur_is_content and is_punct(nxt_text) and overlap < 0.100:
+        # Regr. Case 52: removed 100ms threshold — punct-content overlaps
+        # of any size are always wrong and should be clipped.
+        elif cur_is_content and is_punct(nxt_text):
             intervals[i + 1] = Interval(cur.xmax, nxt.xmax, nxt.text)
             fixed += 1
 
         # ── Punctuation leaking into following content word ──
-        elif is_punct(cur_text) and nxt_is_content and overlap < 0.100:
+        elif is_punct(cur_text) and nxt_is_content:
             intervals[i] = Interval(cur.xmin, nxt.xmin, cur.text)
             fixed += 1
 
@@ -2584,9 +2586,13 @@ def _inject_punctuation(words_tier: Tier, pp_tier: Tier | None,
         return next_boundary
 
     # 第二轮: word 优先, 标点裁剪到词边界
-    for pi in range(len(resolved)):
+    # Regr. Case 52: use while loop so inserted punct fragments
+    # are processed (for-range captures len(resolved) once and misses them).
+    pi = 0
+    while pi < len(resolved):
         ps, pe, ptext, pkind = resolved[pi]
         if pkind != "punct":
+            pi += 1
             continue
         for wi in range(len(resolved)):
             ws, we, wtext, wkind = resolved[wi]
@@ -2596,6 +2602,7 @@ def _inject_punctuation(words_tier: Tier, pp_tier: Tier | None,
                 if ws <= ps and we >= pe:
                     # word contains punct → delete punct
                     resolved[pi] = (0, 0, "", pkind)
+                    break
                 elif ws <= ps:
                     # word overlaps left side of punct → trim punct start
                     resolved[pi] = (we, pe, ptext, pkind)
@@ -2606,14 +2613,17 @@ def _inject_punctuation(words_tier: Tier, pp_tier: Tier | None,
                     pe = ws
                 else:
                     # word inside punct (ws > ps and we < pe):
-                    # split punct into left part (before word) + right part (after word)
-                    # Regression Case 24: else used to delete punct here,
-                    # losing pause markers like … when a word sits inside them
+                    # split punct into left part + right part
+                    # Regr. Case 24: preserve left/right parts instead of deleting
+                    # Regr. Case 52: insert right_part at pi+1 so the while
+                    # loop processes it; break to avoid stale ps/pe
                     left_part  = (ps, ws, ptext, pkind)
                     right_part = (we, pe, ptext, pkind)
                     resolved[pi] = left_part
                     if right_part[1] > right_part[0] + 0.001:
-                        resolved.append(right_part)
+                        resolved.insert(pi + 1, right_part)
+                    break
+        pi += 1
 
     # 去掉零时长 interval
     resolved = [(s, e, t, k) for s, e, t, k in resolved if e > s + 0.001]
@@ -5752,6 +5762,113 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             report.setdefault("cjk_details", {})["raw_count"] = len(raw_cjk)
             report["cjk_details"]["hanzi_count"] = len(hanzi_cjk)
             report["cjk_details"]["delta"] = len(raw_cjk) - len(hanzi_cjk)
+
+        # (c) Pinyin displacement detection — for each Chinese character in the
+        #     hanzi tier, compare its expected pinyin (from pypinyin) against
+        #     the actual pinyin in the words tier.  Consecutive mismatches
+        #     indicate a displacement cascade caused by upstream STT errors
+        #     propagating through the pinyin converter.
+        #     Regression Case 52.
+        _words_tier_qc = tier_by_name(new_tg, "words")
+        if _words_tier_qc is not None and hanzi_tier_final is not None:
+            _mismatch_count = 0
+            _total_cjk = 0
+            _consecutive_runs: list[dict] = []
+            _current_run: list[dict] = []
+            _run_start: int | None = None
+
+            try:
+                from pypinyin import lazy_pinyin, Style as _PyStyle
+            except ImportError:
+                lazy_pinyin = None  # type: ignore[assignment]
+
+            if lazy_pinyin is not None and len(hanzi_tier_final.intervals) == len(_words_tier_qc.intervals):
+                for _idx, (_h_iv, _w_iv) in enumerate(
+                    zip(hanzi_tier_final.intervals, _words_tier_qc.intervals)
+                ):
+                    _h_text = _h_iv.text.strip()
+                    _w_text = _w_iv.text.strip()
+
+                    # Only check Chinese characters (single CJK char per interval)
+                    if not (len(_h_text) == 1 and is_cjk(_h_text)):
+                        # End current run if any
+                        if _current_run and len(_current_run) >= 3:
+                            _consecutive_runs.append({
+                                "start": _run_start,
+                                "end": _idx - 1,
+                                "length": len(_current_run),
+                                "sample": _current_run[:5],
+                            })
+                        _current_run = []
+                        _run_start = None
+                        continue
+
+                    _total_cjk += 1
+
+                    # Get expected pinyin (without tone)
+                    try:
+                        _expected = lazy_pinyin(_h_text, style=_PyStyle.TONE3,
+                                                neutral_tone_with_five=True)
+                        _exp_norm = _re.sub(r'\d+$', '', _expected[0]).lower() if _expected else ""
+                    except Exception:
+                        _exp_norm = ""
+
+                    # Get actual pinyin from words tier (without tone)
+                    _act_norm = _re.sub(r'\d+$', '', _w_text).lower()
+
+                    if _exp_norm and _act_norm and _exp_norm != _act_norm:
+                        _mismatch_count += 1
+                        if _run_start is None:
+                            _run_start = _idx
+                        _current_run.append({
+                            "idx": _idx, "hanzi": _h_text,
+                            "expected": _exp_norm, "actual": _act_norm,
+                        })
+                    else:
+                        # End current run
+                        if _current_run and len(_current_run) >= 3:
+                            _consecutive_runs.append({
+                                "start": _run_start,
+                                "end": _idx - 1,
+                                "length": len(_current_run),
+                                "sample": _current_run[:5],
+                            })
+                        _current_run = []
+                        _run_start = None
+
+                # Flush final run
+                if _current_run and len(_current_run) >= 3:
+                    _consecutive_runs.append({
+                        "start": _run_start,
+                        "end": len(hanzi_tier_final.intervals) - 1,
+                        "length": len(_current_run),
+                        "sample": _current_run[:5],
+                    })
+
+                if _total_cjk > 0:
+                    _mismatch_rate = _mismatch_count / _total_cjk
+                    _has_displacement = len(_consecutive_runs) > 0 and (
+                        _mismatch_rate >= 0.25 or
+                        any(r["length"] >= 6 for r in _consecutive_runs)
+                    )
+
+                    report.setdefault("pinyin_displacement", {})["mismatch_rate"] = round(_mismatch_rate, 3)
+                    report["pinyin_displacement"]["total_cjk"] = _total_cjk
+                    report["pinyin_displacement"]["mismatches"] = _mismatch_count
+                    report["pinyin_displacement"]["displacement_runs"] = len(_consecutive_runs)
+
+                    if _consecutive_runs:
+                        report["pinyin_displacement"]["runs"] = [
+                            {"start": r["start"], "end": r["end"],
+                             "length": r["length"],
+                             "sample_hanzi": "".join(s["hanzi"] for s in r["sample"]),
+                             "sample_expected": "/".join(s["expected"] for s in r["sample"]),
+                             "sample_actual": "/".join(s["actual"] for s in r["sample"])}
+                            for r in _consecutive_runs[:5]
+                        ]
+
+                    if _has_displacement:
+                        filter_reasons.append("pinyin_displacement")
 
     # ── Case 26-D / Regr. Case 47: init_only_phone + single_phone audit ──
     # After the proportional-split fix (Case 26+43), a multi-phone dict
