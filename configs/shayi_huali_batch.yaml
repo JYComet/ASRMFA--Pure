@@ -1,67 +1,155 @@
 # ─────────────────────────────────────────────────────────────────
-# 纱依 + 花礼 — 批量流式管线 (nvrasr_fallback)
+# 纱依 + 花礼 — 批量流式管线 (nvrasr_fallback + pipelined)
 # ─────────────────────────────────────────────────────────────────
-# 数据源:  //RS3621/Research_TTS/Data/Raw/shayi_huali_wav/{纱依,花礼}
-# 输出:    //RS3621/Research_TTS/Data/Raw/shayi_huali/{纱依,花礼}
-# 音频已补全静音 → 跳过 trim, NVASR 从零生成 CTC
-# 总量:    ~84,788 WAV
-# ─────────────────────────────────────────────────────────────────
+#
+# 数据源:
+#   音频:  \\RS3621\Research_TTS\Data\Raw\shayi_huali_wav\{纱依,花礼}\*.wav
+#         纱依: 43,040 WAV | 花礼: 41,748 WAV | 合计: 84,788 WAV
+#   参考文本: 无 {stem}.txt → NVASR 纯 ASR 模式 (转录+对齐同步完成)
+#   音频布局: flat (WAV 直接在 speaker 目录下)
+#
+# 输出:
+#   \\RS3621\Research_TTS\Data\Raw\shayi_huali_new\{纱依,花礼}\
+#     └── output/     → 后处理 TextGrid
+#     └── filtered/   → 质检过滤
+#     └── ctc_pretg_adj/ → CTC 缓存 (供后续重跑复用)
+#
+# 音频已补全静音 → 跳过 trim + pad_silence
+# 无预存 CTC + 无参考文本 → NVASR 从零 ASR 转录 + CTC 对齐
+#
+# ═══════════════════════════════════════════════════════════════
+# 准备 (只需执行一次):
+#
+#   # 1. 将音频缓存到 NVMe (必须! batch cache 指向 NVMe 路径)
+#   #    按 speaker 子目录自动区分 → /mnt/nvme3/mfa_audio_cache/{纱依,花礼}/
+#   python scripts/cache_audio_to_nvme.py \
+#       --source //RS3621/Research_TTS/Data/Raw/shayi_huali_wav
+#
+#   # 验证缓存
+#   python scripts/cache_audio_to_nvme.py --status
+#
+# ═══════════════════════════════════════════════════════════════
+# 运行:
+#
+#   # Pipelined 模式 (推荐 — GPU/CPU 流水线分离, 效率最高)
+#   # batch cache 已指向 NVMe 路径, prefetch 为本地 NVMe→NVMe 快传
+#   python scripts/streaming_pipeline.py \
+#       --config configs/shayi_huali_batch.yaml \
+#       --pipelined
+#
+#   # 非 Pipelined 模式 (8 worker 并行, GPU+CPU 串行)
+#   python scripts/streaming_pipeline.py \
+#       --config configs/shayi_huali_batch.yaml
+#
+#   # 单 speaker 直接模式 (测试/调试用, 自动检测 nvme_cache)
+#   python scripts/run_pipeline.py \
+#       --config configs/shayi_huali_batch.yaml \
+#       --data-dir /mnt/nvme3/mfa_audio_cache/纱依 \
+#       --workspace /mnt/nvme0/mfa_work/纱依 \
+#       --output-dir //RS3621/Research_TTS/Data/Raw/shayi_huali_new/纱依
+#
+# ═══════════════════════════════════════════════════════════════
+# Pipelined 资源分配:
+#   8 GPU workers (每 GPU 一个 NVASR)
+#   48 CPU workers (每 worker 一个 MFA 实例)
+#   num_jobs=8 → 48 workers × 8 = 384 MFA job (跑满 384 CPU 核)
+#   每 batch 500 stems → 每 MFA job 处理 ~62 stems
+# ═══════════════════════════════════════════════════════════════
 
 mode: nvrasr_fallback
-workspace: shayi_huali
 
-# temp_dir 不设绝对路径, 自动用 workspace/temp (每 batch 隔离, 避免 MFA 并发冲突)
+# ── 路径配置 ──────────────────────────────────────────────────
+
+# 输入: NAS 原始音频 (用于 streaming_pipeline 路径翻译 + 直接模式 fallback)
+data_dir: //RS3621/Research_TTS/Data/Raw/shayi_huali_wav
+
+# NVMe 音频缓存 — streaming 模式不设置!
+# 原因: _resolve_nvme_cache() 会无条件用此路径替换 audio_dir,
+# 导致每个 batch 的 --audio-dir 指向全量 84k 文件而非 batch 的 500 文件.
+# 仅直接模式 (python run_pipeline.py) 时取消注释:
+# nvme_cache: /mnt/nvme3/mfa_audio_cache
+
+# 保留 16k 重采样音频 (供后续调试/重跑)
+keep_16k_audio: true
 
 # ── 静音补全 (音频已处理过, 跳过) ──
 pad_silence:
   enabled: false
 
-# ── Streaming (NAS → 本地 → NAS) ──
+# ── Streaming 流式控制 ───────────────────────────────────────
 streaming:
+  # 批量缓存文件 (相对于项目根)
+  # 包含 speaker 列表和路径, 由外部脚本生成
   batch_cache: cache/shayi_huali_batch.cache.json
+
+  # 每批 stem 数量 (平衡 GPU 显存 + 预取延迟)
   batch_size: 500
+
+  # 非 Pipelined 模式的并行 worker 数
+  # Pipelined 模式下不使用此值 (改用 num_gpus + cpu_workers)
   parallel: 8
+
+  # GPU 数量 (自动检测, 可手动覆盖)
   num_gpus: 8
+
+  # 本地 NVMe 工作目录 (多盘负载均衡)
+  # 每个 worker 按 worker_id % len(local_work) 分配
+  # 每盘 ~7TB, 当前使用率低 (3%-17%)
   local_work:
     - /mnt/nvme0/mfa_work
     - /mnt/nvme1/mfa_work
     - /mnt/nvme3/mfa_work
     - /mnt/nvme4/mfa_work
 
-# ── Pipelined mode (GPU/CPU 流水线分离) ──
+# ── Pipelined 模式 (GPU/CPU 流水线分离) ─────────────────────
 pipelined:
-  cpu_workers: 48           # CPU MFA workers (可配, 0=auto)
+  # CPU MFA worker 数量
+  # 48 workers × 8 MFA jobs = 384 并发 (跑满 384 核)
+  # 若 OOM: 降低 cpu_workers 或 mfa.num_jobs
+  cpu_workers: 48
 
-# ── NVASR CTC 预对齐 ──
+# ── NVASR CTC 预对齐 ─────────────────────────────────────────
 ctc_prealign:
   enabled: true
   python: /home/user/miniconda3/envs/asr/bin/python
   model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
-  device: cuda:0
+  device: cuda:0           # streaming_pipeline 通过 CUDA_VISIBLE_DEVICES 映射
+  limit: 0                 # 0=全部处理
+  timeout: 7200            # 单 batch (500 stems) 超时 2h
+  nvv_enabled: true        # 启用 NVV 标签检测 (呼吸/笑声/犹豫声等副语言标注)
+
+# ── CTC 边界能量修正 ─────────────────────────────────────────
+ctc_adjust:
+  enabled: true
   limit: 0
 
-# ── MFA 中文对齐 ──
+# ── MFA 中文对齐 ──────────────────────────────────────────────
 mfa:
-  num_jobs: 0                 # 0 = cpu_count() (384 核全用)
+  # num_jobs: 关键参数!
+  #   Pipelined: 48 CPU workers × 8 jobs = 384 并发 (跑满)
+  #   非 Pipelined (parallel=8): 8 workers × 8 jobs = 64 并发 (保守)
+  #   直接模式单 speaker: 手动 --mfa-jobs 覆盖以利用更多核心
+  #   每 batch 500 stems → 每个 job ~62 stems, 摊销 Kaldi 启动开销
+  num_jobs: 8
   single_speaker: true
   output_format: long_textgrid
   clean: false
   fine_tune: false
   skip_validate: true
+  beam: 20
+  retry_beam: 80
 
-# ── MFA 英文对齐 ──
+# ── MFA 英文对齐 ──────────────────────────────────────────────
 mfa_en:
   enabled: true
   num_jobs: 4
   beam: 10
   retry_beam: 40
   fine_tune: false
+  # 模型路径使用默认值 (pretrained_models/acoustic/english_us_arpa.zip 等)
+  # 自动 fallback 到 /mnt/local_E/MFA_Pause/pretrained_models/
 
-# ── CTC 边界能量修正 ──
-ctc_adjust:
-  enabled: true
-
-# ── 后处理 ──
+# ── 后处理 ────────────────────────────────────────────────────
 postprocess:
   merge_silence: true
   min_sil_merge_sec: 0.2
