@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -193,6 +194,97 @@ def find_english_segments(ctc_dir: Path, stems: list[str],
     return result
 
 
+def _build_corpus_stem(stem: str, segments: list[dict],
+                       audio_dir: Path, corpus_dir: Path,
+                       padding_s: float, min_dur_s: float) -> tuple[str, list[dict] | None]:
+    """Process a single stem's English segments for MFA corpus.
+
+    Returns (stem, updated_segments) or (stem, None) if the stem should be skipped.
+    Module-level so it is picklable for ProcessPoolExecutor.
+    """
+    import numpy as np
+
+    # Find audio file
+    wav_path = audio_dir / f"{stem}.wav"
+    if not wav_path.exists():
+        candidates = list(audio_dir.rglob(f"{stem}.wav"))
+        if candidates:
+            wav_path = candidates[0]
+        else:
+            return (stem, None)
+
+    # Read audio (scipy handles PCM float and int, mono and multi-channel)
+    try:
+        from scipy.io import wavfile as _wavfile
+        sr, audio = _wavfile.read(str(wav_path))
+    except Exception:
+        return (stem, None)
+
+    if audio.dtype == np.int16:
+        audio = audio.astype(np.float32) / 32768.0
+    elif audio.dtype == np.int32:
+        audio = audio.astype(np.float32) / 2147483648.0
+    elif audio.dtype == np.uint8:
+        audio = audio.astype(np.float32) / 128.0 - 1.0
+    else:
+        audio = audio.astype(np.float32)
+
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+
+    total_dur = len(audio) / sr
+    valid_segments = []
+
+    for seg in segments:
+        seg_start_raw = seg["seg_start"]
+        seg_end_raw = seg["seg_end"]
+        seg_dur = seg_end_raw - seg_start_raw
+
+        # Skip segments that are too short for MFA
+        if seg_dur < min_dur_s:
+            seg["skipped"] = True
+            seg["offset"] = seg_start_raw
+            valid_segments.append(seg)
+            continue
+
+        # Add padding
+        seg_start_padded = max(0.0, seg_start_raw - padding_s)
+        seg_end_padded = min(total_dur, seg_end_raw + padding_s)
+
+        start_sample = int(seg_start_padded * sr)
+        end_sample = int(seg_end_padded * sr)
+
+        if end_sample <= start_sample + int(0.05 * sr):
+            seg["skipped"] = True
+            seg["offset"] = seg_start_raw
+            valid_segments.append(seg)
+            continue
+
+        seg_audio = audio[start_sample:end_sample]
+        seg_audio_int16 = (seg_audio * 32767).clip(-32768, 32767).astype(np.int16)
+
+        seg_name = f"{stem}_seg{seg['seg_idx']}"
+        seg_wav = corpus_dir / f"{seg_name}.wav"
+        seg_lab = corpus_dir / f"{seg_name}.lab"
+
+        from scipy.io import wavfile as _wavfile2
+        _wavfile2.write(str(seg_wav), sr, seg_audio_int16)
+
+        # .lab: English word sequence
+        lab_text = " ".join(w["text"] for w in seg["words"])
+        seg_lab.write_text(lab_text + "\n", encoding="utf-8")
+
+        seg["skipped"] = False
+        seg["offset"] = seg_start_padded
+        seg["seg_name"] = seg_name
+        valid_segments.append(seg)
+
+    if valid_segments:
+        return (stem, valid_segments)
+    else:
+        return (stem, None)
+
+
 def build_en_corpus(en_segments: dict[str, list[dict]],
                     audio_dir: Path, corpus_dir: Path,
                     padding_ms: float = 50.0,
@@ -201,97 +293,50 @@ def build_en_corpus(en_segments: dict[str, list[dict]],
 
     Writes {stem}_seg{idx}.wav and {stem}_seg{idx}.lab to corpus_dir.
     Returns updated en_segments with offset info.
-    """
-    import numpy as np
 
+    Uses parallel workers when processing more than 4 stems —
+    each stem's WAV read + segment extraction is independent.
+    """
     corpus_dir.mkdir(parents=True, exist_ok=True)
     padding_s = padding_ms / 1000.0
     min_dur_s = min_segment_dur_ms / 1000.0
 
-    for stem, segments in list(en_segments.items()):
-        # Find audio file
-        wav_path = audio_dir / f"{stem}.wav"
-        if not wav_path.exists():
-            candidates = list(audio_dir.rglob(f"{stem}.wav"))
-            if candidates:
-                wav_path = candidates[0]
+    stem_items = list(en_segments.items())
+    if len(stem_items) <= 4:
+        # Serial: too few stems to justify process overhead
+        for stem, segments in stem_items:
+            _, result = _build_corpus_stem(stem, segments, audio_dir,
+                                           corpus_dir, padding_s, min_dur_s)
+            if result is not None:
+                en_segments[stem] = result
             else:
                 del en_segments[stem]
-                continue
-
-        # Read audio (scipy handles PCM float and int, mono and multi-channel)
-        try:
-            from scipy.io import wavfile as _wavfile
-            sr, audio = _wavfile.read(str(wav_path))
-        except Exception:
-            del en_segments[stem]
-            continue
-
-        import numpy as np
-        if audio.dtype == np.int16:
-            audio = audio.astype(np.float32) / 32768.0
-        elif audio.dtype == np.int32:
-            audio = audio.astype(np.float32) / 2147483648.0
-        elif audio.dtype == np.uint8:
-            audio = audio.astype(np.float32) / 128.0 - 1.0
-        else:
-            audio = audio.astype(np.float32)
-
-        if audio.ndim > 1:
-            audio = audio.mean(axis=1)
-
-        total_dur = len(audio) / sr
-        valid_segments = []
-
-        for seg in segments:
-            seg_start_raw = seg["seg_start"]
-            seg_end_raw = seg["seg_end"]
-            seg_dur = seg_end_raw - seg_start_raw
-
-            # Skip segments that are too short for MFA
-            if seg_dur < min_dur_s:
-                # Still record it — postprocessing will use G2P equal split
-                seg["skipped"] = True
-                seg["offset"] = seg_start_raw
-                valid_segments.append(seg)
-                continue
-
-            # Add padding
-            seg_start_padded = max(0.0, seg_start_raw - padding_s)
-            seg_end_padded = min(total_dur, seg_end_raw + padding_s)
-
-            start_sample = int(seg_start_padded * sr)
-            end_sample = int(seg_end_padded * sr)
-
-            if end_sample <= start_sample + int(0.05 * sr):
-                seg["skipped"] = True
-                seg["offset"] = seg_start_raw
-                valid_segments.append(seg)
-                continue
-
-            seg_audio = audio[start_sample:end_sample]
-            seg_audio_int16 = (seg_audio * 32767).clip(-32768, 32767).astype(np.int16)
-
-            seg_name = f"{stem}_seg{seg['seg_idx']}"
-            seg_wav = corpus_dir / f"{seg_name}.wav"
-            seg_lab = corpus_dir / f"{seg_name}.lab"
-
-            from scipy.io import wavfile as _wavfile
-            _wavfile.write(str(seg_wav), sr, seg_audio_int16)
-
-            # .lab: English word sequence
-            lab_text = " ".join(w["text"] for w in seg["words"])
-            seg_lab.write_text(lab_text + "\n", encoding="utf-8")
-
-            seg["skipped"] = False
-            seg["offset"] = seg_start_padded  # padded segment start in original timeline
-            seg["seg_name"] = seg_name
-            valid_segments.append(seg)
-
-        if valid_segments:
-            en_segments[stem] = valid_segments
-        else:
-            del en_segments[stem]
+    else:
+        n_workers = min(16, os.cpu_count(), len(stem_items))
+        print(f"  Building English corpus: {len(stem_items)} stems,"
+              f" {n_workers} workers")
+        ctx = __import__('multiprocessing').get_context("fork")
+        done = 0
+        with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+            futures = {
+                executor.submit(_build_corpus_stem, stem, segments, audio_dir,
+                                corpus_dir, padding_s, min_dur_s): stem
+                for stem, segments in stem_items
+            }
+            for future in as_completed(futures):
+                stem = futures[future]
+                done += 1
+                try:
+                    s, result = future.result()
+                    if result is not None:
+                        en_segments[s] = result
+                    else:
+                        en_segments.pop(s, None)
+                except Exception as e:
+                    print(f"  [ERROR] corpus build {stem}: {e}")
+                    en_segments.pop(stem, None)
+                if done % 200 == 0 or done == len(stem_items):
+                    print(f"  [{done}/{len(stem_items)}] stems processed")
 
     return en_segments
 

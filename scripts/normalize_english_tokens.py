@@ -15,8 +15,10 @@ and reference-text word units.
 
 import argparse
 import json
+import os
 import re
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -554,10 +556,36 @@ def main():
             if (txt_dir / f"{f.stem}_text_cn.txt").exists():
                 stems.add(f.stem)
 
-    changed = 0
-    for stem in sorted(stems):
-        if normalize_stem(txt_dir, stem, dry_run=args.dry_run):
-            changed += 1
+    stem_list = sorted(stems)
+    if args.dry_run or len(stem_list) <= 4:
+        # Serial: dry-run preview or too few stems to justify process overhead
+        changed = 0
+        for stem in stem_list:
+            if normalize_stem(txt_dir, stem, dry_run=args.dry_run):
+                changed += 1
+    else:
+        # Parallel: each stem is independent (separate .lab / .TextGrid / _tokens.jsonl)
+        n_workers = min(32, os.cpu_count(), len(stem_list))
+        print(f"  Processing {len(stem_list)} stems with {n_workers} workers...")
+        changed = 0
+        done = 0
+        # Use "fork" context on Linux for copy-on-write sharing of module globals
+        ctx = __import__('multiprocessing').get_context("fork")
+        with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+            futures = {
+                executor.submit(normalize_stem, txt_dir, stem, False): stem
+                for stem in stem_list
+            }
+            for future in as_completed(futures):
+                stem = futures[future]
+                done += 1
+                try:
+                    if future.result():
+                        changed += 1
+                except Exception as e:
+                    print(f"  [ERROR] {stem}: {e}")
+                if done % 500 == 0 or done == len(stem_list):
+                    print(f"  [{done}/{len(stem_list)}] {changed} changed")
 
     if args.dry_run:
         print(f"\nWould normalise {changed}/{len(stems)} stems")

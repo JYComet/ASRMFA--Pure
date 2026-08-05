@@ -528,8 +528,11 @@ class StreamingPipeline:
         self.models_dir = models_dir
         self.nas_output_root = nas_output_root
 
-        self.prefetch_queue: queue.Queue[int] = queue.Queue(maxsize=2)
-        self.upload_queue: queue.Queue[int] = queue.Queue()  # 无上限，不回堵主管线
+        # Backpressure: prefetch 4 batches ahead to keep processing saturated
+        # while bounding local NVMe usage; upload queue backpressure (maxsize=4)
+        # prevents unbounded NVMe accumulation when NAS is slow.
+        self.prefetch_queue: queue.Queue[int] = queue.Queue(maxsize=4)
+        self.upload_queue: queue.Queue[int] = queue.Queue(maxsize=4)
 
         self.stats_lock = threading.Lock()
         self.stats: dict[str, int] = {

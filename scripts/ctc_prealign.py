@@ -222,7 +222,9 @@ def make_patched_inference(ref_texts: dict[str, str],
             key *= b
 
         for i in range(b):
-            x = ctc_logits[i, :elens[i].item(), :]
+            # Clone before NVV bias so ctc_logits stays clean for forced
+            # alignment reuse below (avoids a second log_softmax call).
+            x = ctc_logits[i, :elens[i].item(), :].clone()
 
             # ── Blank-frame NVV bias ──
             top_pred = x.argmax(dim=-1)
@@ -232,30 +234,21 @@ def make_patched_inference(ref_texts: dict[str, str],
 
             raw_y = x.argmax(dim=-1).tolist()
 
-            # ── 记录 blank 段 (CTC 空白帧 → 停顿) ──
+            # ── 记录 blank 段 + 长空白注入省略号 (单次扫描) ──
             blank_runs = []
+            yseq_pause = torch.tensor(raw_y).to(x.device)
             jj = 0
             while jj < len(raw_y):
                 if raw_y[jj] == BLANK_ID:
                     s = jj
                     while jj < len(raw_y) and raw_y[jj] == BLANK_ID:
                         jj += 1
+                    run_len = jj - s
                     blank_runs.append((s, jj))
+                    if run_len >= pause_threshold:
+                        yseq_pause[s + run_len // 2] = ELLIPSIS_ID
                 else:
                     jj += 1
-
-            # ── 长空白注入省略号 (供文本转录用, 不影响时间戳) ──
-            yseq_pause = torch.tensor(raw_y).to(x.device)
-            j = 0
-            while j < len(raw_y):
-                if raw_y[j] == BLANK_ID:
-                    s = j
-                    while j < len(raw_y) and raw_y[j] == BLANK_ID:
-                        j += 1
-                    if (j - s) >= pause_threshold:
-                        yseq_pause[s + (j - s) // 2] = ELLIPSIS_ID
-                else:
-                    j += 1
 
             yseq_unique = torch.unique_consecutive(yseq_pause, dim=-1)
             mask = yseq_unique != self.blank_id
@@ -327,10 +320,9 @@ def make_patched_inference(ref_texts: dict[str, str],
                         token_ids_flat.append(124)  # space token
 
                 if token_ids_flat:
-                    # 准备 logits: 去掉 query 帧
-                    logits_speech = self.ctc.log_softmax(enc)[
-                        i, QUERY_FRAMES:total_frames, :
-                    ]
+                    # 准备 logits: 去掉 query 帧 (复用 L213 的 ctc_logits,
+                    # 因 x 已改为 .clone()，NVV bias 不会污染 ctc_logits)
+                    logits_speech = ctc_logits[i, QUERY_FRAMES:total_frames, :]
                     total_speech_frames = total_frames - QUERY_FRAMES
 
                     from funasr.models.sense_voice.utils.ctc_alignment import ctc_forced_align
