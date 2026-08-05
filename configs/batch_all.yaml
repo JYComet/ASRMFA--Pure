@@ -39,7 +39,7 @@ ctc_ready:
   require_all: true
 
 mfa:
-  num_jobs: 32                   # MFA 对齐并行数 (384 核 CPU)
+  num_jobs: 64                   # MFA 对齐并行数 (384 核 CPU, 8 shards × 8 jobs)
   single_speaker: true
 
 postprocess:

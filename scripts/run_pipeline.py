@@ -208,7 +208,9 @@ DEFAULT_CFG: dict = {
     },
     "ctc_adjust": {"enabled": True, "limit": 0},
     "mfa": {
-        "num_jobs": 0,               # 0 = auto (os.cpu_count())
+        "num_jobs": 0,               # 0 = auto (os.cpu_count()); on high-core machines,
+                                     # set explicitly to avoid oversubscription.
+                                     # Shards = min(8, cpu//4, stems//200); ~2 cores/shard for MFCC.
         "single_speaker": True,
         "output_format": "long_textgrid",
         "clean": False,              # keep feature cache for faster re-runs
@@ -1133,7 +1135,7 @@ def _run_mfa_sharded(
     import multiprocessing as _mp
 
     _n = len(stems)
-    _n_shards = min(8, _mp.cpu_count() // 4, max(1, _n // 1000))
+    _n_shards = min(8, _mp.cpu_count() // 4, max(1, _n // 200))
     if _n_shards <= 1:
         return None  # signal: caller should run single MFA
 
@@ -2101,6 +2103,11 @@ def main():
     parser.add_argument("--auto-cache", action="store_true",
                         help="Auto-create temp audio cache on NVMe if permanent"
                              " cache not found (cleaned after pipeline completes).")
+    parser.add_argument("--output-staging", action="store_true",
+                        help="Write final output to NVMe staging first, then rsync to NAS."
+                             " Avoids per-file CIFS write latency for postprocess.")
+    parser.add_argument("--no-output-staging", action="store_true",
+                        help="Disable output staging (override config).")
     parser.add_argument("--validate", action="store_true",
                         help="Validate output structure after each step (uses output_spec in config).")
     parser.add_argument("--mode", type=str, default=None,
@@ -2427,6 +2434,16 @@ def main():
         if not out_p.is_absolute():
             out_p = workspace / raw_out
         output_dir = out_p
+    # ── Output staging: redirect to NVMe first, sync to NAS at end ──
+    _nas_output_dir = None
+    _output_staging = (getattr(args, "output_staging", False)
+                       or cfg.get("output_staging", False)) \
+                      and not getattr(args, "no_output_staging", False)
+    if _output_staging and output_dir:
+        _nas_output_dir = output_dir
+        output_dir = workspace / "output_staging"
+        print(f"  Output staging: NVMe → rsync → {_nas_output_dir}")
+
     filtered_dir = workspace / cfg.get("filtered_dir", "filtered")
     validate_dir = workspace / cfg.get("validate_dir", "validate")
     temp_dir = workspace / cfg.get("temp_dir", "temp")
@@ -2596,9 +2613,20 @@ def main():
     if _nvme_cache_dir and _nvme_is_temp:
         _cleanup_nvme_cache(_nvme_cache_dir, _nvme_is_temp)
 
+    # ── Sync output staging to NAS ──
+    _final_output = output_dir
+    if _nas_output_dir and output_dir.exists():
+        print(f"\n  Syncing output to NAS: {_nas_output_dir}")
+        from pipeline_utils import sync_tree_back
+        if sync_tree_back(output_dir, _nas_output_dir):
+            print(f"  Synced to {_nas_output_dir}")
+            _final_output = _nas_output_dir
+        else:
+            print(f"  WARNING: Sync failed, output remains at {output_dir}")
+
     print(f"\n{'#'*60}")
     print(f"  {'FAILED' if failed else 'DONE'}: {', '.join(failed) if failed else 'Success'}")
-    print(f"  Output: {output_dir}")
+    print(f"  Output: {_final_output}")
     print(f"{'#'*60}\n")
 
 

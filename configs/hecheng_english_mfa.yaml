@@ -62,7 +62,9 @@ nvme_cache: /mnt/nvme3/mfa_audio_cache
 workspace: /mnt/nvme3/mfa_workspace
 
 # 最终对齐结果输出到 NAS
+# output_staging: true 时先写 NVMe workspace/output_staging/，完成后 rsync 到 NAS
 output_dir: /mnt/Raw/新版合成英文数据对齐
+output_staging: true
 
 # 保留 16k 音频 (供后续调试/重跑)
 keep_16k_audio: true
@@ -88,7 +90,7 @@ models_dir: /mnt/local_E/MFA_Pause/repo/models/mfa
 
 # ── MFA 中文对齐 ──────────────────────────────────────────────────────────
 mfa:
-  num_jobs: 32
+  num_jobs: 64
   single_speaker: true
   output_format: long_textgrid
   clean: false

@@ -65,7 +65,8 @@
 
 # ── MFA ─────────────────────────────────────────────────────────────────
 # mfa:
-#   num_jobs: 0             # 0 = auto (os.cpu_count())
+#   num_jobs: 0             # 0 = auto (os.cpu_count()), 大核机器建议显式设置
+#                           # shard 数 = min(8, cpu//4, stems//200), ~2 核/shard
 #   single_speaker: true
 #   output_format: long_textgrid
 #   clean: false            # keep feature cache for faster re-runs
