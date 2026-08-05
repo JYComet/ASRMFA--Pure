@@ -40,6 +40,16 @@
 | 29 | 2026-08-04 | postprocess_textgrids.py | 极短内容词 (< 30ms) 物理不可能 |
 | 30 | 2026-08-04 | postprocess_textgrids.py, adjust_ctc_boundaries.py, pipeline_utils.py | 参考文本模糊子串匹配 — 纯英文 CTC 锚点标定风险分析 |
 | 31 | 2026-08-04 | normalize_english_tokens.py, ctc_prealign.py | 英文 CTC 锚点三重修复 — 碎片化 / 合并错误 / NVV 误判 |
+| 32 | 2026-08-05 | postprocess_textgrids.py | 英文词自引用单音素 — pp 仅 1 个 phone 但 dict 期望 2+ |
+| 33 | 2026-08-05 | postprocess_textgrids.py | 英文词音素不足 — pp 音素数 < dict 期望 |
+| 34 | 2026-08-05 | postprocess_textgrids.py | pinyin_phones 轨道间隙 — 相邻 phone 不连续 |
+| 35 | 2026-08-05 | postprocess_textgrids.py | words 轨道间隙 — 非静音词间空洞 |
+| 36 | 2026-08-05 | postprocess_textgrids.py | 轨道系统性不连续 — >10% interval 有间隙 |
+| 37 | 2026-08-05 | postprocess_textgrids.py | en_mfa_windows 重复词覆盖 → 英文词音素全部丢失 (FULL_WORD_AS_PHONE) |
+| 38 | 2026-08-05 | postprocess_textgrids.py | MFA/CTC 边界 2ms 死区 → 文本重叠 11% |
+| 39 | 2026-08-05 | postprocess_textgrids.py | MFA 帧精度间隙 5-30ms → words/hanzi/pp 三轨道间隙 |
+| 40 | 2026-08-05 | postprocess_textgrids.py | English phone 边界未 snap → phone 与 word 不对齐 |
+| 41 | 2026-08-05 | postprocess_textgrids.py | CTC 锚点膨胀 → 异常长词 (le5 5.6s) + 无检测 |
 
 ---
 
@@ -3832,6 +3842,357 @@ python ctc_prealign.py ... --no-nvv
 ctc_prealign:
   nvv_enabled: false
 ```
+
+---
+
+## Case 32: 英文词自引用单音素 — pp 仅 1 个 phone 但 dict 期望 2+ (english_single_phone)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `process_one` (QC section)
+**触发场景**: 英文 token 出现在 words tier，pinyin_dict 有 2+ 个 ARPABET 音素，但 English MFA 未产出足够 phone → pinyin_phones 仅含 1 个自引用 phone（整词标签）。
+
+### 现象
+
+```
+words:           RIA  [dict 期望: R, IY1, AH0]
+pinyin_phones:   RIA  [全区间]  ← 整词作为单音素, 丢失了声学拆分
+```
+
+英文版 Case 26 FULL_WORD_AS_PHONE。受影响词：RIA (131/200 文件)、AI (18/18)、BGM (11/200)、live 等。
+
+### 根因
+
+1. English MFA 对短英文词/缩写产出 phone 不足或未产出
+2. `_apply_en_phones` 在 CMUdict/English MFA 均缺失时回退到自引用
+3. `build_pinyin_phones_tier` 中 `is_english_token` 守卫使英文词走到自引用路径
+
+### 修改点
+
+**CE. `process_one` QC section — 新增 `english_single_phone` 过滤**
+
+扫描 words tier 中每个英文 token，若 pinyin_dict 期望 2+ 个音素但 pinyin_phones 实际只有 1 个自引用 → `filter_reasons.append("english_single_phone")`。
+
+### 关联样本
+
+- `000004_直播流程_开场介绍.TextGrid`: `AI` → pinyin_phones `AI`
+- `000023_直播流程_开场介绍.TextGrid`: `RIA` → pinyin_phones `RIA` (dict 有 3 phones)
+
+---
+
+## Case 33: 英文词音素不足 — pp 音素数 < dict 期望 (english_phone_deficit)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `process_one` (QC section)
+**触发场景**: 英文 token 的 pinyin_phones 有 ≥2 个 phone 但仍少于 pinyin_dict 期望。
+
+### 现象
+
+```
+words:           BGM  [dict 期望: B, IY1, JH, IY1, EH1, M 共 6 个]
+pinyin_phones:   en:B  +  en:M  (仅 2 个, 缺 4 个)
+```
+
+英文 MFA 产出 2 个 IPA phone 但 CMUdict 需要 6 个。虽未完全丢失，但音素序列不完整，TTS 训练时缺少关键音素过渡。
+
+### 根因
+
+1. `_apply_en_phones` 中 `n_cmu > n_ipa` 分支拆分 IPA 切片来塞入 CMUdict 音素
+2. 当 `n_ipa ≪ n_cmu` 时，大量音素来自纯比例拆分，无真实声学边界参考
+3. 部分 phone 可能完全缺失（如 BGM 只有 B 和 M，中间全部丢失）
+
+### 修改点
+
+**CF. `process_one` QC section — 新增 `english_phone_deficit` 过滤**
+
+对英文 token，比较 pinyin_phones 实际非静音 phone 数量与 dict 期望数量。若 2 ≤ 实际 < 期望 → `filter_reasons.append("english_phone_deficit")`。
+
+### 关联样本
+
+- `000069_直播流程_开场介绍.TextGrid`: `BGM` got 1 phone, dict expects 6
+
+---
+
+## Case 34: pinyin_phones 轨道间隙 — 相邻 phone 不连续 (pp_tier_gaps)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `process_one` (QC section)
+**触发场景**: pinyin_phones tier 中相邻 interval 之间存在 >10ms 的时间间隙，破坏连续性。
+
+### 现象
+
+新版合成英文数据对齐中 26.7% 文件存在 pp_tier_gaps，间隙分布为：
+- `zh→zh` (中文词间): 41 处
+- `punct→zh`: 13 处  
+- `zh→en`: 13 处
+
+### 根因
+
+pp_tier_gaps 通常继承自 words tier 的间隙。当 words tier 中相邻词之间存在未吸收的 MFA 帧精度残余间隙 (<30ms)，pinyin_phones 也随之产生间隙。
+
+### 修改点
+
+**CG. `process_one` QC section — 新增 `pp_tier_gaps` 过滤**
+
+扫描 pinyin_phones tier，统计相邻 interval 之间 >10ms 的间隙数。>0 处 → `filter_reasons.append("pp_tier_gaps")`。
+
+---
+
+## Case 35: words 轨道间隙 — 非静音词间空洞 (words_tier_gaps)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `process_one` (QC section)
+**触发场景**: words tier 中相邻非静音词之间存在 >20ms 的时间间隙。
+
+### 现象
+
+纱依: 21/2894 (0.7%)，花礼: 306/22285 (1.4%)，新版英文: 160/200 (batch2 48%)
+
+```
+dao4 → zhen1   25ms 空洞
+BREATHING → ke3 85ms 空洞
+na4 → ，       873ms 空洞 (极端)
+```
+
+### 根因
+
+1. MFA 对齐后词间存在帧精度残余间隙（5-30ms）
+2. `_snap_to_ctc` 的 ≤5ms 间隙吸收 (Case 7, T 修改点) 阈值不够覆盖
+3. 部分大间隙来自 NVV token 或标点处理后的边界残余
+
+### 修改点
+
+**CH. `process_one` QC section — 新增 `words_tier_gaps` 过滤**
+
+扫描 words tier，统计相邻非静音词之间 >20ms 的间隙。>0 处 → `filter_reasons.append("words_tier_gaps")`。
+
+---
+
+## Case 36: 轨道系统性不连续 (tier_discontinuity)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `process_one` (QC section)
+**触发场景**: 任意轨道中 >10% 的 interval 存在 >10ms 间隙，表明系统性问题而非孤立 MFA 残余。
+
+### 现象
+
+```
+hanzi(7/51), words(7/51) — 13.7% interval 有间隙
+```
+
+与 Case 35 的区别：Case 35 检测孤立间隙（一处也报），Case 36 检测系统性不连续（阈值 10%）。
+
+### 修改点
+
+**CI. `process_one` QC section — 新增 `tier_discontinuity` 过滤**
+
+对每个轨道，统计 >10ms 的间隙，若超过 interval 总数的 10% → `filter_reasons.append("tier_discontinuity")`。
+
+### 修改点汇总
+
+| ID | 位置 | Case | 过滤条件 |
+|------|------|:--:|------|
+| CE | `process_one` QC | 32 | `english_single_phone` — 英文词自引用单音素 |
+| CF | `process_one` QC | 33 | `english_phone_deficit` — 英文词音素不足 |
+| CG | `process_one` QC | 34 | `pp_tier_gaps` — pinyin_phones 轨道间隙 |
+| CH | `process_one` QC | 35 | `words_tier_gaps` — words 轨道间隙 |
+| CI | `process_one` QC | 36 | `tier_discontinuity` — 轨道系统性不连续 |
+
+---
+
+---
+## Case 37: en_mfa_windows 重复词覆盖 → English 词音素全部丢失 (english_phone_loss)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `build_pinyin_phones_tier`, `process_one`, `_sync_derived_tiers`, `_apply_en_phones`
+**触发样本**: 新版合成英文数据 — RIA/BGM/AI 等重复英文词
+
+### 现象
+
+pinyin_phones tier 中英文词（RIA/BGM/AI 等）Phone 数严重不足：
+- RIA (dict 3 phones) → pp 仅 1 个 (RIA 整词自引用): 131 例中 31 例不足
+- BGM (dict 6 phones) → pp 1-2 个
+- AI (dict 2 phones) → pp 仅 1 个: 17/18 例
+共 35% 英文词受影响。
+
+### 根因链
+
+1. `en_mfa_windows` 按 `word_text` 作 key，同一文件中重复出现的英文词后者覆盖前者
+2. Phase 5 `build_pinyin_phones_tier` 使用被覆盖后的窗口匹配，找不到匹配 → `word_phones = []`
+3. 空 `word_phones` 导致 fallthrough 到自引用 label（`Interval(xmin, xmax, word_text)`）
+4. Phase 3.5 的 `build_pinyin_phones_tier` 调用未传 `en_mfa_windows`，但 Phase 5 传了——造成 Phase 5 二次过滤时丢失已在 Phase 3.5 正确注入的 phones
+
+### 修改点
+
+**A. `en_mfa_windows` key 改为 `(word_text, start_time)`** (~line 4594)
+- 从 `dict[str, tuple]` 改为 `dict[tuple[str, float], tuple]`
+- 同一词不同出现有各自的时间窗口
+
+**B. `build_pinyin_phones_tier` English phone 处理重写** (~line 558)
+- `en:` 前缀 phones（_apply_en_phones 注入的）无条件保留
+- 非 `en:` phones 用时间限定 key 查找 MFA 窗口过滤
+- 向后兼容裸 string key
+
+**C. Phase 3.5 传入 `en_mfa_windows`** (~line 4637)
+- 确保 English phones 在任何阶段都能被正确识别
+
+### 关联样本
+
+- 新版合成英文数据对齐 → ria/花礼/雪狐桑 — RIA token 131 例中 31 例不足
+
+---
+
+## Case 38: MFA/CTC 边界 2ms 死区 → 文本重叠 (boundary_overlap_deadzone)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `_snap_to_ctc`, `_fix_overlapping_boundaries`
+**触发样本**: 新版合成英文数据 — 中文词与英文 token 相邻重叠 2ms (44 files, 11%)
+
+### 现象
+
+words tier 中文词与英文 token 相邻时出现 2ms 边界重叠：
+```
+Instagrams[5.862-6.762] ↔ 上[6.760-7.070]  重叠 2ms
+R[6.522-6.882]         ↔ 的[6.880-6.980]  重叠 2ms
+```
+
+### 根因链
+
+1. English token 强制使用 CTC 边界 (`use_mfa=False`)，中文词使用 MFA 边界
+2. CTC 帧移 40ms vs MFA 帧移 10ms → 系统精度差异 → 微重叠
+3. `_snap_to_ctc` 重叠预防阈值 0.002s（2ms）：恰好 2ms 重叠时条件 `word_start < prev_end - 0.002` 为 False
+4. `_fix_overlapping_boundaries` 的 5ms floor：2ms < 5ms → 被跳过
+5. `_fix_overlapping_boundaries` 对 English/NVV token 重叠无专门处理
+
+### 修改点
+
+**A. `_snap_to_ctc` 重叠零容忍** (~line 3787)
+- `prev_end - 0.002` → `prev_end`（任何重叠都修复）
+
+**B. `_fix_overlapping_boundaries` 全面重写** (~line 976)
+- 5ms floor → 0.5ms floor
+- 新增 English/NVV + content word 重叠处理：clip English/NVV 侧
+- `cur_is_content` / `nxt_is_content` 移除 NVV 排除（让 English/NVV 也能参与重叠修复）
+
+**C. `_snap_to_ctc` 新增微重叠吸收** (~line 3937)
+- 在 tiny gap 吸收循环中同步吸收 ≤ 3ms 重叠
+
+### 关联样本
+
+- 新版合成英文数据对齐 → batch1 (直播流程) + batch2 (礼物互动) — 44/400 文件
+
+---
+
+## Case 39: MFA 帧精度间隙 5-30ms → words/hanzi/pp 三层间隙 (frame_precision_gaps)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `_snap_to_ctc`, `_absorb_tiny_gaps` (new), `_sync_derived_tiers`, `process_one`
+**触发样本**: 新版合成英文数据 — Batch1 18%, Batch2 48% 文件有间隙
+
+### 现象
+
+words 和 hanzi tier 存在 5-30ms 间隙（完全镜像，证明同步正确但源头有洞）：
+- Batch1 (直播流程): 33/188 文件 (18%) — 41 处间隙
+- Batch2 (礼物互动): 86/180 文件 (48%) — 160 处间隙
+- 模式: lao2→lao2 15ms, tui1→le5 30ms, idol→... 5ms
+
+连锁导致 pinyin_phones tier 27% 文件不连续。
+
+### 根因链
+
+1. MFA 帧移 10ms → 词边界精度 ±10ms
+2. `_snap_to_ctc` gap 吸收阈值仅 5ms → 5-30ms gap 被保留为 `<spN>` 标签
+3. `_inject_punctuation` 的词间 gap 处理仅针对标点邻接，通用词间间隙无吸收逻辑
+4. pp tier 重建时继承 words tier gap → 三层间隙
+
+### 修改点
+
+**A. `_snap_to_ctc` gap 吸收阈值 5ms → 30ms** (~line 3929)
+- 吸收 ≤ 30ms (3 MFA 帧) 的间隙
+
+**B. 新增 `_absorb_tiny_gaps()` 函数** (~line 1052)
+- 通用微间隙吸收：遍历 words tier，≤ 30ms 的 silence gap 吸收到邻近词
+- 集成进 `_sync_derived_tiers`，每次同步自动吸收
+
+**C. pp tier 微间隙吸收** (~line 5010)
+- Phase 5 重建 pp tier 后，吸收 ≤ 10ms 间隙和 ≤ 3ms 微重叠
+
+### 关联样本
+
+- 新版合成英文数据对齐 → 全量 6881 文件中 1839 个存在 pp 间隙
+
+---
+
+## Case 40: English phone 边界未 snap → phone 与 word 不对齐 (en_phone_boundary_offset)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `_apply_en_phones`, `process_one` (Phase 5)
+**触发样本**: 新版合成英文数据 — 80 处英文 phone 边界偏移
+
+### 现象
+
+英文 token 的 phone (pinyin_phones tier) 起点/终点与 word (words tier) 边界不对齐。
+
+### 根因链
+
+1. `_apply_en_phones` 将 English MFA 音素线性映射到 CTC-snapped word 边界，但不做首尾 snap
+2. English MFA 在 padded segment 上运行，其 word_start/word_end 与 CTC-snapped words tier 边界存在系统性偏移
+3. 线性映射保留了这个偏移
+4. Phase 5 pp 重建时显式跳过 English 词的 first phone snap（`if not is_en`）
+
+### 修改点
+
+**A. `_apply_en_phones` 注入后 snap** (~line 4165)
+- 每个 English word 注入 phones 后，snap 首 phone start 到 word start，尾 phone end 到 word end
+
+**B. Phase 5 移除 `is_en` 限制** (~line 4965)
+- first phone snap 对所有词生效（English MFA phones 可能在 Phase 4 边界变更后偏移）
+
+### 关联样本
+
+- 新版合成英文数据对齐 → 80 处偏移
+
+---
+
+## Case 41: CTC 锚点膨胀 → 异常长词 + 无检测 (ctc_anchor_inflation)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `_snap_to_ctc`, `detect_issues`
+**触发样本**: 新版合成英文数据 — le5 = 5.6s (hao3[9.720-9.914] → le5[9.720-15.554] → 。[15.554-15.987])
+
+### 现象
+
+le5 从正常 0.2s 被拉到 5.6s（在 hao3 和 。 之间吞掉大段静音/未识别内容）。
+
+### 根因链
+
+1. NVASR CTC 将 hao3 和 。 之间的大段内容归入 le5 的 token span
+2. `_snap_to_ctc` 的 duration ratio 规则检测到 ctc_dur(5.6s) >> mfa_dur(0.2s)，触发 `use_mfa=False`
+3. `ratio_skip` 保护未触发：trailing silence 不是 `<eps>` 形态，gap_sil 检测也漏过
+4. 后处理管线有 `fix_short_words` / `word_too_short` 检测，但无对应 `word_too_long` 检测
+
+### 修改点
+
+**A. CTC_MAX_DUR 绝对保护** (~line 3713)
+- CTC duration > 3s 且 MFA duration < 1s 且非 English/NVV → 强制 `ratio_skip = True`
+- CTC end 超过 MFA end 500ms+ → 同样强制 `ratio_skip`
+
+**B. `detect_issues` 新增 `word_too_long`** (~line 2408)
+- 中文词 > 3s、English/NVV > 8s → 标记异常
+
+### 关联样本
+
+- 新版合成英文数据对齐 → hao3→le5→。
+- 新版合成英文数据中可能有更多同类 case
 
 ---
 

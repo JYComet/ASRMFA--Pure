@@ -449,7 +449,7 @@ def build_pinyin_phones_tier(phones_tier: Tier,
                               ipa_to_pinyin: dict[str, str],
                               words_tier: Tier | None = None,
                               pinyin_dict: dict[str, list[str]] | None = None,
-                              en_mfa_windows: dict[str, tuple[float, float]] | None = None) -> Tier:
+                              en_mfa_windows: dict[tuple[str, float], tuple[float, float]] | None = None) -> Tier:
     """Build pinyin_phones tier using fullpinyin dict's initial+final format.
 
     For each word, look up the fullpinyin dict entry (e.g. pao4 -> [p, ao4]),
@@ -459,6 +459,8 @@ def build_pinyin_phones_tier(phones_tier: Tier,
     When *en_mfa_windows* is provided, English word phones are filtered
     to only include those within the English MFA alignment time window,
     preventing neighbouring Chinese phones from leaking into English ranges.
+    Keys are ``(word_text_lower, rounded_start_time)`` tuples to support
+    duplicate English words within the same utterance (Regression Case 32).
     """
     if words_tier is None or pinyin_dict is None:
         # Fallback: 1:1 IPA->pinyin mapping
@@ -559,29 +561,63 @@ def build_pinyin_phones_tier(phones_tier: Tier,
         # authoritative signal — do NOT fall back to phone-level regex
         # heuristics (which misclassify e.g. "m" as Chinese pinyin).
         if is_english_token(w_iv.text):
-            # Filter phones to English MFA alignment window to prevent
-            # neighbouring Chinese phones from leaking into English ranges.
-            if word_phones and en_mfa_windows:
+            # ── Regr. Case 37: en_mfa_windows keyed by (word_text, start_time)
+            #     so duplicate English words in the same utterance don't
+            #     overwrite each other. ──
+            # Separate en:-prefixed phones (injected by _apply_en_phones) from
+            # raw IPA phones.  en:-prefixed phones are ALWAYS kept — they were
+            # already vetted by _apply_en_phones and their boundaries are
+            # proportionally scaled from English MFA alignment.
+            en_prefixed = [(s, e, t) for s, e, t in word_phones
+                           if t.startswith(EN_PHONE_PREFIX)]
+            other_phones = [(s, e, t) for s, e, t in word_phones
+                           if not t.startswith(EN_PHONE_PREFIX) and not is_silence(t)]
+            sil_phones = [(s, e, t) for s, e, t in word_phones
+                         if is_silence(t)]
+
+            if en_prefixed:
+                # en: phones are authoritative — they came from _apply_en_phones
+                # which already scaled English MFA timing to the CTC-snapped
+                # word boundaries.  Use them directly.
+                word_phones = sil_phones + en_prefixed
+            elif other_phones and en_mfa_windows:
+                # Legacy path: no en: prefix, filter by MFA alignment window
                 wl = w_iv.text.strip().lower()
-                if wl in en_mfa_windows:
-                    es, ee = en_mfa_windows[wl]
-                    # Use English MFA time window to identify English phones.
-                    # Phones already en:-prefixed are always kept.  Others must
-                    # be inside the MFA window AND not match Chinese IPA patterns
-                    # to prevent neighbouring Chinese phones from leaking in.
-                    word_phones = [
-                        (s, e, t) for s, e, t in word_phones
-                        if t.startswith(EN_PHONE_PREFIX)
-                        or (s >= es - 0.3 and e <= ee + 0.3
-                            and not _looks_chinese_phone(t)
-                            and not is_silence(t))
+                # Search time-qualified keys for a matching window
+                matched_window = None
+                w_start_rounded = round(w_iv.xmin, 2)
+                for (key_wl, key_ts), (es, ee) in en_mfa_windows.items():
+                    if key_wl == wl and abs(key_ts - w_start_rounded) < 0.5:
+                        matched_window = (es, ee)
+                        break
+                # Fallback: try bare text key (backward compat with old data)
+                if matched_window is None and wl in en_mfa_windows:
+                    # Type guard: only unpack if it looks like a bare string key
+                    val = en_mfa_windows.get(wl)  # type: ignore[arg-type]
+                    if isinstance(val, tuple) and len(val) == 2:
+                        matched_window = val
+
+                if matched_window:
+                    es, ee = matched_window
+                    other_phones = [
+                        (s, e, t) for s, e, t in other_phones
+                        if s >= es - 0.3 and e <= ee + 0.3
+                        and not _looks_chinese_phone(t)
                     ]
                 else:
-                    # Word not in en_mfa_windows — English MFA didn't process
-                    # it.  Clear word_phones so the self-reference fallback
-                    # below is used.  Prevents leaking Chinese phones from
-                    # adjacent words.  See Regression Case 17.
-                    word_phones = []
+                    # No MFA window — keep only non-Chinese-looking phones
+                    other_phones = [(s, e, t) for s, e, t in other_phones
+                                    if not _looks_chinese_phone(t)]
+                word_phones = sil_phones + other_phones
+            elif other_phones:
+                # No en_mfa_windows available — keep non-Chinese-looking phones
+                other_phones = [(s, e, t) for s, e, t in other_phones
+                                if not _looks_chinese_phone(t)]
+                word_phones = sil_phones + other_phones
+            else:
+                # No phones at all — will fall through to self-reference
+                word_phones = sil_phones
+
             if word_phones:
                 for s, e, txt in word_phones:
                     if is_silence(txt):
@@ -589,7 +625,7 @@ def build_pinyin_phones_tier(phones_tier: Tier,
                     elif txt.startswith(EN_PHONE_PREFIX):
                         new_intervals.append(Interval(s, e, en_ipa_to_arpabet(txt)))
                     else:
-                        # English phone -> ARPABET with en: prefix (no-op for ARPA model)
+                        # English phone -> ARPABET with en: prefix
                         label = en_ipa_to_arpabet(f"{EN_PHONE_PREFIX}{txt}")
                         if label:  # skip empty mappings (glottal stop)
                             new_intervals.append(Interval(s, e, label))
@@ -938,7 +974,7 @@ def absorb_nvv_trailing(textgrid: TextGrid) -> None:
 
 
 def _fix_overlapping_boundaries(words_tier) -> int:
-    """Resolve mild (<30ms) overlaps between adjacent content-word intervals.
+    """Resolve overlaps between adjacent intervals.  Regr. Case 38.
 
     Operates on *words_tier* intervals in-place.  Returns the number of
     overlaps that were fixed (so the caller can decide whether to re-sync
@@ -946,11 +982,13 @@ def _fix_overlapping_boundaries(words_tier) -> int:
 
     Strategy
     --------
-    * Two **content words** overlapping < 30 ms → split the overlap evenly
-      (``split_overlap``).
+    * Two **content words** (or content + English) overlapping < 30 ms →
+      split the overlap evenly.  English/NVV tokens are clipped to the
+      content word's boundary (they lack MFA acoustic models, so their
+      CTC boundaries are less precise).
     * Content word overlapping with **punctuation** → clip the punctuation
       side (``clip_punct``).
-    * Overlaps ≥ 30 ms, or involving silence / NVV / English tokens, are
+    * Overlaps ≥ 30 ms (content-content) or ≥ 100 ms (content-punct) are
       **left untouched** — they will be caught by the downstream
       ``overlapping_words`` QC filter (Case 27-B).
     * Zero-duration remnants are removed after all fixes are applied.
@@ -965,24 +1003,34 @@ def _fix_overlapping_boundaries(words_tier) -> int:
         if cur.xmax is None or nxt.xmin is None:
             continue
         overlap = cur.xmax - nxt.xmin
-        if overlap <= 0.005:          # negligible (≤ 5 ms)
+        if overlap <= 0.0005:         # sub-0.5 ms — float noise, skip
             continue
 
         cur_text = cur.text.strip() if cur.text else ""
         nxt_text = nxt.text.strip() if nxt.text else ""
 
         cur_is_content = (cur_text and not is_punct(cur_text)
-                          and not is_silence(cur_text)
-                          and not is_nvv_token(cur_text))
+                          and not is_silence(cur_text))
         nxt_is_content = (nxt_text and not is_punct(nxt_text)
-                          and not is_silence(nxt_text)
-                          and not is_nvv_token(nxt_text))
+                          and not is_silence(nxt_text))
+        cur_is_en_nvv = is_english_token(cur_text) or is_nvv_token(cur_text)
+        nxt_is_en_nvv = is_english_token(nxt_text) or is_nvv_token(nxt_text)
 
-        # ── Two content words with mild overlap ──
+        # ── Two content words with mild overlap (incl. English/NVV adjacent) ──
+        # Regr. Case 38: when one side is English/NVV (no MFA acoustic model),
+        # clip that side to the content word's boundary.
         if cur_is_content and nxt_is_content and overlap < 0.030:
-            mid = (cur.xmax + nxt.xmin) / 2.0
-            intervals[i] = Interval(cur.xmin, mid, cur.text)
-            intervals[i + 1] = Interval(mid, nxt.xmax, nxt.text)
+            if cur_is_en_nvv and not nxt_is_en_nvv:
+                # English/NVV → content: clip English/NVV end
+                intervals[i] = Interval(cur.xmin, nxt.xmin, cur.text)
+            elif nxt_is_en_nvv and not cur_is_en_nvv:
+                # content → English/NVV: push English/NVV start forward
+                intervals[i + 1] = Interval(cur.xmax, nxt.xmax, nxt.text)
+            else:
+                # Both content or both English/NVV: split evenly
+                mid = (cur.xmax + nxt.xmin) / 2.0
+                intervals[i] = Interval(cur.xmin, mid, cur.text)
+                intervals[i + 1] = Interval(mid, nxt.xmax, nxt.text)
             fixed += 1
 
         # ── Content word followed by punctuation that leaks into it ──
@@ -1001,10 +1049,56 @@ def _fix_overlapping_boundaries(words_tier) -> int:
     return fixed
 
 
+def _absorb_tiny_gaps(words_tier: Tier, max_gap_s: float = 0.030) -> Tier:
+    """Absorb sub-frame gaps (< 30 ms) between consecutive content words.
+
+    Regr. Case 39: MFA frame-level precision gaps (5-30 ms) that survive
+    _snap_to_ctc's gap absorption pass (e.g. because they were introduced
+    later by _inject_punctuation or Phase 4 operations) are absorbed into
+    adjacent words.  Only targets gaps between two non-punct, non-silence
+    content intervals.
+    """
+    intervals = list(words_tier.intervals)
+    n = len(intervals)
+    to_delete: set[int] = set()
+
+    for i in range(n - 1):
+        if i in to_delete:
+            continue
+        cur = intervals[i]
+        nxt = intervals[i + 1]
+        cur_text = cur.text.strip() if cur.text else ""
+        nxt_text = nxt.text.strip() if nxt.text else ""
+
+        # Only absorb gaps between two content words (not punct, not silence)
+        if not cur_text or not nxt_text:
+            continue
+        if is_punct(cur_text) or is_punct(nxt_text):
+            continue
+        if is_silence(cur_text):
+            # Silence gap between two content words — absorb if tiny
+            if cur.duration < max_gap_s:
+                # Absorb into the longer neighbouring word
+                prev_word = intervals[i - 1] if i > 0 else None
+                if (prev_word and not is_silence(prev_word.text)
+                        and prev_word.duration >= nxt.duration):
+                    intervals[i - 1] = Interval(prev_word.xmin, nxt.xmin, prev_word.text)
+                else:
+                    intervals[i + 1] = Interval(cur.xmin, nxt.xmax, nxt.text)
+                to_delete.add(i)
+        elif is_silence(nxt_text):
+            continue  # word→silence: not a gap, silence is intentional
+
+    intervals = [iv for idx, iv in enumerate(intervals) if idx not in to_delete]
+    # Remove zero-duration remnants
+    intervals = [iv for iv in intervals if iv.duration > 0.001]
+    return Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals)
+
+
 def _sync_derived_tiers(textgrid: TextGrid, ipa_to_pinyin: dict[str, str],
                         pinyin_dict: dict[str, list[str]] | None = None,
                         raw_text: str = "",
-                        en_mfa_windows: dict[str, tuple[float, float]] | None = None,
+                        en_mfa_windows: dict[tuple[str, float], tuple[float, float]] | None = None,
                         report_warnings: list[str] | None = None) -> None:
     """Rebuild hanzi and pinyin_phones from the current words + phones tiers.
 
@@ -1019,6 +1113,17 @@ def _sync_derived_tiers(textgrid: TextGrid, ipa_to_pinyin: dict[str, str],
     phones_tier = tier_by_name(textgrid, "phones")
     if words_tier is None:
         return
+
+    # 0. Absorb frame-precision gaps before rebuilding derived tiers.
+    #    Regr. Case 39: gaps < 30 ms are MFA alignment residuals, not
+    #    real silences.  Absorb them now so hanzi + pinyin_phones don't
+    #    inherit unnecessary gaps.
+    words_tier = _absorb_tiny_gaps(words_tier)
+    # Update the tier in-place in the textgrid
+    for i, t in enumerate(textgrid.tiers):
+        if t.name == "words":
+            textgrid.tiers[i] = words_tier
+            break
 
     # 1. Rebuild hanzi from updated words tier
     if raw_text:
@@ -2300,6 +2405,13 @@ def detect_issues(textgrid: TextGrid, args, wav_path: Path | None = None,
         eg = max(0.0, w.xmax - pe)
         if w.duration < args.filter_min_word_dur_sec:
             issues.append({"rule": "word_too_short", "text": w.text, "duration": round(w.duration, 4)})
+        # Regr. Case 41: detect abnormally long words (> 3 s for Chinese,
+        # > 8 s for English/NVV).  CTC anchor inflation (e.g. le5 = 5.6 s)
+        # is caught by _snap_to_ctc's CTC_MAX_DUR guard; this check catches
+        # any that slip through.
+        _max_dur = 8.0 if (_is_en_nvv) else 3.0
+        if w.duration > _max_dur:
+            issues.append({"rule": "word_too_long", "text": w.text, "duration": round(w.duration, 4)})
         # Word energy at silence level -> likely misaligned into a silence gap.
         # Skip when the word is adjacent to an English / NVV token — MFA
         # cannot model those, so their boundaries bleed into neighbours.
@@ -3598,6 +3710,20 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
                 )
                 if gap_sil:
                     ratio_skip = True
+        # Regr. Case 41: absolute duration guard against CTC anchor inflation.
+        # CTC anchors can span large unlabeled silences (e.g. 5.6 s le5).
+        # When CTC duration is > 3 s but MFA duration is < 1 s for a Chinese
+        # word, the CTC anchor is clearly inflated — trust MFA boundaries.
+        # Also extend ratio_skip: when CTC end is > 500 ms past MFA end,
+        # the excess is almost certainly silence, not speech.
+        if use_mfa and not ratio_skip and ctc_dur > 3.0 and mfa_dur < 1.0 \
+           and not is_english_token(mfa_iv.text) and not is_nvv_token(mfa_iv.text):
+            ratio_skip = True
+        if use_mfa and not ratio_skip and ctc_end > mfa_end + 0.5 \
+           and mfa_dur < 1.0 \
+           and not is_english_token(mfa_iv.text) and not is_nvv_token(mfa_iv.text):
+            ratio_skip = True
+
         if use_mfa and not has_mfa_phone_evidence and not ratio_skip \
            and (mfa_dur > ctc_dur * 2.0 or ctc_dur > mfa_dur * 2.0):
             use_mfa = False
@@ -3658,7 +3784,12 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
         # by a silence merge (prev_end > prev_ctc_end AND a real CTC gap),
         # the extra length is silence — shorten the previous word instead of
         # squeezing the current one.
-        if word_start < prev_end - 0.002:
+        # Regr. Case 38: zero-tolerance for overlaps — MFA/CTC boundary
+        # resolution must produce contiguous intervals.  Any overlap,
+        # even sub-frame (≤ 2 ms), is resolved by the same logic that
+        # handles larger overlaps: NVV pushes into prev word, English
+        # and Chinese snap to the prev word's end.
+        if word_start < prev_end:
             prev_was_silence_extended = (
                 prev_end > prev_ctc_end + 0.10  # >100ms silence extension
                 and not is_nvv_token(mfa_iv.text)
@@ -3795,16 +3926,25 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
     new_phone_ivs = merged_pp
 
     # Eliminate tiny gaps between consecutive word intervals.
-    # MFA frame precision is 10 ms; gaps below that are alignment
-    # residuals, not real silences.  Absorb them into the preceding
-    # word so the words tier is always contiguous — downstream tiers
-    # (hanzi, pinyin_phones) depend on this invariant.
+    # Regr. Case 39: MFA frame precision is 10 ms; gaps up to 30 ms
+    # (3 frames) are alignment residuals, not real silences.  Absorb
+    # them into the preceding word so the words tier is always
+    # contiguous — downstream tiers (hanzi, pinyin_phones) depend on
+    # this invariant.
+    # Also eliminate tiny overlaps (≤ 3 ms) by splitting at the midpoint —
+    # these are boundary artifacts from CTC/MFA precision mismatch.
     for k in range(len(new_word_ivs) - 1, 0, -1):
         cur = new_word_ivs[k]
         prev = new_word_ivs[k - 1]
         gap = cur[0] - prev[1]
-        if 0 < gap <= 0.005 and prev[3] == "word":
+        if 0 < gap <= 0.030 and prev[3] == "word":
+            # Tiny gap — absorb into previous word
             new_word_ivs[k - 1] = (prev[0], cur[0], prev[2], prev[3])
+        elif gap < 0 and gap >= -0.005 and prev[3] == "word":
+            # Tiny overlap — split at midpoint (only word-word pairs)
+            mid = (prev[1] + cur[0]) / 2.0
+            new_word_ivs[k - 1] = (prev[0], mid, prev[2], prev[3])
+            new_word_ivs[k] = (mid, cur[1], cur[2], cur[3])
 
     # Build new tiers
     new_words_tier = Tier(words_tier.name, words_tier.xmin, words_tier.xmax,
@@ -4021,6 +4161,26 @@ def _apply_en_phones(words_tier: Tier, pp_tier: Tier | None,
             # No data at all — keep self-referencing as fallback
             label = f"{phone_prefix}{w_text}" if phone_prefix else w_text
             new_phone_ivs.append(Interval(w_start, w_end, label))
+
+    # ── Snap English phone edges to word boundaries (Regr. Case 40) ──
+    # After English MFA phones are injected and proportionally scaled,
+    # snap the first phone's start and last phone's end to the word
+    # boundaries.  This prevents boundary offsets caused by the linear
+    # scaling from English MFA's padded segments to CTC-snapped words.
+    for w_start, w_end, w_text in en_ranges:
+        en_phones_for_word = [(idx, iv) for idx, iv in enumerate(new_phone_ivs)
+                              if w_start <= iv.xmin and iv.xmax <= w_end + 0.005
+                              and not is_silence(iv.text)]
+        if not en_phones_for_word:
+            continue
+        # Snap first phone start to word start
+        first_idx, first_iv = en_phones_for_word[0]
+        if first_iv.xmin > w_start + 0.002:
+            new_phone_ivs[first_idx] = Interval(w_start, first_iv.xmax, first_iv.text)
+        # Snap last phone end to word end
+        last_idx, last_iv = en_phones_for_word[-1]
+        if w_end > last_iv.xmax + 0.002:
+            new_phone_ivs[last_idx] = Interval(last_iv.xmin, w_end, last_iv.text)
 
     # Sort and merge same-text intervals
     new_phone_ivs.sort(key=lambda iv: iv.xmin)
@@ -4433,12 +4593,15 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                     new_tg.tiers[i] = pp_tier
 
     # ── Build en_mfa_windows early (needed by _sync_derived_tiers throughout Phases 3.5–5) ──
-    en_mfa_windows: dict[str, tuple[float, float]] = {}
+    # Regr. Case 37: key is (word_text, start_time_rounded) so duplicate English
+    # words in the same utterance do not overwrite each other.
+    en_mfa_windows: dict[tuple[str, float], tuple[float, float]] = {}
     if en_data:
         for entry in en_data:
             es = entry.get("en_word_start", entry["word_start"])
             ee = entry.get("en_word_end", entry["word_end"])
-            en_mfa_windows[entry["word_text"].strip().lower()] = (es, ee)
+            key = (entry["word_text"].strip().lower(), round(es, 2))
+            en_mfa_windows[key] = (es, ee)
 
     # ═══════════════════════════════════════════════════════════════
     # Phase 3.5 — English MFA phoneme injection.
@@ -4469,8 +4632,12 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                 # Re-sync pinyin_phones after English phone injection.
                 # _apply_en_phones rewrites phone intervals for English words;
                 # pinyin_phones must reflect the updated phones.
+                # Regr. Case 37: pass en_mfa_windows so English phones are
+                # correctly identified even in Phase 3.5 (before Phase 4
+                # boundary changes).
                 synced_pp = build_pinyin_phones_tier(phones_tier, ipa_to_pinyin,
-                                                      words_tier, pinyin_dict)
+                                                      words_tier, pinyin_dict,
+                                                      en_mfa_windows=en_mfa_windows)
                 for i, t in enumerate(new_tg.tiers):
                     if t.name == "pinyin_phones":
                         new_tg.tiers[i] = synced_pp
@@ -4794,9 +4961,10 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                     if word_pps:
                         first = word_pps[0]
                         last = word_pps[-1]
-                        # Only extend first phone for non-English words
-                        # (English MFA phones already start correctly)
-                        if not is_en and new_pp_ivs[first].xmin > w_iv.xmin + 0.005:
+                        # Snap first phone to word start for ALL words.
+                        # Regr. Case 40: English MFA phones may have
+                        # residual offset after Phase 4 boundary changes.
+                        if new_pp_ivs[first].xmin > w_iv.xmin + 0.005:
                             new_pp_ivs[first] = Interval(w_iv.xmin, new_pp_ivs[first].xmax, new_pp_ivs[first].text)
                         # Extend last phone to word end.  If the extension
                         # crosses the next word's first-phone start, also
@@ -4838,6 +5006,42 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                         if t.name == "pinyin_phones":
                             new_tg.tiers[i] = pp_tier_final
                             break
+
+            # ── Regr. Case 39: absorb residual pp tier micro-gaps ──
+            # After all snaps and stretches, absorb any remaining gaps
+            # ≤ 10 ms between consecutive non-punct phone intervals.
+            # These are boundary residuals from the MFA↔CTC mismatch,
+            # not real pauses.  Only silence intervals are absorbed;
+            # content-to-content gaps are merged by extending the
+            # preceding phone.
+            _pp_t = tier_by_name(new_tg, "pinyin_phones")
+            if _pp_t is not None:
+                _pp_ivs = list(_pp_t.intervals)
+                _pp_merged: list[Interval] = []
+                for _piv in _pp_ivs:
+                    if not _pp_merged:
+                        _pp_merged.append(_piv)
+                        continue
+                    _prev = _pp_merged[-1]
+                    _gap = _piv.xmin - _prev.xmax
+                    if 0 < _gap <= 0.010:
+                        # Tiny gap — extend previous phone to close it
+                        _pp_merged[-1] = Interval(_prev.xmin, _piv.xmin, _prev.text)
+                        if _piv.xmin > _prev.xmax:
+                            _pp_merged.append(_piv)
+                        # else: absorbed completely
+                    elif _gap < 0 and _gap >= -0.003:
+                        # Tiny overlap — clip previous phone
+                        mid = (_prev.xmax + _piv.xmin) / 2.0
+                        _pp_merged[-1] = Interval(_prev.xmin, mid, _prev.text)
+                        _pp_merged.append(Interval(mid, _piv.xmax, _piv.text))
+                    else:
+                        _pp_merged.append(_piv)
+                _pp_tier_new = Tier(_pp_t.name, _pp_t.xmin, _pp_t.xmax, _pp_merged)
+                for _i, _t in enumerate(new_tg.tiers):
+                    if _t.name == "pinyin_phones":
+                        new_tg.tiers[_i] = _pp_tier_new
+                        break
 
         # Rebuild pinyin tier from words (keeps punct in sync)
         pinyin_tier = tier_by_name(new_tg, "pinyin")
@@ -5552,6 +5756,146 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         filter_reasons.append("short_word")
         report["short_word"] = {"count": _short_count,
                                  "examples": _short_examples}
+
+
+    # ── Case 32: english_single_phone — English word with dict expecting
+    #     2+ ARPABET phones but pinyin_phones has only 1 (self-referencing).
+    #     English-path equivalent of Case 26 FULL_WORD_AS_PHONE. ──
+    _en_single_count = 0
+    _en_single_examples: list[str] = []
+    if words_tier is not None and pp_tier is not None and pinyin_dict is not None:
+        _pp_idx = 0
+        for _wi, _w_iv in enumerate(words_tier.intervals):
+            _wt = _w_iv.text.strip()
+            _ws, _we = _w_iv.xmin, _w_iv.xmax
+            if not _wt or not is_english_token(_wt):
+                while (_pp_idx < len(pp_tier.intervals)
+                       and pp_tier.intervals[_pp_idx].xmax <= _we + 0.002):
+                    _pp_idx += 1
+                continue
+            _dp = (pinyin_dict.get(_wt) or pinyin_dict.get(_wt.upper())
+                   or pinyin_dict.get(_wt.lower()))
+            if not _dp or len(_dp) < 2:
+                while (_pp_idx < len(pp_tier.intervals)
+                       and pp_tier.intervals[_pp_idx].xmax <= _we + 0.002):
+                    _pp_idx += 1
+                continue
+            _w_phones = []
+            __pi = _pp_idx
+            while __pi < len(pp_tier.intervals) and pp_tier.intervals[__pi].xmin < _we - 0.001:
+                _p = pp_tier.intervals[__pi]
+                if (_p.xmax > _ws + 0.001 and _p.mark
+                        and not is_silence(_p.mark.strip())):
+                    _w_phones.append(_p.mark.strip())
+                __pi += 1
+            if len(_w_phones) == 1 and _w_phones[0] in (_wt, _wt.lower(), _wt.upper()):
+                _en_single_count += 1
+                if len(_en_single_examples) < 5:
+                    _en_single_examples.append(
+                        f"{_wt}→{_w_phones[0]!r} (dict:{_dp})")
+    if _en_single_count > 0:
+        filter_reasons.append("english_single_phone")
+        report["english_single_phone"] = {"count": _en_single_count,
+                                           "examples": _en_single_examples}
+
+    # ── Case 33: english_phone_deficit — English word has fewer phones
+    #     than the dict expects (but > 1, so not caught by Case 32).
+    #     English MFA under-produced phones for this word. ──
+    _en_deficit_count = 0
+    _en_deficit_examples: list[str] = []
+    if words_tier is not None and pp_tier is not None and pinyin_dict is not None:
+        _pp_idx = 0
+        for _wi, _w_iv in enumerate(words_tier.intervals):
+            _wt = _w_iv.text.strip()
+            _ws, _we = _w_iv.xmin, _w_iv.xmax
+            if not _wt or not is_english_token(_wt):
+                while (_pp_idx < len(pp_tier.intervals)
+                       and pp_tier.intervals[_pp_idx].xmax <= _we + 0.002):
+                    _pp_idx += 1
+                continue
+            _dp = (pinyin_dict.get(_wt) or pinyin_dict.get(_wt.upper())
+                   or pinyin_dict.get(_wt.lower()))
+            if not _dp or len(_dp) < 2:
+                while (_pp_idx < len(pp_tier.intervals)
+                       and pp_tier.intervals[_pp_idx].xmax <= _we + 0.002):
+                    _pp_idx += 1
+                continue
+            _w_phones = []
+            __pi = _pp_idx
+            while __pi < len(pp_tier.intervals) and pp_tier.intervals[__pi].xmin < _we - 0.001:
+                _p = pp_tier.intervals[__pi]
+                if (_p.xmax > _ws + 0.001 and _p.mark
+                        and not is_silence(_p.mark.strip())):
+                    _w_phones.append(_p.mark.strip())
+                __pi += 1
+            _n_got = len(_w_phones)
+            _n_exp = len(_dp)
+            if _n_got >= 2 and _n_got < _n_exp:
+                if not all(ph in (_wt, _wt.lower(), _wt.upper()) for ph in _w_phones):
+                    _en_deficit_count += 1
+                    if len(_en_deficit_examples) < 5:
+                        _en_deficit_examples.append(
+                            f"{_wt}→got {_n_got} phones, dict:{_dp} ({_n_exp})")
+    if _en_deficit_count > 0:
+        filter_reasons.append("english_phone_deficit")
+        report["english_phone_deficit"] = {"count": _en_deficit_count,
+                                            "examples": _en_deficit_examples}
+
+    # ── Case 34: pp_tier_gaps — pinyin_phones tier has gaps > 10 ms
+    #     between adjacent intervals. ──
+    _pp_gap_count = 0
+    _PP_GAP_THRESHOLD_S = 0.010
+    if pp_tier is not None and len(pp_tier.intervals) >= 2:
+        for _i in range(len(pp_tier.intervals) - 1):
+            _gap = round(pp_tier.intervals[_i + 1].xmin
+                         - pp_tier.intervals[_i].xmax, 4)
+            if _gap > _PP_GAP_THRESHOLD_S:
+                _pp_gap_count += 1
+    if _pp_gap_count > 0:
+        filter_reasons.append("pp_tier_gaps")
+        report["pp_tier_gaps"] = {"count": _pp_gap_count}
+
+    # ── Case 35: words_tier_gaps — words tier has gaps > 20 ms between
+    #     adjacent non-silence words. ──
+    _wt_gap_count = 0
+    _wt_gap_examples: list[str] = []
+    _WT_GAP_THRESHOLD_S = 0.020
+    if words_tier is not None and len(words_tier.intervals) >= 2:
+        for _i in range(len(words_tier.intervals) - 1):
+            _cur = words_tier.intervals[_i]
+            _nxt = words_tier.intervals[_i + 1]
+            _cl = _cur.text.strip() if _cur.text else ""
+            _nl = _nxt.text.strip() if _nxt.text else ""
+            if is_silence(_cl) or is_silence(_nl):
+                continue
+            _gap = round(_nxt.xmin - _cur.xmax, 4)
+            if _gap > _WT_GAP_THRESHOLD_S:
+                _wt_gap_count += 1
+                if len(_wt_gap_examples) < 5:
+                    _wt_gap_examples.append(
+                        f"{_cl!r}→{_nl!r}[{_gap*1000:.0f}ms]")
+    if _wt_gap_count > 0:
+        filter_reasons.append("words_tier_gaps")
+        report["words_tier_gaps"] = {"count": _wt_gap_count,
+                                      "examples": _wt_gap_examples}
+
+    # ── Case 36: tier_discontinuity — a tier has too many gaps
+    #     (> 10% of intervals), indicating systematic alignment failure. ──
+    _discon_tiers: list[str] = []
+    for _t in new_tg.tiers:
+        if len(_t.intervals) < 5:
+            continue
+        _gaps = 0
+        for _i in range(len(_t.intervals) - 1):
+            _g = round(_t.intervals[_i + 1].xmin - _t.intervals[_i].xmax, 4)
+            if _g > 0.010:
+                _gaps += 1
+        if _gaps > len(_t.intervals) * 0.10:
+            _discon_tiers.append(f"{_t.name}({_gaps}/{len(_t.intervals)})")
+    if _discon_tiers:
+        filter_reasons.append("tier_discontinuity")
+        report["tier_discontinuity"] = {"tiers": _discon_tiers}
+
 
     # 统一设置过滤状态和输出路径
     if filter_reasons:
