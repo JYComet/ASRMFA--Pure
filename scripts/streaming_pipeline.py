@@ -520,7 +520,9 @@ class StreamingPipeline:
     def __init__(self, batch_mgr: BatchManager,
                  pipeline_script: Path, config_path: Path,
                  mfa_python: Path, models_dir: Path,
-                 nas_output_root: Path):
+                 nas_output_root: Path,
+                 prefetch_buffer: int = 4,
+                 upload_buffer: int = 4):
         self.bm = batch_mgr
         self.pipeline_script = pipeline_script
         self.config_path = config_path
@@ -528,11 +530,11 @@ class StreamingPipeline:
         self.models_dir = models_dir
         self.nas_output_root = nas_output_root
 
-        # Backpressure: prefetch 4 batches ahead to keep processing saturated
-        # while bounding local NVMe usage; upload queue backpressure (maxsize=4)
-        # prevents unbounded NVMe accumulation when NAS is slow.
-        self.prefetch_queue: queue.Queue[int] = queue.Queue(maxsize=4)
-        self.upload_queue: queue.Queue[int] = queue.Queue(maxsize=4)
+        # Backpressure: prefetch N batches ahead to keep processing saturated
+        # while bounding local NVMe usage; upload queue backpressure prevents
+        # unbounded NVMe accumulation when NAS is slow.
+        self.prefetch_queue: queue.Queue[int] = queue.Queue(maxsize=prefetch_buffer)
+        self.upload_queue: queue.Queue[int] = queue.Queue(maxsize=upload_buffer)
 
         self.stats_lock = threading.Lock()
         self.stats: dict[str, int] = {
@@ -888,6 +890,12 @@ Examples:
                              "Keeps all GPUs busy while all CPU cores run MFA simultaneously.")
     parser.add_argument("--cpu-workers", type=int, default=0,
                         help="Number of CPU workers in pipelined mode (default: auto = cpu_count // 8).")
+    parser.add_argument("--prefetch-buffer", type=int, default=0,
+                        help="Max prefetched batches on local NVMe (0=auto: 4, 1=serial). "
+                             "Larger values trade disk space for throughput.")
+    parser.add_argument("--upload-buffer", type=int, default=0,
+                        help="Max completed batches awaiting NAS upload (0=auto: 4). "
+                             "Backpressure prevents NVMe exhaustion when NAS is slow.")
 
     # ── Pipeline config ──
     parser.add_argument("--config", type=Path,
@@ -930,6 +938,12 @@ Examples:
     args._local_work_drives = tuple(
         p if p.is_absolute() else PROJECT_ROOT / p for p in _lw
     )
+
+    # --prefetch-buffer / --upload-buffer: CLI > config > default 4
+    if args.prefetch_buffer <= 0:
+        args.prefetch_buffer = streaming_cfg.get("prefetch_buffer", 4)
+    if args.upload_buffer <= 0:
+        args.upload_buffer = streaming_cfg.get("upload_buffer", 4)
 
     # --batch-size: CLI > config > default 500
     if args.batch_size is None:
@@ -1009,6 +1023,8 @@ Examples:
             config=args.config, local_work=args.local_work,
             batch_size=args.batch_size, limit=args.limit,
             python_path=args.python,
+            prefetch_buffer=args.prefetch_buffer,
+            upload_buffer=args.upload_buffer,
         )
         if not ok:
             sys.exit(1)
@@ -1027,6 +1043,8 @@ def run_single_dataset(
     batch_size: int = 500, limit: int = 0,
     python_path: str | None = None,
     stems_override: list[str] | None = None,
+    prefetch_buffer: int = 4,
+    upload_buffer: int = 4,
 ) -> bool:
     """Run streaming pipeline for a single dataset.  Returns True on success."""
     # ── Ensure MFA model is pre-extracted before subprocess starts ──
@@ -1109,6 +1127,8 @@ def run_single_dataset(
         mfa_python=mfa_python,
         models_dir=models_dir,
         nas_output_root=nas_output_root,
+        prefetch_buffer=prefetch_buffer,
+        upload_buffer=upload_buffer,
     )
     return pipeline.run()
 
@@ -1617,6 +1637,8 @@ def _run_batch_sequential(args, datasets: list, cache: dict,
             local_work=ds_local, batch_size=args.batch_size,
             limit=args.limit, python_path=args.python,
             stems_override=stems_ov,
+            prefetch_buffer=args.prefetch_buffer,
+            upload_buffer=args.upload_buffer,
         )
 
         if ok:

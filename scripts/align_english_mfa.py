@@ -288,7 +288,8 @@ def _build_corpus_stem(stem: str, segments: list[dict],
 def build_en_corpus(en_segments: dict[str, list[dict]],
                     audio_dir: Path, corpus_dir: Path,
                     padding_ms: float = 50.0,
-                    min_segment_dur_ms: float = 200.0) -> dict[str, list[dict]]:
+                    min_segment_dur_ms: float = 200.0,
+                    corpus_workers: int = 0) -> dict[str, list[dict]]:
     """Extract English audio segments and build MFA corpus.
 
     Writes {stem}_seg{idx}.wav and {stem}_seg{idx}.lab to corpus_dir.
@@ -312,7 +313,9 @@ def build_en_corpus(en_segments: dict[str, list[dict]],
             else:
                 del en_segments[stem]
     else:
-        n_workers = min(16, os.cpu_count(), len(stem_items))
+        _max_w = min(16, os.cpu_count(), len(stem_items))
+        n_workers = corpus_workers if corpus_workers > 0 else _max_w
+        n_workers = min(n_workers, len(stem_items))
         print(f"  Building English corpus: {len(stem_items)} stems,"
               f" {n_workers} workers")
         ctx = __import__('multiprocessing').get_context("fork")
@@ -754,6 +757,8 @@ def main():
                         help="MFA retry beam width for English alignment")
     parser.add_argument("--fine-tune", action="store_true",
                         help="Enable MFA extra fine-tuning pass (default: disabled)")
+    parser.add_argument("--corpus-workers", type=int, default=0,
+                        help="Parallel workers for English corpus building (0=auto)")
     parser.add_argument("--python", type=str, default=None,
                         help="Python interpreter with MFA installed")
     args = parser.parse_args()
@@ -817,6 +822,7 @@ def main():
         en_segments, audio_dir, en_corpus_dir,
         padding_ms=args.padding_ms,
         min_segment_dur_ms=args.min_segment_dur_ms,
+        corpus_workers=args.corpus_workers,
     )
 
     n_segments = sum(

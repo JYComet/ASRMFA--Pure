@@ -222,6 +222,8 @@ DEFAULT_CFG: dict = {
     "mfa_en": {
         "enabled": True,
         "num_jobs": 4,
+        "normalize_workers": 0,       # 0=auto: min(32, cpu_count)
+        "corpus_workers": 0,          # 0=auto: min(16, cpu_count)
         "padding_ms": 50,
         "min_segment_dur_ms": 200,
         "max_gap_merge_s": 0.35,
@@ -281,6 +283,10 @@ DEFAULT_CFG: dict = {
             "output/*.TextGrid", "output/tone_mapping.json",
             "output/postprocess_report.jsonl", "filtered/*.TextGrid",
         ],
+    },
+    "streaming": {
+        "prefetch_buffer": 4,     # max prefetched batches on local NVMe
+        "upload_buffer": 4,       # max completed batches awaiting NAS upload
     },
 }
 
@@ -1045,6 +1051,10 @@ def step_normalize_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
 
     script = SCRIPTS_DIR / "normalize_english_tokens.py"
     norm_en_args = ["--txt-dir", str(ctc_dir)]
+    en_cfg = cfg.get("mfa_en", {})
+    nw = en_cfg.get("normalize_workers", 0)
+    if nw > 0:
+        norm_en_args += ["--workers", str(nw)]
     if ctx.get("mfa_dict"):
         norm_en_args += ["--dict-path", str(ctx["mfa_dict"])]
     return run_python(
@@ -1446,6 +1456,9 @@ def step_mfa_align_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     ]
     if en_cfg.get("fine_tune", False):
         align_en_args.append("--fine-tune")
+    cw = en_cfg.get("corpus_workers", 0)
+    if cw > 0:
+        align_en_args += ["--corpus-workers", str(cw)]
     if args.python:
         align_en_args += ["--python", str(mfa_python)]
 

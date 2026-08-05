@@ -541,6 +541,8 @@ def main():
     parser.add_argument("--txt-dir", type=Path, required=True)
     parser.add_argument("--dict-path", type=Path, default=None,
                         help="MFA dictionary path (for auto-adding missing English tokens)")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Number of parallel workers (0=auto: min(32, cpu_count))")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -565,7 +567,9 @@ def main():
                 changed += 1
     else:
         # Parallel: each stem is independent (separate .lab / .TextGrid / _tokens.jsonl)
-        n_workers = min(32, os.cpu_count(), len(stem_list))
+        _max_w = min(32, os.cpu_count(), len(stem_list))
+        n_workers = args.workers if args.workers > 0 else _max_w
+        n_workers = min(n_workers, len(stem_list))  # don't exceed work items
         print(f"  Processing {len(stem_list)} stems with {n_workers} workers...")
         changed = 0
         done = 0

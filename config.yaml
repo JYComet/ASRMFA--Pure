@@ -78,6 +78,8 @@
 # mfa_en:
 #   enabled: true           # set to false to skip English MFA entirely
 #   num_jobs: 4             # parallel MFA jobs for English segments
+#   normalize_workers: 0    # parallel workers for English token normalisation (0=auto)
+#   corpus_workers: 0       # parallel workers for English corpus building (0=auto)
 #   padding_ms: 50          # audio padding around English segments
 #   min_segment_dur_ms: 200 # skip segments shorter than this (use G2P split)
 #   max_gap_merge_s: 0.35   # max gap between consecutive English words to merge
@@ -121,3 +123,10 @@
 #   enable_text_correction: true
 #   handle_unexpected_sil: true
 #   workers: 0              # 0 = auto (os.cpu_count())
+
+# ── 流式批处理 (streaming_pipeline.py / launch_multi_gpu.sh) ─────────────
+# streaming:
+#   prefetch_buffer: 4      # max prefetched batches on local NVMe (higher=more disk)
+#   upload_buffer: 4        # max completed batches awaiting NAS upload (backpressure)
+#   local_work: /ssd/mfa_work     # local SSD/NVMe work directory
+#   batch_size: 500                # stems per batch
