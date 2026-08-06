@@ -70,6 +70,13 @@
 | 59 | 2026-08-05 | postprocess_textgrids.py | CTC 替换部分成功 → 拼音片段被合并守卫排除 → hanzi 拼音残留 (partial_ctc_merge_guard) |
 | 60 | 2026-08-05 | postprocess_textgrids.py | fix_short_words 仅覆盖虚词 → 实词 < 50ms 不被修复 → short_word 过滤 (content_short_word_unfixed) |
 | 61 | 2026-08-05 | ctc_prealign.py | 参考文本模式英文词被 NVASR tokenizer 拆碎 → 最终 TextGrid 英文变形 (ref_text_english_tokenizer_mangle) |
+| 62 | 2026-08-05 | postprocess_textgrids.py | _normalize_word_spellings 三通道修复: 用原始 .txt 覆盖 tokenizer 损坏的英文词 (ref_text_english_correction_in_postprocess) |
+| 63 | 2026-08-06 | postprocess_textgrids.py | CTC 锚点错位导致参考文本与 hanzi tier CJK 字符序列不匹配 → text_order_mismatch 过滤 (ctc_anchor_text_order) |
+| 64 | 2026-08-06 | postprocess_textgrids.py | english_phone_deficit 读取错误的 Interval.mark → 英文音素不足检测永久失效（已修复） (english_deficit_mark_regression) |
+| 65 | 2026-08-06 | postprocess_textgrids.py, run_pipeline.py | 单文件后处理异常只写 report 不返回非零 → 管线误报成功（已修复） (postprocess_error_exit_masking) |
+| 66 | 2026-08-06 | postprocess_textgrids.py | 派生 tier 同步异常被静默吞掉 → 过期/不同步 tier 仍可能进入输出（已修复） (silent_derived_tier_sync_failure) |
+| 67 | 2026-08-06 | postprocess_textgrids.py, run_pipeline.py | text_order_mismatch 用 CTC 归一化文本做参考 → 检查失效 → 改用原始 txt (text_order_wrong_ref_source) |
+| 68 | 2026-08-06 | ctc_prealign.py, normalize_english_tokens.py, postprocess_textgrids.py, run_pipeline.py | 参考文本未贯穿 CTC→MFA→后处理链，ASR 文本覆盖权威文本并造成严重词面/字符错位；CTC batch/token 映射还有错配风险（已修复） (reference_text_ctc_anchor_authority) |
 
 ---
 
@@ -5453,13 +5460,11 @@ for word_idx in content_candidates:
 
 - 受影响的 token 类型: 英文专有名词、品牌名、缩写（Claude, kimi, MacBook, PV, BGM, K-Pop 等）
 - 中文部分基本不受影响
-- 无法在 postprocess 阶段修复（原始词已被 tokenizer 拆分且无保留的完整英文原文索引）
+- **已修复**: Case 62 — `_normalize_word_spellings` 三通道修复，使用原始 .txt 参考文本覆盖 tokenizer 损坏的英文词
 
-### 可能的修复方向
+### 修复
 
-1. **预处理**: 在 `make_patched_inference` 中，tokenizer 之前用占位符保护英文词，对齐后再还原
-2. **后处理**: postprocess 阶段用原始 `.txt` 覆盖 `raw_text` tier 中的英文片段（需英文词边界检测）
-3. **词典注入**: 将高频英文专有名词加入 NVASR tokenizer 词表（需重新训练/微调 tokenizer）
+见 Case 62: `_normalize_word_spellings` 英文词参考文本覆盖修复。
 
 ### 验证方法
 
@@ -5470,3 +5475,459 @@ stem = "036001_弹幕互动_回应吐槽弹幕"
 # 预期 raw_text 含 "Claude"
 # 实际: "Cudude的推送" / "RIA"
 ```
+
+---
+
+## Case 62: `_normalize_word_spellings` 用原始 .txt 参考文本覆盖 tokenizer 损坏的英文词 (english_reference_overwrite)
+
+**日期**: 2026-08-05
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `_normalize_word_spellings`
+**触发场景**: 参考文本模式 (nvv_enabled=false)，原始 txt 含英文专有名词（Claude, kimi, MacBook 等），
+NVASR tokenizer 拆碎后 `normalize_english_tokens.py` 未能合并/错误合并
+
+### 现象
+
+Case 61 记录了根因：NVASR 中文 tokenizer 将英文词拆为字母碎片，`normalize_english_tokens.py`
+使用 `_text_cn.txt`（ASR 输出）作参考而非原始 `.txt` 参考文本，导致碎片未合并或错误合并。
+最终 words/hanzi tier 中英文词严重变形。
+
+```
+原始 txt:       "Claude的推送"
+tokenizer 输出: "Cla" + "ude" + "的" + "推" + "送"
+normalize_en:  _text_cn.txt 可能含错误 ASR 文本 → 合并失败或输出 "Cudude"
+最终 words:    "Cudude" / "RIA" / "Cla" + "ude" (碎片残留)
+```
+
+### 根因链
+
+1. **`ctc_prealign.py:312`**: NVASR `tokenizer.text2tokens(align_text)` — 中文 tokenizer 将英文词拆为字母碎片（Claude → Cla + ude），每个碎片作为独立 token 参与 CTC 强制对齐
+2. **`normalize_english_tokens.py:285`**: 使用 `_text_cn.txt`（ASR decode 输出）作为参考文本，而非原始 `.txt` 参考文本。ASR 对英文专有名词可能转录错误 → 碎片合并失败或产生错误合并
+3. **`_normalize_word_spellings` (旧)**: 设计为仅修复 "ria" 一种场景，注释写明 "Only replace for 'ria'". 其他英文词（live, BGM, Claude 等）保留 tokenizer 碎片
+4. **`raw_text` 已正确加载但未充分利用**: postprocess 中 `raw_text = find_original_text(stem, args.raw_text_dir)` 返回正确的原始 `.txt` 参考文本，但 `_normalize_word_spellings` 仅用它做 NW 对齐，替换范围被限制在 "ria"
+
+**两阶段失效**:
+- **Stage 1 (normalize_en)**: 参考文本来源错误（ASR 而非 original txt）→ 碎片合并可能失败
+- **Stage 2 (postprocess)**: 正确的参考文本已在手但未充分利用 → 英文碎片残留
+
+### 修改点
+
+**A. `_normalize_word_spellings` — 三通道英文词修复** (~line 1766)
+
+完全重写函数，从"仅 ria"扩展为三个通道：
+
+**Pass 1 — 替换已匹配的英文词**:
+- 对所有 ASCII-alpha 参考词（len >= 2，排除 NVV）
+- 当 word-tier token 文本与参考文本不一致时，用参考文本覆盖
+- 跟踪 `fixed_ctc_indices` 记录被修正的 token 位置
+- NVV token 永不修改（Case 17 保护保留）
+
+**Pass 2 — 合并孤儿 ASCII-alpha 碎片**:
+- 扫描 NW 对齐中未匹配（ref_i=None）的 CTC token
+- 仅处理 ASCII-alpha 碎片（无数字、无 CJK、无 NVV）——pinyin 音节如 `rui4` 被保护
+- 向左/右搜索最近的已修正英文词，扩展其时域覆盖此碎片
+- 碎片 interval 置为零长占位（末尾清理）
+- 跳过中间的 CJK/pinyin/NVV token（安全边界）
+
+**Pass 3 — 未匹配参考英文词 → 替换孤儿 CTC token**:
+- 处理参考英文词完全未被 NW 匹配的情况（如错误合并 "Cudude" 不匹配任何 ref）
+- 用相邻已匹配的 CJK 锚点限定搜索区域
+- 在区域内找到第一个 ASCII-alpha 孤儿 token → 替换为参考英文词
+- 同一区域内的相邻孤儿碎片合并入此词
+
+**清理**: 删除所有零时长占位 interval，保证 words tier 连续。
+
+修改前（旧逻辑）:
+```python
+# Pass 1: Only replace for "ria" — other English words keep fragments
+for ctc_i, ref_i in alignment:
+    if ctc_i is None or ref_i is None:
+        continue
+    ref_spelling = ref_units[ref_i][1]
+    if not (ref_spelling.isascii() and ref_spelling.isalpha() and len(ref_spelling) >= 2):
+        continue
+    wi, w_text = word_entries[ctc_i]
+    if is_nvv_token(w_text):
+        continue
+    if ref_spelling != w_text and ref_spelling.isascii():
+        words_tier.intervals[wi].text = ref_spelling
+# No gap merging (Pass 2 removed)
+```
+
+修改后（新逻辑）:
+```python
+# Pre-scan: detect ALL English reference words (not just "ria")
+en_ref_positions: dict[int, str] = {}
+for ri, (ci, u) in enumerate(ref_units):
+    if u.isascii() and u.isalpha() and len(u) >= 2 and not is_nvv_token(u):
+        en_ref_positions[ri] = u
+
+# Pass 1: Replace ALL mismatched English words
+for ctc_i, ref_i in alignment:
+    if ctc_i is None or ref_i is None: continue
+    if ref_i not in en_ref_positions: continue
+    ref_spelling = en_ref_positions[ref_i]
+    wi, w_text = word_entries[ctc_i]
+    if is_nvv_token(w_text): continue
+    if ref_spelling != w_text:
+        words_tier.intervals[wi].text = ref_spelling
+        fixed_ctc_indices.add(ctc_i)
+
+# Pass 2: Merge orphan ASCII-alpha fragments into fixed English words
+for ctc_i, ref_i in alignment:
+    if ref_i is not None or ctc_i is None: continue
+    wi, w_text = word_entries[ctc_i]
+    if not (w_text.isascii() and w_text.isalpha()): continue
+    if is_nvv_token(w_text): continue
+    # Search left/right for nearest fixed English word, merge into it
+
+# Pass 3: Unmatched reference English words → replace orphan CTC tokens
+for ref_i, en_word in en_ref_positions.items():
+    if ref_i in ref_to_ctc: continue  # already matched
+    # Use neighbouring CJK anchors to bound search region
+    # Replace first orphan ASCII-alpha token in region with en_word
+    # Merge additional orphans into it
+
+# Cleanup: remove zero-duration placeholders
+words_tier.intervals = [iv for iv in words_tier.intervals
+                       if iv.xmax - iv.xmin > 0.001]
+```
+
+**B. 调用点注释更新** (~line 5226)
+
+```python
+# 修改前:
+# 1. Normalise English token fragments ("R"->"ria") so words &
+#    pinyin_phones tiers use the canonical reference spelling.
+
+# 修改后:
+# 1. Normalise English words against original reference text (.txt).
+#    NVASR tokenizer (Chinese-centric) breaks English words into letter
+#    fragments (e.g. "Claude"→"Cla"+"ude") which may survive
+#    normalize_english_tokens.py when _text_cn.txt (ASR) differs from
+#    the reference.  raw_text from the original .txt is ground truth.
+#    Regression Case 62.
+```
+
+### 三个通道覆盖的场景
+
+| 场景 | 示例 | 处理通道 |
+|------|------|---------|
+| 英文词被拆碎，首碎片匹配参考，其余残留 | "Cla"+"ude" → NW: "Cla"↔"Claude", "ude"↔None | Pass 1 替换 "Cla"→"Claude", Pass 2 合并 "ude" |
+| 英文词被错误合并为一个整体 | "Cudude" → NW: 不匹配 "Claude" | Pass 3 在限定区域内替换 "Cudude"→"Claude" |
+| 多个英文词相邻且都被拆碎 | "MacBook Pro" → 三个碎片组 | 各通道独立处理每个参考英文词 |
+| 英文词已被正确修复 | "Claude" = "Claude" | 无操作（`ref_spelling == w_text` 跳过） |
+| 无英文词（纯中文） | "你好世界" | `en_ref_positions` 为空 → 立即返回 |
+| NVV token 被误认为英文 | `<LAUGHTER>` | `is_nvv_token` 保护 → 跳过 |
+
+### 安全保护
+
+- **pinyin 音节保护**: Pass 2/3 仅处理 `w_text.isascii() and w_text.isalpha()` 的 token。`rui4`（含数字）不被合并
+- **CJK 锚点边界**: Pass 3 用相邻已匹配的 CJK ref unit 限定搜索范围，不会越界替换
+- **NVV 保护**: 三层检查 — Pass 1 的 `is_nvv_token(w_text)`、Pass 2 的相同检查、Pass 3 的 `is_nvv_token()` 排除
+- **空操作 fallback**: 无英文参考词时 `en_ref_positions` 为空 → 立即返回，不影响纯中文数据
+
+### 与 normalize_english_tokens.py 的关系
+
+| 特性 | normalize_english_tokens.py | _normalize_word_spellings (修复后) |
+|------|---------------------------|----------------------------------|
+| 运行时机 | pre-MFA (lab 级别) | post-MFA (words tier 级别) |
+| 参考文本来源 | `_text_cn.txt` (ASR) | `raw_text` (原始 .txt) |
+| 修改对象 | `.lab` + `_tokens.jsonl` + `.TextGrid` | words tier intervals (in-place) |
+| 覆盖范围 | CJK pinyin→英文还原 | 所有 ASCII-alpha 英文词 |
+| 失败模式 | ASR 错误 → 碎片未合并/错误合并 | 作为安全网捕获 normalize_en 的漏网之鱼 |
+
+两者互补: normalize_en 在 MFA 之前修复 `.lab`（最佳时机），postprocess 用原始参考文本兜底修复 MFA 之后的残留错误。
+
+### 验证方法
+
+```python
+# 在 ria 数据集中搜索含英文词的段，对比原始 txt 和最终 words tier
+stem = "036001_弹幕互动_回应吐槽弹幕"
+raw_text = open(f"{stem}.txt").read()  # "Claude的推送"
+
+# 提取 raw_text 中的英文词
+import re
+en_words = re.findall(r'[A-Za-z]{2,}', raw_text)  # ["Claude"]
+
+# 在最终 words tier 中验证每个英文词都存在
+for en in en_words:
+    found = any(iv.text.strip() == en for iv in words_tier.intervals)
+    assert found, f"English word '{en}' from reference not found in words tier"
+
+# 反之：words tier 中不应有tokenizer碎片（单字母/短碎片在已修复英文词旁）
+for i, iv in enumerate(words_tier.intervals):
+    if iv.text.strip().isascii() and iv.text.strip().isalpha():
+        # 英文 token 应至少 2 个字符且匹配参考文本中的某个词
+        assert len(iv.text.strip()) >= 2, f"Single-letter fragment: {iv.text}"
+```
+
+### 关联样本
+
+- Case 61: 根因分析 — 参考文本模式英文词被 tokenizer 拆碎
+- Case 17: NVV 文本保护（`is_nvv_token` guard 保留）
+- Case 31: normalize_english_tokens.py 英文 CTC 锚点三重修复（互补关系）
+
+---
+
+## Case 63: CTC 锚点错位导致参考文本与 hanzi tier CJK 字符序列不匹配 → text_order_mismatch 过滤 (ctc_anchor_text_order)
+
+### 现象
+
+CTC 推理的非确定性导致锚点漂移，hanzi tier 中 CJK 字符序列与原始参考文本不同。
+例如：参考 "来了来了，ria上线！用kimi搜了一下" → hanzi "来了来了，RIA瑞！亚kimi上线用，main搜..."
+
+### 根因链
+
+1. NVASR CTC 批量推理每次产生不同的 logits → CTC 强制对齐的锚点位置不同
+2. 锚点漂移导致 token 时间戳错位 → pinyin/word 与 hanzi 错配
+3. 现有 pinyin_displacement 检测拼音级错配，但不直接检测**字符序列顺序**
+
+### 修改点
+
+`scripts/postprocess_textgrids.py` — 在 pinyin_displacement 检查之后新增 text_order_mismatch
+
+```python
+# 提取参考文本 CJK 字符序列
+_ref_cjk = [c for c in re.sub(r'<sp\d+>', '', raw_text) if CJK(c)]
+# 提取 hanzi tier CJK 字符序列
+_hanzi_cjk = [c for h_iv in hanzi_tier_final if CJK(c)]
+# LCS 比率 < 0.6 → text_order_mismatch
+```
+
+### 验证方法
+
+```python
+# 在 ria 数据集上重跑 postprocess
+python3 scripts/run_pipeline.py --config configs/hecheng_ria_0805.yaml \
+    --python .../mfa-dev/bin/python --step postprocess --overwrite
+# 预期: 新增 text_order_mismatch 过滤类别，捕获 CTC 锚点错位文件
+```
+```
+
+---
+
+## Case 64: `english_phone_deficit` 读取错误的 `Interval.mark` → 检测永久失效（已修复） (english_deficit_mark_regression)
+
+**日期**: 2026-08-06
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `process_one`（English phone QC）
+**关联历史问题**: Case 33、Case 49、Case 50
+
+### 现象
+
+Case 50 修复了 English QC 访问 `_p.mark` 导致的 `AttributeError`，但当前 Case 33 的音素不足检查仍然使用 `mark`：
+
+```python
+if (_p.xmax > _ws + 0.001 and getattr(_p, 'mark', None)
+        and not is_silence(getattr(_p, 'mark', '').strip())):
+    _w_phones.append(getattr(_p, 'mark', _p.text if hasattr(_p, 'text') else '').strip())
+```
+
+项目自定义 `Interval` 只有 `xmin`、`xmax`、`text`，没有 `mark` 属性。因此 `getattr(_p, 'mark', None)` 永远是 `None`，`_w_phones` 永远收集不到音素，`english_phone_deficit` 永远不会触发。
+
+### 根因与影响
+
+1. Case 50 只修复了直接崩溃路径；本段后来改成 `getattr` 后避免了异常，却保留了错误的属性名。
+2. `english_phone_deficit` 的期望音素数已正确改为 CMUdict（Case 49），但实际音素计数始终为 0，导致“实际 2 个音素、期望 4 个音素”等真正缺失场景不被过滤。
+3. Case 32 的 `english_single_phone` 使用 `.text`，所以该问题只影响 Case 33，容易被“没有崩溃”误判为已修复。
+
+### 证据
+
+- `Interval` 定义：`scripts/postprocess_textgrids.py:48-57`，字段为 `xmin/xmax/text`。
+- 错误读取：`scripts/postprocess_textgrids.py:6401-6403`。
+- 过滤条件：`scripts/postprocess_textgrids.py:6405-6417`。
+- 编译检查通过，但编译无法发现 `getattr` 导致的逻辑死路。
+
+### 修复要求
+
+已将 `mark` 读取统一改为 `text`。English 词的 CMUdict 期望音素数与实际 `text` 音素数现在可以正常比较；实际少于期望时会加入 `english_phone_deficit`。
+
+---
+
+## Case 65: 单文件后处理异常只写 report 不返回非零 → 管线误报成功（已修复） (postprocess_error_exit_masking)
+
+**日期**: 2026-08-06
+**涉及文件**: `scripts/postprocess_textgrids.py`, `scripts/run_pipeline.py`
+**涉及函数**: `main`, `step_postprocess`
+
+### 现象
+
+`postprocess_textgrids.py::main()` 在串行和并行路径都捕获每个文件的异常，只追加：
+
+```python
+{"stem": tgp.stem, "status": "error", "error": str(exc)}
+```
+
+随后无论 `reports` 中是否包含 error，都写入 `postprocess_report.jsonl` 并自然返回；脚本没有 `sys.exit(1)`。`run_pipeline.py::step_postprocess()` 只返回 `run_python(...)` 的进程码，因此会把“全部文件失败”或“部分文件失败”视为步骤成功。
+
+### 根因与影响
+
+1. 单文件异常被设计为可继续批处理，但没有把 error 数量传递到进程退出状态。
+2. 主管线的步骤失败列表不会包含 `postprocess`，后续缓存/完成状态可能照常保存。
+3. `--validate` 只检查 glob 是否存在；旧输出文件或少量输出也可能满足模式，不能替代失败码。
+4. 结果是监控端看到 `DONE/Success`，实际数据可能只有 filtered 文件、错误记录或混合不完整结果。
+
+### 证据
+
+- 异常捕获：`scripts/postprocess_textgrids.py:6649-6657`、`6682-6690`、`6701-6707`。
+- 无错误退出：`scripts/postprocess_textgrids.py:6709-6717` 只统计并打印 counts。
+- 管线调用：`scripts/run_pipeline.py:1495-1573`，没有解析 `postprocess_report.jsonl` 的 error 状态。
+- 主管线成功判定：`scripts/run_pipeline.py:2555-2560` 仅依赖子进程返回码。
+
+### 修复要求
+
+postprocess 写完 report 后会根据 `status == "error"` 返回非零；无 TextGrid 输入也返回失败。主管线因此会停止并报告 `postprocess` 失败。
+
+---
+
+## Case 66: 派生 tier 同步异常被静默吞掉 → 过期/不同步 tier 仍可能进入输出（已修复） (silent_derived_tier_sync_failure)
+
+**日期**: 2026-08-06
+**涉及文件**: `scripts/postprocess_textgrids.py`
+**涉及函数**: `_sync_derived_tiers`
+
+### 现象
+
+`_sync_derived_tiers()` 在重建 `hanzi` 和 `pinyin_phones` 时分别使用宽泛的 `except Exception: pass`：
+
+```python
+try:
+    ... _build_hanzi_tier(...)
+except Exception:
+    pass
+
+try:
+    ... build_pinyin_phones_tier(...)
+except Exception:
+    pass
+```
+
+如果输入字典、英文窗口、tier 结构或数据类型触发异常，函数会保留旧的派生 tier，并继续进入后续 Phase 5 和输出；调用方也不会得到同步失败标记。
+
+### 根因与影响
+
+1. 项目将 `words` 作为唯一权威 tier，但同步失败后旧 `hanzi/pinyin_phones` 仍可能与新 `words` 边界或文本不一致，违反 Case 17-F 的架构不变量。
+2. 由于异常被吞掉，QC 只可能检查到“旧 tier 的合法性”，无法可靠发现本次同步失败；若旧 tier 恰好存在，甚至不会触发缺失检查。
+3. 多处 Phase 4 调用同步函数，异常不会使文件进入 `error` 或 `filtered`，问题被静默放大。
+
+### 证据
+
+- `scripts/postprocess_textgrids.py:1169-1187`：hanzi 重建异常静默忽略。
+- `scripts/postprocess_textgrids.py:1189-1201`：pinyin_phones 重建异常静默忽略。
+- 调用点：`scripts/postprocess_textgrids.py:5027-5031`、`5051-5053`、`5118-5120`。
+- 现有 QC 在输出前没有 `sync_failed` 或派生 tier 版本/边界一致性断言。
+
+### 修复要求
+
+同步失败现在抛出带上下文的 `RuntimeError`，由 `process_one` 的文件级异常处理捕获并记录为 `error`；不会再保留旧 tier 冒充同步成功。
+
+---
+
+## Case 67: text_order_mismatch 用 CTC 归一化文本做参考 → 检查失效 (text_order_wrong_ref_source)
+
+### 现象
+
+`text_order_mismatch` 报告所有文件 `in_order: true`，包括已知锚点错位的文件。例如 `036002`：
+- 原始 txt: `来啦来啦，ria上线！用kimi搜了一下...`
+- hanzi tier: `来,了,来,了,瑞,亚,上,线,用,搜,了,一,下,为,你,推...`
+- 应检测到字符 `瑞/亚/为` 不在原文中 → 顺序错误
+- 实际报告: `in_order: true`
+
+### 根因链
+
+1. `process_one:4641`: `raw_text = find_original_text(stem, args.raw_text_dir)`
+2. `args.raw_text_dir` = `ctc_pretg`（管线传的 `--raw-text-dir`）
+3. `ctc_pretg` 目录无 `{stem}.txt` → `find_original_text` 返回空
+4. 回退: `raw_text = {stem}_text_cn.txt` — **CTC 归一化后的文本**
+5. 归一化文本已被 CTC 修改（`来啦→来了`、`ria/main/kimi` 被删除）
+6. 归一化文本与 hanzi tier 自然匹配 → `in_order: true` → 检查完全失效
+
+### 修改点
+
+**A. `run_pipeline.py:1514`** — 新增 `--original-txt-dir` 指向原始 `data_dir`
+
+```python
+# 新增行
+"--original-txt-dir", str(ctx["data_dir"]),
+```
+
+**B. `postprocess_textgrids.py:6124-6128`** — text_order 检查改用原始 txt
+
+```python
+# 修改前: 用 raw_text (可能是 CTC 归一化文本)
+_ref_cjk = [c for c in re.sub(r'<sp\d+>', '', raw_text) if CJK(c)]
+
+# 修改后: 先尝试从 original_txt_dir 加载原始 txt
+_orig_txt = raw_text
+if getattr(args, 'original_txt_dir', None):
+    _orig_path = Path(args.original_txt_dir) / f"{stem}.txt"
+    if _orig_path.exists():
+        _orig_txt = _orig_path.read_text(encoding="utf-8").strip()
+_ref_cjk = [c for c in re.sub(r'<sp\d+>', '', _orig_txt) if CJK(c)]
+```
+
+### 验证方法
+
+```python
+# 重跑 postprocess 后检查 036002
+# 预期: status 含 "text_order_mismatch", text_order.in_order = false
+```
+
+
+
+## Case 68: 参考文本未贯穿 CTC→MFA→后处理链，ASR 文本覆盖权威文本并造成严重错位（已修复） (reference_text_ctc_anchor_authority)
+
+**日期**: 2026-08-06
+**涉及文件**: scripts/ctc_prealign.py, scripts/normalize_english_tokens.py, scripts/postprocess_textgrids.py, scripts/run_pipeline.py
+
+### 场景与现象
+
+参考文本模式的设计是“音频和对应文本已知，ASR 只提供 CTC 帧级时间锚点、停顿和中英文/NVV 分类”。实际代码却在后续阶段混入 ASR 文本，导致：
+
+- CTC 强制对齐使用了正确的参考文本，但 postprocess 因找不到原始 .txt 而回退到 _text_cn.txt；
+- ctc_ready 复制的参考文件名是 {stem}_ref.txt，原查找逻辑只识别 {stem}.txt；
+- normalize_english_tokens.py 原本无条件以 _text_cn.txt 作为英文参考，可能把正确的参考英文词改成 ASR 词；
+- 后处理会依据 CTC token 的时间重叠改写 MFA words tier 的 pinyin/英文词面。在参考文本模式下，这相当于允许不可靠的 ASR/CTC 解码结果篡改权威文本；
+- ctc_prealign.py 原来按 all_results 的位置绑定 stems，batch 返回顺序改变或部分结果缺失时，会把一个音频的锚点写到另一个音频；
+- tokenizer 一个逻辑 token 展开为多个 CTC id 时，原代码仍按 speech_tokens[tid] 取标签，展开点之后的 token 时间标签会发生偏移。
+
+### 根因链
+
+参考文本
+  ├─ CTC forced align → .lab / TextGrid（正确）
+  ├─ ASR decode → _text_cn.txt（仅应为诊断信息）
+  └─ 管线后处理 raw_text / normalize_en / CTC rewrite 错误读取或覆盖为 ASR
+                                      ↓
+                       MFA words / hanzi / English 词面错位
+
+问题本质不是 CTC 不能做锚点，而是“文本内容”和“时间锚点”的职责边界没有在文件接口及后处理逻辑中固定下来。
+
+### 修复内容
+
+1. ctc_prealign.py 在存在参考文本时写出 {stem}_ref.txt；ASR 输出继续写入 _text_raw.txt / _text_cn.txt，明确作为诊断或无参考文本时的 fallback。
+2. normalize_english_tokens.py 优先读取 {stem}_ref.txt，只有不存在时才回退到 _text_cn.txt，使 .lab、TextGrid 和英文合并使用同一文本源。
+3. postprocess_textgrids.py::find_original_text() 支持 {stem}_ref.txt；发现参考文本后设置权威模式，禁止 CTC token 改写 MFA words tier 的词面或按 CTC 英文 token 合并区间。CTC 仍可参与时间边界、停顿和语言类别处理。
+4. run_pipeline.py 为 full、ctc_ready、batch_ctc_ready 传递正确的 raw_text_dir；外部 text_dir、工作区中已链接的 {stem}_ref.txt 和原始数据目录均可恢复参考文本。text_order QC 也使用同一目录。
+5. step_link_ctc() 额外保留 CTC 源目录中已有的可选 {stem}_ref.txt，兼容“预先生成 CTC 目录、未配置 text_dir”的用法。
+6. CTC 结果写出改为按结果 key 解析音频 stem，拒绝无法匹配或重复的输入音频结果；token id 展平时同步建立 flat_token_labels，消除逻辑 token 与 CTC id 数量不一致造成的标签漂移。
+7. CTC 强制对齐按返回的 target token id 在目标序列中定位，而不是按非 blank group 计数；检测到任意目标 token 零帧时拒绝生成该文件，并以非零退出码阻止管线继续。
+
+### 设计不变量
+
+- 参考文本存在时：参考文本是 .lab、MFA words、hanzi 和英文词面的唯一权威来源。
+- ASR 文本：只用于诊断、无参考文本时的后备，以及从音频提取 CTC 分类信息；不得覆盖参考文本。
+- CTC：只提供时间锚点、停顿和语言/NVV 类别；不得凭时间重叠替换参考词面。
+- 每个 CTC 结果必须通过 result[key] 映射回同名输入音频；不能依赖 batch 位置。
+
+### 验证
+
+- 临时回归：目录同时存在 demo_ref.txt = “参考 life” 和错误的 _text_cn.txt = “参考 live” 时，英文归一化输出为 life。
+- 临时回归：find_original_text("demo", ...) 正确返回 demo_ref.txt。
+- python3 -W error -m compileall -q scripts check_ipa_mapping.py verify_risks.py 通过。
+- git -c core.whitespace=cr-at-eol diff --check 通过。
+
+### 关联问题
+
+- Case 61/62：参考文本英文词被 tokenizer 拆碎及 postprocess 兜底修复。
+- Case 63/67：CTC 锚点字符顺序检查及检查参考源错误。

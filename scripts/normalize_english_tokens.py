@@ -282,11 +282,18 @@ def _reclaim_fragments(lab_tokens: list[str],
 # ---------------------------------------------------------------------------
 
 def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
+    # CTC output contains both the ASR diagnostic transcript and, when the
+    # pipeline was run in reference-text mode, the authoritative source as
+    # ``*_ref.txt``.  English fragment normalization must follow the same
+    # source as .lab/TextGrid, never the potentially erroneous ASR result.
+    ref_path = txt_dir / f"{stem}_ref.txt"
     cn_path = txt_dir / f"{stem}_text_cn.txt"
-    if not cn_path.exists():
+    if ref_path.exists():
+        ref_text = ref_path.read_text(encoding="utf-8").strip()
+    elif cn_path.exists():
+        ref_text = cn_path.read_text(encoding="utf-8").strip()
+    else:
         return False
-
-    ref_text = cn_path.read_text(encoding="utf-8").strip()
     char_units = extract_word_chars(ref_text)
 
     # Reference word units (punct filtered)

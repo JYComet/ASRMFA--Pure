@@ -1166,7 +1166,9 @@ def _sync_derived_tiers(textgrid: TextGrid, ipa_to_pinyin: dict[str, str],
             textgrid.tiers[i] = words_tier
             break
 
-    # 1. Rebuild hanzi from updated words tier
+    # 1. Rebuild hanzi from updated words tier.
+    # This is an invariant: words is authoritative, so stale derived tiers
+    # must never survive a failed rebuild (Regression Case 66).
     if raw_text:
         try:
             hanzi_tier = _build_hanzi_tier(words_tier, raw_text,
@@ -1183,10 +1185,12 @@ def _sync_derived_tiers(textgrid: TextGrid, ipa_to_pinyin: dict[str, str],
                         if t.name == "words":
                             textgrid.tiers.insert(i, hanzi_tier)
                             break
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError(
+                "failed to rebuild hanzi tier from authoritative words tier"
+            ) from exc
 
-    # 2. Rebuild pinyin_phones from updated phones + words tiers
+    # 2. Rebuild pinyin_phones from updated phones + words tiers.
     if phones_tier is not None and pinyin_dict is not None:
         try:
             synced_pp = build_pinyin_phones_tier(
@@ -1197,8 +1201,10 @@ def _sync_derived_tiers(textgrid: TextGrid, ipa_to_pinyin: dict[str, str],
                     if t.name == "pinyin_phones":
                         textgrid.tiers[i] = synced_pp
                         break
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError(
+                "failed to rebuild pinyin_phones tier from words/phones tiers"
+            ) from exc
 
 
 def strip_edge_punctuation(textgrid: TextGrid) -> None:
@@ -1764,17 +1770,26 @@ def _build_hanzi_tier(words_tier: Tier, raw_text: str,
 
 
 def _normalize_word_spellings(words_tier: Tier, raw_text: str) -> None:
-    """Replace tokenizer fragments in *words_tier* with canonical reference spellings.
+    """Replace tokenizer-damaged English words with canonical reference spellings.
 
     Uses Needleman-Wunsch alignment (:func:`_align_word_sequences`) to
     map word-tier tokens to reference word units.  When a token is a
-    fragment of an English/NVV word (e.g. "R" for "ria"), the word-tier
+    fragment of an English word (e.g. "Cla" for "Claude"), the word-tier
     text is updated in-place to match the reference spelling so that all
-    downstream tiers (words, pinyin_phones) stay consistent.
+    downstream tiers (words, pinyin_phones, hanzi) stay consistent.
 
-    CTC gaps (fragments absorbed into the preceding matched word, e.g.
-    "ya4" after "rui4"->"ria") are **merged** into the matched word by
-    extending its time range.
+    Three passes:
+      1. Replace matched English tokens that differ from reference spelling.
+      2. Merge orphan ASCII-alpha fragments (tokenizer remnants) into adjacent
+         corrected English words by extending time ranges.
+      3. For unmatched reference English words, find orphan ASCII-alpha tokens
+         in the approximate region and replace them.
+
+    Regression Case 62: NVASR tokenizer breaks English words into letter
+    fragments (e.g. "Claude" → "Cla"+"ude").  normalize_english_tokens.py
+    may fail to merge them when _text_cn.txt (ASR output) differs from the
+    original reference .txt.  This function uses the original reference text
+    (raw_text) as ground truth to correct all surviving errors.
     """
     clean = raw_text.replace('<sp1>', '')
     char_units = _extract_word_chars(clean)
@@ -1784,6 +1799,14 @@ def _normalize_word_spellings(words_tier: Tier, raw_text: str) -> None:
     for i, u in enumerate(char_units):
         if is_word_like(u):
             ref_units.append((i, u))
+
+    # ── English reference positions (auto-detect from raw_text) ──
+    # ASCII-alpha, len >= 2, excluding NVV tokens (which have no acoustic
+    # model and must keep their canonical <>-wrapped form).
+    en_ref_positions: dict[int, str] = {}   # ref_units index → english word
+    for ri, (ci, u) in enumerate(ref_units):
+        if u.isascii() and u.isalpha() and len(u) >= 2 and not is_nvv_token(u):
+            en_ref_positions[ri] = u
 
     # Word-tier tokens (silence & punct filtered)
     word_entries: list[tuple[int, str]] = []
@@ -1802,34 +1825,143 @@ def _normalize_word_spellings(words_tier: Tier, raw_text: str) -> None:
     ref_texts = [u for _, u in ref_units]
     alignment = _align_word_sequences(ctc_texts, ref_texts)
 
-    # ── Pass 1: replace fragment spellings with canonical form ──
-    # Only replace for "ria" (rui4->ria / R->ria).  Other English words
-    # (live, BGM, etc.) keep their original tokenizer fragments.
-    # Pre-MFA normalize_english_tokens.py already handles the .lab-level
-    # merge for ria, so this pass is a safety net for any missed cases.
+    # Build lookup: ctc_i → ref_i and ref_i → [ctc_i...]
+    ctc_to_ref: dict[int, int] = {}
+    ref_to_ctc: dict[int, list[int]] = {}
+    for ctc_i, ref_i in alignment:
+        if ctc_i is not None and ref_i is not None:
+            ctc_to_ref[ctc_i] = ref_i
+            ref_to_ctc.setdefault(ref_i, []).append(ctc_i)
+
+    # ── Pass 1: Replace matched English tokens with canonical spelling ──
+    # For every matched pair where the reference is an English word and the
+    # word-tier text differs, overwrite it with the reference spelling.
+    # NVV tokens are NEVER replaced (Regression Case 17).
+    fixed_ctc_indices: set[int] = set()   # word_entries indices fixed in Pass 1
     for ctc_i, ref_i in alignment:
         if ctc_i is None or ref_i is None:
             continue
-        ref_spelling = ref_units[ref_i][1]
-        # Normalise spelling for auto-detected English words (ASCII-alpha, len >= 2)
-        if not (ref_spelling.isascii() and ref_spelling.isalpha() and len(ref_spelling) >= 2):
+        if ref_i not in en_ref_positions:
             continue
+        ref_spelling = en_ref_positions[ref_i]
         wi, w_text = word_entries[ctc_i]
-        # NEVER replace an NVV token's text — it has no MFA acoustic model and
-        # its canonical form (e.g. SURPRISE-OH) is the key to downstream NVV
-        # handling.  Replacing it with a reference spelling (e.g. SURPRISE)
-        # breaks NVV detection, causing the word to be treated as English and
-        # getting no valid phones.  See Regression Case 17.
         if is_nvv_token(w_text):
             continue
-        if ref_spelling != w_text and ref_spelling.isascii():
+        if ref_spelling != w_text:
             words_tier.intervals[wi].text = ref_spelling
+            fixed_ctc_indices.add(ctc_i)
 
-    # Note: gap merging (Pass 2) was removed.  English-word fragments like
-    # "ve" after "li"->"live" are now kept as separate word intervals with
-    # empty hanzi labels — the user wants them preserved.  Ria fragments no
-    # longer exist at this stage because normalize_english_tokens.py merges
-    # them into a single token before MFA alignment.
+    if not en_ref_positions:
+        return
+
+    # ── Pass 2: Merge orphan ASCII-alpha fragments into corrected words ──
+    # After Pass 1, unmatched CTC tokens (ref_i=None) that are ASCII-alpha
+    # (e.g. tokenizer remnants like "ude" after "Cla"→"Claude") are merged
+    # into the nearest corrected English word by extending its time range.
+    # Safety: only ASCII-alpha (no digits, no CJK) — pinyin syllables like
+    # "rui4" and CJK tokens like "的" are protected.
+    merged_ctc: set[int] = set()
+    for ctc_i, ref_i in alignment:
+        if ref_i is not None:
+            continue          # already matched — skip
+        if ctc_i is None:
+            continue
+        wi, w_text = word_entries[ctc_i]
+        if not (w_text.isascii() and w_text.isalpha()):
+            continue          # not an English fragment (pinyin / CJK / NVV)
+        if is_nvv_token(w_text):
+            continue
+
+        # Merge into the nearest fixed English word (look left, then right)
+        merged = False
+        # ── Left search: walk backward through alignment to find fixed neighbour ──
+        for left_i in range(ctc_i - 1, -1, -1):
+            if left_i in fixed_ctc_indices:
+                left_wi = word_entries[left_i][0]
+                left_iv = words_tier.intervals[left_wi]
+                cur_iv = words_tier.intervals[wi]
+                words_tier.intervals[left_wi] = Interval(
+                    left_iv.xmin, max(left_iv.xmax, cur_iv.xmax), left_iv.text)
+                # Zero out the merged fragment (cleaned up below)
+                words_tier.intervals[wi] = Interval(cur_iv.xmin, cur_iv.xmin, "")
+                merged_ctc.add(ctc_i)
+                merged = True
+                break
+            # Only skip over other English fragments; stop at CJK/pinyin/NVV
+            left_text = word_entries[left_i][1]
+            if not (left_text.isascii() and left_text.isalpha() and not is_nvv_token(left_text)):
+                break
+        if merged:
+            continue
+
+        # ── Right search ──
+        for right_i in range(ctc_i + 1, len(word_entries)):
+            if right_i in fixed_ctc_indices:
+                right_wi = word_entries[right_i][0]
+                right_iv = words_tier.intervals[right_wi]
+                cur_iv = words_tier.intervals[wi]
+                words_tier.intervals[right_wi] = Interval(
+                    min(right_iv.xmin, cur_iv.xmin), right_iv.xmax, right_iv.text)
+                words_tier.intervals[wi] = Interval(cur_iv.xmin, cur_iv.xmin, "")
+                merged_ctc.add(ctc_i)
+                merged = True
+                break
+            right_text = word_entries[right_i][1]
+            if not (right_text.isascii() and right_text.isalpha() and not is_nvv_token(right_text)):
+                break
+
+    # ── Pass 3: Unmatched reference English words → replace orphan CTC tokens ──
+    # A reference English word may have no matched CTC token (e.g. when the
+    # word-tier token is a wrong merge like "Cudude" that NW can't match to
+    # "Claude").  For each unmatched English reference word, scan for orphan
+    # ASCII-alpha CTC tokens in the approximate region and replace the first
+    # one with the reference spelling.  Region is bounded by the neighbouring
+    # matched CJK anchors on either side.
+    for ref_i, en_word in en_ref_positions.items():
+        if ref_i in ref_to_ctc:
+            continue  # already matched — handled in Pass 1/2
+
+        # Find left/right CTC boundaries from matched neighbouring ref units
+        left_ctc_bound = 0
+        for lr in range(ref_i - 1, -1, -1):
+            if lr in ref_to_ctc:
+                left_ctc_bound = max(ref_to_ctc[lr]) + 1
+                break
+        right_ctc_bound = len(word_entries)
+        for rr in range(ref_i + 1, len(ref_units)):
+            if rr in ref_to_ctc:
+                right_ctc_bound = min(ref_to_ctc[rr])
+                break
+
+        # Scan for orphan ASCII-alpha tokens in [left_ctc_bound, right_ctc_bound)
+        orphan_candidates: list[int] = []
+        for ctc_i in range(left_ctc_bound, min(right_ctc_bound, len(word_entries))):
+            if ctc_i in ctc_to_ref or ctc_i in merged_ctc:
+                continue  # already matched or merged
+            wi, w_text = word_entries[ctc_i]
+            if w_text.isascii() and w_text.isalpha() and not is_nvv_token(w_text):
+                orphan_candidates.append(ctc_i)
+
+        if orphan_candidates:
+            # Replace the first orphan with the reference word
+            first_orphan = orphan_candidates[0]
+            wi = word_entries[first_orphan][0]
+            words_tier.intervals[wi].text = en_word
+            fixed_ctc_indices.add(first_orphan)
+            # Merge remaining orphans into this word
+            for other in orphan_candidates[1:]:
+                other_wi = word_entries[other][0]
+                words_tier.intervals[wi] = Interval(
+                    words_tier.intervals[wi].xmin,
+                    max(words_tier.intervals[wi].xmax, words_tier.intervals[other_wi].xmax),
+                    en_word)
+                words_tier.intervals[other_wi] = Interval(
+                    words_tier.intervals[other_wi].xmin,
+                    words_tier.intervals[other_wi].xmin, "")
+
+    # ── Clean up zero-duration placeholders ──
+    words_tier.intervals = [iv for iv in words_tier.intervals
+                           if iv.xmax - iv.xmin > 0.001]
 
 
 # ---------------------------------------------------------------------------
@@ -2567,10 +2699,13 @@ def find_original_text(stem: str, raw_text_dir: Path | None) -> str:
     """Find the original Chinese text for a given output stem (searches recursively)."""
     if not raw_text_dir or not raw_text_dir.exists():
         return ""
-    # Try stem.txt (flat or recursive)
-    candidates = list(raw_text_dir.rglob(f"{stem}.txt"))
-    if candidates:
-        return candidates[0].read_text(encoding="utf-8").strip()
+    # Prefer the exact source transcript.  ``*_ref.txt`` is emitted by
+    # ctc_prealign/step_link_ctc when the original text lives outside the
+    # CTC directory; it is authoritative and must precede ASR fallbacks.
+    for pattern in (f"{stem}.txt", f"{stem}_ref.txt"):
+        candidates = list(raw_text_dir.rglob(pattern))
+        if candidates:
+            return candidates[0].read_text(encoding="utf-8").strip()
     # Try with engine suffix appended
     for suffix in ("_qwen3-api", "_qwen3", "_firered"):
         candidates = list(raw_text_dir.rglob(f"{stem}{suffix}.txt"))
@@ -2580,9 +2715,10 @@ def find_original_text(stem: str, raw_text_dir: Path | None) -> str:
     m = re.search(r"_(firered|qwen3|qwen3-api)$", stem)
     if m:
         base = stem[:m.start()]
-        candidates = list(raw_text_dir.rglob(f"{base}.txt"))
-        if candidates:
-            return candidates[0].read_text(encoding="utf-8").strip()
+        for pattern in (f"{base}.txt", f"{base}_ref.txt"):
+            candidates = list(raw_text_dir.rglob(pattern))
+            if candidates:
+                return candidates[0].read_text(encoding="utf-8").strip()
         for suffix in ("_qwen3-api", "_qwen3", "_firered"):
             candidates = list(raw_text_dir.rglob(f"{base}{suffix}.txt"))
             if candidates:
@@ -4505,8 +4641,11 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                 if canonical is not None and canonical != word:
                     iv.text = canonical
 
-    # Tier 1: original Chinese text (from data_dir)
+    # Tier 1: original/reference Chinese text.  This flag is intentionally
+    # captured before ASR fallback: CTC may provide boundaries and language
+    # hints, but it must not replace a supplied reference transcript.
     raw_text = find_original_text(stem, args.raw_text_dir)
+    reference_text_authoritative = bool(raw_text)
     if not raw_text:
         # Try NVASR Chinese ASR output
         cn_path = txt_dir / f"{stem}_text_cn.txt"
@@ -4534,7 +4673,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # For each MFA word that is <unk>/[bracketed], or is a pinyin syllable
     # (e.g. rui4) where the CTC anchor says it should be English (e.g. ria),
     # restore the correct word text from CTC anchors by time overlap.
-    if ctc_token_list:
+    if ctc_token_list and not reference_text_authoritative:
         for iv in words_tier.intervals:
             if is_silence(iv.text) or iv.text.strip() in ("", "<eps>"):
                 continue
@@ -4563,7 +4702,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # Guard: both words must be English tokens (not Chinese pinyin like "yi1")
     # to avoid swallowing real Chinese words that happen to overlap the
     # English token boundary.
-    if ctc_token_list:
+    if ctc_token_list and not reference_text_authoritative:
         merged_intervals = []
         for iv in words_tier.intervals:
             if (merged_intervals
@@ -5097,8 +5236,12 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # stale (pre-normalisation) labels while words/pinyin advance.
     final_words_tier = tier_by_name(new_tg, "words")
     if final_words_tier:
-        # 1. Normalise English token fragments ("R"->"ria") so words &
-        #    pinyin_phones tiers use the canonical reference spelling.
+        # 1. Normalise English words against original reference text (.txt).
+        #    NVASR tokenizer (Chinese-centric) breaks English words into letter
+        #    fragments (e.g. "Claude"→"Cla"+"ude") which may survive
+        #    normalize_english_tokens.py when _text_cn.txt (ASR) differs from
+        #    the reference.  raw_text from the original .txt is ground truth.
+        #    Regression Case 62.
         _normalize_word_spellings(final_words_tier, raw_text)
         # 2. Rebuild hanzi from normalised words.
         hanzi_tier = _build_hanzi_tier(final_words_tier, raw_text,
@@ -5978,6 +6121,66 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                     if _has_displacement:
                         filter_reasons.append("pinyin_displacement")
 
+                # ── text_order_mismatch: verify hanzi CJK char sequence
+                #     is a subsequence of the ORIGINAL reference text (.txt).
+                #     If not, CTC anchors have rearranged the character order
+                #     which is a hard error — no ratio, no threshold. ──
+                _orig_txt = raw_text  # fallback: may be CTC-normalized
+                if getattr(args, 'original_txt_dir', None):
+                    _orig_path = Path(args.original_txt_dir) / f"{stem}.txt"
+                    if _orig_path.exists():
+                        _orig_txt = _orig_path.read_text(encoding="utf-8").strip()
+                _ref_cjk = [c for c in re.sub(r'<sp\d+>', '', _orig_txt)
+                            if '一' <= c <= '鿿']
+                _hanzi_cjk = []
+                for _h_iv in hanzi_tier_final.intervals:
+                    _ht = _h_iv.text.strip()
+                    if _ht and not _ht.startswith('<sp') and not _ht.startswith('<'):
+                        for _c in _ht:
+                            if '一' <= _c <= '鿿':
+                                _hanzi_cjk.append(_c)
+                if len(_ref_cjk) >= 6 and len(_hanzi_cjk) >= 6:
+                    # Subsequence check: every char in hanzi must appear
+                    # in ref in the same relative order
+                    _ri = 0
+                    _in_order = True
+                    for _hc in _hanzi_cjk:
+                        while _ri < len(_ref_cjk) and _ref_cjk[_ri] != _hc:
+                            _ri += 1
+                        if _ri >= len(_ref_cjk):
+                            _in_order = False
+                            break
+                        _ri += 1
+                    report["text_order"] = {
+                        "ref_cjk_count": len(_ref_cjk),
+                        "hanzi_cjk_count": len(_hanzi_cjk),
+                        "in_order": _in_order,
+                    }
+                    if not _in_order:
+                        # Find first 5 out-of-order positions for diagnostics
+                        _samples = []
+                        _ri = 0
+                        _sample_count = 0
+                        for _hi, _hc in enumerate(_hanzi_cjk):
+                            while _ri < len(_ref_cjk) and _ref_cjk[_ri] != _hc:
+                                _ri += 1
+                            if _ri >= len(_ref_cjk):
+                                _samples.append(
+                                    f"hanzi[{_hi}]={_hc} not found after pos "
+                                    f"{_ri if _ri < len(_ref_cjk) else 'end'} "
+                                    f"in ref")
+                                _sample_count += 1
+                            elif _ri > _hi + 3:
+                                _samples.append(
+                                    f"hanzi[{_hi}]={_hc} found at "
+                                    f"ref[{_ri}] (gap={_ri - _hi})")
+                                _sample_count += 1
+                            _ri += 1
+                            if _sample_count >= 5:
+                                break
+                        report["text_order"]["samples"] = _samples
+                        filter_reasons.append("text_order_mismatch")
+
     # ── Case 26-D / Regr. Case 47: init_only_phone + single_phone audit ──
     # After the proportional-split fix (Case 26+43), a multi-phone dict
     # word must never appear as its initial-only phone in pinyin_phones.
@@ -6213,9 +6416,11 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             __pi = _pp_idx
             while __pi < len(pp_tier.intervals) and pp_tier.intervals[__pi].xmin < _we - 0.001:
                 _p = pp_tier.intervals[__pi]
-                if (_p.xmax > _ws + 0.001 and getattr(_p, 'mark', None)
-                        and not is_silence(getattr(_p, 'mark', '').strip())):
-                    _w_phones.append(getattr(_p, 'mark', _p.text if hasattr(_p, 'text') else '').strip())
+                # Interval stores its label in ``text``; ``mark`` is not
+                # part of this project's interval API (Case 64).
+                if (_p.xmax > _ws + 0.001 and _p.text
+                        and not is_silence(_p.text.strip())):
+                    _w_phones.append(_p.text.strip())
                 __pi += 1
             _n_got = len(_w_phones)
             _n_exp = len(_dp)
@@ -6336,7 +6541,7 @@ def _worker_fn(tgp):
                        _ipa, _py_dict, _py_case)
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="Post-process MFA TextGrids for Chinese alignment.")
     parser.add_argument("--txt-dir", type=Path, default=PROJECT_ROOT / "corpus_clean" / "txt")
     parser.add_argument("--textgrid-dir", type=Path, default=PROJECT_ROOT / "aligned")
@@ -6345,6 +6550,8 @@ def main():
     parser.add_argument("--wav-dir", type=Path, default=PROJECT_ROOT / "corpus_clean" / "wav")
     parser.add_argument("--raw-text-dir", type=Path, default=None,
                         help="Directory with original Chinese text files")
+    parser.add_argument("--original-txt-dir", type=Path, default=None,
+                        help="Directory with original {stem}.txt reference texts (for text_order check)")
     parser.add_argument("--pinyin-dict", type=Path, default=PROJECT_ROOT / "dict" / "fullpinyin_enword.dict")
     parser.add_argument("--ipa-dict", type=Path, default=PROJECT_ROOT / "dict" / "mfa_ipa.dict")
     parser.add_argument("--en-phones-dir", type=Path, default=None,
@@ -6448,7 +6655,7 @@ def main():
     tg_paths = sorted(args.textgrid_dir.glob("*.TextGrid"))
     if not tg_paths:
         print(f"No TextGrid files in {args.textgrid_dir}")
-        return
+        return 1
 
     # Resolve worker count
     import multiprocessing as mp
@@ -6530,7 +6737,12 @@ def main():
     for r in reports:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     print(f"Done. {counts}. report={rp}")
+    error_count = counts.get("error", 0)
+    if error_count:
+        print(f"ERROR: {error_count} file(s) failed during post-processing; see {rp}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

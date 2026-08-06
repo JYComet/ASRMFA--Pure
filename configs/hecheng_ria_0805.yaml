@@ -20,8 +20,8 @@ mode: nvrasr_fallback
 
 # ── 路径配置 ──────────────────────────────────────────────────
 
-# 输入: ria speaker 子目录 (WAV + 参考文本 .txt, flat 布局)
-data_dir: /mnt/Raw/新版合成英文数据/ria
+# 输入: ria speaker 子目录 (WAV + 参考文本 .txt, flat 布局, 全 NVMe)
+data_dir: /mnt/nvme3/mfa_audio_cache_ria/ria
 
 # 工作目录 (NVMe)
 workspace: /mnt/nvme3/mfa_workspace_ria_0805
@@ -34,9 +34,6 @@ output_staging: true
 
 # 保留 16k 音频 (供后续调试/重跑)
 keep_16k_audio: true
-
-# NVMe 音频长期存储 (ria 独立缓存, 与纱依/花礼隔离)
-nvme_cache: /mnt/nvme3/mfa_audio_cache_ria
 
 # MFA 临时目录 (本地 NVMe 避免 CIFS SQLite 锁死)
 temp_dir: /tmp/mfa_temp

@@ -12,7 +12,7 @@ from collections import Counter, defaultdict
 from pypinyin import lazy_pinyin, Style
 
 SP_TOKEN_PAT = re.compile(r'^<sp\d+>$')
-PUNCT_ONLY = re.compile(r'^[，。！？、；：""''…\-,.!?;:\'"\s\n\t\r]+$')
+PUNCT_ONLY = re.compile(r"""^[-，。！？、；："'…,.!?;:\s\n\t\r]+$""")
 CHINESE_CHAR = re.compile(r'[一-鿿]')
 
 def parse_textgrid(filepath):

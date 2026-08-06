@@ -1510,7 +1510,8 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         "--output-dir", str(ctx["output_dir"]),
         "--filtered-dir", str(ctx["filtered_dir"]),
         "--wav-dir", str(ctx["mfa_audio_dir"]),
-        "--raw-text-dir", str(ctc_dir),  # adjusted dir has _text_cn.txt too
+        "--raw-text-dir", str(ctx.get("raw_text_dir", ctx["data_dir"])),
+        "--original-txt-dir", str(ctx.get("raw_text_dir", ctx["data_dir"])),
         "--pinyin-dict", str(resolve_path(PROJECT_ROOT, cfg.get("pinyin_dict", "dict/fullpinyin_enword.dict"))),
         "--ipa-dict", str(resolve_path(PROJECT_ROOT, cfg.get("mfa_dict", "dict/mfa_ipa.dict"))),
         "--en-phones-dir", str(ctx["workspace"] / "en_phones"),
@@ -1972,6 +1973,20 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                 print(f"    ... and {len(ctc_missing) - 10} more")
         print(f"  CTC linked:  {ctc_linked} -> {ctc_out}")
 
+        # Preserve a reference transcript already bundled with generated CTC
+        # output.  It is optional for legacy CTC directories, but when
+        # present it is the only authoritative text if text_dir is omitted.
+        bundled_refs = 0
+        for stem in valid:
+            ctc_base = _ctc_base_cache.get(stem, ctc_dir_src)
+            src_ref = ctc_base / f"{stem}_ref.txt"
+            dst_ref = ctc_out / f"{stem}_ref.txt"
+            if src_ref.exists() and (not dst_ref.exists() or args.overwrite):
+                if _link_or_copy(src_ref, dst_ref):
+                    bundled_refs += 1
+        if bundled_refs:
+            print(f"  Bundled refs: {bundled_refs} -> {ctc_out}")
+
         # ── 6. Copy/link reference text (.txt from text_dir) ──
         if text_index:
             txt_linked = 0
@@ -2317,6 +2332,14 @@ def main():
                 "mfa_audio_dir": sub_workspace / "audio_16k",
                 "ctc_pretg": sub_ctc_pretg,
                 "ctc_pretg_adj": sub_ctc_pretg_adj,
+                # In ctc_ready mode the reference may be external.  If no
+                # external directory is configured, step_link_ctc copies it
+                # as *_ref.txt into the workspace CTC directory.
+                "raw_text_dir": (
+                    resolve_input_path(sub_cfg["ctc_ready"]["text_dir"], PROJECT_ROOT)
+                    if sub_cfg.get("ctc_ready", {}).get("text_dir")
+                    else sub_ctc_pretg
+                ),
             }
 
             # Run all ctc_ready steps
@@ -2547,6 +2570,15 @@ def main():
         "mfa_audio_dir": workspace / "audio_16k",
         "ctc_pretg": workspace / cfg.get("ctc_pretg", "ctc_pretg"),
         "ctc_pretg_adj": workspace / cfg.get("ctc_pretg_adj", "ctc_pretg_adj"),
+        # Keep the reference transcript available to postprocess.  Full and
+        # fallback modes read {stem}.txt from data_dir; ctc_ready uses the
+        # configured external text_dir or the linked *_ref.txt files.
+        "raw_text_dir": (
+            resolve_input_path(cfg.get("ctc_ready", {}).get("text_dir"), PROJECT_ROOT)
+            if mode == "ctc_ready" and cfg.get("ctc_ready", {}).get("text_dir")
+            else (workspace / cfg.get("ctc_pretg", "ctc_pretg")
+                  if mode == "ctc_ready" else data_dir)
+        ),
     }
 
     failed = []

@@ -84,7 +84,7 @@ def parse_textgrid(filepath: str) -> Optional[Dict]:
 # pinyin sequence from the 'words' tier vs the 'pinyin' tier's sequence.
 
 SP_TOKEN_PAT = re.compile(r'^<sp\d+>$')
-PUNCT_PAT = re.compile(r'^[，。！？、；：""''…\-,.!?;:\'"\s]+$')
+PUNCT_PAT = re.compile(r"""^[-，。！？、；："'…,.!?;:\s]+$""")
 CHINESE_CHAR_PAT = re.compile(r'[一-鿿]')
 ENGLISH_WORD_PAT = re.compile(r'^[A-Za-z0-9]+$')
 RIA_PLACEHOLDER_PAT = re.compile(r'^RIA.*$')

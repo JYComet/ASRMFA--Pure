@@ -313,11 +313,18 @@ def make_patched_inference(ref_texts: dict[str, str],
                 speech_tokens = tokens
                 token_ids_list = tokenizer.tokens2ids(speech_tokens)
                 token_ids_flat = []
-                for tids in token_ids_list:
+                # ``tokens2ids`` may expand one logical tokenizer token into
+                # multiple CTC ids.  Keep a label for every flattened id;
+                # indexing ``speech_tokens`` by the flattened position
+                # silently shifts all following timestamps in that case.
+                flat_token_labels = []
+                for token, tids in zip(speech_tokens, token_ids_list):
                     if tids:
                         token_ids_flat.extend(tids)
+                        flat_token_labels.extend([token] * len(tids))
                     else:
                         token_ids_flat.append(124)  # space token
+                        flat_token_labels.append(token)
 
                 if token_ids_flat:
                     # 准备 logits: 去掉 query 帧 (复用 L213 的 ctc_logits,
@@ -339,24 +346,49 @@ def make_patched_inference(ref_texts: dict[str, str],
                         ignore_id=self.ignore_id,
                     )
 
-                    # 分组提取 token 边界
+                    # 分组提取 token 边界。 ctc_forced_align 返回的是
+                    # target token id，不是 target 序号；某个 target 可能
+                    # 获得 0 帧。按“第几个非 blank group”取标签会在此处
+                    # 将后续所有时间戳左移，因此必须按 token id 在目标
+                    # 序列中的下一个出现位置恢复逻辑 token 标签。
                     pred_grp = groupby(align[0, :total_speech_frames].tolist())
                     _s = 0
-                    tid = 0
+                    target_cursor = 0
+                    matched_target_positions: set[int] = set()
                     for ptok, pframe_iter in pred_grp:
                         frame_indices = list(pframe_iter)
                         _e = _s + len(frame_indices)
-                        if ptok != 0 and tid < len(token_ids_flat):
-                            t_left = max((_s * FRAME_MS - 30) / 1000, 0)
-                            t_right = min((_e * FRAME_MS - 30) / 1000, duration_s)
-                            token_str = speech_tokens[tid] if tid < len(speech_tokens) else ""
-                            words_aligned.append({
-                                "word": token_str,
-                                "start": round(t_left, 3),
-                                "end": round(t_right, 3),
-                            })
-                            tid += 1
+                        if ptok != 0:
+                            matched = next(
+                                (pos for pos in range(target_cursor, len(token_ids_flat))
+                                 if token_ids_flat[pos] == ptok),
+                                None,
+                            )
+                            if matched is not None:
+                                t_left = max((_s * FRAME_MS - 30) / 1000, 0)
+                                t_right = min((_e * FRAME_MS - 30) / 1000, duration_s)
+                                words_aligned.append({
+                                    "word": flat_token_labels[matched],
+                                    "start": round(t_left, 3),
+                                    "end": round(t_right, 3),
+                                })
+                                matched_target_positions.add(matched)
+                                target_cursor = matched + 1
                         _s = _e
+
+                    missing_target_positions = [
+                        pos for pos in range(len(token_ids_flat))
+                        if pos not in matched_target_positions
+                    ]
+                    missing_ctc_tokens = [
+                        flat_token_labels[pos] for pos in missing_target_positions
+                    ]
+                else:
+                    missing_ctc_tokens = list(speech_tokens)
+            else:
+                missing_ctc_tokens = []
+
+            ctc_alignment_complete = not missing_ctc_tokens
 
             # ── Check English token completeness ──
             # CTC forced alignment can drop tokens that get 0 frames
@@ -388,6 +420,8 @@ def make_patched_inference(ref_texts: dict[str, str],
                 "blank_runs": blank_runs,
                 "english_complete": english_complete,
                 "missing_english": missing_english,
+                "ctc_alignment_complete": ctc_alignment_complete,
+                "missing_ctc_tokens": missing_ctc_tokens,
             })
 
         return results, meta
@@ -1267,7 +1301,7 @@ def main():
     if not paths:
         print("错误: 没有可处理的音频文件")
         model.model.inference = orig_inf
-        return
+        return 1
 
     # ── 批量推理 ──
     t0 = time.time()
@@ -1319,10 +1353,37 @@ def main():
     manifest = []
     ok = fail = 0
 
+    input_stems = set(stems)
+    seen_result_stems: set[str] = set()
     for i, r in enumerate(all_results):
-        stem = stems[i] if i < len(stems) else Path(r["key"]).stem
+        # FunASR normally preserves batch order, but the result key is the
+        # only reliable ownership relation.  Positional mapping can write
+        # one file's CTC anchors under another audio after a reordered or
+        # partially failed batch.
+        result_key = str(r.get("key", ""))
+        result_stem = Path(result_key).stem if result_key else ""
+        if not result_stem or result_stem not in input_stems:
+            print(f"  FAIL result[{i}]: invalid/unmatched key {result_key!r}")
+            fail += 1
+            continue
+        if result_stem in seen_result_stems:
+            print(f"  FAIL result[{i}]: duplicate result key for {result_stem!r}")
+            fail += 1
+            continue
+        seen_result_stems.add(result_stem)
+        stem = result_stem
         words_aligned = r["words"]
         duration_s = r["duration_s"]
+
+        # ── Reject incomplete target alignment before writing any anchor ──
+        # A zero-frame target cannot be repaired by shifting the following
+        # labels; emitting it would create a text/time mismatch.
+        if not r.get("ctc_alignment_complete", True):
+            missing = r.get("missing_ctc_tokens", [])
+            print(f"  FAIL {stem}: incomplete CTC target alignment - {', '.join(map(str, missing[:12]))}")
+            skipped.setdefault("incomplete_ctc_alignment", []).append(stem)
+            fail += 1
+            continue
 
         # ── Skip stems with incomplete English fragments ──
         # CTC forced alignment can drop OOV English fragments (e.g.
@@ -1635,6 +1696,14 @@ def main():
             cn_path = args.output_dir / f"{stem}_text_cn.txt"
             cn_path.write_text(text_cn + "\n", encoding="utf-8")
 
+            # Preserve the source transcript beside CTC output.  The ASR
+            # text above is diagnostic only; downstream normalization and
+            # post-processing must be able to recover the authoritative
+            # reference even when the original data directory is not passed.
+            if stem in ref_texts:
+                (args.output_dir / f"{stem}_ref.txt").write_text(
+                    ref_texts[stem].strip() + "\n", encoding="utf-8")
+
             manifest.append({
                 "audio": str(audio_dir / f"{stem}.wav"),
                 "textgrid": str(out_tg),
@@ -1734,6 +1803,7 @@ def main():
     skip_labels = {
         "japanese": "含假名 (管线不支持)",
         "incomplete_english": "英文碎片不完整",
+        "incomplete_ctc_alignment": "CTC 目标 token 未完整对齐",
         "empty_asr": "ASR 无输出文本",
     }
     for reason, label in skip_labels.items():
@@ -1751,7 +1821,8 @@ def main():
         f"  *.lab       → MFA corpus (same source as anchors, 100% match)\n"
         f"  manifest.json    → full file index\n"
         f"  *_tokens.jsonl   → per-word CTC timestamps (ms)\n\n"
-        f"Pipeline: NVASR ASR text → TextGrid + .lab (same text)\n"
+        f"Pipeline: reference text (when available) → CTC anchors + .lab;\n"
+        f"  ASR text is diagnostic/fallback only\n"
         f"  → MFA reads .lab as transcript, TextGrid as anchors\n"
         f"  → 100% word match → every CTC boundary used for phone refinement\n"
     )
@@ -1771,7 +1842,8 @@ def main():
     # ── 恢复模型 ──
     model.model.inference = orig_inf
     print(f"完成! 输出: {args.output_dir}")
+    return 1 if fail else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
