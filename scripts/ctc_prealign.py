@@ -882,10 +882,17 @@ def _wav_duration_s(path: Path) -> float:
 
 def _rebuild_final_manifest(ctc_dir: Path, audio_dir: Path) -> None:
     """Atomically publish a manifest from final normalized CTC artifacts."""
+    # Build stem→WAV mapping (supports subdirectory layout)
+    wav_map: dict[str, Path] = {}
+    for p in audio_dir.rglob("*.wav"):
+        if p.stem not in wav_map:
+            wav_map[p.stem] = p
+
     entries = []
     for lab in sorted(ctc_dir.glob("*.lab")):
-        stem = lab.stem; audio = audio_dir / f"{stem}.wav"; tokens = ctc_dir / f"{stem}_tokens.jsonl"
-        if not audio.is_file() or not tokens.is_file():
+        stem = lab.stem; tokens = ctc_dir / f"{stem}_tokens.jsonl"
+        audio = wav_map.get(stem)
+        if audio is None or not audio.is_file() or not tokens.is_file():
             raise ValueError(f"cannot build final manifest for {stem}")
         rows = [json.loads(line) for line in tokens.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
         duration = _wav_duration_s(audio)
@@ -1137,6 +1144,22 @@ def main():
         print(f"ERROR: --require-fresh-output refuses existing output: {args.output_dir}", file=sys.stderr)
         return 2
 
+    # ── Model tree provenance (Case 99 / R5) ──────────────────────────
+    # Compute once at startup so both all-GPU parent and single-GPU child
+    # paths share the same frozen identity.
+    from pipeline_utils import (compute_model_tree_digest,
+                                write_ctc_run_receipt,
+                                validate_ctc_receipts_same_identity)
+    _model_path = Path(args.model_path).resolve()
+    if not _model_path.is_dir():
+        print(f"ERROR: model path is not a directory: {_model_path}", file=sys.stderr)
+        return 2
+    _model_tree_digest, _model_file_manifest = compute_model_tree_digest(_model_path)
+    _dict_digest = hashlib.sha256(
+        Path(args.dict_path).read_bytes() if args.dict_path and args.dict_path.is_file()
+        else b""
+    ).hexdigest() if args.dict_path else ""
+
     # ── --all-gpus: auto-detect GPUs, split files, launch parallel subprocesses ──
     if args.all_gpus:
         if not torch.cuda.is_available():
@@ -1303,6 +1326,27 @@ def main():
                 )
                 if not _marker_ok:
                     raise RuntimeError(f"shard normalization marker mismatch: {_shard_dir}")
+                # ── Shard receipt validation (Case 99 / R5) ──────────
+                _receipt_path = _shard_dir / ".ctc_run_receipt.json"
+                if not _receipt_path.is_file():
+                    raise RuntimeError(f"shard missing run receipt: {_shard_dir}")
+                try:
+                    _receipt = _json.loads(_receipt_path.read_text(encoding="utf-8"))
+                except Exception as _exc:
+                    raise RuntimeError(f"invalid shard run receipt: {_shard_dir}") from _exc
+                _receipt_model = _receipt.get("model", {}).get("tree_digest", "")
+                _receipt_dict = _receipt.get("dictionary", {}).get("digest", "")
+                if _receipt_model != _model_tree_digest:
+                    raise RuntimeError(
+                        f"shard model tree digest mismatch: "
+                        f"{_receipt_model!r} != parent {_model_tree_digest!r}"
+                    )
+                if _receipt_dict != _dict_digest:
+                    raise RuntimeError(
+                        f"shard dict digest mismatch: "
+                        f"{_receipt_dict!r} != parent {_dict_digest!r}"
+                    )
+                # ───────────────────────────────────────────────────────
                 if _seen_shard_stems & _expected:
                     raise RuntimeError(f"duplicate shard stem set: {_shard_dir}")
                 _seen_shard_stems |= _expected
@@ -1425,6 +1469,21 @@ def main():
                 make_ctc_normalization_marker(_stem_count, _manifest_digest),
                 encoding="utf-8",
             )
+            # ── Parent run receipt (Case 99 / R5) ──────────────────
+            _all_stems = sorted({p.stem for p in all_wavs})
+            write_ctc_run_receipt(
+                args.output_dir,
+                actual_argv=sys.argv,
+                asr_python=sys.executable,
+                model_path=_model_path,
+                model_tree_digest=_model_tree_digest,
+                model_file_manifest=_model_file_manifest,
+                dict_path=Path(args.dict_path) if args.dict_path else Path(""),
+                dict_digest=_dict_digest,
+                input_stems=_all_stems,
+                output_stems=_all_stems,
+            )
+            # ─────────────────────────────────────────────────────────
             print(f"完成! 输出: {args.output_dir}")
             sys.exit(0)
 
@@ -1438,6 +1497,12 @@ def main():
     if args.limit > 0:
         wav_files = wav_files[:args.limit]
     print(f"扫描到 {len(wav_files)} 个 WAV 文件")
+
+    # 建立 stem → WAV 路径映射 (支持子目录布局)
+    wav_map: dict[str, Path] = {}
+    for p in wav_files:
+        if p.stem not in wav_map:
+            wav_map[p.stem] = p
 
     # ── 构建参考文本查找表 {stem: chinese_text} ──
     print("构建参考文本查找表...")
@@ -1565,7 +1630,7 @@ def main():
         words_aligned = r["words"]
         # Encoder frame duration can differ at its endpoint.  Every published
         # artifact is instead clamped to the physical WAV header duration.
-        duration_s = _wav_duration_s(audio_dir / f"{stem}.wav")
+        duration_s = _wav_duration_s(wav_map[stem])
 
         # ── Reject incomplete target alignment before writing any anchor ──
         # A zero-frame target cannot be repaired by shifting the following
@@ -1920,7 +1985,7 @@ def main():
                     ref_texts[stem].strip() + "\n", encoding="utf-8")
 
             manifest.append({
-                "audio": str(audio_dir / f"{stem}.wav"),
+                "audio": str(wav_map[stem]),
                 "textgrid": str(out_tg),
                 "lab": str(out_lab),
                 "text_asr": r.get("text_asr", ""),
@@ -2061,6 +2126,23 @@ def main():
             (args.output_dir / ".ctc_normalized").write_text(
                 make_ctc_normalization_marker(_stem_count, _manifest_digest),
                 encoding="utf-8",
+            )
+            # ── CTC run receipt (Case 99 / R5) ─────────────────────
+            _all_output_stems = sorted(
+                p.stem for p in args.output_dir.glob("*.lab")
+            )
+            _all_input_stems = sorted(p.stem for p in paths)
+            write_ctc_run_receipt(
+                args.output_dir,
+                actual_argv=sys.argv,
+                asr_python=sys.executable,
+                model_path=_model_path,
+                model_tree_digest=_model_tree_digest,
+                model_file_manifest=_model_file_manifest,
+                dict_path=Path(args.dict_path) if args.dict_path else Path(""),
+                dict_digest=_dict_digest,
+                input_stems=_all_input_stems,
+                output_stems=_all_output_stems,
             )
         else:
             print("ERROR: refusing to write CTC normalization marker")

@@ -7,6 +7,7 @@
 
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -1503,3 +1504,364 @@ def extract_word_chars(text: str) -> list[str]:
     if buf:
         result.append(buf)
     return result
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Model tree digest — Case 99 provenance (R5)
+# ═══════════════════════════════════════════════════════════════════
+
+def compute_model_tree_digest(model_dir: Path) -> tuple[str, list[dict]]:
+    """Compute a deterministic content digest of an ASR model directory.
+
+    Walks every regular file in *model_dir* (sorted by relative path),
+    records its size and SHA-256, and feeds both the relative path and
+    content hash into a rolling tree digest.
+
+    Symlinks, non-regular files, and path-escape attempts are rejected.
+
+    Returns:
+        (tree_digest_hex, file_manifest) where *file_manifest* is a list
+        of ``{"relpath": str, "size": int, "sha256": str}`` sorted by
+        ``relpath``.
+    """
+    if not model_dir.is_dir() or model_dir.is_symlink():
+        raise ValueError(f"model tree root is not a regular directory: {model_dir}")
+    digest = hashlib.sha256()
+    file_manifest: list[dict] = []
+    for child in sorted(p for p in model_dir.rglob("*") if p.is_file()):
+        if child.is_symlink():
+            raise ValueError(f"symlink not allowed in model tree: {child}")
+        rel = child.relative_to(model_dir).as_posix()
+        if rel.startswith("..") or rel.startswith("/"):
+            raise ValueError(f"model tree path escape: {rel}")
+        file_sha = _sha256_file(child)
+        file_manifest.append({
+            "relpath": rel,
+            "size": child.stat().st_size,
+            "sha256": file_sha,
+        })
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(file_sha.encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest(), file_manifest
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CTC run receipt — Case 99 provenance (R5)
+# ═══════════════════════════════════════════════════════════════════
+
+_CTC_RUN_RECEIPT_SCHEMA = "ctc-run-receipt-v1"
+_SHARD_RECEIPT_SCHEMA = "ctc-shard-receipt-v1"
+
+
+def _stable_json_digest(value: object) -> str:
+    """Deterministic SHA-256 of a JSON-serialisable value."""
+    return hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True,
+                   separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def write_ctc_run_receipt(
+    output_dir: Path,
+    actual_argv: list[str],
+    asr_python: str,
+    model_path: Path,
+    model_tree_digest: str,
+    model_file_manifest: list[dict],
+    dict_path: Path,
+    dict_digest: str,
+    input_stems: list[str],
+    output_stems: list[str],
+) -> dict:
+    """Atomically write a CTC run receipt binding provenance evidence.
+
+    The receipt proves that a specific CTC process loaded a specific model
+    tree, dictionary, and input stem set, and produced an exact output stem
+    set.  It is the on-disk counterpart of the prepare-time frozen model
+    identity.
+
+    Returns the receipt dict that was written.
+    """
+    import time as _time  # local to avoid shadowing
+    input_sorted = sorted(input_stems)
+    output_sorted = sorted(output_stems)
+    receipt: dict = {
+        "schema": _CTC_RUN_RECEIPT_SCHEMA,
+        "timestamp_utc": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+        "argv": list(actual_argv),
+        "asr_python": str(asr_python),
+        "model": {
+            "path": str(model_path.resolve()),
+            "tree_digest": model_tree_digest,
+            "files": model_file_manifest,
+        },
+        "dictionary": {
+            "path": str(dict_path.resolve()),
+            "digest": dict_digest,
+        },
+        "input_stems": input_sorted,
+        "input_stems_digest": _stable_json_digest(input_sorted),
+        "output_stems": output_sorted,
+        "output_stems_digest": _stable_json_digest(output_sorted),
+    }
+    receipt_path = output_dir / ".ctc_run_receipt.json"
+    tmp = receipt_path.with_name(".ctc_run_receipt.json.tmp")
+    tmp.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, receipt_path)
+    return receipt
+
+
+def write_ctc_shard_receipt(
+    shard_dir: Path,
+    gpu_id: int,
+    model_tree_digest: str,
+    dict_digest: str,
+    stems: list[str],
+    parent_argv: list[str],
+) -> dict:
+    """Atomically write a per-GPU-shard receipt for all-GPU provenance.
+
+    Every shard must record the same model/dict identity so the parent
+    can cross-check before merging artifacts.
+    """
+    stems_sorted = sorted(stems)
+    receipt: dict = {
+        "schema": _SHARD_RECEIPT_SCHEMA,
+        "gpu_id": gpu_id,
+        "model_tree_digest": model_tree_digest,
+        "dict_digest": dict_digest,
+        "stems": stems_sorted,
+        "stems_digest": _stable_json_digest(stems_sorted),
+        "parent_argv": list(parent_argv),
+    }
+    receipt_path = shard_dir / ".shard_receipt.json"
+    tmp = receipt_path.with_name(".shard_receipt.json.tmp")
+    tmp.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, receipt_path)
+    return receipt
+
+
+def validate_ctc_receipts_same_identity(
+    shard_receipts: list[dict],
+    parent_model_tree_digest: str,
+    parent_dict_digest: str,
+) -> list[str]:
+    """Check that all shard receipts share the same model/dict identity.
+
+    Returns a list of error strings (empty = all consistent).
+    """
+    errors: list[str] = []
+    for i, r in enumerate(shard_receipts):
+        if r.get("model_tree_digest") != parent_model_tree_digest:
+            errors.append(
+                f"shard {i} model_tree_digest {r.get('model_tree_digest')!r} "
+                f"!= parent {parent_model_tree_digest!r}"
+            )
+        if r.get("dict_digest") != parent_dict_digest:
+            errors.append(
+                f"shard {i} dict_digest {r.get('dict_digest')!r} "
+                f"!= parent {parent_dict_digest!r}"
+            )
+    return errors
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Strict MFA TextGrid validator — Cases 76/83 (R7)
+# ═══════════════════════════════════════════════════════════════════
+
+_TG_TIMING_TOLERANCE_S = 0.003  # matches TIMING_TOLERANCE_S in prepare/v4 verifier
+
+
+def validate_strict_mfa_textgrid(
+    path: Path,
+    wav_duration_s: float | None = None,
+) -> list[str]:
+    """Validate a long-format MFA TextGrid with structural and domain checks.
+
+    This replaces the old substring match (``"words" in content``) with a
+    proper grammar-aware parser.  Every violation is returned as a
+    diagnostic string; an empty list means the file is structurally valid.
+
+    Checks performed:
+      - Grammar header (``File type = "ooTextFile"``, ``Object class = "TextGrid"``)
+      - Finite, strictly-increasing global xmin/xmax
+      - ``tiers? <exists>`` header and matching tier count
+      - Unique tier names, each ``"IntervalTier"`` with in-domain xmin/xmax
+      - Interval count matches declaration
+      - Every interval is finite, positive-duration, monotonic within its tier
+      - WAV domain (when *wav_duration_s* is provided)
+      - Expected tiers ``words`` and ``phones`` exist with at least one
+        non-empty interval each
+    """
+    errors: list[str] = []
+
+    try:
+        raw = path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        return [f"cannot read TextGrid: {exc}"]
+
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        return ["empty TextGrid file"]
+
+    i = 0
+    n = len(lines)
+
+    def _peek() -> str:
+        return lines[i] if i < n else "<eof>"
+
+    def _take(expected: str) -> None:
+        nonlocal i
+        if i >= n:
+            raise ValueError(f"expected {expected!r}, got <eof>")
+        if lines[i] != expected:
+            raise ValueError(f"expected {expected!r}, got {lines[i]!r}")
+        i += 1
+
+    def _pref(prefix: str) -> str:
+        nonlocal i
+        if i >= n:
+            raise ValueError(f"expected line starting with {prefix!r}, got <eof>")
+        line = lines[i]
+        if not line.startswith(prefix):
+            raise ValueError(f"expected line starting with {prefix!r}, got {line!r}")
+        i += 1
+        return line
+
+    def _num(line: str, key: str) -> float:
+        if not line.startswith(key + " = "):
+            raise ValueError(f"expected {key!r}, got {line!r}")
+        val = float(line.split("=", 1)[1])
+        if not math.isfinite(val):
+            raise ValueError(f"non-finite {key}: {val}")
+        return val
+
+    def _unquote(val: str) -> str:
+        val = val.strip()
+        if val.startswith('"') and val.endswith('"'):
+            val = val[1:-1]
+        return val.replace('""', '"')
+
+    try:
+        # Grammar header
+        _take('File type = "ooTextFile"')
+        _take('Object class = "TextGrid"')
+
+        # Global domain
+        gxmin = _num(_pref("xmin = "), "xmin")
+        gxmax = _num(_pref("xmax = "), "xmax")
+        if gxmax <= gxmin:
+            errors.append(f"global xmax {gxmax} <= xmin {gxmin}")
+
+        _take("tiers? <exists>")
+        size_line = _pref("size = ")
+        declared_tiers = int(size_line.split("=", 1)[1])
+        if declared_tiers < 1:
+            errors.append(f"declared {declared_tiers} tiers, need >= 1")
+
+        _take("item []:")
+
+        tier_names: list[str] = []
+        tiers_data: list[dict] = []
+
+        for ti in range(1, declared_tiers + 1):
+            _take(f"item [{ti}]:")
+            _take('class = "IntervalTier"')
+
+            name_line = _pref("name = ")
+            name = _unquote(name_line.split("=", 1)[1].strip())
+            if name in tier_names:
+                errors.append(f"duplicate tier name: {name!r}")
+            tier_names.append(name)
+
+            txmin = _num(_pref("xmin = "), "xmin")
+            txmax = _num(_pref("xmax = "), "xmax")
+            if not (gxmin - _TG_TIMING_TOLERANCE_S <= txmin <= gxmax + _TG_TIMING_TOLERANCE_S):
+                errors.append(
+                    f"tier {name!r} xmin {txmin} outside global "
+                    f"[{gxmin}, {gxmax}]"
+                )
+            if not (gxmin - _TG_TIMING_TOLERANCE_S <= txmax <= gxmax + _TG_TIMING_TOLERANCE_S):
+                errors.append(
+                    f"tier {name!r} xmax {txmax} outside global "
+                    f"[{gxmin}, {gxmax}]"
+                )
+
+            iv_size_line = _pref("intervals: size = ")
+            declared_ivs = int(iv_size_line.split("=", 1)[1])
+            if declared_ivs < 0:
+                errors.append(f"tier {name!r}: negative interval count {declared_ivs}")
+
+            intervals: list[tuple[float, float, str]] = []
+            for ji in range(1, declared_ivs + 1):
+                _take(f"intervals [{ji}]:")
+                iv_xmin = _num(_pref("xmin = "), "xmin")
+                iv_xmax = _num(_pref("xmax = "), "xmax")
+                text_line = _pref("text = ")
+                iv_text = _unquote(text_line.split("=", 1)[1].strip())
+                if not math.isfinite(iv_xmin) or not math.isfinite(iv_xmax):
+                    errors.append(
+                        f"tier {name!r} interval {ji}: non-finite boundary"
+                    )
+                if iv_xmax <= iv_xmin:
+                    errors.append(
+                        f"tier {name!r} interval {ji}: xmax {iv_xmax} <= xmin {iv_xmin}"
+                    )
+                if intervals:
+                    prev_end = intervals[-1][1]
+                    if iv_xmin + _TG_TIMING_TOLERANCE_S < prev_end:
+                        errors.append(
+                            f"tier {name!r} interval {ji}: xmin {iv_xmin} "
+                            f"< previous xmax {prev_end} (non-monotonic)"
+                        )
+                intervals.append((iv_xmin, iv_xmax, iv_text))
+
+            tiers_data.append({
+                "name": name,
+                "xmin": txmin,
+                "xmax": txmax,
+                "intervals": intervals,
+            })
+
+        # No trailing content
+        if i != n:
+            errors.append(f"unexpected trailing content at line {i}: {_peek()!r}")
+
+        # Expected tiers: words and phones with non-empty intervals
+        tier_map = {td["name"]: td for td in tiers_data}
+        for required in ("words", "phones"):
+            if required not in tier_map:
+                errors.append(f"missing required tier: {required!r}")
+                continue
+            non_empty = [iv for iv in tier_map[required]["intervals"] if iv[2].strip()]
+            if not non_empty:
+                errors.append(f"tier {required!r} has no non-empty intervals")
+
+        # WAV domain check
+        if wav_duration_s is not None:
+            if gxmax > wav_duration_s + _TG_TIMING_TOLERANCE_S:
+                errors.append(
+                    f"TextGrid xmax {gxmax} exceeds WAV duration {wav_duration_s}"
+                )
+            for td in tiers_data:
+                for iv in td["intervals"]:
+                    if iv[1] > wav_duration_s + _TG_TIMING_TOLERANCE_S:
+                        errors.append(
+                            f"tier {td['name']!r} interval end {iv[1]} "
+                            f"exceeds WAV duration {wav_duration_s}"
+                        )
+                    if iv[0] < -_TG_TIMING_TOLERANCE_S:
+                        errors.append(
+                            f"tier {td['name']!r} interval start {iv[0]} negative"
+                        )
+
+    except ValueError as exc:
+        errors.append(str(exc))
+    except OSError as exc:
+        errors.append(f"I/O error: {exc}")
+
+    return errors

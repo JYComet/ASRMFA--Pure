@@ -845,6 +845,74 @@ def _case_v4_marker_encodes_stem_count_and_manifest_digest() -> None:
     assert parse_ctc_normalization_marker("garbage") is None
 
 
+def _case_strict_mfa_textgrid_validator_rejects_damaged_tiers() -> None:
+    """Case 83: strict TextGrid parser rejects damaged tier names, inverted
+    intervals, and domain violations that string matching would miss."""
+    import tempfile as _tmp
+    from pipeline_utils import validate_strict_mfa_textgrid
+
+    # Build a valid TextGrid
+    valid_lines = [
+        'File type = "ooTextFile"', 'Object class = "TextGrid"', "",
+        "xmin = 0.0 ", "xmax = 2.0 ",
+        "tiers? <exists> ", "size = 2 ", "item []: ",
+        "    item [1]:", '        class = "IntervalTier" ',
+        '        name = "words" ', "        xmin = 0.0 ", "        xmax = 2.0 ",
+        "        intervals: size = 1 ",
+        "        intervals [1]:", "            xmin = 0.0 ",
+        "            xmax = 2.0 ", '            text = "hello" ',
+        "    item [2]:", '        class = "IntervalTier" ',
+        '        name = "phones" ', "        xmin = 0.0 ", "        xmax = 2.0 ",
+        "        intervals: size = 2 ",
+        "        intervals [1]:", "            xmin = 0.0 ",
+        "            xmax = 1.0 ", '            text = "hh" ',
+        "        intervals [2]:", "            xmin = 1.0 ",
+        "            xmax = 2.0 ", '            text = "ow" ',
+    ]
+
+    with _tmp.TemporaryDirectory() as td:
+        root = Path(td)
+
+        # Valid TextGrid passes strict validator
+        vpath = root / "valid.TextGrid"
+        vpath.write_text("\n".join(valid_lines), encoding="utf-8")
+        assert validate_strict_mfa_textgrid(vpath) == [], "valid TextGrid should pass"
+
+        # Strict parser rejects files with wrong tier names:
+        # A file with tiers named "other" instead of "words"/"phones"
+        # must be rejected, even though it is otherwise well-formed.
+        wrong_tiers = [
+            'File type = "ooTextFile"', 'Object class = "TextGrid"', "",
+            "xmin = 0.0 ", "xmax = 2.0 ",
+            "tiers? <exists> ", "size = 2 ", "item []: ",
+            "    item [1]:", '        class = "IntervalTier" ',
+            '        name = "other1" ',
+            "        xmin = 0.0 ", "        xmax = 2.0 ",
+            "        intervals: size = 1 ",
+            "        intervals [1]:", "            xmin = 0.0 ",
+            "            xmax = 2.0 ", '            text = "hello" ',
+            "    item [2]:", '        class = "IntervalTier" ',
+            '        name = "other2" ',
+            "        xmin = 0.0 ", "        xmax = 2.0 ",
+            "        intervals: size = 1 ",
+            "        intervals [1]:", "            xmin = 0.0 ",
+            "            xmax = 2.0 ", '            text = "hh" ',
+        ]
+        wpath = root / "wrong_tiers.TextGrid"
+        wpath.write_text("\n".join(wrong_tiers), encoding="utf-8")
+        # Old substring match would have found nothing wrong (file parses
+        # cleanly but doesn't have required words/phones tiers), but
+        # strict parser must reject.
+        errors = validate_strict_mfa_textgrid(wpath)
+        assert len(errors) > 0, f"wrong-tier TextGrid should be rejected, got {errors}"
+
+        # Domain violation: xmax > WAV duration
+        dpath = root / "overdomain.TextGrid"
+        dpath.write_text("\n".join(valid_lines), encoding="utf-8")
+        errors = validate_strict_mfa_textgrid(dpath, wav_duration_s=1.0)
+        assert len(errors) > 0, f"domain-violating TextGrid should be rejected, got {errors}"
+
+
 def main() -> int:
     cases = [
         _case_ref_fragment_uses_reference,
@@ -872,6 +940,8 @@ def main() -> int:
         _case_protect_ria_fragment_merge,
         _case_reference_only_masks_nvv_ids_in_free_decode,
         _case_v4_marker_encodes_stem_count_and_manifest_digest,
+        # Case 83 (R7): strict MFA TextGrid validator
+        _case_strict_mfa_textgrid_validator_rejects_damaged_tiers,
     ]
     failures = 0
     for case in cases:

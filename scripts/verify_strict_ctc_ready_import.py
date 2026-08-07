@@ -582,6 +582,309 @@ class PaddingContractTests(unittest.TestCase):
                 self.assertNotEqual(0, padding.main())
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Model tree + receipt tests (Case 99 / R5)
+# ═══════════════════════════════════════════════════════════════════════
+
+class ModelTreeReceiptTests(unittest.TestCase):
+    """Fault tests for model tree digest, CTC run receipt, and shard receipt."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _write_model_tree(self, base: Path, files: dict[str, str]) -> None:
+        """Write a model tree fixture: {relpath: content}."""
+        base.mkdir(parents=True, exist_ok=True)
+        for rel, content in files.items():
+            p = base / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+
+    def test_model_tree_digest_is_deterministic(self):
+        """Same file tree produces same digest across two calls."""
+        from pipeline_utils import compute_model_tree_digest
+        base = self.root / "model_v1"
+        self._write_model_tree(base, {"model.pt": "weights", "config.json": '{"layers": 12}'})
+        d1, m1 = compute_model_tree_digest(base)
+        d2, m2 = compute_model_tree_digest(base)
+        self.assertEqual(d1, d2)
+        self.assertEqual(m1, m2)
+
+    def test_model_tree_digest_rejects_symlink(self):
+        """A symlink in the model tree raises ValueError."""
+        from pipeline_utils import compute_model_tree_digest
+        base = self.root / "model_sym"
+        self._write_model_tree(base, {"model.pt": "weights"})
+        # Create a symlink inside the tree
+        sym = base / "link.pt"
+        os.symlink(str(base / "model.pt"), str(sym))
+        with self.assertRaises(ValueError):
+            compute_model_tree_digest(base)
+
+    def test_model_tree_digest_detects_content_change(self):
+        """Replacing a file changes the tree digest."""
+        from pipeline_utils import compute_model_tree_digest
+        base = self.root / "model_chg"
+        self._write_model_tree(base, {"model.pt": "weights_v1"})
+        d1, _ = compute_model_tree_digest(base)
+        # Replace content
+        (base / "model.pt").write_text("weights_v2", encoding="utf-8")
+        d2, _ = compute_model_tree_digest(base)
+        self.assertNotEqual(d1, d2)
+
+    def test_model_tree_digest_detects_file_addition(self):
+        """Adding a file changes the tree digest."""
+        from pipeline_utils import compute_model_tree_digest
+        base = self.root / "model_add"
+        self._write_model_tree(base, {"model.pt": "weights"})
+        d1, _ = compute_model_tree_digest(base)
+        # Add a file
+        (base / "tokenizer.json").write_text("{}", encoding="utf-8")
+        d2, _ = compute_model_tree_digest(base)
+        self.assertNotEqual(d1, d2)
+
+    def test_model_tree_digest_manifest_matches_files(self):
+        """File manifest entries match actual file sizes and hashes."""
+        from pipeline_utils import compute_model_tree_digest, _sha256_file
+        base = self.root / "model_manifest"
+        self._write_model_tree(base, {"model.pt": "weights", "config.json": "{}"})
+        _, manifest = compute_model_tree_digest(base)
+        self.assertEqual(len(manifest), 2)
+        for entry in manifest:
+            p = base / entry["relpath"]
+            self.assertEqual(entry["size"], p.stat().st_size)
+            self.assertEqual(entry["sha256"], _sha256_file(p))
+
+    def test_run_receipt_is_atomic_and_binds_all_fields(self):
+        """Write receipt, read back, verify all keys present and digests match."""
+        from pipeline_utils import (compute_model_tree_digest, write_ctc_run_receipt)
+        model_dir = self.root / "model_rec"
+        self._write_model_tree(model_dir, {"model.pt": "weights"})
+        tree_digest, manifest = compute_model_tree_digest(model_dir)
+        dict_dir = self.root / "dict"
+        dict_dir.mkdir()
+        dict_path = dict_dir / "mfa_ipa.dict"
+        dict_path.write_text("a a\n", encoding="utf-8")
+        dict_dig = hashlib.sha256(dict_path.read_bytes()).hexdigest()
+
+        out = self.root / "output"
+        out.mkdir()
+        receipt = write_ctc_run_receipt(
+            out, actual_argv=["python", "ctc_prealign.py"],
+            asr_python="/usr/bin/python",
+            model_path=model_dir,
+            model_tree_digest=tree_digest,
+            model_file_manifest=manifest,
+            dict_path=dict_path,
+            dict_digest=dict_dig,
+            input_stems=["s1", "s2"],
+            output_stems=["s1", "s2"],
+        )
+        self.assertEqual(receipt["schema"], "ctc-run-receipt-v1")
+        self.assertEqual(receipt["model"]["tree_digest"], tree_digest)
+        self.assertEqual(receipt["input_stems"], ["s1", "s2"])
+        # Verify atomic write
+        receipt_file = out / ".ctc_run_receipt.json"
+        self.assertTrue(receipt_file.is_file())
+        reloaded = json.loads(receipt_file.read_text(encoding="utf-8"))
+        self.assertEqual(reloaded["model"]["tree_digest"], tree_digest)
+
+    def test_run_receipt_mismatched_model_digest_detected(self):
+        """Modifying receipt's model_tree_digest causes cross-check to fail."""
+        from pipeline_utils import (compute_model_tree_digest, write_ctc_run_receipt)
+        model_dir = self.root / "model_mm"
+        self._write_model_tree(model_dir, {"model.pt": "weights"})
+        tree_digest, manifest = compute_model_tree_digest(model_dir)
+        dict_path = self.root / "dict_mm" / "dict.txt"
+        dict_path.parent.mkdir()
+        dict_path.write_text("a a\n", encoding="utf-8")
+        dict_dig = hashlib.sha256(dict_path.read_bytes()).hexdigest()
+
+        out = self.root / "output_mm"
+        out.mkdir()
+        write_ctc_run_receipt(out, actual_argv=["p"], asr_python="/usr/bin/p",
+                              model_path=model_dir, model_tree_digest=tree_digest,
+                              model_file_manifest=manifest, dict_path=dict_path,
+                              dict_digest=dict_dig, input_stems=["s1"], output_stems=["s1"])
+        # Tamper the receipt
+        receipt_file = out / ".ctc_run_receipt.json"
+        data = json.loads(receipt_file.read_text(encoding="utf-8"))
+        data["model"]["tree_digest"] = "deadbeef"
+        receipt_file.write_text(json.dumps(data), encoding="utf-8")
+        # Re-read and check
+        tampered = json.loads(receipt_file.read_text(encoding="utf-8"))
+        self.assertNotEqual(tampered["model"]["tree_digest"], tree_digest)
+
+
+class MfaTextGridValidatorTests(unittest.TestCase):
+    """Fault tests for strict MFA TextGrid validator (Cases 76/83 / R7)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _write_tg(self, path: Path, xmin: float = 0.0, xmax: float = 2.0,
+                  tiers: list[dict] | None = None) -> None:
+        """Write a minimal valid long-format TextGrid."""
+        if tiers is None:
+            tiers = [
+                {"name": "words", "xmin": 0.0, "xmax": 2.0,
+                 "intervals": [(0.0, 1.0, "hello"), (1.0, 2.0, "world")]},
+                {"name": "phones", "xmin": 0.0, "xmax": 2.0,
+                 "intervals": [(0.0, 0.5, "hh"), (0.5, 1.0, "ow"), (1.0, 1.5, "w"), (1.5, 2.0, "d")]},
+            ]
+        lines = [
+            'File type = "ooTextFile"', 'Object class = "TextGrid"', "",
+            f"xmin = {xmin} ", f"xmax = {xmax} ",
+            "tiers? <exists> ", f"size = {len(tiers)} ", "item []: ",
+        ]
+        for ti, tier in enumerate(tiers, start=1):
+            lines.extend([
+                f"    item [{ti}]:", '        class = "IntervalTier" ',
+                f'        name = "{tier["name"]}" ',
+                f"        xmin = {tier['xmin']} ", f"        xmax = {tier['xmax']} ",
+                f"        intervals: size = {len(tier['intervals'])} ",
+            ])
+            for ji, (ix, iy, it) in enumerate(tier["intervals"], start=1):
+                lines.extend([
+                    f"        intervals [{ji}]:",
+                    f"            xmin = {ix} ",
+                    f"            xmax = {iy} ",
+                    f'            text = "{it}" ',
+                ])
+        path.write_text("\n".join(lines), encoding="utf-8")
+
+    def test_valid_textgrid_passes(self):
+        """A well-formed words+phones TextGrid returns empty error list."""
+        from pipeline_utils import validate_strict_mfa_textgrid
+        tg = self.root / "valid.TextGrid"
+        self._write_tg(tg)
+        errors = validate_strict_mfa_textgrid(tg)
+        self.assertEqual(errors, [])
+
+    def test_corrupt_header_fails(self):
+        """Missing File type header produces an error."""
+        from pipeline_utils import validate_strict_mfa_textgrid
+        tg = self.root / "bad_header.TextGrid"
+        tg.write_text("not a TextGrid file\n", encoding="utf-8")
+        errors = validate_strict_mfa_textgrid(tg)
+        self.assertTrue(len(errors) > 0)
+
+    def test_tier_name_duplicate_fails(self):
+        """Two tiers named 'words' produces an error."""
+        from pipeline_utils import validate_strict_mfa_textgrid
+        tg = self.root / "dup_tier.TextGrid"
+        self._write_tg(tg, tiers=[
+            {"name": "words", "xmin": 0.0, "xmax": 1.0,
+             "intervals": [(0.0, 1.0, "hi")]},
+            {"name": "words", "xmin": 0.0, "xmax": 1.0,
+             "intervals": [(0.0, 1.0, "h")]},
+        ])
+        errors = validate_strict_mfa_textgrid(tg)
+        dup_errors = [e for e in errors if "duplicate" in e]
+        self.assertTrue(len(dup_errors) > 0, f"Expected duplicate tier error, got: {errors}")
+
+    def test_inverted_interval_fails(self):
+        """Interval with xmin > xmax produces an error."""
+        from pipeline_utils import validate_strict_mfa_textgrid
+        tg = self.root / "inverted.TextGrid"
+        self._write_tg(tg, tiers=[
+            {"name": "words", "xmin": 0.0, "xmax": 2.0,
+             "intervals": [(1.0, 0.5, "bad")]},
+            {"name": "phones", "xmin": 0.0, "xmax": 2.0,
+             "intervals": [(0.0, 1.0, "h")]},
+        ])
+        errors = validate_strict_mfa_textgrid(tg)
+        self.assertTrue(len(errors) > 0)
+
+    def test_zero_duration_interval_fails(self):
+        """Interval with xmin == xmax produces an error."""
+        from pipeline_utils import validate_strict_mfa_textgrid
+        tg = self.root / "zero_dur.TextGrid"
+        self._write_tg(tg, tiers=[
+            {"name": "words", "xmin": 0.0, "xmax": 2.0,
+             "intervals": [(0.5, 0.5, "bad")]},
+            {"name": "phones", "xmin": 0.0, "xmax": 2.0,
+             "intervals": [(0.0, 1.0, "h")]},
+        ])
+        errors = validate_strict_mfa_textgrid(tg)
+        self.assertTrue(len(errors) > 0)
+
+    def test_non_monotonic_intervals_fail(self):
+        """Interval that starts before the previous one ends fails."""
+        from pipeline_utils import validate_strict_mfa_textgrid
+        tg = self.root / "nonmono.TextGrid"
+        self._write_tg(tg, tiers=[
+            {"name": "words", "xmin": 0.0, "xmax": 3.0,
+             "intervals": [(0.0, 1.0, "first"), (0.5, 2.0, "overlap")]},
+            {"name": "phones", "xmin": 0.0, "xmax": 3.0,
+             "intervals": [(0.0, 0.5, "f"), (0.5, 1.0, "o")]},
+        ])
+        errors = validate_strict_mfa_textgrid(tg)
+        self.assertTrue(len(errors) > 0)
+
+    def test_textgrid_exceeds_wav_domain_fails(self):
+        """TextGrid with xmax > wav_duration_s produces an error."""
+        from pipeline_utils import validate_strict_mfa_textgrid
+        tg = self.root / "overdomain.TextGrid"
+        self._write_tg(tg, xmax=10.0, tiers=[
+            {"name": "words", "xmin": 0.0, "xmax": 10.0,
+             "intervals": [(0.0, 1.0, "hi")]},
+            {"name": "phones", "xmin": 0.0, "xmax": 10.0,
+             "intervals": [(0.0, 1.0, "h")]},
+        ])
+        errors = validate_strict_mfa_textgrid(tg, wav_duration_s=3.0)
+        domain_errors = [e for e in errors if "exceeds WAV" in e]
+        self.assertTrue(len(domain_errors) > 0, f"Expected domain error, got: {errors}")
+
+    def test_missing_phones_tier_fails(self):
+        """TextGrid with only words tier is rejected."""
+        from pipeline_utils import validate_strict_mfa_textgrid
+        tg = self.root / "no_phones.TextGrid"
+        self._write_tg(tg, tiers=[
+            {"name": "words", "xmin": 0.0, "xmax": 2.0,
+             "intervals": [(0.0, 2.0, "hi")]},
+        ])
+        errors = validate_strict_mfa_textgrid(tg)
+        missing = [e for e in errors if "phones" in e]
+        self.assertTrue(len(missing) > 0, f"Expected missing phones error, got: {errors}")
+
+    def test_string_match_would_pass_but_parser_fails(self):
+        """TextGrid containing name='words' as text in an interval but no actual tier."""
+        from pipeline_utils import validate_strict_mfa_textgrid
+        tg = self.root / "sneaky.TextGrid"
+        lines = [
+            'File type = "ooTextFile"', 'Object class = "TextGrid"', "",
+            "xmin = 0.0 ", "xmax = 2.0 ",
+            "tiers? <exists> ", "size = 1 ", "item []: ",
+            "    item [1]:", '        class = "IntervalTier" ',
+            '        name = "other" ',
+            "        xmin = 0.0 ", "        xmax = 2.0 ",
+            "        intervals: size = 2 ",
+            "        intervals [1]:",
+            "            xmin = 0.0 ",
+            "            xmax = 1.0 ",
+            '            text = "name = \\"words\\" name = \\"phones\\"" ',
+            "        intervals [2]:",
+            "            xmin = 1.0 ",
+            "            xmax = 2.0 ",
+            '            text = "" ',
+        ]
+        tg.write_text("\n".join(lines), encoding="utf-8")
+        errors = validate_strict_mfa_textgrid(tg)
+        # Must have missing words/phones tier, not pass
+        self.assertTrue(len(errors) > 0, f"Should have failed but got no errors")
+        has_missing = any("words" in e or "phones" in e for e in errors)
+        self.assertTrue(has_missing, f"Should report missing words/phones tier, got: {errors}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--verbose", action="store_true")

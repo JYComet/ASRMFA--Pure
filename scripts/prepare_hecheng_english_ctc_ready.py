@@ -20,7 +20,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
-from pipeline_utils import CTC_SUFFIXES, load_ctc_token_entries, validate_ctc_transcript_bundle
+from pipeline_utils import CTC_SUFFIXES, load_ctc_token_entries, validate_ctc_transcript_bundle, compute_model_tree_digest
 from postprocess_textgrids import Interval, TextGrid, Tier, parse_textgrid, write_textgrid
 
 SCHEMA = "hecheng-english-ctc-ready-v3"
@@ -821,7 +821,13 @@ def prepare(args,r):
     for s in r["authoritative_stems"]:
         items.append(_v4_copy(Path(r["wav_paths"][s]),args.run_root/"audio_view"/(s+".wav"),args.run_root,s,"audio_view",True)); items.append(_v4_copy(Path(r["txt_paths"][s]),args.run_root/"reference_view"/(s+".txt"),args.run_root,s,"reference_view"))
     items.append(_v4_copy(args.dictionary_source,args.run_root/"dict"/"mfa_ipa.dict",args.run_root,"","run_local_dict"))
-    m={"schema":V4_SCHEMA,"state":"awaiting_acoustic_rerun","inventory_sha256":r["inventory_sha256"],"stem_count":len(r["authoritative_stems"]),"authoritative_stems":r["authoritative_stems"],"missing_reference":r["missing_reference"],"txt_only":r["txt_only"],"final_audio_axis":V4_AXIS,"padding_policy":"forbidden","action_counts":r["action_counts"],"taxonomy":r["taxonomy"],"taxonomy_sha256":r["taxonomy_sha256"],"prepared_files":items,"prepared_files_sha256":stable_hash(items),"source_dictionary":_v4_evidence(args.dictionary_source),"run_local_dictionary":_v4_evidence(args.run_root/"dict"/"mfa_ipa.dict"),"rerun_command":render_rerun_command(args),"nvv_mode":V4_NVV_MODE,"asr_nvv_bias":V4_ASR_NVV_BIAS,"content_authority":V4_CONTENT_AUTHORITY}
+    # ── Model tree provenance (Case 99 / R5) ──────────────────────
+    _model_path = Path(args.asr_model).resolve()
+    if not _model_path.is_dir():
+        raise FileNotFoundError(f"ASR model path is not a directory: {_model_path}")
+    _model_tree_digest, _model_file_manifest = compute_model_tree_digest(_model_path)
+    # ────────────────────────────────────────────────────────────────
+    m={"schema":V4_SCHEMA,"state":"awaiting_acoustic_rerun","inventory_sha256":r["inventory_sha256"],"stem_count":len(r["authoritative_stems"]),"authoritative_stems":r["authoritative_stems"],"missing_reference":r["missing_reference"],"txt_only":r["txt_only"],"final_audio_axis":V4_AXIS,"padding_policy":"forbidden","action_counts":r["action_counts"],"taxonomy":r["taxonomy"],"taxonomy_sha256":r["taxonomy_sha256"],"prepared_files":items,"prepared_files_sha256":stable_hash(items),"source_dictionary":_v4_evidence(args.dictionary_source),"run_local_dictionary":_v4_evidence(args.run_root/"dict"/"mfa_ipa.dict"),"rerun_command":render_rerun_command(args),"nvv_mode":V4_NVV_MODE,"asr_nvv_bias":V4_ASR_NVV_BIAS,"content_authority":V4_CONTENT_AUTHORITY,"asr_model_path":str(_model_path),"asr_model_tree_digest":_model_tree_digest,"asr_model_files":_model_file_manifest}
     p=args.run_root/"prepare_manifest.json"; temporary=p.with_name(p.name+".tmp"); temporary.write_text(json.dumps(m,ensure_ascii=False,indent=2)+"\n",encoding="utf-8"); os.replace(temporary,p); return p
 
 def _v4_load(args,r):
@@ -829,10 +835,15 @@ def _v4_load(args,r):
     try:m=json.loads(p.read_text(encoding="utf-8"))
     except Exception as e: raise ValueError("missing/corrupt prepare manifest") from e
     binds={"schema":V4_SCHEMA,"state":"awaiting_acoustic_rerun","inventory_sha256":r["inventory_sha256"],"stem_count":len(r["authoritative_stems"]),"authoritative_stems":r["authoritative_stems"],"missing_reference":r["missing_reference"],"txt_only":r["txt_only"],"final_audio_axis":V4_AXIS,"padding_policy":"forbidden","action_counts":r["action_counts"],"taxonomy":r["taxonomy"],"taxonomy_sha256":r["taxonomy_sha256"],"rerun_command":render_rerun_command(args),"nvv_mode":V4_NVV_MODE,"asr_nvv_bias":V4_ASR_NVV_BIAS,"content_authority":V4_CONTENT_AUTHORITY}
-    expected_keys=set(binds)|{"prepared_files","prepared_files_sha256","source_dictionary","run_local_dictionary"}
+    expected_keys=set(binds)|{"prepared_files","prepared_files_sha256","source_dictionary","run_local_dictionary","asr_model_path","asr_model_tree_digest","asr_model_files"}
     if set(m)!=expected_keys or any(m.get(k)!=v for k,v in binds.items()) or m.get("prepared_files_sha256")!=stable_hash(m.get("prepared_files",[])): raise ValueError("prepare binding invalid")
     source_dict=_v4_evidence(args.dictionary_source); run_dict=_v4_evidence(args.run_root/"dict"/"mfa_ipa.dict")
     if m.get("source_dictionary")!=source_dict or m.get("run_local_dictionary")!=run_dict or (source_dict["size"],source_dict["sha256"])!=(run_dict["size"],run_dict["sha256"]): raise ValueError("dictionary evidence invalid")
+    # ── Model tree binding (Case 99 / R5) ──────────────────────────
+    _model_path = Path(args.asr_model).resolve()
+    _current_tree_digest, _current_file_manifest = compute_model_tree_digest(_model_path)
+    if m.get("asr_model_path") != str(_model_path) or m.get("asr_model_tree_digest") != _current_tree_digest or m.get("asr_model_files") != _current_file_manifest: raise ValueError("ASR model tree changed since prepare")
+    # ────────────────────────────────────────────────────────────────
     _v4_verify_copies(m["prepared_files"],args,r); return m,p
 
 def _v4_json(path,punct,duration):

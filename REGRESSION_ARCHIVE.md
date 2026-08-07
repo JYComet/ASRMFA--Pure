@@ -6348,9 +6348,9 @@ if _pp is not None:
 
 ---
 
-## Case 76: 分片 MFA 只看退出码、日志和 stem 完整性不足（部分草案，未闭环）
+## Case 76: 分片 MFA 只看退出码、日志和 stem 完整性不足（部分草案，已实施 strict validator）
 
-状态：部分草案已写入，仍有未闭环项，暂停修复。
+状态：代码已实施（2026-08-07）。`pipeline_utils.py` 新增 `validate_strict_mfa_textgrid`；`run_pipeline.py:_run_mfa_sharded` 用 strict validator 替换字符串匹配；单进程 MFA 路径增加 strict 验证；输出 manifest 增加 `invalid_detail` 结构化错误记录。
 
 ### 现象
 
@@ -6568,9 +6568,9 @@ RIA 归一化被当作普通文本替换，而 lab、tokens、CTC TextGrid 实�
 
 ---
 
-## Case 83: MFA TextGrid 验证和子进程异常处理仍不充分（未闭环）
+## Case 83: MFA TextGrid 验证和子进程异常处理仍不充分（已实施 strict validator + 进程异常捕获）
 
-状态：修复方案已记录，未闭环，暂停修复。
+状态：代码已实施（2026-08-07）。`pipeline_utils.py` 新增 `validate_strict_mfa_textgrid` 严格 long TextGrid parser/validator，显式检查 grammar、tier 唯一性、interval 合法性、WAV domain；`run_pipeline.py:_run_mfa_sharded` 用 strict validator 替换原 `"words" in content` 字符串匹配，Popen 增加 OSError 异常捕获，超时/信号/非零退出统一写入结构化失败记录；单进程 MFA 路径同样调用 strict validator。`verify_strict_ctc_ready_import.py` 新增 9 个 TextGrid validator 负例测试，`verify_reference_authority.py` 新增 1 个回归 case。
 
 ### 现象
 
@@ -7292,7 +7292,7 @@ CTC 六件套及当前独立验证仍可能全部通过。词典和权威源数�
 4. 增加模型文件内容替换但路径不变、symlink/extra/non-regular 文件、argv 漂移、词典漂移、
    shard receipt 不一致和 stem digest 篡改的负例。任何一项必须在进入 MFA 前非零失败。
 
-状态：代码未实施（仅文档方案）。`ctc_prealign.py` 和 `pipeline_utils.py` 中均无 CTC run receipt 或 model tree digest 相关代码。必须在创建真实 prepare root 前实施。
+状态：代码已实施（2026-08-07）。`pipeline_utils.py` 新增 `compute_model_tree_digest`、`write_ctc_run_receipt`、`write_ctc_shard_receipt`；`ctc_prealign.py` 启动时计算 model tree digest，成功后写 run receipt，all-GPU 预检验证 shard receipt；`prepare_hecheng_english_ctc_ready.py` prepare 时冻结 model tree 到 prepare_manifest.json；`verify_hecheng_english_ctc_ready_v4.py` 交叉核对 prepare 冻结值、receipt 值和实际文件树；`verify_strict_ctc_ready_import.py` 新增 7 个负例测试。待 GPU canary 集成验证。
 
 ---
 
@@ -7440,12 +7440,44 @@ required sidecar，违背 reference 是唯一内容权威的契约。
 
 ### 仍需 GPU 验证的案例
 
-Cases 80（单条 CTC 重跑 051809）、81（ria 三方原子同步集成）、83（MFA TextGrid parser 故障注入）、85–86（配置+生产数据验证）、99（代码不存在，需实施后验证）。
+Cases 80（单条 CTC 重跑 051809）、81（ria 三方原子同步集成）、85–86（配置+生产数据验证）、99（代码已实施，待 GPU canary 集成验证）。
+
+### 已实施的非 GPU 案例（2026-08-07）
+
+- Case 76 (R7): strict MFA TextGrid validator 替换字符串匹配
+- Case 83 (R7): strict MFA TextGrid validator + 进程异常捕获
+- Case 99 (R5): model tree digest + CTC run receipt + shard receipt
 
 ### 前置条件
 
 生产 canary 执行前必须完成：
-1. Case 99 模型树绑定代码实施
+1. ~~Case 99 模型树绑定代码实施~~ ✓ 已完成
 2. 补齐 Case 86 缺失参考文本（036000）或显式隔离
 3. 生成冻结的 canary stems 文件（基于 `test_data/canary_cases_69_102.txt` 设计，使用生产数据实际 stem ID）
 4. Sol high 对 Case 96 v4 prepare 的最终 GO
+
+---
+
+## Case 103: `run_pipeline.py` 未支持 `--all-gpus` 多卡 CTC 推理（待实施） (all_gpus_pipeline_support)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/run_pipeline.py, scripts/ctc_prealign.py, configs/hecheng_ria_fresh.yaml
+
+### 现象
+
+`ctc_prealign.py` 已实现 `--all-gpus` 多卡并行模式，但 `run_pipeline.py` 的 `step_prealign` 没有传递该参数。
+当前 54,000 条 CTC 推理只能用单卡（`--device cuda:0`），56 分钟跑完；其余 7 张 GPU 空闲。
+
+### 修复方案
+
+1. `configs/hecheng_ria_fresh.yaml` 中 `ctc_prealign` 增加 `all_gpus: true` 配置项
+2. `run_pipeline.py::step_prealign` 读取 `pc.get("all_gpus", False)`，为 `True` 时追加 `--all-gpus` 到 `prealign_args`
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `configs/hecheng_ria_fresh.yaml` | `ctc_prealign` 下增加 `all_gpus: true` |
+| `scripts/run_pipeline.py` ~line 838 | `if pc.get("all_gpus", False): prealign_args.append("--all-gpus")` |
+
+状态：已实施。`configs/hecheng_ria_fresh.yaml` 增加 `all_gpus: true`；`run_pipeline.py::step_prealign` line ~845 传递 `--all-gpus`。

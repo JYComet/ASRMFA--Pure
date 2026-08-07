@@ -49,6 +49,7 @@ from pipeline_utils import (
     load_ctc_token_entries, normalize_reference_numerals,
     read_ctc_textgrid_words, rebuild_lab_from_tokens,
     validate_ctc_transcript_bundle,
+    validate_strict_mfa_textgrid,
 )
 
 
@@ -842,6 +843,8 @@ def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         prealign_args += ["--offset", str(pc["offset"])]
     if args.overwrite:
         prealign_args.append("--overwrite")
+    if pc.get("all_gpus", False):
+        prealign_args.append("--all-gpus")
 
     # Use run_python with the NVASR Python, not mfa_python
     return run_python(SCRIPTS_DIR / "ctc_prealign.py", prealign_args, nvras_py_path,
@@ -1460,12 +1463,25 @@ def _run_mfa_sharded(
               f" {_jobs_per_shard} jobs")
         _log_path = _log_dir / f"shard_{_si:02d}.log"
         _log_handle = _log_path.open("w", encoding="utf-8")
-        _proc = subprocess.Popen(
-            _cmd,
-            env=get_mfa_env(mfa_python, models_dir),
-            stdout=_log_handle,
-            stderr=subprocess.STDOUT,
-        )
+        # ── OSError capture (Case 83 / R7) ─────────────────────────
+        try:
+            _proc = subprocess.Popen(
+                _cmd,
+                env=get_mfa_env(mfa_python, models_dir),
+                stdout=_log_handle,
+                stderr=subprocess.STDOUT,
+            )
+        except OSError as _os_err:
+            _log_handle.close()
+            _return_codes[_si] = f"os_error:{_os_err}"
+            _failed.append(_si)
+            print(f"  [shard {_si}] OSError starting MFA: {_os_err}")
+            _procs.append((
+                _si, None, _sd, None, _log_path,
+                set(_ss), time.time(),
+            ))
+            continue
+        # ─────────────────────────────────────────────────────────────
         _procs.append((
             _si, _proc, _sd, _log_handle, _log_path,
             set(_ss), time.time(),
@@ -1476,6 +1492,11 @@ def _run_mfa_sharded(
     _return_codes: dict[int, int | str] = {}
     for (_si, _proc, _sd, _log_handle, _log_path,
          _expected, _started_at) in _procs:
+        # ── Handle OSError from Popen (Case 83 / R7) ──────────────
+        if _proc is None:
+            # Already recorded as failed with os_error return code
+            continue
+        # ─────────────────────────────────────────────────────────────
         try:
             if timeout:
                 _remaining = max(1.0, float(timeout) - (time.time() - _started_at))
@@ -1494,7 +1515,8 @@ def _run_mfa_sharded(
                 _proc.wait()
             _rc = _proc.returncode if _proc.returncode is not None else -9
         finally:
-            _log_handle.close()
+            if _log_handle is not None:
+                _log_handle.close()
         _return_codes.setdefault(_si, _rc)
         if _rc != 0:
             if _si not in _failed:
@@ -1512,19 +1534,35 @@ def _run_mfa_sharded(
     _all_invalid: list[str] = []
     for (_si, _proc, _sd, _log_handle, _log_path,
          _expected, _started_at) in _procs:
+        # Skip shards that failed at Popen (already recorded)
+        if _proc is None:
+            _manifest_rows.append({
+                "shard": _si,
+                "return_code": _return_codes.get(_si),
+                "log": str(_log_path),
+                "expected_count": len(_expected),
+                "produced_count": 0,
+                "missing": sorted(_expected),
+                "extra": [],
+                "invalid": [],
+                "invalid_detail": [],
+            })
+            continue
         _tg_paths = sorted((_sd / "output").glob("*.TextGrid"))
         _produced = {path.stem for path in _tg_paths}
         _missing = sorted(_expected - _produced)
         _extra = sorted(_produced - _expected)
         _invalid: list[str] = []
+        _invalid_detail: list[dict] = []
         for _tg in _tg_paths:
             try:
-                _content = _tg.read_text(encoding="utf-8-sig")
-                if ('name = "words"' not in _content
-                        or 'name = "phones"' not in _content):
+                _errors = validate_strict_mfa_textgrid(_tg)
+                if _errors:
                     _invalid.append(_tg.stem)
+                    _invalid_detail.append({"stem": _tg.stem, "errors": _errors})
             except OSError:
                 _invalid.append(_tg.stem)
+                _invalid_detail.append({"stem": _tg.stem, "errors": ["OSError reading TextGrid"]})
         _all_missing.extend(_missing)
         _all_extra.extend(_extra)
         _all_invalid.extend(_invalid)
@@ -1540,6 +1578,7 @@ def _run_mfa_sharded(
             "missing": _missing,
             "extra": _extra,
             "invalid": _invalid,
+            "invalid_detail": _invalid_detail,
         })
 
     _manifest_path = _log_dir / "mfa_output_manifest.json"
@@ -1778,6 +1817,19 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         if _extra:
             print(f"    extra ({len(_extra)}): {_extra[:10]}")
         return 1
+    # ── Strict TextGrid validation (Case 83 / R7) ──────────────────
+    _invalid_count = 0
+    for _tg_path in sorted(ctx["aligned_dir"].glob("*.TextGrid")):
+        _errors = validate_strict_mfa_textgrid(_tg_path)
+        if _errors:
+            if _invalid_count < 5:
+                for _err in _errors[:3]:
+                    print(f"    [{_tg_path.stem}] {_err}")
+            _invalid_count += 1
+    if _invalid_count:
+        print(f"  ERROR: {_invalid_count} MFA TextGrid(s) failed strict validation")
+        return 1
+    # ─────────────────────────────────────────────────────────────────
     print(f"  MFA output set: {len(_produced)}/{len(_expected)} complete")
     return 0
 

@@ -41,6 +41,7 @@ ctc_prealign:
   python: /home/user/miniconda3/envs/asr/bin/python
   model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
   device: cuda:0
+  all_gpus: true
   limit: 0
   timeout: 14400
   nvv_enabled: false         # 参考文本模式: CTC 用 {stem}.txt 做强制对齐

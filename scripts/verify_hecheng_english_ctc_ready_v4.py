@@ -8,6 +8,9 @@ from __future__ import annotations
 import argparse, hashlib, json, math, os, re, sys, wave
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+
 SCHEMA="hecheng-english-ctc-ready-v4"; SIGNATURE="ctc-ready-independent-v1"; SUFFIXES=(".TextGrid",".lab","_tokens.jsonl","_punct.json","_text_cn.txt","_text_raw.txt"); REF_SUFFIX="_ref.txt"; REQUIRED_SUFFIXES=SUFFIXES+(REF_SUFFIX,); TOL=.003; DOMAIN_TOL=.000001; NVV_MODE="reference_only"; ASR_NVV_BIAS=False; CONTENT_AUTHORITY="reference"
 SOURCE=Path('/mnt/Raw/新版合成英文数据')
 DEFAULT_DICT=Path(__file__).resolve().parent.parent/'dict'/'mfa_ipa.dict'
@@ -177,7 +180,7 @@ def source_inventory(source):
 def verify(run_root,source_dir=SOURCE,dictionary_source=DEFAULT_DICT,
            asr_python=DEFAULT_ASR_PYTHON,asr_model=DEFAULT_ASR_MODEL):
  root=run_root.resolve(); e=json.loads((root/'ctc_ready_evidence.json').read_text(encoding='utf-8')); stems=e.get('authoritative_stems')
- expected_keys={'schema','state','independent_verifier_signature','prepare_manifest_sha256','inventory_sha256','stem_count','authoritative_stems','missing_reference','txt_only','final_audio_axis','padding_policy','action_counts','taxonomy','taxonomy_sha256','nvv_mode','asr_nvv_bias','content_authority','roots','source_dictionary','run_local_dictionary','artifacts','rerun_files','rerun_files_sha256'}
+ expected_keys={'schema','state','independent_verifier_signature','prepare_manifest_sha256','inventory_sha256','stem_count','authoritative_stems','missing_reference','txt_only','final_audio_axis','padding_policy','action_counts','taxonomy','taxonomy_sha256','nvv_mode','asr_nvv_bias','content_authority','roots','source_dictionary','run_local_dictionary','artifacts','rerun_files','rerun_files_sha256','asr_model_path','asr_model_tree_digest','asr_model_files','ctc_run_receipt_digest'}
  if set(e)!=expected_keys:raise ValueError('evidence top-level keys')
  if e.get('schema')!=SCHEMA or e.get('state')!='ready' or e.get('independent_verifier_signature')!=SIGNATURE or e.get('final_audio_axis')!='authoritative_wav' or e.get('padding_policy')!='forbidden' or e.get('nvv_mode')!=NVV_MODE or e.get('asr_nvv_bias') is not ASR_NVV_BIAS or e.get('content_authority')!=CONTENT_AUTHORITY:raise ValueError('schema/axis/reference-only metadata')
  wavs,txts,expected_stems,expected_missing,expected_only,source_report=source_inventory(Path(source_dir))
@@ -210,6 +213,35 @@ def verify(run_root,source_dir=SOURCE,dictionary_source=DEFAULT_DICT,
  command=m.get('rerun_command'); expected_command=[str(asr_python),'scripts/ctc_prealign.py','--data-dir',str(root/'reference_view'),'--audio-dir',str(root/'audio_view'),'--pinyin-dir',str(root/'reference_view'),'--output-dir',str(root/'ctc_rerun_output'),'--model-path',str(asr_model),'--dict-path',str(root/'dict'/'mfa_ipa.dict'),'--all-gpus','--no-dict-update','--require-fresh-output','--no-nvv']
  if command!=expected_command or command.count('--no-nvv')!=1 or '--overwrite' in command:raise ValueError('rerun command')
  rerun_manifest(root,stems)
+ # ── Model tree + receipt cross-check (Case 99 / R5) ──────────────
+ try:
+  from pipeline_utils import compute_model_tree_digest
+ except ImportError:
+  raise ValueError('cannot import model tree digest for provenance check')
+ _model_p = Path(asr_model).resolve()
+ _current_tree_digest, _current_tree_manifest = compute_model_tree_digest(_model_p)
+ if m.get('asr_model_path') != str(_model_p) or m.get('asr_model_tree_digest') != _current_tree_digest or m.get('asr_model_files') != _current_tree_manifest:
+  raise ValueError('ASR model tree does not match prepare freeze')
+ # Receipt cross-check
+ _receipt_path = root/'ctc_rerun_output'/'.ctc_run_receipt.json'
+ if not _receipt_path.is_file():
+  raise ValueError('missing CTC run receipt in ctc_rerun_output')
+ try:
+  _receipt = json.loads(_receipt_path.read_text(encoding='utf-8'))
+ except Exception as ex:
+  raise ValueError('invalid CTC run receipt') from ex
+ if _receipt.get('schema') != 'ctc-run-receipt-v1':
+  raise ValueError('CTC run receipt schema mismatch')
+ _receipt_model_digest = _receipt.get('model', {}).get('tree_digest', '')
+ if _receipt_model_digest != _current_tree_digest:
+  raise ValueError('CTC run receipt model tree digest does not match current model tree')
+ _receipt_input = sorted(_receipt.get('input_stems', []))
+ _receipt_output = sorted(_receipt.get('output_stems', []))
+ if _receipt_input != stems:
+  raise ValueError('CTC run receipt input stems do not match expected')
+ if _receipt_output != stems:
+  raise ValueError('CTC run receipt output stems do not match expected')
+ # ──────────────────────────────────────────────────────────────────
  art=e.get('artifacts');
  if not isinstance(art,dict) or sorted(art)!=stems:raise ValueError('artifacts')
  for s in stems:
