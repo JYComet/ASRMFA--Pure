@@ -19,6 +19,7 @@ import os
 import re
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from difflib import SequenceMatcher
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -29,6 +30,7 @@ from pipeline_utils import (
     is_cjk, is_nvv_token, is_english_token, is_pinyin_syllable,
     is_word_like, is_punct, extract_word_chars,
 )
+from postprocess_textgrids import Interval, Tier, parse_textgrid, write_textgrid
 
 # Lazy import — only needed for CJK pinyin fragments in mixed text.
 # Pure English processing can proceed without pypinyin.
@@ -58,6 +60,48 @@ def _ensure_pypinyin():
 
 def _is_alpha_group(s: str) -> bool:
     return s.isascii() and bool(s) and all(c.isalpha() or c == '-' for c in s)
+
+
+def _fragment_letters(token: str) -> str:
+    """Return the alphabetic payload of an English/pinyin fragment."""
+    t = token.strip().strip("<>").lower()
+    if is_pinyin_syllable(t):
+        return t[:-1]
+    if t.isascii() and t.isalpha():
+        return t
+    return ""
+
+
+def _tokens_plausibly_realise_reference(tokens: list[str], ref_word: str) -> bool:
+    """Whether *tokens* can be safely collapsed to authoritative *ref_word*.
+
+    In reference-text mode the spelling must come from ``*_ref.txt``.  This
+    helper allows noisy CTC/ASR fragments such as ``li``+``ve`` to realise
+    ``life`` without letting an unrelated word sequence consume the reference.
+    """
+    ref = "".join(ch for ch in ref_word.lower() if ch.isalpha())
+    if not ref:
+        return False
+
+    pieces: list[str] = []
+    for t in tokens:
+        if is_nvv_token(t):
+            return False
+        piece = _fragment_letters(t)
+        if not piece:
+            return False
+        pieces.append(piece)
+
+    joined = "".join(pieces)
+    if not joined:
+        return False
+    if joined == ref or joined in ref or ref in joined:
+        return True
+
+    # One or two ASR spelling substitutions are common for short English words
+    # in a Chinese tokenizer (life/live, word/world).  Require a fairly close
+    # string relationship so unrelated neighbouring English words are protected.
+    return SequenceMatcher(None, joined, ref).ratio() >= 0.72
 
 
 
@@ -281,6 +325,64 @@ def _reclaim_fragments(lab_tokens: list[str],
 # Core: normalise a single stem
 # ---------------------------------------------------------------------------
 
+def rewrite_ctc_textgrid_words(tg_path: Path, tokens: list[dict]) -> None:
+    """Structurally rewrite a normal CTC ``words`` tier, atomically.
+
+    This intentionally accepts only a regular TextGrid with unique words and
+    pauses tiers.  The historical malformed grammar is handled by the strict
+    CTC-ready canonicalizer, never silently rewritten here.
+    """
+    original = parse_textgrid(tg_path)
+    words = [tier for tier in original.tiers if tier.name == "words"]
+    pauses = [tier for tier in original.tiers if tier.name == "pauses"]
+    if len(words) != 1 or len(pauses) != 1:
+        raise ValueError(f"Requires unique standard words/pauses tiers: {tg_path}")
+    old_lexical = [iv for iv in words[0].intervals if iv.text.strip()]
+    if not old_lexical or words[0].xmin != original.xmin or words[0].xmax != original.xmax:
+        raise ValueError(f"Requires an intact standard words tier: {tg_path}")
+    previous_end = original.xmin
+    for index, interval in enumerate(words[0].intervals):
+        if interval.xmax <= interval.xmin or interval.xmin + .003 < previous_end:
+            raise ValueError(f"Requires valid standard word intervals ({index}): {tg_path}")
+        previous_end = interval.xmax
+    before_pauses = [(iv.xmin, iv.xmax, iv.text) for iv in pauses[0].intervals]
+    cursor = original.xmin; intervals: list[Interval] = []
+    for index, token in enumerate(tokens):
+        try:
+            start, end, text = float(token["start_s"]), float(token["end_s"]), str(token["word"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid token {index}") from exc
+        if not (start >= cursor - .003 and end > start and end <= original.xmax + .003):
+            raise ValueError(f"Invalid/non-monotonic token timing {index}")
+        if start > cursor + 1e-9:
+            intervals.append(Interval(cursor, start, ""))
+        intervals.append(Interval(start, end, text)); cursor = end
+    if cursor < original.xmax - 1e-9:
+        intervals.append(Interval(cursor, original.xmax, ""))
+    if not intervals and original.xmax > original.xmin:
+        intervals.append(Interval(original.xmin, original.xmax, ""))
+    words[0].xmin = original.xmin; words[0].xmax = original.xmax; words[0].intervals = intervals
+    temporary = tg_path.with_name(tg_path.name + ".tmp")
+    try:
+        write_textgrid(original, temporary)
+        rewritten = parse_textgrid(temporary)
+        rewritten_words = [tier for tier in rewritten.tiers if tier.name == "words"]
+        rewritten_pauses = [tier for tier in rewritten.tiers if tier.name == "pauses"]
+        if len(rewritten_words) != 1 or len(rewritten_pauses) != 1:
+            raise ValueError("rewritten TextGrid lost required tiers")
+        lexical = [iv for iv in rewritten_words[0].intervals if iv.text.strip()]
+        if len(lexical) != len(tokens): raise ValueError("rewritten words/token count mismatch")
+        for index, (interval, token) in enumerate(zip(lexical, tokens)):
+            if (interval.text != str(token["word"]) or abs(interval.xmin - float(token["start_s"])) > .003
+                    or abs(interval.xmax - float(token["end_s"])) > .003):
+                raise ValueError(f"rewritten words/token mismatch {index}")
+        if [(iv.xmin, iv.xmax, iv.text) for iv in rewritten_pauses[0].intervals] != before_pauses:
+            raise ValueError("rewritten pauses tier changed")
+        os.replace(temporary, tg_path)
+    finally:
+        if temporary.exists(): temporary.unlink()
+
+
 def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
     # CTC output contains both the ASR diagnostic transcript and, when the
     # pipeline was run in reference-text mode, the authoritative source as
@@ -288,10 +390,12 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
     # source as .lab/TextGrid, never the potentially erroneous ASR result.
     ref_path = txt_dir / f"{stem}_ref.txt"
     cn_path = txt_dir / f"{stem}_text_cn.txt"
+    reference_authoritative = False
     if ref_path.exists():
-        ref_text = ref_path.read_text(encoding="utf-8").strip()
+        ref_text = ref_path.read_text(encoding="utf-8-sig").strip()
+        reference_authoritative = bool(ref_text)
     elif cn_path.exists():
-        ref_text = cn_path.read_text(encoding="utf-8").strip()
+        ref_text = cn_path.read_text(encoding="utf-8-sig").strip()
     else:
         return False
     char_units = extract_word_chars(ref_text)
@@ -319,13 +423,13 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
     lab_path = txt_dir / f"{stem}.lab"
     if not lab_path.exists():
         return False
-    lab_tokens = lab_path.read_text(encoding="utf-8").strip().split()
+    lab_tokens = lab_path.read_text(encoding="utf-8-sig").strip().split()
 
     # Read tokens.jsonl
     tokens_path = txt_dir / f"{stem}_tokens.jsonl"
     ctc_tokens: list[dict] = []
     if tokens_path.exists():
-        for line in tokens_path.read_text(encoding="utf-8").strip().split("\n"):
+        for line in tokens_path.read_text(encoding="utf-8-sig").strip().split("\n"):
             if line:
                 ctc_tokens.append(json.loads(line))
 
@@ -357,9 +461,9 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
             g += 1
 
     # Check if any English word needs normalisation.
-    # Only replace when tokens are clearly fragments (single letters,
-    # pinyin syllables) — never replace a complete English word that
-    # just happens to differ from the reference (e.g. "life"→"live").
+    # In reference-text mode, ref_text is authoritative: complete but wrong
+    # ASR spellings (e.g. "live" for ref "life") must also be corrected.
+    # Without *_ref.txt, keep the legacy conservative behaviour.
     changes: list[tuple[str, list[int]]] = []
     for ri, indices in sorted(ref_to_lab.items()):
         if not indices:
@@ -376,24 +480,27 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
         if any(is_nvv_token(t) for t in current):
             continue
 
-        # Safety: only replace if tokens are clearly fragments of the target.
-        # Pinyin fragments must share at least one letter with the English word
-        # (phonetic plausibility).  e.g. "rui4" shares 'r','i' with "ria" ✓,
-        # but "bu4" shares nothing with "ria" ✗.
-        all_fragments = True
-        en_lower = en_word.lower()
-        for t in current:
-            if len(t) == 1 and t.isascii() and t.isalpha():
-                if t.lower() not in en_lower:
+        if reference_authoritative:
+            all_fragments = _tokens_plausibly_realise_reference(current, en_word)
+        else:
+            # Safety: only replace if tokens are clearly fragments of the
+            # target.  Pinyin fragments must share at least one letter with
+            # the English word (phonetic plausibility).  e.g. "rui4" shares
+            # 'r','i' with "ria" ✓, but "bu4" shares nothing with "ria" ✗.
+            all_fragments = True
+            en_lower = en_word.lower()
+            for t in current:
+                if len(t) == 1 and t.isascii() and t.isalpha():
+                    if t.lower() not in en_lower:
+                        all_fragments = False; break
+                elif is_pinyin_syllable(t):
+                    base = t[:-1]  # strip tone digit
+                    if not any(c in en_lower for c in base):
+                        all_fragments = False; break
+                elif is_english_token(t) and t.lower() in en_lower:
+                    pass  # substring of target (e.g. "play" in "cosplay")
+                else:
                     all_fragments = False; break
-            elif is_pinyin_syllable(t):
-                base = t[:-1]  # strip tone digit
-                if not any(c in en_lower for c in base):
-                    all_fragments = False; break
-            elif is_english_token(t) and t.lower() in en_lower:
-                pass  # substring of target (e.g. "play" in "cosplay")
-            else:
-                all_fragments = False; break
         if not all_fragments:
             continue
 
@@ -436,12 +543,20 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
         new_lab = list(lab_tokens)
         new_ctc = list(ctc_tokens)
 
-    # ── Pass 2: Fragment reclamation (always runs, even if Pass 1 had no changes) ──
-    # Handles orphan fragments that Pass 1 missed: two short fragments
-    # adjacent to each other (e.g. "f"+"an"→"fan") or fragments not
-    # matched to any reference word by NW alignment.
-    # Regression Case 31 Fix-1.
-    new_lab2, new_ctc2, frag_merged = _reclaim_fragments(new_lab, new_ctc)
+    # ── Pass 2: Fragment reclamation ───────────────────────────────────
+    # Legacy ASR mode may still self-reclaim adjacent fragments.  In
+    # reference-text mode this is unsafe: it can synthesize "live" from
+    # "li"+"ve" even when *_ref.txt says "life".  Pass 1 above already has
+    # the reference word list, so any remaining orphan must not invent a new
+    # spelling before MFA.
+    if reference_authoritative:
+        new_lab2, new_ctc2, frag_merged = new_lab, new_ctc, 0
+    else:
+        # Handles orphan fragments that Pass 1 missed: two short fragments
+        # adjacent to each other (e.g. "f"+"an"→"fan") or fragments not
+        # matched to any reference word by NW alignment.
+        # Regression Case 31 Fix-1.
+        new_lab2, new_ctc2, frag_merged = _reclaim_fragments(new_lab, new_ctc)
 
     if not changes and not frag_merged:
         return False
@@ -457,35 +572,7 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
     # English words into fragments.
     tg_path = txt_dir / f"{stem}.TextGrid"
     if tg_path.exists():
-        raw = tg_path.read_text(encoding="utf-8")
-        lines_out = []
-        in_words = False
-        iv_idx = 0
-        for line in raw.split("\n"):
-            stripped = line.strip()
-            if 'name = "words"' in stripped:
-                in_words = True
-                lines_out.append(line)
-            elif in_words and stripped.startswith("intervals: size"):
-                lines_out.append(f"        intervals: size = {len(new_ctc2)}")
-            elif in_words and stripped.startswith("intervals ["):
-                # Skip old interval blocks, will be replaced below
-                pass
-            elif in_words and (stripped.startswith("xmin =") or stripped.startswith("xmax =") or stripped.startswith("text =")):
-                # Skip old interval detail lines
-                pass
-            elif in_words and 'name = "' in stripped and 'pauses' in stripped.lower():
-                # End of words tier — insert new intervals before pauses tier
-                for idx, t in enumerate(new_ctc2):
-                    lines_out.append(f"        intervals [{idx}]:")
-                    lines_out.append(f"            xmin = {t['start_s']:.6f}")
-                    lines_out.append(f"            xmax = {t['end_s']:.6f}")
-                    lines_out.append(f'            text = "{t["word"]}"')
-                in_words = False
-                lines_out.append(line)
-            else:
-                lines_out.append(line)
-        tg_path.write_text("\n".join(lines_out), encoding="utf-8")
+        rewrite_ctc_textgrid_words(tg_path, new_ctc2)
 
     for en_word, indices in changes:
         old = " + ".join(lab_tokens[i] for i in indices)
@@ -514,7 +601,7 @@ def _auto_add_english_to_dict(txt_dir: Path, dict_path: Path) -> int:
     # Collect English tokens from all .lab files
     english_tokens_found: set[str] = set()
     for lab_path in sorted(txt_dir.glob("*.lab")):
-        tokens = lab_path.read_text(encoding="utf-8").strip().split()
+        tokens = lab_path.read_text(encoding="utf-8-sig").strip().split()
         for t in tokens:
             if is_english_token(t):
                 english_tokens_found.add(t)
@@ -542,7 +629,7 @@ def _auto_add_english_to_dict(txt_dir: Path, dict_path: Path) -> int:
     return len(new_tokens)
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Normalise English-word tokens in NVASR CTC output")
     parser.add_argument("--txt-dir", type=Path, required=True)
@@ -569,9 +656,14 @@ def main():
     if args.dry_run or len(stem_list) <= 4:
         # Serial: dry-run preview or too few stems to justify process overhead
         changed = 0
+        errors = 0
         for stem in stem_list:
-            if normalize_stem(txt_dir, stem, dry_run=args.dry_run):
-                changed += 1
+            try:
+                if normalize_stem(txt_dir, stem, dry_run=args.dry_run):
+                    changed += 1
+            except Exception as e:
+                errors += 1
+                print(f"  [ERROR] {stem}: {e}")
     else:
         # Parallel: each stem is independent (separate .lab / .TextGrid / _tokens.jsonl)
         _max_w = min(32, os.cpu_count(), len(stem_list))
@@ -579,9 +671,13 @@ def main():
         n_workers = min(n_workers, len(stem_list))  # don't exceed work items
         print(f"  Processing {len(stem_list)} stems with {n_workers} workers...")
         changed = 0
+        errors = 0
         done = 0
-        # Use "fork" context on Linux for copy-on-write sharing of module globals
-        ctx = __import__('multiprocessing').get_context("fork")
+        # Use fork on Linux for copy-on-write sharing of module globals; fall
+        # back to the platform default on Windows, where fork is unavailable.
+        mp = __import__('multiprocessing')
+        ctx = (mp.get_context("fork") if "fork" in mp.get_all_start_methods()
+               else mp.get_context())
         with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
             futures = {
                 executor.submit(normalize_stem, txt_dir, stem, False): stem
@@ -594,6 +690,7 @@ def main():
                     if future.result():
                         changed += 1
                 except Exception as e:
+                    errors += 1
                     print(f"  [ERROR] {stem}: {e}")
                 if done % 500 == 0 or done == len(stem_list):
                     print(f"  [{done}/{len(stem_list)}] {changed} changed")
@@ -607,6 +704,11 @@ def main():
     if args.dict_path and not args.dry_run:
         _auto_add_english_to_dict(txt_dir, args.dict_path)
 
+    if errors:
+        print(f"ERROR: {errors} stem(s) failed during English token normalization")
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

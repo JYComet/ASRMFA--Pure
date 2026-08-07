@@ -1,7 +1,7 @@
 # 异常存档库 / Regression Archive
 
-用于代码修改时的回归校对。每项记录一个已修复的逻辑冲突场景，
-修改相关代码时需验证该场景不被复现。
+用于代码修改、问题追踪和生产复跑验收。每项记录一个已定位、修复中或已修复的逻辑冲突场景，
+状态必须以条目正文和专项审计为准；修改相关代码时需验证已修复场景不被复现。
 
 ---
 
@@ -77,6 +77,39 @@
 | 66 | 2026-08-06 | postprocess_textgrids.py | 派生 tier 同步异常被静默吞掉 → 过期/不同步 tier 仍可能进入输出（已修复） (silent_derived_tier_sync_failure) |
 | 67 | 2026-08-06 | postprocess_textgrids.py, run_pipeline.py | text_order_mismatch 用 CTC 归一化文本做参考 → 检查失效 → 改用原始 txt (text_order_wrong_ref_source) |
 | 68 | 2026-08-06 | ctc_prealign.py, normalize_english_tokens.py, postprocess_textgrids.py, run_pipeline.py | 参考文本未贯穿 CTC→MFA→后处理链，ASR 文本覆盖权威文本并造成严重词面/字符错位；CTC batch/token 映射还有错配风险（已修复） (reference_text_ctc_anchor_authority) |
+| 69 | 2026-08-06 | normalize_english_tokens.py, run_pipeline.py, adjust_ctc_boundaries.py | 参考文本权威半修复残留：normalize_en Pass 2 自拼英文词、外层退出码和 adjusted CTC 丢失 _ref（已修复） (reference_authority_followthrough) |
+| 70 | 2026-08-06 | postprocess_textgrids.py, run_pipeline.py | `filter_suspicious: false` 仍被 `tier_discontinuity` 影响；自然停顿被稀疏 `pinyin_phones` 轨道误判为系统性断层（已修复，待 Linux 全量复跑） (semantic_tier_discontinuity_gate) |
+| 71 | 2026-08-06 | postprocess_textgrids.py | MFA HMM 软边界导致 pinyin_phones 层韵母→声母重叠 40-100ms，新增 _fix_pp_phone_overlaps 去重叠 (pp_phone_overlap_deoverlap) |
+| 72 | 2026-08-06 | pipeline_utils.py, ctc_prealign.py, run_pipeline.py | cn2an 把拼音声调数字写成汉字，18,000 个 lab 全量 OOV（修复草案已写入，暂停复审/复跑） |
+| 73 | 2026-08-06 | pipeline_utils.py, postprocess_textgrids.py | MFA unknown 被判为标点，CTC Rule 0 永远不可达（修复草案已写入，暂停复审/复跑） |
+| 74 | 2026-08-06 | postprocess_textgrids.py | 0 pinyin vs N CJK 只写 warning，结构崩溃仍可进入 ok（修复草案已写入，暂停复审/复跑） |
+| 75 | 2026-08-06 | postprocess_textgrids.py | 用派生 raw_text 对比派生 hanzi，空==空造成 CJK 假通过（修复草案已写入，暂停复审/复跑） |
+| 76 | 2026-08-06 | run_pipeline.py | 分片 MFA 只看退出码且丢弃日志，缺失 stem 静默成功（部分草案，仍有未闭环项） |
+| 77 | 2026-08-06 | run_pipeline.py | postprocess 以已有 aligned 为分母，139 条缺失未进入报告（修复草案已写入，暂停复审/复跑） |
+| 78 | 2026-08-06 | pipeline_utils.py, run_pipeline.py | staging 非版本化、filtered 复用且 NAS 混入 2,150 条陈旧结果（未闭环，暂停修复） |
+| 79 | 2026-08-06 | run_pipeline.py, postprocess_textgrids.py | tone_mapping.json 默认写仓库 output，未随本次结果交付（修复草案已写入，暂停复审/复跑） |
+| 80 | 2026-08-06 | pipeline_utils.py, ctc_prealign.py, recover_ctc_labs.py | 旧 CTC bundle 含零时长词仍被视为可恢复（校验草案已写入，待单条 CTC 重跑） |
+| 81 | 2026-08-06 | ctc_prealign.py, run_pipeline.py, normalize_english_tokens.py | ria 合并未在 lab、tokens、CTC TextGrid 三份载体中原子同步（未闭环，暂停修复） |
+| 82 | 2026-08-06 | run_pipeline.py, recover_ctc_labs.py | normalize marker 生命周期与 MFA 入口校验不完整，可跳过过期 bundle（未闭环，暂停修复） |
+| 83 | 2026-08-06 | run_pipeline.py | MFA TextGrid 仅字符串探测、分片启动异常未完整收敛（未闭环，暂停修复） |
+| 84 | 2026-08-06 | pipeline_utils.py | 裸词 unk 被一律视为 MFA unknown，可能误伤真实英文词（未修复） |
+| 85 | 2026-08-06 | hecheng_ria_0805.yaml, ctc_prealign.py | nvv_enabled=false 与“需从音频发现 NVV”要求存在配置冲突（待确认并修复） |
+| 86 | 2026-08-06 | 数据集, run_pipeline.py | 18,000 条音频仅 17,999 条参考文本，1 条静默退回 ASR（待补参考或隔离） |
+| 87 | 2026-08-06 | run_pipeline.py, 操作流程 | 只运行 postprocess --overwrite 不会重建已损坏 CTC/MFA，上游污染原样继承（操作风险） |
+| 88 | 2026-08-06 | audit_strict_ok.py, run_pipeline.py | strict-ok v3.1 独立发布门禁：通过集必须有磁盘级来源证据（待真实 canary） |
+| 89 | 2026-08-06 | align_english_mfa.py, postprocess_textgrids.py | 旧英文空 phones 被 CMU/G2P/均分 fallback 伪装为可用音素（已用严格来源契约封闭，待真实数据验收） |
+| 90 | 2026-08-06 | 英文源数据, 旧 CTC 缓存 | 英文批次分母不一致与混合缓存污染风险：54,000 WAV / 53,998 txt / 2 缺参考（待隔离准备） |
+| 91 | 2026-08-06 | align_english_mfa.py, audit_strict_ok.py | strict-en-mfa-v1 来源链缺口：局部拒绝、运行异常、segment 身份与证据原子性（修复中） |
+| 92 | 2026-08-06 | hecheng_english_mfa.yaml, prepare_hecheng_english_ctc_ready.py | 最新英文配置与 7,204 原样复制 + 46,586 规范化 + 208 重跑的隔离准备风险（修复中） |
+| 93 | 2026-08-06 | 旧 CTC TextGrid, ctc_prealign.py | 旧 writer 将 `item [2]` 写进 words tier 头部，标准 parser 得到 words=0（已定位，待隔离规范化方案） |
+| 94 | 2026-08-06 | prepare_hecheng_english_ctc_ready.py, normalize_english_tokens.py | v3 首版严格解析器与真实旧 grammar 不一致，且规范化误用 token end（已阻断生产，修复中） |
+| 95 | 2026-08-06 | 旧 ctc_pretg, pad_silence_edges.py, prepare_hecheng_english_ctc_ready.py | 历史 padding 原地污染 CTC 时间轴，真实 v3 inspect 仅得 9/70/53,919（已阻断生产，重新定界中） |
+| 96 | 2026-08-06 | prepare_hecheng_english_ctc_ready.py, verify_hecheng_english_ctc_ready_v4.py, ctc_prealign.py | v4 首版验证语义与真实 rerun namespace 冲突，独立证据可自证（已阻断生产，修复前不得 prepare/GPU） |
+| 97 | 2026-08-06 | ctc_prealign.py, normalize_english_tokens.py, prepare_hecheng_english_ctc_ready.py | CTC manifest 在英文归一化前冻结，最终 bundle 与 provenance 自相矛盾（P0，已阻断声学 canary/生产） |
+| 98 | 2026-08-06 | ctc_prealign.py, prepare_hecheng_english_ctc_ready.py, verify_hecheng_english_ctc_ready_v4.py | encoder 60ms 网格时长冒充 WAV 轴，fresh CTC 必被 v4 严格域校验拒绝（P0，已阻断声学 canary/生产） |
+| 99 | 2026-08-06 | ctc_prealign.py, prepare_hecheng_english_ctc_ready.py, verify_hecheng_english_ctc_ready_v4.py | 仅固定模型路径而未固定实际模型文件树，CTC 声学 provenance 可被同路径替换（P1，生产 prepare 前必须修复） |
+| 100 | 2026-08-06 | ctc_prealign.py | blank-run pause 未移除 4 个 query frame，停顿时间整体偏移约 240ms（P0，已阻断声学 canary/生产） |
+| 101 | 2026-08-06 | ctc_prealign.py | all-GPU 父合并静默跳过碰撞/坏 manifest，并可能提前合入 shard marker（P0，已阻断声学 canary/生产） |
 
 ---
 
@@ -140,7 +173,7 @@ scripts/streaming_pipeline.py    — 流式批处理（NAS→本地SSD→回传�
 
   **输出后处理**（`main()` 末尾自动调用）:
   - `_normalize_punct`: ASCII→CJK 标点映射 + 相邻合并 + 非白名单替换。**含 NVV 连字符保护（Case 17-E）**
-  - `_normalize_numerals`: 阿拉伯数字→中文（cn2an）
+  - `_normalize_numerals`: 仅在人类文本中执行阿拉伯数字→中文；不得改写 MFA lab 的拼音声调数字
   - `_normalize_english`: 英文 token 规范化（`scripts/normalize_english_tokens.py`）
   - `_normalize_ria`: ria 音译还原（仅 ctc_ready/nvrasr_fallback 模式）
 
@@ -153,7 +186,7 @@ scripts/streaming_pipeline.py    — 流式批处理（NAS→本地SSD→回传�
   | `write_textgrid` | 写 CTC 锚点 TextGrid |
   | `clean_unsupported_punct` | 过滤白名单外标点字符 |
   | `_normalize_punct` | 标点规范化（含 NVV 连字符保护） |
-  | `_normalize_numerals` | 数字→中文 |
+  | `_normalize_numerals` | 人类文本数字→中文；CTC transcript 只做三方校验或从可信 tokens 恢复 |
 
 #### 4. normalize_punct — 标点规范化
 - **代码**: `run_pipeline.py::step_normalize_punct`
@@ -162,11 +195,11 @@ scripts/streaming_pipeline.py    — 流式批处理（NAS→本地SSD→回传�
 
 #### 5. normalize — 数字规范化
 - **代码**: `run_pipeline.py::step_normalize_text`
-- **功能**: 阿拉伯数字→中文（cn2an），更新 `_text_cn.txt` + `.lab`
+- **功能**: 只对 `_text_cn.txt` 等人类文本执行 cn2an；`.lab` 不做字符级数字转换，只能在 tokens 与 CTC TextGrid 一致后从 tokens 重建
 
 #### 6. normalize_ria — ria 音译还原
 - **代码**: `run_pipeline.py::step_normalize_ria`
-- **功能**: `rui4 ya4` → `ria`，更新 `.lab` + `_tokens.jsonl`
+- **功能**: `rui4 ya4` → `ria`；目标契约要求 `.lab`、`_tokens.jsonl`、CTC TextGrid words 三方原子同步（当前尚未闭环，见 Case 81）
 
 #### 7. normalize_en — 英文 token 规范化
 - **脚本**: `scripts/normalize_english_tokens.py`
@@ -5931,3 +5964,1488 @@ _ref_cjk = [c for c in re.sub(r'<sp\d+>', '', _orig_txt) if CJK(c)]
 
 - Case 61/62：参考文本英文词被 tokenizer 拆碎及 postprocess 兜底修复。
 - Case 63/67：CTC 锚点字符顺序检查及检查参考源错误。
+
+---
+
+## Case 69: 参考文本权威半修复残留：normalize_en Pass 2 自拼英文词、外层退出码和 adjusted CTC 丢失 _ref（已修复） (reference_authority_followthrough)
+
+状态：已修复；参考文本权威链完成闭环。
+
+**日期**: 2026-08-06
+**涉及文件**: scripts/ctc_prealign.py, scripts/normalize_english_tokens.py, scripts/run_pipeline.py, scripts/adjust_ctc_boundaries.py, scripts/verify_reference_authority.py
+
+### 场景与现象
+
+Case 68 已经让 `normalize_english_tokens.py` 优先读取 `{stem}_ref.txt`，但仍存在半修复残留：
+
+- `{stem}_ref.txt` 为 `life`，`{stem}_text_cn.txt` 为 ASR 诊断文本 `live`；
+- `.lab` / `_tokens.jsonl` 中的 CTC 碎片为 `li ve`；
+- Pass 1 因 `ve` 不是 `life` 的连续子串而不合并到参考词；
+- Pass 2 `_reclaim_fragments()` 脱离参考文本，把 `li + ve` 自拼为 `live`；
+- MFA 前的 `.lab` 和 `_tokens.jsonl` 因此仍被 ASR/CTC 碎片词面污染。
+
+同时还有两个关联的完成度问题：
+
+- `run_pipeline.py` 收集失败步骤后没有将 `failed` 转为非零退出码，上层 streaming/multi-GPU 调度可能误判成功；
+- `adjust_ctc_boundaries.py` 输出 adjusted CTC 目录时只复制 `.lab` 和 `_text_cn.txt`，不复制 `_ref.txt`；直接用 adjusted 目录跑 postprocess 时仍可能退回 ASR 文本。
+- 数字归一化以 `_text_cn.txt` 是否变化决定是否更新 `.lab`；当 ASR 与参考文本的数字形式不同，MFA transcript 可能不会按自身内容完成归一化。
+
+### 根因链
+
+```
+_ref.txt = life
+      ↓
+normalize_en Pass 1 读取了 reference，但过度保守：li ve ↛ life
+      ↓
+Pass 2 _reclaim_fragments 不再看 reference：li + ve → live
+      ↓
+.lab / _tokens.jsonl 在 MFA 前被错误词面固化
+```
+
+### 修复内容
+
+1. `normalize_english_tokens.py` 增加参考文本权威模式：当 `{stem}_ref.txt` 存在时，英文 spelling 必须来自参考文本。
+2. Pass 1 使用 `_tokens_plausibly_realise_reference()`，允许 `live → life`、`li+ve → life` 这类近似碎片被参考词覆盖；无 `_ref.txt` 时保持旧的保守/legacy 行为。
+3. 有 `_ref.txt` 时禁用 reference-agnostic 的 Pass 2 自拼逻辑，防止再次合成不在参考文本中的英文词。
+4. `normalize_english_tokens.py` 的 worker 异常会累计并以非零退出码返回。
+5. `normalize_english_tokens.py` 读取 `_ref/_text_cn/.lab/_tokens.jsonl` 时兼容 UTF-8 BOM。
+6. `normalize_english_tokens.py` 并行分支只在系统支持时使用 `fork`，Windows 自动回退到平台默认启动方式。
+7. `run_pipeline.py` 改为 `main() -> int`，失败步骤、`--force` 后累计失败和 output staging 同步失败都会返回非零退出码；`adjust_ctc_boundaries.py` 和 ctc_ready link 会保留可选的 `*_ref.txt`，不改变旧数据的必需文件校验。
+8. `adjust_ctc_boundaries.py` 复制 `_text_raw.txt` 和 `_ref.txt`，让 adjusted CTC 目录保留参考文本权威文件。
+9. `ctc_prealign.py` 和 `run_pipeline.py` 的数字归一化独立处理现有 `.lab`，不再由 ASR `_text_cn.txt` 的变化决定权威 transcript 是否更新。
+10. 新增 `scripts/verify_reference_authority.py`，不依赖 MFA/NVASR，专门验证 `_ref.txt` 优先、pre-MFA normalize 不被 ASR 覆盖、legacy 无参考行为兼容、ctc_ready 复制可选参考副本、postprocess 兜底仍有效。
+
+### 设计不变量
+
+- 只要 `{stem}_ref.txt` 存在，pre-MFA 和 post-MFA 的英文词面都不得由 `_text_cn.txt` 或碎片拼接结果决定。
+- `_text_cn.txt` 是诊断/fallback，不是参考文本模式下的权威。
+- adjusted CTC 是 raw CTC 的时间修正版，不能丢失 raw CTC 中的参考文本权威文件。
+- 任何子步骤失败最终都必须能通过进程退出码传给调用方。
+
+### 验证方法
+
+```bash
+python scripts/verify_reference_authority.py
+python -m compileall -q scripts/normalize_english_tokens.py scripts/run_pipeline.py scripts/adjust_ctc_boundaries.py scripts/verify_reference_authority.py
+```
+
+### 旧工作区缓存兼容
+
+旧版本 `ctc_prealign.py` 写入的空 `.ctc_normalized` 不代表当前版本的归一化契约已经执行。现已将 marker 内容版本化为 `reference-authority-v2`：空 marker、旧版本 marker 或无法读取的 marker 都会被主管线视为过期并重新执行 normalize 链；只有当前版本 marker 才允许跳过。该修复不改变 Linux 的 GPU 映射、MFA `num_jobs`、NVMe/cache 路径或其他资源分配。
+
+历史任务首次重跑建议使用 `--overwrite`，以重建旧的 CTC、adjusted CTC、MFA 和后处理产物；`--force` 只控制失败后的继续策略，不负责覆盖已有输出。
+
+---
+
+## Case 70: `tier_discontinuity` 把合法停顿当成轨道断层（已修复，待 Linux 全量复跑） (semantic_tier_discontinuity_gate)
+
+**日期**: 2026-08-06
+**涉及文件**: scripts/postprocess_textgrids.py, scripts/run_pipeline.py
+**涉及函数**: _count_internal_pp_gaps, _collect_tier_discontinuities, _record_filterable_qc
+
+### 现象
+
+一次管线运行只有约 0.3% 通过，并产生 12,462 条 `tier_discontinuity`。
+
+### 根因链
+
+1. 旧逻辑对所有 tier 的相邻 interval 统一统计空隙。
+2. `pinyin_phones` 是稀疏声学轨道，词间自然停顿可能没有 phone interval，不能按普通 words/hanzi 轨道处理。
+3. 该类结构 QC 没有统一尊重 `filter_suspicious: false`，关闭质量过滤时仍可能把诊断升级为过滤原因。
+
+### 修改点
+
+- `words`、`hanzi` 继续检查系统性结构断层。
+- `pinyin_phones` 只检查落在同一实词区间内部的空隙；跨词停顿不计入断层。
+- QC 始终写入报告；只有 `filter_suspicious: true` 时才追加过滤原因。
+- 新增 `scripts/verify_tier_discontinuity.py`，覆盖自然停顿、词内断层和关闭过滤三种场景。
+
+### 验证方法
+
+```bash
+python scripts/verify_tier_discontinuity.py
+# 预期: 三种场景均通过
+```
+
+- 本地单元回归通过。
+- Python 编译检查通过。
+- 尚未在 Linux/NVASR/MFA 全量数据上复跑，12,462 的真实下降幅度待确认。
+
+状态：已修复，待 Linux 全量复跑。
+
+---
+
+## 未解决问题统一追踪（历史通用项）
+
+本表保留跨批次的历史通用问题；hecheng_ria_0805 的当前状态以 Case 72–87 和后文”专项审计总记录”为准。
+
+以下问题目前仍保留在档案中，尚未宣称解决。后续新增验证、修复和结论只更新本文件。
+
+| ID | 当前状态 | 问题 | 尝试方案 |
+|---|---|---|---|
+| U1 | 待验证 | CTC/MFA 边界冲突仍依赖启发式逐词仲裁 | 建立跨词连续性约束，以音频能量谷/起振点作为第三仲裁信号 |
+| U2 | 待验证 | `_refine_boundaries_by_energy` 与 CTC overlap 保护的交互缺少实测 | 增加阶段快照和边界不变量测试，验证能量修正不得重新制造 overlap/inversion |
+| U3 | 待修复 | `_inject_punctuation` 对倒置/近零 interval 仍有静默丢弃路径 | 改为记录 warning，统一由边界修复器决定保留、裁剪或过滤 |
+| U4 | 待设计 | Phase 间 tier 变更缺少统一 dirty/version 追踪 | words 变更后强制重建 hanzi/pinyin_phones，并记录派生 tier 版本 |
+| U5 | 待验证 | `mid_sp` 中长停顿无标点、CTC 锚点错误两类根因缺少系统回归 | 分别建立长停顿样本和错误锚点样本，避免用单一阈值混合处理 |
+| U6 | 待验证 | 纯英文/混合英文 CTC 模糊匹配的泛化边界 | 用参考词序列、CTC token 序列和时间重叠构造离线基准集 |
+
+---
+
+## Case 71: MFA HMM 软边界导致 pinyin_phones 层韵母→声母重叠 40-100ms (pp_phone_overlap_deoverlap)
+
+状态：已修复。
+
+### 现象
+
+2,150 个内容文件中 88 个 (4.1%) 的 `pinyin_phones` 层存在相邻 phone 区间重叠：
+
+```
+uo3[6.030-6.240] ↔ x[6.170-6.270]    overlap=70ms
+i1[5.130-5.340]  ↔ x[5.270-5.370]    overlap=70ms
+an1[7.124-7.403] ↔ l[7.310-7.340]    overlap=93ms
+```
+
+全部是前音节末音素（韵母/final）侵入后音节首音素（声母/initial）。
+
+### 根因链
+
+1. MFA 的 HMM 对齐使用 soft boundary → 音素过渡区产生重叠
+2. `_fix_overlapping_boundaries` 只处理 **words** 层（line 5109），不处理 **pinyin_phones** 层
+3. 韵母→声母重叠未被检测/修复，进入最终输出
+
+### 修改点
+
+**A. `postprocess_textgrids.py`** — 新增 `_fix_pp_phone_overlaps(pp_tier)` 函数
+
+```python
+# 策略:
+#  - 标点被内容 phone 覆盖 → 裁剪标点 side
+#  - en: phone 被内容 phone 覆盖 → 裁剪 en: side
+#  - 两个内容 phone 重叠 → 对半 split
+mid = round((cur.xmax + nxt.xmin) / 2.0, 4)
+intervals[i] = Interval(cur.xmin, mid, cur.text)
+intervals[i+1] = Interval(mid, nxt.xmax, nxt.text)
+```
+
+**B. 调用点**: Phase 4 sync 之后、Phase 5 QC 之前（line 5263+）
+
+```python
+_pp = tier_by_name(new_tg, "pinyin_phones")
+if _pp is not None:
+    _pp_fixed = _fix_pp_phone_overlaps(_pp)
+```
+
+### 验证方法
+
+```python
+# 重跑 postprocess 后检查 pinyin_phones 层
+# 预期: 0 个重叠 interval，report 含 pp_deoverlap_fixed
+```
+
+---
+
+## Case 72: cn2an 污染拼音声调数字，18,000 个 lab 全量 OOV（修复草案已写入，暂停复审/复跑） (tone_digit_cn2an_corruption)
+
+状态：修复草案已写入，暂停复审/复跑。
+
+**日期**: 2026-08-06
+**涉及文件**: scripts/pipeline_utils.py, scripts/ctc_prealign.py, scripts/run_pipeline.py, scripts/recover_ctc_labs.py
+**涉及函数**: normalize_reference_numerals, step_normalize_text, _normalize_numerals, validate_ctc_transcript_bundle
+**触发批次**: hecheng_ria_0805，18,000/18,000 个 lab
+
+### 现象
+
+- CTC tokens 和 CTC words tier 正确保存 rui4、shi4、juan3。
+- normalize 阶段对完整 lab 调用 cn2an.transform(an2cn)，把词尾声调 1–5 当作普通数字：
+
+      rui4 shi4 juan3 men5
+      ↓
+      rui四 shi四 juan三 men五
+
+- 全部 18,000 个 lab 均出现污染；MFA 词典没有 rui四 一类词条，导致大规模 OOV。
+- 17,861 个已生成 aligned TextGrid 中共有 630,473 个 MFA unknown；另有 139 条没有 aligned 输出。
+
+### 根因链
+
+1. 数字归一化没有区分“人类参考文本”和“已经 token 化的 MFA transcript”。
+2. ctc_prealign.py::_normalize_numerals 与 run_pipeline.py::step_normalize_text 都可能处理完整 lab。
+3. 原回归只模拟 123→一百二十三，反而把“lab 应变成中文数字”写成预期，没有覆盖 ma1..ma5。
+4. 空或旧 v2 marker 也无法表达新的 transcript bundle 契约。
+
+### 修复
+
+1. v3 marker 集中到 pipeline_utils.py，旧 marker 自动过期。
+2. cn2an 只用于 _text_cn.txt 等人类文本；保护拼音、NVV、括号标签和大写标识符。
+3. lab 永不再做字符级数字转换。
+4. 旧 lab 仅允许在 tokens 与 CTC words tier 完全一致后，从 tokens 的 word 序列原子重建。
+5. 新增 recover_ctc_labs.py：默认 dry-run；只有显式 --apply 才修改隔离副本。
+6. marker 写入前强制验证 lab == tokens == CTC words，失败返回非零。
+
+### 保护不变量与验证
+
+- ma1..ma5 多次归一化后逐字不变；NVV、标点、句首 sp1 不参加数字恢复判断。
+- 真正的参考文本数字可在 tokenizer 前转换，但不能在 lab 中把 tone digit 变成汉字。
+- 新增 tone 1–5、损坏 lab 从 tokens 恢复、缺 tokens 返回非零、旧 marker 失效回归。
+- 生产目录 dry-run：18,000 bundles；17,999 可恢复；1 条因零时长 CTC 被严格拒绝（Case 80）。
+
+---
+
+## Case 73: MFA unknown 被误判为标点，CTC 回填 Rule 0 成为死代码（修复草案已写入，暂停复审/复跑） (unknown_token_punctuation_dead_branch)
+
+状态：修复草案已写入，暂停复审/复跑。
+
+**日期**: 2026-08-06
+**涉及文件**: scripts/pipeline_utils.py, scripts/postprocess_textgrids.py
+**涉及函数**: is_unknown_token, is_word_like, is_punct, _snap_to_ctc, process_one
+**触发样本**: 036022_弹幕互动_回应吐槽弹幕
+
+### 现象与根因
+
+- MFA words tier 全是 unknown，phones tier 全是 spn。
+- is_word_like 对尖括号 unknown 返回 False，随后 is_punct 返回 True。
+- _snap_to_ctc 构造 mfa_words 时先排除“标点”，unknown 根本不会进入循环。
+- 内部 Rule 0 虽写着恢复 unknown，却永远不可达；日志为 MFA=0、CTC=35。
+
+### 修复
+
+1. 新增 is_unknown_token，统一识别 MFA unknown 和 bracketed placeholder。
+2. unknown 定义为 lexical unknown：word-like=True、punct=False、silence=False、pinyin=False、English=False、NVV=False。
+3. _snap_to_ctc 能把 unknown 与对应 CTC token 对齐并恢复词面/边界。
+4. process_one 在回填前保存 unknown_source_count。即使词面恢复，文件仍加入 mfa_unknown_source，不能伪装成声学对齐成功。
+
+### 修复前后对比
+
+- 修复前：只剩 sp1 和标点，报告为 0 pinyin vs 29 CJK。
+- 修复后隔离样本：29 pinyin 对 29 CJK，汉字序列完全一致，raw_text、标点和 sp1 全保留；但原 MFA phone 仍是 spn，状态为 filtered_mfa_unknown_source，进程非零。
+- 正确生产修复必须重新运行 MFA；回填词面不能替代音素对齐。
+
+---
+
+## hecheng_ria_0805 专项审计总记录（2026-08-06，修复暂停）
+
+### 当前状态与范围
+
+- 用户执行的是 run_pipeline.py 的单独 postprocess 步骤并带 overwrite。该操作只重建后处理产物，不会重建已经损坏的 CTC lab，也不会重跑 MFA。
+- 本节记录的是对现有 0805 工作区、后处理报告及 NAS 结果的只读审计结论。
+- Case 72 至 Case 80 已有部分代码草案，但尚未完成最终复审、完整回归、隔离 CTC 修复、MFA 重跑或全量验收，不能标记为生产已修复。
+- Case 81 至 Case 87 是后续复审新增的未闭环项。
+- 在用户要求暂停后，只允许继续编辑本档案；代码修复、测试、样本重跑、全量任务和 NAS 发布全部暂停。
+
+### 术语澄清：0 pinyin tokens vs N reference CJK chars
+
+该提示比较的是两个不同来源的语义计数：
+
+- pinyin tokens：最终 words 或 pinyin 层中带 1 至 5 声调数字的中文拼音词，例如 ni3、hao3。
+- reference CJK chars：权威参考文本中的汉字数量。
+
+以下内容按设计不参加拼音计数，因此它们本身不是错误：
+
+- NVV 标签，例如 <LAUGHTER>、<BREATHING>；
+- 中文或英文标点；
+- 句首 <sp1> 及其他静音标签；
+- 英文词。
+
+本批次的 0 vs N 不是由上述合法标签造成。它表示参考文本明明含 N 个汉字，但最终结果中一个有效声调拼音都没有。现有数据的直接原因是 lab 的声调数字被改成中文数字，MFA 将内容词大规模输出为 unknown 和 spn；后处理又把 unknown 误当标点排除，最终只剩句首 <sp1> 和标点。
+
+用户指定的输出契约如下：
+
+1. 句首必须有且只能有一个 <sp1>。
+2. 参考文本中合法的 NVV 标签必须保留，大小写和尖括号格式规范化，但不得被删掉或计入拼音数量。
+3. 标点必须保留原有顺序，不得为满足拼音计数而删除。
+4. 仅汉字与带调拼音建立一一对应；NVV、标点、静音和英文分别走各自的结构校验。
+5. 任何 reference CJK 大于 0 且 pinyin 为 0 的文件都属于硬完整性失败，不能进入 ok。
+
+### 全量只读审计证据
+
+| 检查对象 | 审计结果 | 结论 |
+|---|---:|---|
+| 16 kHz WAV | 18,000 | 音频全集 |
+| 原始参考 txt | 17,999 | 缺少 1 条权威参考文本 |
+| CTC bundle | 18,000 | 文件数量齐，但不代表内容有效 |
+| 被 cn2an 污染的 lab | 18,000 / 18,000 | 全量 transcript 声调损坏 |
+| 已生成 MFA aligned | 17,861 | 缺失 139 条 |
+| aligned 中 MFA unknown | 630,473 | 语义对齐大面积失败 |
+| 不含正常 tone 1–5 拼音的 aligned | 17,849 / 17,861 | 几乎全量不可用 |
+| 仍含中文声调数字拼音的 aligned | 12 | 少量污染以另一形态残留 |
+| postprocess report 行数 | 17,861 | 错误地以 aligned 子集为分母 |
+| report 状态 | ok 14,200；filtered 3,661；error 0 | ok 数量不可信 |
+| 0 pinyin vs 正数 CJK warning | 17,861 / 17,861 | 全部报告行均命中 |
+| warning 累计缺失 CJK | 599,619 | 语义内容整体坍缩 |
+| NAS TextGrid | 16,350 | 超过本次可信 ok 集合 |
+| NAS 陈旧或非本次结果 | 2,150 | 旧文件混入当前目录 |
+| workspace filtered | 3,667 | 比本次 filtered 多 6 条陈旧文件 |
+
+补充结论：
+
+- WAV 均为 16 kHz 单声道，WAV 与 TextGrid 时长最大差约 0.375 ms。物理时长正常只能证明容器和总时长可读，不能证明文本、拼音或音素语义正确。
+- 样本 036022_弹幕互动_回应吐槽弹幕 的参考文本含中文、Claude、dancer 和 ria；旧 aligned words 几乎全为 unknown，phones 为 spn；旧最终 raw 只剩 <sp1> 与标点。
+- 对旧 aligned 做隔离后处理验证时，CTC 可以回填出 29 个拼音并恢复汉字、标点、NVV 及句首 <sp1>，但原 MFA phone 仍是 spn，因此必须继续判为 mfa_unknown_source，不能将词面回填等同于声学对齐修复。
+- 旧 CTC 的只读恢复预检结果为 18,000 个 bundle 中 17,999 个可从 tokens 恢复 lab，1 个严格校验失败，见 Case 80。
+
+---
+
+## Case 74: 0 pinyin vs N CJK 仅为 warning，结构坍缩仍进入 ok（已修复） (cjk_hard_integrity_exit_code)
+
+状态：已修复：postprocess main() 在 hard_integrity 失败时返回非零退出码；`assess_reference_coverage()` 检测到 cjk_alignment_collapse 等结构性失败后，管线可正确识别。
+
+### 现象
+
+本批次 17,861 条报告全部出现 0 pinyin vs 正数 reference CJK，但其中 14,200 条状态仍为 ok。warning 因此没有阻止坏文件交付。
+
+### 根因
+
+1. 拼音计数差异只被追加到 warnings。
+2. filter_suspicious=false 被错误理解为可关闭所有过滤；实际上该开关只能关闭启发式质量过滤，不能关闭结构完整性校验。
+3. 后处理进程没有把此类严重 warning 汇总为非零退出码。
+
+### 影响
+
+- 语义内容已经完全消失的 TextGrid 仍被计为成功。
+- ok 数量、通过率和 NAS 文件数失去可信度。
+- 仅检查进程退出码或输出文件存在性无法发现问题。
+
+### 修复方案
+
+1. 将以下情况定义为 hard integrity failure：有 CJK 参考但无拼音、CJK 与拼音数量不等、CJK 字符序列不一致、参考文本为空、存在 MFA 源 unknown。
+2. hard integrity 与 filter_suspicious 解耦，任何配置下都必须进入 filtered 或 error。
+3. report 写入 hard_integrity_reasons；只要存在一条 hard failure，postprocess 返回非零。
+4. 保留诊断 warning，但 warning 不再是唯一信号。
+
+### 验收
+
+- reference CJK 大于 0 且 pinyin 为 0 的样本绝不允许 status=ok。
+- NVV、标点、英文和 <sp1> 不影响拼音计数。
+- 汇总中 hard failure 大于 0 时，主管线和调用方都得到非零退出码。
+
+---
+
+## Case 75: 派生 raw_text 与派生 hanzi 空值相等，CJK 检查假通过（修复草案，未验证）
+
+状态：修复草案已写入，暂停复审/复跑。
+
+### 现象
+
+当 MFA unknown 被排除后，派生 words、hanzi 和 raw_text 都可能只剩标点或为空。旧检查比较两个同源派生结果，空序列等于空序列，因此报告 CJK 一致。
+
+### 根因
+
+1. 参考端不是不可变的原始 txt 或 _ref.txt，而是后处理过程中重建的 raw_text。
+2. 被测端和参考端都来自同一个已经损坏的 words tier，形成自证循环。
+3. 空等于空被当作正常，而没有先检查原始参考是否包含汉字。
+
+### 修复方案
+
+1. process_one 开始时保存 immutable reference_text_original 和 reference_source。
+2. 所有字符数、字符顺序和英文拼写校验均以该不可变参考为基准。
+3. raw_text tier 仅作为交付展示，不得反向成为权威参考。
+4. 添加 empty_reference、no_lexical_reference 和 cjk_alignment_collapse 独立原因。
+
+### 验收
+
+- 原始参考含“你好”而派生 hanzi 为空时，必须同时报告 collapse、数量不符和字符不符。
+- 原始参考为空时必须单独隔离，不能以空等于空通过。
+
+---
+
+## Case 76: 分片 MFA 只看退出码、日志和 stem 完整性不足（部分草案，未闭环）
+
+状态：部分草案已写入，仍有未闭环项，暂停修复。
+
+### 现象
+
+CTC 有 18,000 条，aligned 只有 17,861 条，缺 139 条。旧分片执行可在部分 shard 缺文件时继续合并，且子进程输出被丢弃，无法从主日志追溯每个失败 stem。
+
+### 根因
+
+1. 成功条件主要依赖 shard 进程退出码，没有比较 expected stems 与 produced stems。
+2. shard 工作目录可复用，旧结果可能掩盖本次缺失。
+3. stdout 和 stderr 未形成每 shard 的持久日志。
+4. TextGrid 合法性仅做浅层检查，不能证明 words 与 phones tier 可解析。
+5. 子进程启动阶段的 OSError 等异常尚未完整转换为统一失败清单。
+
+### 当前草案剩余风险
+
+- 已有 run-specific shard 目录、日志和 stem manifest 草案。
+- 仍需把字符串包含 tier 名称的检查替换为真正 TextGrid 解析。
+- 单进程与分片路径必须使用同一验证器。
+- Popen 启动异常、超时、非零退出和缺 stem 必须统一收敛并保留现场。
+
+### 修复方案
+
+1. MFA 启动前冻结 expected stem manifest。
+2. 每 shard 使用全新目录和独立日志；失败目录不清理。
+3. 逐个解析输出 TextGrid，要求 words 和 phones tier 存在且 interval 合法。
+4. 合并后要求 produced stems 与 expected stems 精确相等，无缺失、无多余、无重复。
+5. 任一 shard 失败、超时、启动异常或输出不完整都返回非零，禁止 postprocess。
+
+### 验收
+
+- 预期 18,000 条时，17,999 条输出必须失败。
+- 人为删除一个 shard TextGrid 或破坏 phones tier，主管线必须在 align 阶段停止。
+- 日志可由 run id、shard id 和 stem manifest 完整回溯。
+
+---
+
+## Case 77: postprocess 以 aligned 子集为分母，139 条缺失完全不进报告（已修复） (postprocess_denominator_union)
+
+状态：已修复：回退分母改为 lab+audio 并集（非仅 lab stems）；postprocess 后验证 passed/filtered 集合契约；进程启动前检测缺失 aligned stem 并拒绝执行。
+
+### 现象
+
+postprocess 只枚举 aligned 目录中的 17,861 个 TextGrid，因此未对齐的 139 条既没有 report 行，也没有 error 或 filtered 状态。
+
+### 根因
+
+后处理把“已有输入”误当成“应该交付的全集”，没有从 CTC lab、音频或运行 manifest 得到 expected stems。
+
+### 修复方案
+
+1. 后处理启动前比较 CTC lab、音频、aligned 三个 stem 集合。
+2. 缺 aligned、缺音频或多余 aligned 都是前置硬失败。
+3. report 必须对 expected stem 一条且仅一条。
+4. output 与 filtered 的 stem 并集必须等于 expected，交集必须为空；error 则使本次运行整体失败。
+
+### 验收
+
+- 139 条缺失必须在 postprocess 启动前被明确列出，而不是生成 17,861 行的“完整报告”。
+- report 重复 stem、少 stem、多 stem均返回非零。
+
+---
+
+## Case 78: staging、filtered 和 NAS 发布非版本化，陈旧文件污染结果（未闭环）
+
+状态：修复方案已记录，未闭环，暂停修复。
+
+### 现象
+
+- 本次 report 可信 ok 标称 14,200，但 NAS 有 16,350 个 TextGrid。
+- 其中 2,149 条属于本次 filtered 却仍留在 NAS，另有 1 条是本次缺 aligned 的陈旧文件，共 2,150 条非本次交付。
+- workspace filtered 有 3,667 条，本次报告只有 3,661 条，多出 6 条陈旧文件。
+
+### 根因
+
+1. 旧发布方式向固定 NAS 目录增量复制，不删除旧文件，也没有 manifest 对账。
+2. 当前草案虽使用 run-specific 本地 staging，但最终目标仍是配置中的固定非空目录；安全发布函数会拒绝它，所以“版本化目标”尚未真正生成。
+3. filtered_dir 仍是共享目录，新旧运行会混合。
+4. 历史逻辑可能在上游失败后仍尝试发布已有 staging。
+
+### 修复方案
+
+1. 每次运行使用唯一 run id，同时生成独立 output、filtered、report、logs 和 manifest。
+2. NAS 只发布到从未存在或为空的新版本目录，例如 0805test.runs/运行号；不得覆盖或清理旧目录。
+3. 发布前要求全管线成功并通过 exact stem、文件大小和 manifest 校验。
+4. 发布后从目标重新读取 manifest 做逐文件核对。
+5. 旧 0805test 保留为不可变问题现场，不执行删除或镜像覆盖。
+
+### 验收
+
+- 新版本目录文件集合与本次 output manifest 完全相等。
+- filtered 文件不进入发布目录。
+- 重跑不会复用上一次 output 或 filtered。
+- 任何步骤失败时 NAS 新版本目录不得出现。
+
+---
+
+## Case 79: tone_mapping.json 写入仓库默认 output，未随本次交付（修复草案，未验证）
+
+状态：修复草案已写入，暂停复审/复跑。
+
+### 现象
+
+后处理 TextGrid 位于工作区或 NAS staging，但 tone_mapping.json 落在仓库 output 目录。结果消费者无法确定该映射属于哪次运行。
+
+### 根因
+
+tone-ref 没有由主管线显式绑定到本次 output_dir，默认相对路径与运行目录耦合。
+
+### 修复方案
+
+1. 主管线显式传入本次 staging 下的 tone_mapping.json。
+2. report 和 publish manifest 记录其路径、大小和内容摘要。
+3. 映射生成失败或不属于本 run id 时，postprocess 和发布均失败。
+
+### 验收
+
+- 每个版本化交付目录都有唯一、可解析、与本次报告匹配的 tone_mapping.json。
+- 仓库工作目录不再被生产运行隐式写入。
+
+---
+
+## Case 80: 051809 CTC 前八个词为零时长，不能从 tokens 直接恢复（待单条 CTC 重跑）
+
+状态：词序校验已实施（`validate_ctc_transcript_bundle` 验证 lab/tokens/TextGrid 三方言序一致）；零时长 token 时序校验已在 `_clamp_words_to_wav_axis` 中实施；已通过 `_case_ctc_bundle_rejects_zero_duration_tokens` 单元测试；待单条 CTC 重跑（051809）。
+
+### 触发样本
+
+051809_礼物互动_特殊礼物反馈
+
+### 现象
+
+严格 dry-run 检查发现该样本前 8 个 token（“欢迎每一位瑞士卷”对应拼音）均为 start=end=0；CTC TextGrid 中对应 interval 同样为零时长。音频总长约 7.336 秒，参考文本存在。
+
+### 根因与风险
+
+- tokens 和 TextGrid 虽然彼此“相等”，但共同包含不可能的时间戳。
+- 只校验 lab、tokens、TextGrid 的词序相等会把共同损坏误判为可信。
+- 不能通过平均分时长或从邻词猜测边界修复，否则会伪造声学证据。
+
+### 修复方案
+
+1. 从原音频和权威参考文本只重跑该 stem 的 CTC。
+2. 要求每个 lexical/NVV token end 大于 start，整体单调、不重叠并在音频时长范围内。
+3. 用新 bundle 替换隔离恢复副本中的同 stem 文件，不修改旧工作区。
+4. 再对 18,000 个 bundle 做严格全量验证，只有全部通过才允许恢复 lab。
+
+### 验收
+
+- 该样本不再含零时长 lexical interval。
+- 词序与权威参考一致，tokens、lab、CTC words tier 三者一致。
+- 单条重跑仍失败时必须隔离并停止全量 MFA，不得猜时长。
+
+---
+
+## Case 81: ria 合并未在三份 CTC 载体中原子同步（未闭环）
+
+状态：修复方案已记录，未闭环，暂停修复。
+
+### 现象
+
+旧 ctc_prealign.py 的 RIA safety net 将 rui4 ya4 合并为 ria 时只修改 lab 与 tokens，CTC TextGrid words tier 保持旧的两个词。当前 run_pipeline.py 已有三份同步草案，但 TextGrid 原地写入先于临时 lab/tokens 替换，异常中途仍可能留下半更新 bundle。
+
+### 根因
+
+RIA 归一化被当作普通文本替换，而 lab、tokens、CTC TextGrid 实际构成一个不可拆分的 transcript bundle。
+
+### 修复方案
+
+1. ctc_prealign 和主管线统一调用同一个三方同步函数。
+2. 先在临时文件中生成 lab、tokens 和 TextGrid，完整校验后再提交。
+3. 任一文件缺失、解析失败或词序不一致时三份都不提交。
+4. 更新后清除旧 normalize marker，重新验证并写新 marker。
+
+### 验收
+
+- rui4 ya4 或 rui4 a4 合并后，三份载体都只含一个 ria，起止时间覆盖原两个 token。
+- 在提交中途注入异常时，原 bundle 三份文件保持一致，不出现半更新。
+
+---
+
+## Case 82: normalize marker 生命周期与 MFA 入口验证不完整（已修复） (marker_content_identity_v4)
+
+状态：已修复：marker v4 嵌入 stem 数量和 manifest SHA-256 digest；`_skip_if_ctc_normalized` 解析并验证内容身份，拒绝过期/篡改 marker；`recover_ctc_labs.py` 重建 lab 后自动清除旧 marker。
+
+### 现象
+
+1. marker 是固定版本字符串，无法证明 marker 对应当前文件内容。
+2. 恢复脚本 apply 修改 lab 后没有清除旧 marker。
+3. 分步执行 normalize 链时，成功后的 marker 写入路径不统一。
+4. align 入口尚未无条件重新验证全部 CTC bundle；旧 marker 或直接指定 step=align 可能绕过校验。
+
+### 根因
+
+1. 旧 marker 被设计为简单的完成标志（常量字符串），未绑定任何内容身份证明，无法区分"本次数据已验证"和"标记残留"。
+2. 恢复脚本（`recover_ctc_labs.py`）修改 lab 后未联动清除 marker，导致下游误判数据已就绪。
+3. 分步执行模式下 normalize 链的 marker 写入分散在多个调用点，缺少统一的事务边界。
+
+### 风险
+
+损坏的 lab、tokens 或 TextGrid 可能因 marker 存在而跳过 normalize，随后进入 MFA。用户单步运行命令更容易触发该绕过。
+
+### 修复方案
+
+1. 任何 transcript 文件变更前先使 marker 失效。
+2. 只有完成全目录 strict validation 后才写 marker。
+3. marker 至少记录契约版本、stem 数量和 manifest 摘要；不能只依赖常量字符串。
+4. MFA align 启动前无条件执行快速 bundle 校验，marker 只允许优化，不允许替代验证。
+5. 缺 marker 不应自动修改数据；只表示必须验证或重新执行明确步骤。
+
+### 验收
+
+- 修改任一 lab 后旧 marker 不能让 align 继续。
+- 直接运行 step=align 遇到 Case 80 或任意三方不一致时，在清理 aligned 之前失败。
+- 恢复 apply 后 marker 被清除，重新校验成功后才产生新 marker。
+
+---
+
+## Case 83: MFA TextGrid 验证和子进程异常处理仍不充分（未闭环）
+
+状态：修复方案已记录，未闭环，暂停修复。
+
+### 现象
+
+当前分片草案通过搜索 name = words 和 name = phones 判断输出存在 tier。损坏、截断或 interval 非法的 TextGrid 仍可能包含这两个字符串。单进程和分片路径的检查粒度也不完全一致。
+
+### 根因
+
+1. MFA 分片验证采用字符串包含匹配（`"words" in content`），而非结构化 TextGrid 解析，无法检测语法损坏。
+2. 单进程路径和分片路径各自实现了不同的验证逻辑，未收敛到统一的 validator。
+3. 子进程异常（OSError、超时、信号退出）未被系统捕获并转换为结构化失败报告，部分失败模式静默。
+
+### 修复方案
+
+1. 使用项目 TextGrid parser 真正解析每个输出。
+2. 校验 tier 唯一性、interval 数量、非负时长、单调性、音频边界和必要词面。
+3. 统一单进程与分片的验证和 manifest 生成。
+4. 捕获进程启动 OSError、超时、信号退出及返回码异常，全部写入结构化失败报告。
+
+### 验收
+
+- 只有 tier 名字符串但语法损坏的文件必须失败。
+- words 存在而 phones 缺失、interval 倒置或超出音频时长都必须失败。
+
+---
+
+## Case 84: 裸词 unk 被一律当作 MFA unknown，可能误伤真实英文词（未修复）
+
+状态：问题已定位，未修复。
+
+### 现象
+
+当前 unknown helper 同时识别 <unk>、[bracketed] 和裸词 unk。裸词 unk 可能是参考文本中的真实英文拼写，不能仅凭字符值判为 MFA 占位符。
+
+### 根因
+
+1. `is_unknown_token()` 在 `pipeline_utils.py` 中的实现过于宽泛，将裸词 `unk` 与 MFA 明确占位符 `<unk>` 等同处理。
+2. 缺少参考文本对照和 MFA phone 上下文（是否为 `spn`）的二次确认，纯字符匹配无法区分"MFA 对齐失败的占位符"和"参考文本中的真实英文词"。
+
+### 修复方案
+
+1. 默认只识别 MFA 明确占位格式，例如 <unk>。
+2. 对裸词 unk 必须结合参考文本、MFA phone=spn 或解析器元数据判断。
+3. NVV 标签在 unknown 判断前优先分类，避免合法标签误入 unknown。
+
+### 验收
+
+- 参考英文句中真实的 unk 保持英文词。
+- MFA 输出的 <unk> 仍可触发 CTC 词面回填和 mfa_unknown_source 硬失败。
+
+---
+
+## Case 85: nvv_enabled=false 与 NVV 发现需求存在配置冲突（待确认）
+
+状态：待确认并修复。
+
+### 现象
+
+hecheng_ria_0805.yaml 当前设置 ctc_prealign.nvv_enabled=false。该设置会关闭从音频中发现额外 NVV 的能力。
+
+### 根因
+
+1. 配置层面未区分"参考文本已标注的 NVV（应始终保留）"和"需从音频自动发现的 NVV（受 nvv_enabled 控制）"两种语义。
+2. `nvv_enabled` 作为一个统一开关同时影响 blank-frame NVV bias 和 NVV token 的发现/保留逻辑，导致关闭自动发现时可能连带影响参考标注 NVV 的贯穿。
+
+### 边界说明
+
+- 如果权威参考文本已经显式包含 NVV，关闭自动发现不应删除这些标签；它们必须沿参考文本贯穿 CTC、MFA 占位和最终 tiers。
+- 如果业务要求从音频自动发现参考文本中未写出的 NVV，则当前配置不满足要求，必须启用并单独评估误检和漏检。
+- 无论是否自动发现，NVV 都不计入 CJK 与拼音一一对应数量。
+
+### 修复方案
+
+1. 明确本批次 NVV 的权威来源：参考标注、音频自动检测，或两者合并。
+2. 参考标注始终保留；自动检测结果必须记录来源和置信策略，不能覆盖参考词序。
+3. 为 NVV 建立独立的标签顺序、数量、边界和格式 QC。
+
+### 验收
+
+- 参考文本中的每个 NVV 在最终 words、hanzi/raw 展示层按契约保留。
+- 若启用自动发现，新增标签有独立 provenance，且不会造成汉字拼音计数误报。
+
+---
+
+## Case 86: 18,000 条音频只有 17,999 条权威参考文本（待补参考或隔离）
+
+状态：已修复。`--no-nvv` 参考文本模式下，无参考文本的 stem 直接跳过不处理（不退回 ASR），管线正常继续。`ctc_prealign.py` line 1466–1472。
+
+### 缺失 stem
+
+036000_弹幕互动_回应吐槽弹幕
+
+### 现象与风险
+
+现有流程对该文件退回 ASR 文本，因此一个批次中混入了两种文本权威级别。若仍以与其余 17,999 条相同的标准发布，会破坏”参考文本是唯一权威”的契约。
+
+### 根因
+
+1. 管线在 `{stem}.txt` 缺失时静默退回 ASR 解码文本（`_text_cn.txt`），未区分”有权威参考”和”ASR fallback”两种质量等级。
+2. 缺少批次级的 reference_source 枚举和 manifest 记录，17,999 条 reference 和 1 条 asr_fallback 在同一个 output 目录中不可区分。
+
+### 修复方案
+
+优先级如下：
+
+1. 从源数据补齐对应 txt，并按完整参考模式重跑。
+2. 若无法补齐，将该 stem 显式隔离为 missing_reference，不进入权威参考批次。
+3. 只有业务明确接受 ASR fallback 时，才能另建不同质量等级的交付，并在 manifest 标明 reference_source=asr_fallback。
+
+### 验收
+
+- 全量 manifest 对每个 stem 明确记录 reference_source。
+- 权威参考批次中不存在静默 fallback。
+- 若要求最终必须交付 18,000 条，则补齐该 txt 是前置条件。
+
+---
+
+## Case 87: 只运行 postprocess --overwrite 无法修复上游污染（操作风险）
+
+状态：操作风险已记录，非代码缺陷。
+
+### 现象
+
+用户命令指定 step=postprocess。overwrite 只覆盖该步骤将要写出的后处理文件，不会重新生成 ctc_pretg、lab、aligned 或英文 MFA 结果。因此：
+
+- 18,000 个污染 lab 不会改变；
+- 17,861 个含 unknown/spn 的 aligned 不会改变；
+- 缺失的 139 个 aligned 不会补齐；
+- 后处理最多能回填展示词面，无法恢复真实 phone 对齐。
+
+### 根因
+
+1. `--step postprocess --overwrite` 只覆盖后处理阶段产物，上游步骤（CTC prealign、normalize、MFA align）的缓存/输出被复用。
+2. 管线设计允许任意步骤独立运行，但缺少跨步骤的产物版本校验——后处理不检查上游 CTC lab 是否已被 cn2an 污染或 MFA aligned 是否包含 unknown/spn。
+3. 这是操作流程风险而非代码逻辑 bug：正确的修复需要从污染源（CTC lab）开始全链路重跑，而非单独重跑后处理。
+
+### 修复后的正确运行边界
+
+恢复工作必须使用新工作区和版本化输出，从严格验证或恢复后的 CTC 开始重新执行 normalize、MFA align、English align 和 postprocess；不得在旧 0805test 上原地覆盖。
+
+### 命令行注意
+
+Shell 多行命令中的反斜杠必须是该行最后一个字符。反斜杠后若存在空格，续行可能失效。正式运行前应保存并回显完整解析后的参数。
+
+### 验证方法
+
+此案例为操作风险文档，不涉及代码修改验证。预防措施：
+- 全量重跑应使用新工作区和新 `--output-dir`，不在旧目录上 `--overwrite`。
+- 运行前用 `recover_ctc_labs.py --dry-run` 预检上游 CTC bundle 完整性。
+- 在 `run_pipeline.py` 中通过 marker 版本化阻止过期产物被误用（见 Case 82）。
+
+---
+
+## 暂停后的统一修复方案（仅记录，尚未执行）
+
+### 阶段 0：冻结问题现场
+
+1. 保留原工作区 /mnt/nvme3/mfa_workspace_ria_0805 和 NAS /mnt/Raw/0805test 不变。
+2. 保存旧 report、CTC/MFA stem manifest、NAS 文件清单和问题样本。
+3. 所有恢复只在新工作区与新版本输出目录进行。
+
+### 阶段 1：完成代码契约与回归
+
+1. 完成 Case 72 至 87 的代码复审，尤其是 RIA 三方原子同步、marker 生命周期、MFA 入口校验和真正版本化发布。
+2. 建立 tone 1–5、unknown、NVV、标点、句首 <sp1>、纯英文、混合英文、缺参考和零时长 token 回归。
+3. 单进程和分片 MFA 使用同一输出验证器。
+
+### 阶段 2：隔离恢复 CTC
+
+1. 只重跑 Case 80 的 051809 CTC，不猜测时间。
+2. 处理 Case 86：补齐 036000 参考文本或明确隔离。
+3. 将旧 CTC 复制到新工作区，在副本上从已验证 tokens 重建 17,999 个损坏 lab。
+4. 对全部目标 stem 验证 lab、tokens、CTC words 三方词序以及时间合法性。
+
+### 阶段 3：小规模 canary
+
+选择至少包含以下类型的样本：
+
+- 036022：中文、Claude、dancer、ria 混合；
+- 051809：历史零时长 CTC；
+- 含 NVV、标点和句首 <sp1>；
+- 纯中文、纯英文、混合英文；
+- 036000 或其 missing_reference 隔离路径。
+
+canary 必须从新 CTC 工作区运行到 MFA 和 postprocess，不能只跑 postprocess。
+
+### 阶段 4：全量新工作区重跑
+
+1. 生成冻结的 expected stem manifest。
+2. 在全新 aligned、en_phones、output 和 filtered 目录运行。
+3. 持续监控每 shard 退出码、日志、GPU/CPU 进程、产出计数和超时。
+4. 任一阶段失败立即停止后续发布，不使用 force 掩盖失败。
+
+### 阶段 5：版本化发布
+
+1. 只将通过 hard integrity 的 output 发布到全新 NAS 版本目录。
+2. filtered、error、logs、report 和 manifest 保存在同 run id 的审计目录，但 filtered 不混入交付 output。
+3. 发布后重新核对文件集合、大小和 manifest。
+
+---
+
+## 全量验收矩阵
+
+| 层级 | 必须满足 |
+|---|---|
+| 数据全集 | 每个 WAV 都有明确 reference_source；缺参考不得静默 fallback |
+| CTC transcript | lab、tokens、CTC words 词序完全一致 |
+| CTC 时间 | lexical/NVV interval 均为正时长、单调、在音频范围内 |
+| 声调 | 拼音只使用 tone 1–5，不得出现 ma一、rui四 等污染 |
+| RIA | lab、tokens、CTC TextGrid 同步为一个 ria |
+| MFA 数量 | aligned stems 与 expected stems 精确相等 |
+| MFA 结构 | words、phones tier 可解析，lexical 内容不得来自 unknown/spn |
+| 参考覆盖 | 每个汉字恰有一个带调拼音，字符序列与权威参考一致 |
+| NVV | 标签按权威来源保留并独立校验，不计入拼音数 |
+| 标点 | 顺序与参考一致，不因计数或 snap 被删除 |
+| 句首静音 | 恰有一个 <sp1>，位置在句首 |
+| 英文 | 拼写来自权威参考，音素来自 English MFA 或明确失败 |
+| 报告 | expected stem 每条恰有一行；无重复、无遗漏 |
+| 输出集合 | output 与 filtered 互斥，并集等于 expected；error 使整次运行失败 |
+| tone mapping | 与本次 run id 同目录并纳入 manifest |
+| NAS | 全新版本目录，文件集合与发布 manifest 完全一致，无陈旧文件 |
+| 进程状态 | 任一 hard failure、缺 stem、超时或解析失败均向上传递非零退出码 |
+
+### 当前结论
+
+现有 /mnt/Raw/0805test 不能作为合格 MFA 结果交付。0 pinyin vs N reference CJK 是本批次上游 transcript 和 MFA 对齐整体损坏的直接信号，不是 NVV、标点或句首 <sp1> 导致。所有修复、测试和运行工作现已按用户要求暂停；恢复执行前应先以本节为唯一问题清单逐项确认。
+
+## Case 88: strict-ok v3.1 独立发布门禁（2026-08-06）
+
+**日期**: 2026-08-06
+**涉及文件**: scripts/audit_strict_ok.py, scripts/verify_strict_ok.py, scripts/run_pipeline.py
+
+### 现象
+
+旧发布流程中，后处理 QC 的 `status=ok` 直接决定文件进入 output 目录，NAS 发布依赖进程内判断
+而无独立磁盘级交叉验证。发布后的文件集合缺少可审计的 manifest，陈旧文件可能混入交付目录
+（见 Case 78）。
+
+### 根因链
+
+1. 后处理 report 的 `ok/filtered/error` 分类完全依赖进程内 QC 逻辑，无外部验证。
+2. NAS 发布为增量复制到固定目录，不校验目标文件集合与本次运行结果的一致性。
+3. output/filtered 共享目录可被多次运行复用，缺少 run-id 级别的隔离。
+4. 无发布 manifest 记录交付文件的 identity（路径、大小、SHA-256），交付后无法审计。
+
+### 修复方案
+
+- 新增 `scripts/audit_strict_ok.py`：独立磁盘 auditor，从 output 目录重读 TextGrid、WAV、
+  权威参考、CTC bundle、MFA aligned 来源及 postprocess report，逐文件交叉验证；报告阳性
+  只可否决，不能证明通过。
+- 新增 `scripts/verify_strict_ok.py`：strict manifest 验证器，拒绝文件或集合漂移。
+- output/filtered 使用同一 run-id 的私有目录且集合守恒（并集等于 expected，交集为空）；
+  二次失败会原子隔离到该 run 的 filtered，safe_empty 明确不可发布。
+- manifest 记录 strict-ok-v3.1 契约版本、最终 TextGrid/参考 SHA-256、英文 MFA 自包含证据、
+  已执行检查与未评估的主观声学自然度。
+- 版本发布仅接受有效 strict manifest，且目标必须是新的 `<configured>.runs/<run_id>` 目录。
+
+### 验证方法
+
+```bash
+python scripts/verify_strict_ok.py <strict_ok_manifest.json> <output_dir>
+# 预期: 0 errors，manifest 文件集合与实际目录完全一致
+python scripts/audit_strict_ok.py --require-expected-counts
+# 预期: 独立重读验证通过，文件身份与 manifest 一致
+```
+
+状态：实现草案经 root 复审，待真实 canary；未对旧 NVMe/NAS 结果运行或发布。
+
+---
+
+## Case 89: 旧英文空 phones 被 fallback 伪装为可用音素
+
+### 现象
+
+旧英文产物中有 10,742 个 JSON 文件出现 `phones: []`。旧后处理路径可在英文 MFA 没有提供可验证 phone 时，改用 CMU/G2P 词典序列或在词区间内等分时间；最终 TextGrid 外观完整，却不能证明 phone 标签和边界来自该条音频的 English MFA 对齐。
+
+### 根因
+
+旧契约只验证“最终是否有英文 phone”，没有验证“每个 phone 是否逐项来自本次成功的 English MFA 源 TextGrid”。同一个词典序列既被当作发音先验又被错误地当作声学对齐证据，空 phone 因而能够被补齐后进入通过集。
+
+### 修复方案与状态
+
+1. 严格模式使用 `strict-en-mfa-v1` 全局 manifest 和逐 stem ledger，冻结 CTC full-tier ordinal、segment/word ID、源 TextGrid 路径与 SHA-256。
+2. 最终英文 phone 必须与源 MFA ARPABET 序列完全一致，时间只能由源 word/phone 区间做仿射映射；CMU、G2P、自引用词面和等分时间只允许存在于非严格兼容路径。
+3. 任一英文 segment 缺源、空 phone、未知 phone、错序、越界、哈希不符或局部拒绝，只过滤受影响 stem；不得生成 fallback phone。
+4. 独立 auditor 再次重读 CTC、源 MFA TextGrid 和最终 TextGrid，不信任后处理自报。
+
+状态：合成回归已覆盖空 phone、缺源、哈希篡改、重复英文词和中英文分隔；仍须以真实 canary 和全量输出确认。旧英文结果不能因外观完整而追认通过。
+
+---
+
+## Case 90: 英文批次分母不一致与混合缓存污染风险
+
+### 已确认盘点
+
+- 权威源目录 `/mnt/Raw/新版合成英文数据`：54,000 个 WAV，53,998 个 txt。
+- 精确缺参考 stem：`024198_杂谈互动_数据里程牌庆祝`、`036000_弹幕互动_回应吐槽弹幕`。
+- 旧 `/mnt/nvme3/mfa_workspace/ctc_pretg` 有 54,000 个六件套 CTC bundle。真实只读分类为：7,204 条标准 TextGrid 可原样复制，46,586 条通过共享 transcript 契约但属于 Case 93 的精确旧畸形格式、须在隔离目录规范化，208 条共享契约硬错误必须从原音频重跑。
+- `/mnt/nvme3/mfa_audio_cache` 有 84,788 个 WAV，manifest 指向另一来源 `/mnt/Raw/shayi_huali_wav`，不是本批次权威音频集合。
+- 旧 aligned 仅 53,364 条，不能作为 53,998 条目标分母的完整输入。
+
+### 风险
+
+若用 54,000 WAV 当权威参考分母，会让 2 条缺 txt 静默退回 ASR；若使用 84,788 条混合 cache，会把其他数据集音频混入本次运行；若直接复用全部旧 CTC，会让 208 条严格无效 bundle 进入后续 MFA。
+
+### 修复方案
+
+目标分母固定为 53,998 条有权威 txt 的 stem，2 条缺参考明确排除并写入 manifest。只在全新 run root 中处理旧 bundle：7,204 条标准 bundle 普通复制，46,586 条按 Case 93 的严格、可证明转换方案只规范化 TextGrid，精确 208 条从原音频单 GPU 重跑；三类结果都必须得到标准 parser 可读、集合精确相同的六件套，再合并为 53,998 条 ready 集。禁止使用混合 audio cache，也不得修改旧 CTC、旧 aligned 或旧 NAS 输出。
+
+状态：2026-08-06 已完成三轮真实只读盘点，确认 54,000 WAV、53,998 txt、2 个指定缺参考、0 个 txt-only，以及 7,204/46,586/208 的精确三类分布。run root 仍不存在。准备器尚未实现严格旧格式规范化，当前不得据此写入生产数据。
+
+---
+
+## Case 91: strict-en-mfa-v1 来源链的局部/全局失败语义不完整
+
+### 复审发现的问题
+
+1. 全局 manifest 若把一个可局部过滤的 segment rejection 当作整批失败，会不必要地阻断其他可证明正确的 stem；反之，MFA 非零、超时、启动异常、非空 exception、模型/词典哈希失败若只做局部拒绝，会让未知全局状态进入通过集。
+2. 仅比较 ledger 中的 phone 列表属于自证；auditor 必须重读源 English MFA TextGrid。
+3. segment ID/ordinal 若未绑定唯一、同名的源 TextGrid，相同英文片段可能复用错误来源。
+4. 最终 words 内的英文 phone 即使正确，其他位置额外出现 `en:` phone 仍是污染。
+5. 逐 stem 直接复制证据时，后续全局失败可能留下孤立 `_provenance`，不能把未完成证据误认为可发布证明。
+6. 所有英文段均因过短等本地原因拒绝时，虽然 MFA 不启动，仍必须能哈希实际模型和配置词典；纯中文 `no_english` 才允许完全不依赖英文模型。
+
+### 契约
+
+- 全局异常：整次审计非零、不可发布。
+- 局部英文来源异常：只过滤含异常 segment 的 stem；其他 stem 仍需逐条独立证明。
+- 通过 stem：CTC full ordinal、ledger、源 MFA words/phones、最终 words/`en:` phones 和证据副本形成一一对应闭环。
+- filtered 结果不纳入准确性结论，但必须与 output 互斥且并集守恒。
+
+状态：producer、postprocess 与 auditor 的合成 P0 回归及 root 独立复跑均已通过；仍待 Case 92/93 runner 与真实 canary 验收。
+
+---
+
+## Case 92: 最新英文配置和隔离 CTC 准备器存在执行级风险
+
+### 根审查发现的问题
+
+初版准备器虽然能粗分类旧 bundle，但生成了 `ctc_prealign.py` 不支持的 `--stems-file`，遗漏必需的 `--pinyin-dir`，并使用了与“208 条隔离单 GPU 重跑”不一致的 `--all-gpus`。它还可能把 repo 词典直接交给会追加英文词条的 CTC 脚本，缺少 `use_cache: false`，只核对部分计数，未完整证明 source/destination copy equality、精确 rerun stem set 和 ready 产物哈希。后续真实盘点又发现 Case 93 的 46,586 条旧格式规范化需求，以及主管线 link 使用 symlink/hardlink 会被 pad/normalize 穿透改写 ready 源集。
+
+### 修复方案
+
+1. 配置固定 `ctc_ready`、全新 workspace、`use_cache: false`、`output_staging: false`、strict English provenance、MFA timeout 7200 秒和 G2P timeout 600 秒。
+2. prepare 创建 run-local 普通词典副本并记录源/目标 size 与 SHA；CTC 重跑只写 run-local 字典。
+3. 生产门禁精确检查 54,000 WAV、53,998 txt、53,998 authoritative、2 个指定 missing-reference stem、0 个 txt-only stem。
+4. 重跑命令只作用于隔离的 rerun audio 目录，提供 `--pinyin-dir`，默认 `--device cuda:0`，保留 NVV。
+5. finalize 必须在复制前验证重跑输出 stem set 精确等于待重跑 set；任何 extra、missing、损坏、symlink、路径逃逸或冲突都非零停止。
+6. ready manifest 记录全部音频和 CTC 六件套哈希，并由 read-only `verify-ready` 重读磁盘复核。
+
+状态：准备器第一轮 P0 已通过合成回归，但 Case 93 规范化、主管线普通复制/精确 evidence 分母、MFA 工作词典隔离仍在 Sol/Terra 完整调度中；完成前不创建真实 run root。
+
+---
+
+## Case 93: 旧 CTC writer 生成非标准双 tier TextGrid，标准 parser 得到空 words
+
+### 真实只读盘点结果
+
+2026-08-06 对 `/mnt/Raw/新版合成英文数据` 与 `/mnt/nvme3/mfa_workspace/ctc_pretg` 运行新版准备器的只读 `inspect`：
+
+- WAV 54,000；txt 53,998；权威交集 53,998；缺参考为 Case 90 的精确 2 条；txt-only 为 0。
+- 在不创建 run root、不修改任何源文件的前提下，准备器首轮标准 named-tier gate 将 53,998 条全部判为不可直接使用，因此得到 `legacy_valid=0 / needs_rerun=53,998`，触发生产停止条件。
+- 三条抽样均为 `words/tokens count mismatch`。例如 `000000_直播流程_开场介绍` 的共享旧校验器返回无错误，tokens 有 43 条，而标准 parser 得到 words tier 0 条、pauses tier 81 条。
+
+### 根因
+
+旧 writer 的原始顺序为：
+
+```text
+name = "words"
+intervals: size = 43
+item [2]:
+intervals [0]: ... "rui4"
+...
+name = "pauses"
+intervals: size = 38
+```
+
+也就是在写完 words 的数量声明后、真正写 words intervals 之前提前插入 `item [2]`。标准 parser 因而把后续 43 个实词 interval 归入第二 tier，并在读到 `name = "pauses"` 后继续把 38 个 pause interval 追加到同一 tier。旧共享 reader 与 English `parse_textgrid_simple` 只是按 `name="words"` 到 `name="pauses"` 的文本顺序宽松扫描，所以仍能恢复 43 个词；这解释了旧版为何曾估计 53,790 条“有效”。当前 `ctc_prealign.py::write_textgrid` 的写入顺序已经正确，但旧 54,000 个文件不会自动修复。
+
+### 风险
+
+1. MFA/English 分段若使用宽松 reader，可能继续工作；独立 auditor 使用标准 tier parser 时会得到空英文集合或 ordinal 错位，两条路径对同一文件产生矛盾解释。
+2. 直接放宽标准 parser 会把未知结构损坏也当作已知 writer bug，扩大伪通过面。
+3. 直接把 53,998 条全部送 GPU 重跑成本高且混淆“格式恢复”和“声学重算”；但未经证明的文本重写也不能替代真正无效的 208 条 CTC。
+
+### 精确分类补充
+
+随后用共享六件套契约与独立标准 parser 重新只读分类全部 53,998 条：
+
+- 7,204 条：标准 words/pauses tier，可由通用 parser 正确读取；
+- 46,586 条：共享 transcript 契约通过，但属于上述唯一旧畸形 grammar；
+- 208 条：共享契约已失败，主要含零时长 token，必须声学重跑。
+
+TextGrid 与 `_tokens.jsonl` 必须有相同 lexical 词序和对应 start，但不能错误要求每个 end 完全相等：当前 writer 的 TextGrid word end 使用下一 lexical word start/CTC end，而 tokens 的中间 end 可受标点 start 影响，最后 end 会由 VAD 重估。两套 end 各自都必须正时长、单调且在音频内，规范化旧 TextGrid 时须保留旧 TextGrid 自身的 lexical start/end，不得用 tokens end 猜写。
+
+### 待实施的严格方案
+
+1. 只识别并接受这一种精确旧畸形模式；任何 tier 顺序、数量或字段不同均拒绝。
+2. 对候选逐项比较旧 words interval 与 `_tokens.jsonl` 的词面和 start；两种容器分别要求正时长、有限、单调、不重叠并在对应 WAV 时长范围内。只有已知旧畸形 writer（其 words 确由 tokens 重写）才额外要求 end 一致；标准 writer 不作跨容器 end 等值要求。同时继续执行 lab/tokens/reference 三方契约。
+3. 对满足上述证明的 46,586 条候选，只在 fresh run root 中确定性写出标准 named `words`/`pauses` tiers；源 TextGrid、tokens、音频和目标 TextGrid 的路径、size、SHA-256 与转换版本全部进入 evidence。不得原样覆盖旧文件。7,204 条标准文件普通复制并证明 source/destination 相等。
+4. 规范化后必须由标准 parser 重读；唯一 words tier 的非空 interval 必须保留已证明的旧 TextGrid 词面/start/end，并与 tokens 的词面/start 对应。full-tier ordinal 以后只以规范化文件为准。
+5. 不能满足精确旧模式或任一内容/时间检查的 stem 才进入原音频 CTC 重跑集合；重新计算后才能确认是否仍为 53,790/208。
+6. pauses tier 必须由精确旧 grammar 状态机单独恢复并验证数量、正时长、单调和音频边界；不得把标准 parser 当前看到的 81 条合并 tier 直接复制为合法 pauses。无法无歧义恢复的 stem 转入重跑。
+
+状态：问题已定位并进入 Sol high 架构复审；尚未实施转换、未创建 run root、未启动 GPU。
+
+---
+
+## Case 94: v3 首版严格解析器没有忠实实现真实旧 grammar
+
+### 主审发现与真实证据
+
+在接受 Terra 的第一版 `hecheng-english-ctc-ready-v3` 实现前，root 直接只读检查了真实文件
+`/mnt/nvme3/mfa_workspace/ctc_pretg/000000_直播流程_开场介绍.TextGrid`。真实旧格式为：
+
+1. `name = "words"` 后直接出现 `intervals: size = 43`，words tier 没有自己的 `xmin/xmax`；
+2. 随后提前出现 `item [2]` 和 `class = "IntervalTier"`；
+3. words interval 使用零基编号 `intervals [0]` 至 `intervals [42]`；
+4. words 结束后才出现 `name = "pauses"`，pauses tier 带有 `xmin/xmax`，其 interval 使用一基编号。
+
+首版状态机却要求 words tier 先有 `xmin/xmax`，并要求 words interval 从 1 开始。因此它虽然测试通过，仍会把真实 46,586 条可证明恢复的旧文件全部拒绝。测试 fixture 复制了实现的错误假设，而不是生产文件的精确语法。
+
+同一次主审还发现三项相关缺陷：
+
+- CTC 六件套缺文件时，`classify_ctc_bundle` 返回单个 `errors` 列表，而调用方按三元组解包，缺文件会从预期的严格分类失败变成异常崩溃；
+- `_canonical_words` 从 `_tokens.jsonl` 取词的 start/end，违反 Case 93 已冻结的转换契约。即使 token end 与旧 TextGrid end 只相差容差内数毫秒，目标文件也必须逐值保留旧 TextGrid lexical start/end，不能用 token end 代写；
+- 标准 TextGrid 检查只要求能找到唯一 `words`/`pauses`，未拒绝第三个未知 tier、错误 tier 顺序或 tier domain 与全局 domain 不一致，证据边界不够封闭。
+
+### 影响
+
+若直接执行生产 `inspect`，分类计数将偏离已独立确认的 7,204 / 46,586 / 208，导致不必要的 46,586 条 GPU 重跑或生产门禁停止。若仅放宽计数继续，规范化目标又会丢失旧 lexical end 的逐值来源证明，不能成为 strict-ok 的可信 CTC authority。缺文件分支还可能绕过结构化错误报告。
+
+### 修复与验收方案
+
+1. 状态机只接受上述“words 无 domain + 零基 words + 一基 pauses”的唯一生产 grammar；注入 words domain、把 words 改为一基、缺/多 interval 或追加尾字段均须拒绝。
+2. 缺文件路径固定返回 `(None, errors, None)`，并用缺任一六件套的 fixture 验证不会崩溃且归入 rerun。
+3. canonical words 从解析出的旧 `words` interval 构建；tokens 只用于词面/start/end 容差证明和 token→规范 full-tier ordinal 映射。测试必须构造旧 end 与 token end 不同但在容差内的样本，并断言输出精确保留旧 end。
+4. 转换 evidence 增加固定 parser signature、transform version、word count、pause count，并由 `verify_transforms` 逐项重算/拒绝篡改。
+5. 标准输入和规范化输出都只允许顺序严格为 `words`、`pauses` 的两个 tier，两个 tier domain 均须等于全局 domain。
+6. 先通过合成回归，再重新执行真实只读 `inspect`；只有计数精确回到 7,204 / 46,586 / 208 才允许创建 fresh run root。
+
+状态：已在任何生产写入前阻断，并退回 Terra 修复；真实 run root 仍未创建，GPU 尚未启动。
+
+---
+
+## Case 95: 历史 padding 原地污染旧 CTC 时间轴，真实 v3 分类再次失败
+
+### 真实门禁结果
+
+Case 94 合成回归通过后，root 于 2026-08-06 执行只读生产门禁：
+
+```bash
+python scripts/prepare_hecheng_english_ctc_ready.py inspect --require-expected-counts
+```
+
+命令逐条读取 53,998 个权威 stem，约 24 分钟后以非零退出：
+
+```text
+actual=(54000, 53998, 53998, 2, 0, 9, 70, 53919)
+expected=(54000, 53998, 53998, 2, 0, 7204, 46586, 208)
+```
+
+生产 run root 在此之前和之后都未创建，GPU 未启动。门禁正确阻止了错误的准备结果。
+
+### 样本证据与根因链
+
+`000000_直播流程_开场介绍` 的权威 WAV 位于
+`/mnt/Raw/新版合成英文数据/雪狐桑/`，时长为 12.480 秒；其 SHA-256 与
+`/mnt/nvme3/mfa_audio_cache_ria/雪狐桑/` 中的缓存副本完全相同。旧 CTC 却有：
+
+- TextGrid 全局域：`0.208–12.688`，跨度恰好仍为 12.480 秒；
+- tokens 首词从 0.718 秒开始，末尾标点到 12.688 秒；
+- 历史 `padded_audio` 时长仅为 12.392 秒。
+
+历史 `pad_silence_edges.py` 会直接修改传入的 `ctc_pretg`：根据头部补/裁得到一个 `time_offset`，把 TextGrid、tokens 和 punct 的所有时间统一平移并将负数截到 0；但尾部静音裁剪只缩短音频，不同步修正/限制 CTC 末端。本样本原始 CTC 显然被整体加了 0.208 秒，随后 padded WAV 又在尾部缩短约 0.296 秒。因此旧 `ctc_pretg` 已不是与权威源 WAV 同轴的原始声学结果，也不与历史 padded WAV 自洽。
+
+首版 v3 准备器把“区间必须落在权威 WAV 的 0–duration”作为正确门禁，因而真实分类仅剩 9 条标准、70 条可规范化，其余 53,919 条被拒绝。这不是可以通过放宽越界判断解决的问题；必须先证明每个 stem 的历史平移及信息是否可逆，再决定确定性重基或声学重跑。
+
+### Sol high 最终实现审计同时发现的准备层 P0
+
+1. 旧畸形 parser 仍错误要求 TextGrid lexical end 与 token end 相等；冻结契约只允许跨容器比较词面、顺序和 start，同时要求各容器自身时间合法。
+2. 标准路径没有独立证明 token 时间有限、正时长、单调并在对应音频轴内。
+3. `finalize` 用双模式校验 rerun 输出，可能接受旧畸形 grammar 后原样复制；rerun 和最终 ready 都必须严格为标准 grammar。
+4. transform identity 未把 `source_audio` 绑定到该 stem 的权威 WAV，存在跨 stem 音频替换空间。
+5. standalone `verify-ready` 只做 stems 的 set equality，重复或乱序列表可能由准备器自身漏检；类别列表也应精确、排序、唯一。
+
+### 重新定界方案
+
+1. 对全部 stem 只读统计 `(TextGrid xmin, xmax, WAV duration)`、tokens/punct 极值及历史 padded WAV；按可证明的共同平移、发生负值截断、尾裁越界和其他结构错误分类，不沿用 7,204/46,586/208 作为未经复核的生产事实。
+2. 只有当源音频 SHA 与权威 WAV 相符、CTC 全部时间字段共享唯一可逆偏移、重基后所有容器落在 0–duration 且词面/start 契约成立时，才允许在 fresh run root 中同时转换 TextGrid、tokens 和 punct，并记录每个字段的旧/新哈希、偏移和变换版本。
+3. 发生 `max(0, t + offset)` 信息丢失、无法唯一推导 offset、重基后仍越界/重叠/零时长，或任何 transcript/grammar 错误的 stem 必须从权威 WAV 声学重跑，不得猜测修补。
+4. 修复 Sol 审计的五项准备证据缺口，增加真实时间轴 fixture、畸形 rerun、跨 stem source audio、重复/乱序 evidence 列表回归。
+5. 重新执行真实只读 inspect 并冻结新的精确分类计数；只有新分类可由独立统计复现且全套回归通过，才允许创建 run root。
+
+状态：生产继续阻断；runner 隔离层通过 Sol 审查，但准备层和旧 CTC 时间轴未获接受。
+
+### Sol high 最终重定结论
+
+旧 manifest 只有旧 audio 路径、duration、words/pauses，没有输入音频 SHA、head/tail、offset 或 new-duration 记录。它能佐证 `000000` 的 `+0.208s` 原地平移，却不能把旧 CTC 声学来源绑定到与权威 WAV 字节相同的输入；负 offset 又经过 `max(0, t + offset)`，存在不可逆截断。因此 v3 被正式废弃，不采用 `9/70/53,919` 作为新生产分类，也不再猜测恢复旧 CTC。
+
+本批次采用最小安全 v4 路径：
+
+1. schema 升级为 `hecheng-english-ctc-ready-v4`，最终音频轴固定为未改动的权威 WAV；
+2. 53,998 个有权威参考的 stem 全部标记为 `acoustic_rerun`，原因统一为 `legacy_audio_provenance_unbound`；
+3. fresh CTC 直接在 run-local `audio_view` / `reference_view` 上多 GPU 生成，旧 CTC 不进入任何生产 ready artifact；
+4. rerun 和最终 ready 只接受标准双 tier grammar，并独立验证 TextGrid、tokens、punct 的有限、正时长、时序、毫秒/秒一致性与音频边界；跨容器只比较词面/顺序/start，不比较 end；
+5. v4 strict runner 禁止并省略 downstream `pad_silence`。若未来必须统一 0.5 秒边缘静音，应先生成 append-only padded audio、冻结其样本/hash，再在该音频上生成 CTC；不得在 CTC 之后改音频；
+6. v4 evidence 与独立 verifier 绑定全量 stem、action taxonomy、权威源/运行副本音频身份、WAV frames/rate/channels、参考、六件套、运行词典及精确 namespace；
+7. 只有全量 fresh CTC、finalize、独立 verify-ready、SHA/taxonomy pin 全部通过，才进入 canary/full MFA。
+
+这一路径牺牲旧 CTC 复用成本，换取可机器证明的单一时间轴和声学来源，是“通过集不得含已知机器错误”目标下的最终选择。
+
+### 多次累积 mutation 的只读溯源证据
+
+Terra 对 Git 历史、旧 manifest、权威 WAV、现存 padded WAV 与 CTC 做了逐样本只读比对，确认 Case 95 不是一次可统一反向平移的污染，而是同一个 `ctc_pretg` 被重复运行 padding 后累计修改；音频目录却只保留最后一次变换：
+
+- `000000` 权威 WAV 头静音约 0.448 秒，单次脚本应平移 `+0.052s`；现存 CTC 净移为 `+0.208s`，恰好累计 4 次。最后一次 padded 音频与权威 WAV 在映射保留区逐样本一致，但尾部删去 6,720 samples；
+- `000001` 为 `+0.244×4=+0.976s`，`001000` 为约 `+0.201333×4=+0.805332s`；
+- `005000`、`010000` 累计约 3 次；`020000`、`030000`、`040000`、`050000`、`053999` 累计约 2 次；
+- 负偏移样本 `036059` 的 manifest 首词为 0.93 秒，现存值已被 `max(0, t+offset)` 压成 0；累计净移 `-1.133334s`，信息不可逆。`036018` 同样发生两次负移并删头/删尾；
+- `000000` 现存 pause 终点可到 12.868 秒，而最后一次 padded WAV 只有 12.392 秒，证明 CTC 累积次数和音频变换次数不同。
+
+旧 `/mnt/nvme3/mfa_workspace/ctc_pretg/manifest.json` 大小为 251,014,502 bytes，SHA-256 为
+`127bb36d2645c2072c2822342ed3e34efdb8dea8e3e298e5aead5baaf5d2cabc`。它没有输入/CTC hash、head/tail、offset 或 new-duration；其中指向的 flat cache 音频已不存在，后来同路径 cache 又被替换为其他数据源。因而即使部分正偏移样本能从几何关系求出累计净移，也无法恢复每次顺序、被截断字段、被裁音频或最初声学输入身份。
+
+该证据使“全量 53,998 fresh acoustic rerun、禁止复用/转换旧 lineage”从保守选择升级为确定的生产要求。
+
+---
+
+## Case 96: v4 首版校验器与真实 CTC 产物契约不一致
+
+### 主代理接收前复核发现
+
+Sol high 已冻结“token 的 start/end 分别单调、允许相邻 token 合法重叠；punct 保留原顺序并允许重叠”的安全契约。但 v4 首版准备器与独立验证器都用“当前 start 不得早于上一个 end”判断 token/punct，会把正常 CTC overlap 误拒为时间错误，与 `pipeline_utils.load_ctc_token_entries` 的已冻结语义相矛盾。
+
+真实 `ctc_prealign.py --all-gpus` 还会对每个成功 stem 生成 `<stem>_ref.txt`，分片合并时将其移入主 rerun 目录。首版 finalize 的 exact namespace 却只允许六件套、`manifest.json` 、`summary.txt` 和 `.ctc_normalized`，因此一次完全成功的真实 rerun 也必然被 finalize 拒绝。反向地，新 writer 只在检测到标点时写 `_punct.json`，空标点样本可能缺失六件套成员；必须在正式 GPU 前用源文本盘点和合成 fixture 确认，不能等 53,998 条跑完才发现。
+
+独立 verifier 另有以下“自证”缺口：
+
+1. 未用磁盘上的 `prepare_manifest.json` 重算并校验 `prepare_manifest_sha256`；
+2. standalone 路径不重新扫描权威源目录，未把 `authoritative_audio/reference.path` 精确绑定到该 stem 在 `/mnt/Raw/新版合成英文数据` 中的实际路径；只要 evidence 指向另一份与运行副本自洽的文件就可能通过；
+3. 未重算权威 inventory/taxonomy，也未在 standalone 路径固定 54,000/53,998/2/0 和两个精确 missing-reference stem；
+4. 未拒绝 audio/reference/ready/rerun 目录的多余文件或非普通项，未证明 source/run-local dictionary 哈希始终相同；
+5. 只比较 `.lab`/tokens/TextGrid 词面，没有利用 rerun `_ref.txt` 与运行副本参考文本证明此 stem 的声学任务使用了对应权威参考；
+6. 未解析 rerun `manifest.json` 的精确 stem 集合、`audio`/`textgrid`/`lab` 路径、duration 和 `_words`，因而没有用生成器自身记录证明每个 CTC bundle 确实指向 run-local 权威音频副本；
+7. 顶层 rerun 命令虽未带 `--overwrite`，但 `ctc_prealign.py --all-gpus` 会在内部给每个子进程强制追加 `--overwrite`，且 shard 目录以 `exist_ok=True` 打开。这与本任务“不覆盖、不复用失败根”的操作契约冲突，还可在意外重启时把新旧 shard 混合；
+8. `finalize` 写出 ready evidence 后未自动调用独立 verifier，不能把“evidence 文件已存在”当成“独立验证已通过”。
+
+### 修复与验收要求
+
+1. token 要求 start/end 各自有限、正时长、分别单调且允许 overlap；punct 要求每个 interval 有效、在音频边界内并保留原数组顺序，不以区间重叠作为拒绝条件。准备器与独立 verifier 必须有一致但不共享实现的 fixture。
+2. 对真实 writer 冻结一个唯一 namespace：要么让 rerun 明确不生成 `_ref.txt`，要么将其作为每 stem 必需的 rerun 证据输入，精确校验其内容/哈希等于 `reference_view/<stem>.txt`，但最终 `ctc_ready` 仍只包含标准六件套。
+3. writer 对无标点样本也必须写入合法的空数组 `_punct.json`；增加无标点、token overlap、punct overlap 回归。
+4. v4 rerun 必须有 fresh-output 前置门禁：目标和 shard 一旦存在就在加载模型/GPU 前失败；移除 all-gpus 内部强制 `--overwrite`，失败后只能使用新 run root，不在原根上续跑。
+5. 独立 verifier 从固定/显式 `source-dir` 独立扫描 WAV/TXT，重算 exact inventory/taxonomy，按 stem 比较权威路径与哈希，重算 prepare manifest 哈希，解析 rerun manifest 并把其 audio/textgrid/lab/duration/words 与运行副本和六件套交叉核对，再重跑所有 exact namespace/dictionary/copy 校验。
+6. `finalize` 只在全量预检查和复制完成后写 evidence，然后必须调用独立 verifier；任一缺口非零停止，不得配置 pin，不得启动 MFA。
+
+### 第二轮主审仍未闭环的问题
+
+Terra 第二轮已修复 `_ref.txt`、rerun manifest、fresh-output 和权威源重扫，但 root 逐行复核后仍阻断生产：
+
+1. punct 仍被强制要求 start/end 分别单调。冻结契约只要求 punct 逐项有效、保留数组顺序并允许重叠；嵌套 overlap 可出现“后一项 end 早于前一项 end”，当前 fixture 只覆盖了 end 仍上升的重叠，没有真正证明契约。
+2. verifier 虽重扫了源 stem，却没有重算/比较 `inventory_sha256`；`prepare_manifest.json` 中的 inventory、missing/txt-only、axis/padding、action counts、`prepared_files_sha256`、exact prepared copy mapping 和 `rerun_command` 也没有全量绑定。
+3. standalone verifier 仍未执行 audio_view、reference_view、dict、ctc_ready、ctc_rerun_output 的 exact regular-file namespace 检查，多余文件或目录可通过；也未重验 audio/reference/dictionary/rerun→ready 为普通 copy 而非 hardlink inode alias。
+4. source/run-local dictionary 只各自自洽，没有要求 path 指向冻结的项目词典且 size/hash 完全相等；`.ctc_normalized` marker 内容和 summary 计数也未核对。
+5. 所有边界都共用 3 ms 容差，违反 Sol “音频轴/序列化容差与 lexical-start 3 ms 分离”的明确要求。TextGrid 全局/tier domain 应使用 WAV sample/六位小数精度，seconds↔milliseconds 使用约 0.51 ms，只有词起点交叉比较可使用 3 ms。
+6. 第二轮测试未覆盖已要求的 extra namespace、manifest tamper、authority substitution、dictionary drift/hardlink 和嵌套 punct overlap，所以“测试通过”尚不等于 Case 96 验收完成。
+
+真实源文本的附加只读盘点已确认：53,998 个 txt 全部非空、均含管线可识别标点、无日语假名，且原文字节全部恰好等于生成器的 `strip()+"\\n"` `_ref.txt` 规范。因此本数据可安全做严格 `_ref.txt` 字节等值比较，但 writer 仍应为一般无标点输入写 `[]`。
+
+第三轮实现虽已加入 inventory digest、marker/summary、词典等值和大部分 namespace 检查，但主审发现代码与“已完成”报告仍不一致：
+
+- standalone verifier 没有对 `ctc_rerun_output` 调用 exact-directory gate，因而 rerun extra 仍可通过；
+- 它没有重算 `prepared_files_sha256`、没有核对 107,997 条 prepared copy 的精确顺序/路径/evidence/inode，也没有核对 `rerun_command`；
+- 准备器的二次 `_v4_verify_copies` 未再拒绝准备后被替换成 hardlink 的目标；
+- 实际执行的 `v4_main` 仍只有重排 stem、nonfinite token 和 malformed TextGrid 等少数负例，并未实作 extra namespace、prepared-manifest tamper、authority substitution、dictionary drift/hardlink、marker/summary 错误等已要求 fixture。
+
+此外，rerun manifest 的 `duration_s` 仍使用 3 ms 比较，而该字段来自同一 WAV 的未截断 Python float，应使用 axis/serialization 容差；3 ms 仍只属于 lexical start 交叉比较。
+
+### 修复后的合成与真实只读验收
+
+第四轮实现及 root 补充回归已完成以下闭环：
+
+- 准备器专项 16 项全部通过，实际覆盖 taxonomy、fresh/no-overwrite、token/punct overlap、空 punct、authority、重排/nonfinite、prepared manifest、audio/rerun extra、跨 stem authority、marker、summary、dictionary drift、ASR command identity、hardlink 和 malformed rerun；
+- runner/import 专项 12/12 通过，覆盖 v4 evidence/tamper、full/canary 精确分母、普通 copy/inode、direct verifier、无 padding 步骤、无 padded denominator、active audio shrink 和真实配置 placeholder 阻断；
+- ASR Python 和 model path 已从 manifest 自证改为独立 verifier 的显式期望值；rerun manifest duration 改用 axis 容差；`_ref.txt` 也拒绝 inode alias；
+- scoped Python compile 通过；配置在 evidence/taxonomy SHA 仍为 placeholder 时正确非零退出，且退出前未创建 workspace。
+
+2026-08-06 执行了修复后的真实 v4 只读 `inspect --require-expected-counts`，结果成功：
+
+- WAV 54,000；TXT 53,998；权威 stem 53,998；两个精确 missing-reference；txt-only 0；
+- `action_counts={"acoustic_rerun": 53998}`，53,998 行 taxonomy 全部为 `legacy_audio_provenance_unbound -> acoustic_rerun`，stem 精确排序唯一；
+- `taxonomy_sha256=163587d39963f2f3441a4cb99315b4e4efe5d28832a6566f034c36ab8373193c`；
+- `inventory_sha256=888db5297cdc1f70dd0a86c9d3cd2678dcaf332a247df481a04bb52fe44e814f`，root 独立重算相等；
+- 完整报告 `/tmp/hecheng_english_v4_inspect_20260806.json` 为 23,943,369 bytes，SHA-256 `7f3306e27991d362d31ea54778c3ec2a49158ab2ec0c2421997f4a1478de0daa`。
+
+此检查之后 `/mnt/nvme3/mfa_runs/hecheng_english/20260806_strict_v4_0` 仍不存在，未启动 GPU。
+
+状态：Case 96 代码与真实只读 inventory 门禁已通过；生产仍冻结到 Sol high 终审和真实小样本声学 canary 通过。
+
+---
+
+## Case 97: CTC manifest 在英文归一化前冻结，最终 bundle 与 provenance 自相矛盾
+
+### Sol high 终审发现的 P0
+
+`ctc_prealign.py` 当前在主推理循环中先从归一化前的词结果构造 manifest entry，并在约第
+1774–1776 行写出 `manifest.json`；真正会修改产物的 `_normalize_punct`、
+`_normalize_numerals`、`_normalize_ria` 和 `_normalize_english` 却到约第 1856–1860 行才执行。
+其中 `normalize_english_tokens.py` 的英语合并逻辑会重写 `.lab`、`_tokens.jsonl` 和
+`.TextGrid`，可能改变词面、词数和词边界。
+
+因此，一个声学推理本身成功且最终六件套合法的 English stem，仍可能留下归一化前的
+`manifest.n_words` / `manifest._words`。v4 finalize 与独立 verifier 会把 manifest 与最终
+tokens/TextGrid 逐 stem 交叉校验，遇到实际英语片段合并时必然拒绝整批。当前
+`.ctc_normalized` marker 的验证只覆盖最终 bundle，没有同步证明 manifest 已刷新，不能封闭该缺口。
+
+多 GPU 路径也受影响：父进程合并各 shard 的 manifest；如果子进程落盘的是归一化前 manifest，
+父进程只会忠实合并过期证据，无法在顶层恢复正确 provenance。
+
+### 风险与停止条件
+
+1. 真实 6-stem 声学 canary 可能在 finalize 阶段失败；即使恰好未触发合并，也不能证明全量
+   53,998 stem 不会触发。
+2. 若放宽 v4 manifest 校验，会把生成器记录与最终交付物不一致的问题隐藏进 strict-ok 证据链，
+   违反“通过结果无机器可检测错误”的验收目标。
+3. 在修复并由回归强制触发一次英语合并前，不得启动声学 canary、生产 prepare 或全量 GPU。
+
+### 冻结的修复与验收方案
+
+1. 所有 normalizer 成功后，从最终 `_tokens.jsonl`（并与最终 TextGrid/WAV 校验）重建每个
+   manifest entry 的 `_words`、`n_words`、`n_punct` 和 `duration`；不得保留归一化前词表。
+2. 只有最终六件套全量验证成功后才原子写入最终 `manifest.json`，marker 的生成/验证顺序必须
+   保证 manifest 与 bundle 同属一次成功事务；失败不得留下可被误认成完成态的最终 manifest。
+3. all-GPU 子进程各自写出归一化后的最终 manifest，父进程仅合并这些最终 shard manifest，
+   并继续执行顶层全量 bundle/namespace 校验。
+4. 增加强制触发英语或 `ria` 合并的无 GPU 回归，断言归一化后 manifest 的词面、词数、start
+   与最终 lab/tokens/TextGrid 一致；另验证 manifest 只在后处理成功后出现或被替换。
+5. 修复后重新执行 Case 96 的 16 项准备器专项、12 项 runner/import 专项、既有 provenance/
+   reference/strict/tier 回归、compile 与 scoped diff check，并交回 Sol high 做最终 GO/NO-GO。
+
+状态：代码已实施（`_rebuild_final_manifest` 在所有 normalizer 之后从最终 `_tokens.jsonl` 重建 manifest）；已通过 `_case_manifest_rebuilt_from_final_tokens` 单元测试；待 GPU canary 集成验证。
+
+---
+## Case 98: encoder 60ms 网格时长冒充权威 WAV 时间轴
+
+### Sol high 终审发现与真实数据证据
+
+`ctc_prealign.py` 当前用 encoder 输出长度 `elens` 计算
+`duration_s = (total_frames - 4) * 0.06`，并把这个 60ms 网格值用于 TextGrid 全局域、
+punct 边界和 `manifest.duration`。它描述的是模型帧轴近似值，不是该 stem 的实际 WAV
+`frames / sample_rate`。
+
+v4 准备器与独立 verifier 则有意把最终音频轴冻结为未修改的 authoritative WAV，并要求
+TextGrid domain、tier domain 与 rerun manifest duration 在 1µs 轴容差内等于 WAV header 时长。
+两边契约不能同时成立。
+
+Sol 对真实源目录前 200 个 WAV 做只读 header 抽查，其中 122/200 的时长不落在 60ms 网格；
+常见值包括 8.80、9.44、11.84 秒，与最近 60ms 网格相差 20ms。多数样本有权威参考文本，
+包括 `036001`、`036003`、`036006` 等。因此这不是极端理论分支：fresh CTC 即使模型推理、
+词面与时间点都成功，也会因全局域/manifest 与 WAV 不同而被 v4 finalize 确定性拒绝。
+
+### 风险与停止条件
+
+1. 将 v4 的 1µs 轴容差放宽到模型帧误差会破坏“最终 bundle 精确绑定 authoritative WAV”
+   的证据契约，并允许区间真实越界，不能作为修复。
+2. 仅改 manifest duration 不够；TextGrid 全局/tier domain、punct 及所有 lexical/pause endpoint
+   都必须在同一 WAV 轴上有效。
+3. 在 writer 明确使用 run-local WAV header 且非 60ms 时长 fixture 通过前，不得启动声学
+   canary、生产 prepare 或全量 GPU。
+
+### 冻结的修复与验收方案
+
+1. 每 stem 从实际 run-local WAV header 读取 `frames / sample_rate`，将其作为唯一
+   authoritative duration，传入 TextGrid、punct 和 manifest writer；禁止用 encoder grid
+   填写容器全局域或 provenance duration。
+2. 对模型生成的 token/pause interval 定义一致的边界策略：浮点非有限、负时长或 start 超出
+   WAV domain 必须失败；仅由 encoder 最后一帧量化造成的 endpoint 超出可在写盘前明确裁到
+   WAV duration，裁后仍须保持正时长、各字段单调和既有 overlap 语义。不得靠 verifier 放宽容差。
+3. 所有最终 bundle 在写 marker/manifest 前按 WAV duration 再验证；多 GPU shard 同样逐 stem
+   使用自己的 WAV header，不得使用 batch/global 近似时长。
+4. 增加至少 1.00s 与 9.44s 的非 60ms 网格 WAV fixture，走 writer/最终 manifest 刷新到 v4
+   finalize/独立验证的关键路径；断言 TG/tier/manifest domain 精确等于 WAV，所有 endpoint 在域内。
+5. 与 Case 97 的后归一化 manifest 修复共同回归，并由 Sol high 复核后才解除 canary 冻结。
+
+状态：代码已实施（`_wav_duration_s` 使用 wave 模块读取 WAV header 时长，`_clamp_words_to_wav_axis` 强制边界策略）；已通过 `_case_wav_duration_from_header_not_encoder_grid` 和 `_case_clamp_words_to_wav_axis_enforces_boundaries` 单元测试；待 GPU canary 集成验证。
+
+## Case 99: 模型路径已固定但实际模型文件树未绑定
+
+### Sol high provenance 审计发现
+
+v4 准备器和独立 verifier 当前会检查预期 rerun command 中的 ASR Python 与 model path，
+但 `ctc_prealign.py` 的最终 manifest 没有记录模型目录的逐文件身份、模型树 digest、实际 argv、
+运行词典 digest 或输入 stem 集合 digest。现有证据证明的是“命令计划指向该路径”，并不能证明
+推理进程加载时该路径包含哪一版模型。
+
+因此，只要在相同 model path 下替换例如大型 `model.pt`，planned command、准备 manifest、
+CTC 六件套及当前独立验证仍可能全部通过。词典和权威源数据的复制/哈希链已经闭环，但模型
+这一声学决定因素尚未达到同等级 provenance。
+
+### 风险与停止条件
+
+1. 不能仅把 model path 字符串或目录 mtime 当作模型身份；同路径可变内容会让两次运行不可区分。
+2. 只在 prepare 时计算 digest 仍不够；必须由实际 CTC 进程写运行 receipt，再由 finalize/独立
+   verifier 与 prepare 冻结值交叉核对，才能证明计划与执行相同。
+3. 该项为 provenance P1，不是 Case 97/98 的即时功能崩溃原因；但若在真实 prepare 后才修复，
+   已准备或已生成的 root 缺少不可追补的执行时证据，应废弃并使用新 root。因此生产 prepare
+   与声学 canary 的最终验收必须先纳入此契约。
+
+### 冻结的修复与验收方案
+
+1. prepare 对 model directory 做 exact regular-file tree 清单，至少记录每个文件的相对路径、
+   size、SHA-256，并计算确定性 tree digest；拒绝 symlink、目录逃逸、重复/乱序或其他非普通项。
+2. `ctc_prealign.py` 由实际进程在成功后写原子 run receipt，绑定规范化实际 argv、ASR Python、
+   model path/tree digest、dictionary path/digest、输入 stem 精确排序唯一集合及其 digest；多 GPU
+   须证明所有 shard 使用同一模型/词典身份，并由父进程生成精确合并 receipt。
+3. finalize 与独立 verifier 重算当前 model tree，核对 prepare 冻结值、CTC run receipt 和实际
+   文件树三者一致；同时核对 rerun manifest stem 集与 receipt input/success stem 集无缺失或额外项。
+4. 增加模型文件内容替换但路径不变、symlink/extra/non-regular 文件、argv 漂移、词典漂移、
+   shard receipt 不一致和 stem digest 篡改的负例。任何一项必须在进入 MFA 前非零失败。
+
+状态：代码未实施（仅文档方案）。`ctc_prealign.py` 和 `pipeline_utils.py` 中均无 CTC run receipt 或 model tree digest 相关代码。必须在创建真实 prepare root 前实施。
+
+---
+
+## Case 100: blank-run pause 坐标包含 query frames，整体偏移约 240ms
+
+### Sol high 逐帧审计发现
+
+`ctc_prealign.py` 的 blank-run 检测目前在包含 4 个 query frames 的 `raw_y` 上记录 `(s, e)`；
+后续构造 pauses 时却直接使用 `s * 60ms` / `e * 60ms`，没有像 lexical forced-alignment
+路径那样切到 speech slice 或减去 `QUERY_FRAMES`。因此 pauses tier 的声学空白坐标会整体向后
+偏移 `4 * 60ms = 240ms`，尾部还可能越过实际 WAV duration。
+
+这类 pause 即使随后被简单裁到 WAV 末端，也只隐藏尾部越界，无法纠正前面所有停顿的 240ms
+系统偏移；它会污染 TextGrid pauses tier、manifest pauses 及下游停顿判断。
+
+### 修复与验收方案
+
+1. blank-run 必须在去除 query frames 的 speech slice 上检测；等价实现只能先与
+   `[QUERY_FRAMES, total_frames)` 相交，再将坐标减去 `QUERY_FRAMES`，不得只在 writer 末端减
+   一个常数而保留跨 query/speech 边界的伪 run。
+2. 转到秒轴后使用 Case 98 的 authoritative WAV duration gate：非有限、负坐标、start 超域、
+   非正时长均失败；仅不超过一个 encoder frame 加轴 epsilon 的末端量化越界可裁到 WAV 末端，
+   更大越界必须失败。pause 裁剪后重算 `duration_ms` 和 label。
+3. 增加精确 fixture：在 query frame 与 speech frame 交界处构造 blank run，断言输出 pause 从
+   speech 轴 0 开始而非 0.240 秒；另覆盖尾部小幅可裁、>60ms 拒绝和裁后零长处理。
+4. 与 Case 97/98 的 final manifest、非 60ms WAV 与 marker 事务回归共同通过后，再交 Sol high
+   终审。
+
+状态：代码已实施（`blank_runs_speech` 减去 `QUERY_FRAMES`，过滤跨 query/speech 边界的 run）；已通过 `_case_blank_run_subtracts_query_frames` 单元测试；待 GPU canary 集成验证。
+
+---
+
+## Case 101: all-GPU 父合并不是严格事务，可拼出混合或不完整完成态
+
+### 独立 Terra high 与 Sol high 审计发现
+
+`ctc_prealign.py --all-gpus` 当前收集 shard 文件时，如果主输出中同名目标已存在会静默跳过；
+读取 shard `manifest.json` 失败只打印 warning 后继续；没有在移动前证明 shard stem 集互斥、
+文件 namespace 精确、manifest stem 与文件 stem 一一对应。shard 自己生成的 `.ctc_normalized`
+也可能作为普通文件在第一个 shard 阶段提前进入主根。
+
+父进程随后还会先写 merged manifest/summary，再做有限 bundle 校验和 manifest 重建。这样一旦
+发生重复 stem、旧目标碰撞、坏 manifest、部分 shard 缺文件或父进程中途失败，主根可能同时
+包含不同来源的 artifacts 和看似完成的 marker/manifest，fresh-output 的入口检查不能替代
+合并过程内部的事务完整性。
+
+### 修复与验收方案
+
+1. 父进程在修改最终 namespace 前，解析并严格验证每个 shard：精确允许文件集、最终 manifest、
+   marker 内容、请求 stem 集/成功 stem 集、普通文件类型；任何 parse warning 升级为非零失败。
+2. 汇总阶段先在内存中证明所有 shard stem 集互斥、并集等于全局预期 stem，文件名无重复、
+   每个文件只属于其 manifest stem。主目标存在任何同名项必须失败，禁止静默 skip。
+3. shard marker 不得复制到主根；父级只在全部 artifact 合并、路径重写、全量 bundle/domain/
+   namespace 校验、最终 manifest 与 summary 原子写成功后，最后原子发布唯一父 marker。
+4. 失败根不可续跑；任何阶段失败均不得留下父级 final marker。生产操作必须换新 run root，
+   不得以 `--overwrite` 或重复启动修补。
+5. 增加重复 stem、同名文件碰撞、坏 shard manifest、缺 artifact、多余 artifact、shard marker
+   提前合入及父验证失败的无 GPU fixture；均须证明非零失败且无父 marker/final manifest。
+
+状态：代码已实施（all-GPU preflight 验证 shard stem 互斥、namespace 精确、manifest/summary/marker 校验；父 marker 在所有 artifact 合并和全量验证之后最后写入）；待 GPU canary 集成验证。
+
+---
+
+## Case 102: reference-only `--no-nvv` 仍允许 ASR 内容污染 required sidecar
+
+### 复现与根因
+
+在 reference-only forced-alignment 模式中，`--no-nvv` 旧实现只关闭 blank-frame NVV bias；
+它没有在自由解码使用的 logits 副本上屏蔽 NVV ID 区间，因此原始 CTC logits 的自然 argmax
+仍可能产生 ASR-added NVV。更严重的是，CTC writer 曾从自由 `text_asr` 写入
+`_text_raw.txt`，再由该文本生成 `_text_cn.txt`，使 ASR-only NVV、CJK、英文或标点进入
+required sidecar，违背 reference 是唯一内容权威的契约。
+
+### 风险与停止条件
+
+1. reference 不含 NVV 时，required artifacts 可能凭 ASR argmax 增加 NVV；reference 已有
+   NVV 时也可能重复或重排。
+2. 自由 ASR 的 CJK、英文和标点可能改变 `_text_raw/_text_cn`，而 `.lab`、tokens、TextGrid
+   和 punct 又分别依赖不同来源，最终 bundle 发生不可见内容漂移。
+3. 仅检查 argv 中存在 `--no-nvv` 或生成器自报 reference-only 不足以证明内容隔离；在修复、
+   fault tests 和独立 semantic verifier 全部通过前，禁止 English canary、MFA 或生产 rerun。
+
+### 冻结的修复与验收方案
+
+1. `--no-nvv` 时仅在自由解码 logits clone 上将 NVV ID 区间设为 `-inf`；forced alignment
+   继续使用干净原 logits 和 reference target，保证 reference NVV 仍可对齐。
+2. required `_ref.txt`、`.lab`、`_tokens.jsonl`、TextGrid words、`_punct.json`、
+   `_text_raw.txt` 和 `_text_cn.txt` 全部从 canonical reference 或其确定性 transform 生成；
+   自由 ASR 结果只能作为 diagnostic，不得成为 required artifact 的词面来源。
+3. 独立 verifier 从 reference 重算 lexical/NVV/标点序列，并拒绝 extra/missing/reordered
+   content、`0 pinyin`、非法时间轴和集合不守恒；非 reference-only 模式仍保留 ASR-added NVV
+   能力。
+4. 增加 mock logits、monkeypatch `text_asr`、reference NVV、sidecar extra NVV、argv
+   缺失/重复和 shard 未继承等正负测试；所有违规必须非零，且 filtered 不得掩盖全局集合错误。
+
+状态：代码已实施（`_free_decode_logits` 在 `reference_only=True` 时将 NVV ID 区间设为 `-inf`）；已通过 `_case_reference_only_masks_nvv_ids_in_free_decode` 单元测试；待 GPU canary 集成验证。
+
+---
+
+## 验证执行记录（2026-08-07）
+
+### Phase A: 代码修复
+
+| 修复 | 案例 | 文件 | 状态 |
+|------|------|------|------|
+| hard_integrity 非零退出码 | Case 74 | postprocess_textgrids.py | ✅ |
+| stem 集合回退分母 | Case 77 | run_pipeline.py | ✅ |
+| marker v4 内容身份 | Case 82 | pipeline_utils.py, ctc_prealign.py, run_pipeline.py, recover_ctc_labs.py | ✅ |
+
+### Phase B+D: 验证套件结果（全部通过）
+
+| 验证器 | 测试数 | 结果 |
+|--------|--------|------|
+| verify_reference_authority.py | 24 | 24/24 OK |
+| verify_tier_discontinuity.py | 3 | 3/3 OK |
+| verify_strict_ok.py (self-test) | 30 | 30/30 OK |
+| verify_strict_ctc_ready_import.py | 12 | 12/12 OK |
+| verify_prepare_hecheng_english_ctc_ready.py | 17 | 17/17 OK |
+| **总计** | **86** | **86/86 OK** |
+
+### Phase D: 新增测试覆盖
+
+| 新增测试 | 覆盖案例 |
+|---------|---------|
+| `_case_wav_duration_from_header_not_encoder_grid` | Case 98 |
+| `_case_clamp_words_to_wav_axis_enforces_boundaries` | Case 98 |
+| `_case_blank_run_subtracts_query_frames` | Case 100 |
+| `_case_manifest_rebuilt_from_final_tokens` | Case 97 |
+| `_case_ctc_bundle_rejects_zero_duration_tokens` | Case 80 |
+| `_case_merge_ria_tokens_produces_single_token` | Case 81 |
+| `_case_protect_ria_fragment_merge` | Case 81 |
+| `_case_reference_only_masks_nvv_ids_in_free_decode` | Case 102 |
+| `_case_v4_marker_encodes_stem_count_and_manifest_digest` | Case 82 |
+
+### Phase E: P0 代码审计结论
+
+| Case | 代码实施 | 单元测试 | 状态 |
+|------|---------|---------|------|
+| 97 | ✅ `_rebuild_final_manifest` 在所有 normalizer 之后重建 | ✅ | 待 GPU canary |
+| 98 | ✅ `_wav_duration_s` + `_clamp_words_to_wav_axis` | ✅ | 待 GPU canary |
+| 99 | ❌ 代码不存在 | N/A | 仅文档方案 |
+| 100 | ✅ `blank_runs_speech` 减去 `QUERY_FRAMES` | ✅ | 待 GPU canary |
+| 101 | ✅ all-GPU preflight + parent marker 最后写 | 代码审计 | 待 GPU canary |
+| 102 | ✅ `_free_decode_logits` reference_only 屏蔽 NVV | ✅ | 待 GPU canary |
+
+### 仍需 GPU 验证的案例
+
+Cases 80（单条 CTC 重跑 051809）、81（ria 三方原子同步集成）、83（MFA TextGrid parser 故障注入）、85–86（配置+生产数据验证）、99（代码不存在，需实施后验证）。
+
+### 前置条件
+
+生产 canary 执行前必须完成：
+1. Case 99 模型树绑定代码实施
+2. 补齐 Case 86 缺失参考文本（036000）或显式隔离
+3. 生成冻结的 canary stems 文件（基于 `test_data/canary_cases_69_102.txt` 设计，使用生产数据实际 stem ID）
+4. Sol high 对 Case 96 v4 prepare 的最终 GO

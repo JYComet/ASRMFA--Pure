@@ -18,6 +18,7 @@ Also generates tone_mapping.json — bidirectional IPA↔pinyin tone reference t
 
 import argparse
 import array
+import hashlib
 import json
 import math
 import re
@@ -43,7 +44,7 @@ from pipeline_utils import (
     TONE_MARK_CHARS, FINAL_DECOMPOSE, FINAL_TONE_INDEX,
     CHINESE_SHORT_WORDS,
     is_cjk, is_nvv_token, is_english_token, is_pinyin_syllable,
-    is_word_like, is_punct, extract_word_chars,
+    is_unknown_token, is_word_like, is_punct, extract_word_chars,
     is_english_phone, is_english_vowel_phone, is_english_consonant_phone,
     en_ipa_to_arpabet, apply_arpabet_stress, align_sequences,
     is_silence, EN_PHONE_PREFIX,
@@ -53,6 +54,12 @@ SHORT_PAUSE_PUNCT = set("，、：；,")
 LONG_PAUSE_PUNCT = set("。？！…!?.")
 SHORT_PAUSE_TOKEN = "[PAUSE]"
 LONG_PAUSE_TOKEN = "<PAUSE>"
+
+# This schema is intentionally duplicated rather than imported from
+# align_english_mfa: post-processing must be able to reject malformed or
+# legacy producer output without creating an import cycle.
+STRICT_EN_MFA_SCHEMA = "strict-en-mfa-v1"
+_STRICT_EN_SILENCE = {"sil", "sp", "spn", "<eps>"}
 
 @dataclass
 class Interval:
@@ -718,6 +725,77 @@ def _build_pinyin_phones_1to1(phones_tier: Tier, ipa_to_pinyin: dict[str, str]) 
     return Tier("pinyin_phones", phones_tier.xmin, phones_tier.xmax, new_intervals)
 
 
+def _count_internal_pp_gaps(pp_tier: Tier | None, words_tier: Tier | None,
+                            threshold_s: float = 0.010) -> int:
+    """Count pinyin-phone gaps that fall inside one content-word interval.
+
+    ``pinyin_phones`` is a sparse acoustic tier: a real pause between words
+    may have no phone interval after later boundary caps.  That is not a tier
+    discontinuity.  Only an uncovered gap inside one non-silence word means
+    the word's phone reconstruction lost coverage.
+    """
+    if pp_tier is None or words_tier is None:
+        return 0
+
+    content_ranges = [
+        (iv.xmin, iv.xmax)
+        for iv in words_tier.intervals
+        if iv.text.strip() and not is_silence(iv.text)
+    ]
+    gaps = 0
+    for left, right in zip(pp_tier.intervals, pp_tier.intervals[1:]):
+        gap_start, gap_end = left.xmax, right.xmin
+        if gap_end - gap_start <= threshold_s:
+            continue
+        if any(
+            word_start <= gap_start + 0.001
+            and gap_end <= word_end + 0.001
+            for word_start, word_end in content_ranges
+        ):
+            gaps += 1
+    return gaps
+
+
+def _collect_tier_discontinuities(textgrid: TextGrid,
+                                  words_tier: Tier | None,
+                                  threshold_s: float = 0.010) -> list[str]:
+    """Return structural discontinuities in final, user-facing tiers.
+
+    Raw text and pinyin are single full-span intervals.  ``phones`` is an
+    internal MFA tier dropped from the final TextGrid.  ``pinyin_phones`` is
+    intentionally sparse across natural pauses, so only gaps inside a content
+    word are relevant there.  Treating all sparse-tier gaps as failures made
+    normal pauses look like systemic alignment collapse.
+    """
+    discontinuities: list[str] = []
+    for tier_name in ("hanzi", "words"):
+        tier = tier_by_name(textgrid, tier_name)
+        if tier is None or len(tier.intervals) < 5:
+            continue
+        gaps = sum(
+            1
+            for left, right in zip(tier.intervals, tier.intervals[1:])
+            if right.xmin - left.xmax > threshold_s
+        )
+        if gaps > len(tier.intervals) * 0.10:
+            discontinuities.append(f"{tier.name}({gaps}/{len(tier.intervals)})")
+
+    pp_tier = tier_by_name(textgrid, "pinyin_phones")
+    if pp_tier is not None and len(pp_tier.intervals) >= 5:
+        gaps = _count_internal_pp_gaps(pp_tier, words_tier, threshold_s)
+        if gaps > len(pp_tier.intervals) * 0.10:
+            discontinuities.append(f"{pp_tier.name}({gaps}/{len(pp_tier.intervals)})")
+    return discontinuities
+
+
+def _record_filterable_qc(report: dict, filter_reasons: list[str],
+                          enabled: bool, name: str, details) -> None:
+    """Always retain diagnostics; filter only when quality filtering is on."""
+    report[name] = details
+    if enabled:
+        filter_reasons.append(name)
+
+
 def _resolve_spn(phone_iv: Interval, words_tier: Tier | None,
                  pinyin_dict: dict[str, list[str]] | None) -> str:
     """Find the word overlapping this spn phone interval and return its pinyin label."""
@@ -1087,6 +1165,62 @@ def _fix_overlapping_boundaries(words_tier) -> int:
     # Remove zero-duration remnants
     intervals[:] = [iv for iv in intervals if iv.xmax - iv.xmin > 0.001]
     words_tier.intervals = intervals
+    return fixed
+
+
+def _fix_pp_phone_overlaps(pp_tier: Tier) -> int:
+    """Resolve adjacent phone↔phone overlaps in pinyin_phones tier.
+
+    MFA HMM alignment produces soft transitions where a final (rhyme)
+    can overlap the next initial (onset) by 40-100ms.  These are not
+    detected by _fix_overlapping_boundaries (which only fixes the words
+    tier).  This pass clips all adjacent phone overlaps at the midpoint.
+
+    Punctuation phones (,/。/！/？) and en: phones are clipped to favour
+    the content phone: punct is trimmed, en: phones keep their start.
+    """
+    intervals = list(pp_tier.intervals)
+    n = len(intervals)
+    fixed = 0
+
+    for i in range(n - 1):
+        cur = intervals[i]
+        nxt = intervals[i + 1]
+        overlap = cur.xmax - nxt.xmin
+        if overlap <= 0.001:       # sub-1ms — float noise, skip
+            continue
+
+        cur_text = cur.text.strip() if cur.text else ""
+        nxt_text = nxt.text.strip() if nxt.text else ""
+        cur_is_punct = cur_text in ('，', '。', '！', '？', '、', '：', '；', '…')
+        nxt_is_punct = nxt_text in ('，', '。', '！', '？', '、', '：', '；', '…')
+        cur_is_en = cur_text.startswith('en:')
+        nxt_is_en = nxt_text.startswith('en:')
+
+        # Punct overlapped by content phone → trim punct
+        if cur_is_punct and not nxt_is_punct and not nxt_is_en:
+            intervals[i] = Interval(cur.xmin, nxt.xmin, cur.text)
+            fixed += 1
+        elif nxt_is_punct and not cur_is_punct and not cur_is_en:
+            intervals[i + 1] = Interval(cur.xmax, nxt.xmax, nxt.text)
+            fixed += 1
+        # en: phone overlapped by content phone → trim en: side
+        elif cur_is_en and not nxt_is_en:
+            intervals[i] = Interval(cur.xmin, nxt.xmin, cur.text)
+            fixed += 1
+        elif nxt_is_en and not cur_is_en:
+            intervals[i + 1] = Interval(cur.xmax, nxt.xmax, nxt.text)
+            fixed += 1
+        # Two content phones → split at midpoint
+        else:
+            mid = round((cur.xmax + nxt.xmin) / 2.0, 4)
+            intervals[i] = Interval(cur.xmin, mid, cur.text)
+            intervals[i + 1] = Interval(mid, nxt.xmax, nxt.text)
+            fixed += 1
+
+    # Remove zero-duration remnants
+    intervals[:] = [iv for iv in intervals if iv.xmax - iv.xmin > 0.001]
+    pp_tier.intervals = intervals
     return fixed
 
 
@@ -1767,6 +1901,68 @@ def _build_hanzi_tier(words_tier: Tier, raw_text: str,
             )
 
     return Tier("hanzi", words_tier.xmin, words_tier.xmax, intervals)
+
+
+def assess_reference_coverage(
+    reference_text: str,
+    words_tier: Tier | None,
+    hanzi_tier: Tier | None,
+    *,
+    reference_source: str,
+    unknown_source_count: int = 0,
+) -> tuple[dict, list[str]]:
+    """Assess hard lexical integrity independently of optional acoustic QC."""
+    reference_cjk = "".join(ch for ch in reference_text if is_cjk(ch))
+    word_intervals = words_tier.intervals if words_tier is not None else []
+    pinyin_tokens = [
+        iv.text.strip() for iv in word_intervals
+        if is_pinyin_syllable(iv.text.strip())
+    ]
+    hanzi_intervals = hanzi_tier.intervals if hanzi_tier is not None else []
+    hanzi_cjk = "".join(
+        label for iv in hanzi_intervals
+        if len((label := iv.text.strip())) == 1 and is_cjk(label)
+    )
+
+    lexical_reference = re.sub(r"<sp\d+>", "", reference_text)
+    has_lexical_reference = bool(
+        reference_cjk
+        or re.search(r"[A-Za-z]", lexical_reference)
+        or any(is_nvv_token(token) for token in extract_word_chars(lexical_reference))
+    )
+
+    reasons: list[str] = []
+    if not reference_text.strip():
+        reasons.append("empty_reference")
+    elif not has_lexical_reference:
+        reasons.append("no_lexical_reference")
+
+    if reference_cjk:
+        if not pinyin_tokens:
+            reasons.append("cjk_alignment_collapse")
+        if len(reference_cjk) != len(pinyin_tokens):
+            reasons.append("cjk_token_count_mismatch")
+    elif pinyin_tokens:
+        reasons.append("unexpected_pinyin_without_cjk")
+
+    if reference_cjk != hanzi_cjk:
+        reasons.append("cjk_mismatch")
+    if unknown_source_count:
+        reasons.append("mfa_unknown_source")
+
+    coverage = {
+        "reference_source": reference_source,
+        "reference_cjk_count": len(reference_cjk),
+        "pinyin_token_count": len(pinyin_tokens),
+        "assigned_cjk_count": len(hanzi_cjk),
+        "missing_cjk_count": max(0, len(reference_cjk) - len(pinyin_tokens)),
+        "extra_pinyin_count": max(0, len(pinyin_tokens) - len(reference_cjk)),
+        "unknown_source_count": unknown_source_count,
+        "exact_cjk_sequence": reference_cjk == hanzi_cjk,
+        "reference_cjk": reference_cjk,
+        "hanzi_cjk": hanzi_cjk,
+    }
+    return coverage, list(dict.fromkeys(reasons))
 
 
 def _normalize_word_spellings(words_tier: Tier, raw_text: str) -> None:
@@ -3922,7 +4118,7 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
         use_mfa = (start_diff <= snap_threshold and end_diff <= snap_threshold)
         # Rule 0: MFA produced <unk> — alignment failed; restore CTC token text
         # and use CTC boundaries (same as Rule 1).
-        if mfa_iv.text.strip() == '<unk>':
+        if is_unknown_token(mfa_iv.text):
             use_mfa = False
             mfa_iv.text = ctc.get('word', mfa_iv.text)
         # Rule 1: NVV / English — no MFA acoustic model, always CTC.
@@ -4296,6 +4492,259 @@ def load_en_phones(stem: str, en_phones_dir: Path | None) -> list[dict] | None:
         return None
 
 
+def _strict_en_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _strict_en_report(status: str, required_words: int = 0, verified_words: int = 0,
+                      failed_word_ids: list[str] | None = None, ledger_sha256: str = "",
+                      reason: str = "") -> dict:
+    """Return the fixed strict-English report shape on every outcome."""
+    result = {"status": status, "required_words": int(required_words),
+              "verified_words": int(verified_words),
+              "failed_word_ids": list(failed_word_ids or []),
+              "ledger_sha256": ledger_sha256}
+    if reason:
+        result["reason"] = reason
+    return result
+
+
+def _strict_en_fail(required_words: int, reason: str, *, ledger_sha256: str = "",
+                    failed_word_ids: list[str] | None = None) -> tuple[dict, list[tuple[Interval, dict]]]:
+    return (_strict_en_report("rejected", required_words, 0, failed_word_ids,
+                              ledger_sha256, reason), [])
+
+
+def _strict_en_lexical_words(words_tier: Tier | None) -> list[Interval]:
+    if words_tier is None:
+        return []
+    return [iv for iv in words_tier.intervals if is_english_token(iv.text.strip())]
+
+
+def _strict_en_phone_is_valid(phone: dict, mfa_word: dict) -> bool:
+    """Validate one immutable producer phone before affine mapping it."""
+    try:
+        label = str(phone["label"]).strip()
+        start, end = float(phone["start"]), float(phone["end"])
+        word_start, word_end = float(mfa_word["start"]), float(mfa_word["end"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (label not in _STRICT_EN_SILENCE and is_english_phone(label)
+            and math.isfinite(start) and math.isfinite(end)
+            and math.isfinite(word_start) and math.isfinite(word_end)
+            and word_end > word_start and end > start
+            and start >= word_start - 0.003 and end <= word_end + 0.003)
+
+
+def load_strict_en_provenance(stem: str, words_tier: Tier | None,
+                              en_phones_dir: Path | None) -> tuple[dict, list[tuple[Interval, dict]]]:
+    """Load a strict-en-mfa-v1 ledger and bind it by ordered word instance.
+
+    The old JSON list is deliberately not accepted here.  In particular, no
+    text/time lookup is used: repeated words and English separated by Chinese
+    are matched solely by their ordered instances in the full words tier.
+    """
+    english_words = _strict_en_lexical_words(words_tier)
+    required = len(english_words)
+    if en_phones_dir is None:
+        return _strict_en_fail(required, "strict_en_manifest_missing")
+    manifest_path = en_phones_dir / "en_alignment_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return _strict_en_fail(required, "strict_en_manifest_missing_or_corrupt")
+    if (not isinstance(manifest, dict) or manifest.get("schema") != STRICT_EN_MFA_SCHEMA
+            or manifest.get("strict_provenance") is not True
+            or manifest.get("status") not in {"success", "no_english"}):
+        return _strict_en_fail(required, "strict_en_manifest_invalid")
+    expected_segments = manifest.get("expected_segments")
+    produced_segments = manifest.get("produced_segments")
+    rejected_segments = manifest.get("rejected_segments")
+    if (not isinstance(expected_segments, list) or not isinstance(produced_segments, list)
+            or not isinstance(rejected_segments, list)
+            or not all(isinstance(item, str) for item in expected_segments)
+            or not all(isinstance(item, str) for item in produced_segments)):
+        return _strict_en_fail(required, "strict_en_manifest_partition_invalid")
+    rejected_ids = [item.get("id") for item in rejected_segments if isinstance(item, dict)]
+    if (len(rejected_ids) != len(rejected_segments) or not all(isinstance(item, str) for item in rejected_ids)
+            or len(expected_segments) != len(set(expected_segments))
+            or len(produced_segments) != len(set(produced_segments))
+            or len(rejected_ids) != len(set(rejected_ids))
+            or set(expected_segments) != set(produced_segments) | set(rejected_ids)
+            or set(produced_segments) & set(rejected_ids)
+            or (manifest.get("status") == "no_english" and expected_segments)):
+        return _strict_en_fail(required, "strict_en_manifest_partition_invalid")
+    if not english_words:
+        return _strict_en_report("not_required"), []
+    if manifest.get("status") != "success":
+        return _strict_en_fail(required, "strict_en_manifest_has_no_english")
+
+    prefix = f"{stem}:s"
+    expected_for_stem = {item for item in expected_segments
+                         if isinstance(item, str) and item.startswith(prefix)}
+    produced_for_stem = {item for item in produced_segments
+                         if isinstance(item, str) and item.startswith(prefix)}
+    rejected_for_stem = {item.get("id") for item in rejected_segments
+                         if isinstance(item, dict) and isinstance(item.get("id"), str)
+                         and item["id"].startswith(prefix)}
+    if (not expected_for_stem or expected_for_stem != produced_for_stem | rejected_for_stem
+            or produced_for_stem & rejected_for_stem or rejected_for_stem):
+        return _strict_en_fail(required, "strict_en_manifest_segment_rejected_or_incomplete")
+
+    entries = manifest.get("stem_ledgers")
+    if not isinstance(entries, list):
+        return _strict_en_fail(required, "strict_en_ledger_missing")
+    matches = [entry for entry in entries if isinstance(entry, dict) and entry.get("stem") == stem]
+    if len(matches) != 1:
+        return _strict_en_fail(required, "strict_en_ledger_missing_or_ambiguous")
+    entry = matches[0]
+    expected_hash = entry.get("sha256")
+    try:
+        ledger_path = Path(entry["path"])
+        actual_hash = _strict_en_sha256(ledger_path)
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except Exception:
+        return _strict_en_fail(required, "strict_en_ledger_missing_or_corrupt")
+    if not isinstance(expected_hash, str) or not expected_hash or actual_hash != expected_hash:
+        return _strict_en_fail(required, "strict_en_ledger_hash_mismatch", ledger_sha256=actual_hash)
+    if not isinstance(ledger, dict) or ledger.get("schema") != STRICT_EN_MFA_SCHEMA or ledger.get("stem") != stem:
+        return _strict_en_fail(required, "strict_en_ledger_schema_or_stem_mismatch", ledger_sha256=actual_hash)
+
+    records: list[dict] = []
+    seen_segment_ids: set[str] = set()
+    segments = ledger.get("segments")
+    if not isinstance(segments, list):
+        return _strict_en_fail(required, "strict_en_segments_missing", ledger_sha256=actual_hash)
+    for segment in sorted(segments, key=lambda item: item.get("segment_ordinal", -1)
+                          if isinstance(item, dict) else -1):
+        if not isinstance(segment, dict):
+            return _strict_en_fail(required, "strict_en_segment_invalid", ledger_sha256=actual_hash)
+        segment_id = segment.get("segment_id")
+        if not isinstance(segment_id, str) or segment_id in seen_segment_ids:
+            return _strict_en_fail(required, "strict_en_segment_id_invalid", ledger_sha256=actual_hash)
+        seen_segment_ids.add(segment_id)
+        if segment_id not in expected_for_stem:
+            return _strict_en_fail(required, "strict_en_segment_not_in_manifest", ledger_sha256=actual_hash)
+        if segment.get("status") != "verified":
+            failed = [str(word.get("word_id", "")) for word in segment.get("words", [])
+                      if isinstance(word, dict)]
+            return _strict_en_fail(required, "strict_en_segment_rejected", ledger_sha256=actual_hash,
+                                   failed_word_ids=failed)
+        source = segment.get("mfa_textgrid")
+        try:
+            source_path = Path(source["path"])
+            if not isinstance(source.get("sha256"), str) or not source["sha256"]:
+                raise ValueError("hash_missing")
+            if _strict_en_sha256(source_path) != source["sha256"]:
+                raise ValueError("hash_mismatch")
+        except Exception:
+            return _strict_en_fail(required, "strict_en_source_evidence_invalid",
+                                   ledger_sha256=actual_hash)
+        words = segment.get("words")
+        if not isinstance(words, list):
+            return _strict_en_fail(required, "strict_en_words_missing", ledger_sha256=actual_hash)
+        records.extend(words)
+
+    if seen_segment_ids != expected_for_stem:
+        return _strict_en_fail(required, "strict_en_ledger_segment_partition_invalid",
+                               ledger_sha256=actual_hash)
+
+    if len(records) != required:
+        return _strict_en_fail(required, "strict_en_word_count_mismatch", ledger_sha256=actual_hash,
+                               failed_word_ids=[str(item.get("word_id", "")) for item in records
+                                                if isinstance(item, dict)])
+    pairs: list[tuple[Interval, dict]] = []
+    previous_ctc_ordinal = -1
+    seen_word_ids: set[str] = set()
+    seen_mfa_phone_ordinals: set[int] = set()
+    for final_word, record in zip(english_words, records):
+        if not isinstance(record, dict):
+            return _strict_en_fail(required, "strict_en_word_invalid", ledger_sha256=actual_hash)
+        word_id = record.get("word_id")
+        mfa_word = record.get("mfa_word")
+        phones = record.get("phones")
+        try:
+            ordinal = int(record["ctc_ordinal"])
+        except (KeyError, TypeError, ValueError):
+            ordinal = -1
+        if (record.get("status") != "verified" or record.get("provenance") != "english_mfa_textgrid"
+                or not isinstance(word_id, str) or not word_id or word_id in seen_word_ids
+                or ordinal <= previous_ctc_ordinal
+                or str(record.get("ctc_text", "")).casefold() != final_word.text.strip().casefold()
+                or not isinstance(mfa_word, dict) or not isinstance(phones, list) or not phones):
+            return _strict_en_fail(required, "strict_en_word_identity_or_evidence_invalid",
+                                   ledger_sha256=actual_hash, failed_word_ids=[str(word_id or "")])
+        seen_word_ids.add(word_id); previous_ctc_ordinal = ordinal
+        try:
+            if (not isinstance(mfa_word.get("ordinal"), int)
+                    or mfa_word["ordinal"] < 0
+                    or str(mfa_word.get("text", "")).casefold() != final_word.text.strip().casefold()):
+                raise ValueError("mfa_word_identity")
+        except Exception:
+            return _strict_en_fail(required, "strict_en_mfa_word_invalid", ledger_sha256=actual_hash,
+                                   failed_word_ids=[word_id])
+        prior_end = -math.inf
+        for phone_ordinal, phone in enumerate(phones):
+            if (not isinstance(phone, dict) or phone.get("ordinal") != phone_ordinal
+                    or not _strict_en_phone_is_valid(phone, mfa_word)):
+                return _strict_en_fail(required, "strict_en_phone_invalid", ledger_sha256=actual_hash,
+                                       failed_word_ids=[word_id])
+            if float(phone["start"]) < prior_end:
+                return _strict_en_fail(required, "strict_en_phone_unordered", ledger_sha256=actual_hash,
+                                       failed_word_ids=[word_id])
+            prior_end = float(phone["end"])
+            if (not isinstance(phone.get("mfa_phone_ordinal"), int)
+                    or phone["mfa_phone_ordinal"] < 0
+                    or phone["mfa_phone_ordinal"] in seen_mfa_phone_ordinals):
+                return _strict_en_fail(required, "strict_en_mfa_phone_ordinal_invalid",
+                                       ledger_sha256=actual_hash, failed_word_ids=[word_id])
+            seen_mfa_phone_ordinals.add(phone["mfa_phone_ordinal"])
+        pairs.append((final_word, record))
+    return _strict_en_report("verified", required, required, [], actual_hash), pairs
+
+
+def _strip_english_phone_intervals(pp_tier: Tier | None, words_tier: Tier | None) -> Tier | None:
+    """Remove non-provenance English phone candidates from a filtered output."""
+    if pp_tier is None:
+        return None
+    english = _strict_en_lexical_words(words_tier)
+    if not english:
+        return pp_tier
+    retained = [phone for phone in pp_tier.intervals if not any(
+        phone.xmax > word.xmin + 0.001 and phone.xmin < word.xmax - 0.001
+        for word in english)]
+    return Tier(pp_tier.name, pp_tier.xmin, pp_tier.xmax, retained)
+
+
+def inject_strict_en_phones(pp_tier: Tier | None, words_tier: Tier | None,
+                            pairs: list[tuple[Interval, dict]]) -> Tier | None:
+    """Affine-map exact MFA ARPABET evidence without snapping or relabelling."""
+    base = _strip_english_phone_intervals(pp_tier, words_tier)
+    if base is None:
+        return None
+    injected = list(base.intervals)
+    for final_word, record in pairs:
+        mfa_word = record["mfa_word"]
+        source_start, source_end = float(mfa_word["start"]), float(mfa_word["end"])
+        final_duration = final_word.xmax - final_word.xmin
+        if final_duration <= 0:
+            raise ValueError("strict_en_final_word_invalid")
+        for phone in record["phones"]:
+            start = final_word.xmin + ((float(phone["start"]) - source_start)
+                                       / (source_end - source_start)) * final_duration
+            end = final_word.xmin + ((float(phone["end"]) - source_start)
+                                     / (source_end - source_start)) * final_duration
+            if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+                raise ValueError("strict_en_affine_invalid")
+            injected.append(Interval(start, end, f"{EN_PHONE_PREFIX}{phone['label']}"))
+    injected.sort(key=lambda iv: (iv.xmin, iv.xmax, iv.text))
+    return Tier(base.name, base.xmin, base.xmax, injected)
+
+
 def _apply_en_phones(words_tier: Tier, pp_tier: Tier | None,
                      en_data: list[dict],
                      phone_prefix: str = "") -> tuple[Tier, Tier | None]:
@@ -4614,12 +5063,16 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
 
     # Load English MFA phone data.
     # Auto-detect en_phones dir from workspace if not explicitly provided.
+    strict_en_mode = bool(getattr(args, "strict_ok", False))
     en_phones_dir = getattr(args, 'en_phones_dir', None)
     if en_phones_dir is None:
         auto_dir = output_dir.parent / "en_phones"
         if auto_dir.exists():
             en_phones_dir = auto_dir
-    en_data = load_en_phones(stem, en_phones_dir)
+    # A strict run must never deserialize the historical list JSON: it enables
+    # CMUdict/equal-split recovery in the legacy branch below.  Strict evidence
+    # is loaded only after the final words tier is settled.
+    en_data = None if strict_en_mode else load_en_phones(stem, en_phones_dir)
     report: dict = {"stem": stem, "status": "ok", "warnings": []}
     txt_path = txt_dir / f"{stem}.txt"
     if not txt_path.exists():
@@ -4631,6 +5084,10 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         raise ValueError(f"Need at least 2 tiers in {tg_path}")
     words_tier = tg.tiers[0]
     phones_tier = tg.tiers[1]
+    mfa_unknown_before_snap = [
+        iv.text.strip() for iv in words_tier.intervals
+        if is_unknown_token(iv.text)
+    ]
 
     # Fix MFA's forced lowercase: use dictionary's canonical form
     if pinyin_case:
@@ -4646,14 +5103,18 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # hints, but it must not replace a supplied reference transcript.
     raw_text = find_original_text(stem, args.raw_text_dir)
     reference_text_authoritative = bool(raw_text)
+    reference_source = "original_or_ref" if reference_text_authoritative else ""
     if not raw_text:
         # Try NVASR Chinese ASR output
         cn_path = txt_dir / f"{stem}_text_cn.txt"
         if cn_path.exists():
             raw_text = cn_path.read_text(encoding="utf-8").strip()
+            reference_source = "asr_fallback"
     if not raw_text:
         # Fallback: use the pinyin txt content
         raw_text = txt_path.read_text(encoding="utf-8").strip()
+        reference_source = "lab_fallback"
+    reference_text_original = raw_text
 
     # Tier 2: pinyin with punctuation (from corpus txt)
     pinyin_text = txt_path.read_text(encoding="utf-8").strip()
@@ -4960,7 +5421,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                     if t.name == "pinyin_phones":
                         new_tg.tiers[i] = synced_pp
                         break
-    else:
+    elif not strict_en_mode:
         # No en_data — check if there are English tokens that need it
         words_tier = tier_by_name(new_tg, "words")
         if words_tier:
@@ -5367,7 +5828,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                         break
 
             # Apply CMUdict stress to English ARPABET phones
-            if en_data:
+            if en_data and not strict_en_mode:
                 pp_tier_final = tier_by_name(new_tg, "pinyin_phones")
                 if pp_tier_final and final_words_tier:
                     pp_intervals_final = list(pp_tier_final.intervals)
@@ -5434,9 +5895,16 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         raw_tier = tier_by_name(new_tg, "raw_text")
         hanzi_after = tier_by_name(new_tg, "hanzi")
         if raw_tier and hanzi_after:
-            raw_tokens = [iv.text for iv in hanzi_after.intervals
-                          if not is_silence(iv.text) and iv.text.strip()]
-            raw_tier.intervals[0].text = "".join(raw_tokens) if raw_tokens else raw_tier.intervals[0].text
+            if reference_text_authoritative:
+                # Keep supplied lexical content authoritative.  Rebuilding raw
+                # from a collapsed hanzi tier created the former "empty==empty"
+                # false pass; rendered punctuation edits remain in raw_text.
+                raw_tier.intervals[0].text = raw_text
+            else:
+                raw_tokens = [iv.text for iv in hanzi_after.intervals
+                              if not is_silence(iv.text) and iv.text.strip()]
+                if raw_tokens:
+                    raw_tier.intervals[0].text = "".join(raw_tokens)
 
     # 最终恢复: CTC 长停顿注入 … 覆盖了原标点, 用 CTC punct 替换回去
     if punct_entries:
@@ -5639,10 +6107,85 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                                 new_tg.tiers[_i] = _t_new
                                 break
 
+    # ── Final de-overlap: pinyin_phones tier (must be after ALL
+    #     Phase 5 phone modifications including _apply_en_stress) ──
+    _pp = tier_by_name(new_tg, "pinyin_phones")
+    if _pp is not None:
+        _pp_fixed = _fix_pp_phone_overlaps(_pp)
+        if _pp_fixed:
+            report["pp_deoverlap_fixed"] = _pp_fixed
+
+    # Strict MFA provenance is intentionally injected last.  Phase 4/5 may
+    # normalise, stretch, merge, de-overlap, or apply CMU stress to legacy
+    # English phones.  None of those transformations are admissible for a
+    # strict result: the final pinyin_phones tier must be the exact ledger
+    # sequence and affine timings, with only the ``en:`` namespace added.
+    strict_en_rejected = False
+    if strict_en_mode:
+        final_words_tier = tier_by_name(new_tg, "words")
+        strict_en, strict_pairs = load_strict_en_provenance(
+            stem, final_words_tier, en_phones_dir)
+        report["english_provenance"] = strict_en
+        if strict_en["status"] == "verified":
+            try:
+                strict_pp = inject_strict_en_phones(
+                    tier_by_name(new_tg, "pinyin_phones"), final_words_tier, strict_pairs)
+                if strict_pp is None:
+                    raise ValueError("strict_en_pinyin_phones_missing")
+                for _index, _tier in enumerate(new_tg.tiers):
+                    if _tier.name == "pinyin_phones":
+                        new_tg.tiers[_index] = strict_pp
+                        break
+            except Exception as exc:
+                strict_en_rejected = True
+                report["english_provenance"] = _strict_en_report(
+                    "rejected", strict_en["required_words"], 0,
+                    strict_en.get("failed_word_ids", []), strict_en.get("ledger_sha256", ""),
+                    f"strict_en_injection_failed:{exc}")
+                stripped = _strip_english_phone_intervals(
+                    tier_by_name(new_tg, "pinyin_phones"), final_words_tier)
+                if stripped is not None:
+                    for _index, _tier in enumerate(new_tg.tiers):
+                        if _tier.name == "pinyin_phones":
+                            new_tg.tiers[_index] = stripped
+                            break
+        elif strict_en["status"] == "rejected":
+            strict_en_rejected = True
+            # A filtered TextGrid must not contain a fabricated English phone
+            # sequence left by Chinese MFA or the legacy recovery path.
+            stripped = _strip_english_phone_intervals(
+                tier_by_name(new_tg, "pinyin_phones"), final_words_tier)
+            if stripped is not None:
+                for _index, _tier in enumerate(new_tg.tiers):
+                    if _tier.name == "pinyin_phones":
+                        new_tg.tiers[_index] = stripped
+                        break
+
     # ================================================================
     # 最终筛选: 所有处理完成后再统一判断 (用最终的边界和静音结构)
     # ================================================================
     filter_reasons = []
+    if strict_en_rejected:
+        filter_reasons.append("english_provenance_rejected")
+
+    # Hard lexical integrity is independent of optional acoustic filtering.
+    # NVV, punctuation and sentence-initial <sp1> are intentionally excluded
+    # from the CJK/pinyin denominator.
+    _coverage, _coverage_reasons = assess_reference_coverage(
+        reference_text_original,
+        tier_by_name(new_tg, "words"),
+        tier_by_name(new_tg, "hanzi"),
+        reference_source=reference_source,
+        unknown_source_count=len(mfa_unknown_before_snap),
+    )
+    report["reference_coverage"] = _coverage
+    report["hard_integrity_reasons"] = _coverage_reasons
+    filter_reasons.extend(_coverage_reasons)
+    if mfa_unknown_before_snap:
+        report["mfa_unknown_source"] = {
+            "count": len(mfa_unknown_before_snap),
+            "examples": mfa_unknown_before_snap[:20],
+        }
 
     # ── Load CMUdict for English word QC (Regr. Case 48) ──
     # Case 32 (english_single_phone) and Case 33 (english_phone_deficit)
@@ -6002,14 +6545,16 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         # (b) CJK character coverage — compare raw_text CJK sequence
         #     against hanzi tier CJK sequence.  Missing or out-of-order
         #     CJK chars indicate the alignment dropped or misassigned them.
-        raw_cjk = "".join(c for c in raw_tier.intervals[0].text.replace("<sp1>", "")
-                         if "一" <= c <= "鿿" or "㐀" <= c <= "䶿")
+        # Compare against the immutable source reference, never against the
+        # rendered raw tier (which may have been rebuilt or punctuation-edited).
+        raw_cjk = _coverage["reference_cjk"]
         hanzi_cjk = "".join(iv.text.strip() for iv in hanzi_tier_final.intervals
                            if iv.text.strip()
                            and ("一" <= iv.text.strip() <= "鿿"
                                 or "㐀" <= iv.text.strip() <= "䶿"))
         if raw_cjk != hanzi_cjk:
-            filter_reasons.append("cjk_mismatch")
+            if "cjk_mismatch" not in filter_reasons:
+                filter_reasons.append("cjk_mismatch")
             report.setdefault("cjk_details", {})["raw_count"] = len(raw_cjk)
             report["cjk_details"]["hanzi_count"] = len(hanzi_cjk)
             report["cjk_details"]["delta"] = len(raw_cjk) - len(hanzi_cjk)
@@ -6447,8 +6992,10 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             if _gap > _PP_GAP_THRESHOLD_S:
                 _pp_gap_count += 1
     if _pp_gap_count > 0:
-        filter_reasons.append("pp_tier_gaps")
-        report["pp_tier_gaps"] = {"count": _pp_gap_count}
+        _record_filterable_qc(
+            report, filter_reasons, args.filter_suspicious,
+            "pp_tier_gaps", {"count": _pp_gap_count}
+        )
 
     # ── Case 35: words_tier_gaps — words tier has gaps > 20 ms between
     #     adjacent non-silence words. ──
@@ -6470,29 +7017,35 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                     _wt_gap_examples.append(
                         f"{_cl!r}→{_nl!r}[{_gap*1000:.0f}ms]")
     if _wt_gap_count > 0:
-        filter_reasons.append("words_tier_gaps")
-        report["words_tier_gaps"] = {"count": _wt_gap_count,
-                                      "examples": _wt_gap_examples}
+        _record_filterable_qc(
+            report, filter_reasons, args.filter_suspicious,
+            "words_tier_gaps", {"count": _wt_gap_count,
+                                 "examples": _wt_gap_examples}
+        )
 
     # ── Case 36: tier_discontinuity — a tier has too many gaps
     #     (> 10% of intervals), indicating systematic alignment failure. ──
-    _discon_tiers: list[str] = []
-    for _t in new_tg.tiers:
-        if len(_t.intervals) < 5:
-            continue
-        _gaps = 0
-        for _i in range(len(_t.intervals) - 1):
-            _g = round(_t.intervals[_i + 1].xmin - _t.intervals[_i].xmax, 4)
-            if _g > 0.010:
-                _gaps += 1
-        if _gaps > len(_t.intervals) * 0.10:
-            _discon_tiers.append(f"{_t.name}({_gaps}/{len(_t.intervals)})")
+    _discon_tiers = _collect_tier_discontinuities(new_tg, words_tier)
     if _discon_tiers:
-        filter_reasons.append("tier_discontinuity")
-        report["tier_discontinuity"] = {"tiers": _discon_tiers}
+        _record_filterable_qc(
+            report, filter_reasons, args.filter_suspicious,
+            "tier_discontinuity", {"tiers": _discon_tiers}
+        )
 
 
     # 统一设置过滤状态和输出路径
+    # Finalize before the final classification.  Strict reviewers must inspect
+    # exactly the labels that are written, never an earlier pre-finalized view.
+    new_tg.tiers = [t for t in new_tg.tiers if t.name != "phones"]
+    _finalize_textgrid(new_tg)
+
+    # strict-ok is intentionally stricter than the legacy best-effort mode:
+    # every already-computed diagnostic is a veto.  It does not invent a new
+    # acoustic judgement; the independent disk auditor records that judgement
+    # as not evaluated.
+    if getattr(args, "strict_ok", False) and report.get("warnings"):
+        filter_reasons.append("warnings")
+    filter_reasons = list(dict.fromkeys(filter_reasons))
     if filter_reasons:
         report["status"] = "filtered_" + "_".join(filter_reasons)
         report["filter_reasons"] = filter_reasons
@@ -6504,12 +7057,6 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         report["status"] = "ok"
         out_path = output_dir / tg_path.name
         stale = filtered_dir / tg_path.name
-
-    # Drop phones tier (IPA) — used internally, not needed in final output
-    new_tg.tiers = [t for t in new_tg.tiers if t.name != "phones"]
-
-    # ── Finalize: NVV brackets + sp1 normalization (AFTER phones drop, BEFORE write) ──
-    _finalize_textgrid(new_tg)
 
     if out_path.exists() and not args.overwrite:
         raise FileExistsError(f"Output exists: {out_path}")
@@ -6619,11 +7166,18 @@ def main() -> int:
     parser.add_argument("--filter-min-phone-coverage", type=float, default=0.35)
     parser.add_argument("--filter-edge-gap-sec", type=float, default=0.25)
     parser.add_argument("--copy-errors", action="store_true")
+    parser.add_argument("--strict-ok", action="store_true",
+                        help="Treat every executed QC positive and warning as filterable.")
     parser.add_argument("--enable-text-correction", action=argparse.BooleanOptionalAction, default=True,
                         help="Cross-check punctuation against silence gaps and emit corrected_text tier.")
     parser.add_argument("--handle-unexpected-sil", action=argparse.BooleanOptionalAction, default=True,
                         help="Merge <sp0> gaps without punct; flag <sp1-3> gaps for filtering.")
     args = parser.parse_args()
+
+    if args.strict_ok:
+        # _record_filterable_qc honours this flag.  A configured legacy
+        # --no-filter-suspicious must never weaken strict-ok.
+        args.filter_suspicious = True
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.filtered_dir.mkdir(parents=True, exist_ok=True)
@@ -6741,7 +7295,10 @@ def main() -> int:
     if error_count:
         print(f"ERROR: {error_count} file(s) failed during post-processing; see {rp}")
         return 1
-    return 0
+    hard_integrity_count = sum(1 for row in reports if row.get("hard_integrity_reasons"))
+    if hard_integrity_count:
+        print(f"  {hard_integrity_count} mandatory-integrity failures isolated in filtered/")
+    return 1 if hard_integrity_count else 0
 
 
 if __name__ == "__main__":

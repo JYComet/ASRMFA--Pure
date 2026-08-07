@@ -364,7 +364,7 @@ def process_one(stem: str, ctc_dir: Path, audio_dir: Path,
         rebuild_textgrid(orig_tg, out_dir / f"{stem}.TextGrid",
                         adj_tokens, adj_punct)
 
-    for suffix in [".lab", "_text_cn.txt"]:
+    for suffix in [".lab", "_text_cn.txt", "_text_raw.txt", "_ref.txt"]:
         src = ctc_dir / f"{stem}{suffix}"
         if src.exists():
             shutil.copy2(src, out_dir / f"{stem}{suffix}")

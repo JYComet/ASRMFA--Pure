@@ -21,11 +21,14 @@ NV V 标签处理:
 """
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import re
 import sys
 import time
+import wave
 from collections import Counter
 from itertools import groupby
 from pathlib import Path
@@ -94,10 +97,13 @@ def chars_and_pinyin(text: str):
 # ── Import shared constants from pipeline_utils ──
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 from pipeline_utils import (
+    CTC_NORMALIZATION_MARKER,
+    make_ctc_normalization_marker, parse_ctc_normalization_marker,
     NVV_NAMES, NVV_TO_MFA,
     is_nvv_token, is_english_token, is_pinyin_syllable, is_punct,
     RIA_VARIANTS, replace_ria_variants, normalize_punct_inline,
     _ASCII_TO_CJK_PUNCT,
+    normalize_reference_numerals, validate_ctc_transcript_bundle,
 )
 
 
@@ -151,10 +157,24 @@ def preprocess_asr_for_mfa(text: str) -> str:
 # Monkey-patch: 用参考文本做 CTC 强制对齐, 非 ASR 解码
 # ═══════════════════════════════════════════════════════════════
 
+def _free_decode_logits(logits: torch.Tensor, *, reference_only: bool,
+                        enable_nvv: bool, bias_value: float,
+                        blank_id: int = BLANK_ID) -> torch.Tensor:
+    """Prepare only the logits clone used by free CTC decoding."""
+    decoded = logits.clone()
+    if reference_only:
+        decoded[..., NVV_START:NVV_END + 1] = -float("inf")
+    elif enable_nvv:
+        top_pred = decoded.argmax(dim=-1)
+        is_blank = top_pred == blank_id
+        decoded[is_blank, NVV_START:NVV_END + 1] += bias_value
+    return decoded
+
 def make_patched_inference(ref_texts: dict[str, str],
                            bias_value: float = NVV_BIAS_DEFAULT,
                            pause_threshold: int = PAUSE_FRAMES_DEFAULT,
-                           enable_nvv: bool = True):
+                           enable_nvv: bool = True,
+                           reference_only: bool = False):
     """
     创建打了补丁的 inference 方法.
 
@@ -164,7 +184,9 @@ def make_patched_inference(ref_texts: dict[str, str],
     - 同样做 blank-frame NVV bias + 停顿检测 + 省略号注入
 
     ref_texts: {stem: chinese_text}  — 键为音频文件 stem (无扩展名)
-    enable_nvv: 若 False, 关闭 blank-frame NVV bias, 模型不会检测 NVV token.
+    enable_nvv: 非 reference-only 模式是否启用 blank-frame NVV bias.
+    reference_only: 仅在自由解码 logits clone 上屏蔽 NVV；forced alignment
+                    继续使用干净原 logits 和 reference target.
     """
     try:
         import cn2an as _cn2an
@@ -222,15 +244,15 @@ def make_patched_inference(ref_texts: dict[str, str],
             key *= b
 
         for i in range(b):
-            # Clone before NVV bias so ctc_logits stays clean for forced
-            # alignment reuse below (avoids a second log_softmax call).
-            x = ctc_logits[i, :elens[i].item(), :].clone()
-
-            # ── Blank-frame NVV bias ──
-            top_pred = x.argmax(dim=-1)
-            is_blank = (top_pred == BLANK_ID)
-            if enable_nvv:
-                x[is_blank, NVV_START:NVV_END + 1] += bias_value
+            # Free decode gets an isolated clone; forced alignment below keeps
+            # the clean ctc_logits and reference target.
+            x = _free_decode_logits(
+                ctc_logits[i, :elens[i].item(), :],
+                reference_only=reference_only,
+                enable_nvv=enable_nvv,
+                bias_value=bias_value,
+                blank_id=self.blank_id,
+            )
 
             raw_y = x.argmax(dim=-1).tolist()
 
@@ -286,8 +308,9 @@ def make_patched_inference(ref_texts: dict[str, str],
                 # 无参考文本, 使用 ASR 解码文本
                 align_text = asr_clean
 
-            # cn2an 数字正则化 (参考文本和 ASR 文本都可能含阿拉伯数字)
-            if _cn2an is not None:
+            # Reference-only keeps the canonical reference surface exactly;
+            # non-reference mode retains its historical deterministic transforms.
+            if _cn2an is not None and not reference_only:
                 parts = re.split(r'(\[[^\]]+\]|[A-Z][A-Z0-9-]*[A-Z0-9])', align_text)
                 for k, part in enumerate(parts):
                     if re.match(r'^(\[[^\]]+\]|[A-Z][A-Z0-9-]*[A-Z0-9])$', part):
@@ -298,13 +321,13 @@ def make_patched_inference(ref_texts: dict[str, str],
                         pass
                 align_text = ''.join(parts)
 
-            # ria 音译还原: 必须在 tokenizer 之前处理, 确保 .lab / .TextGrid
-            # / _tokens.jsonl 从源头就使用 ria, 而非 rui4 ya4 拼音碎片.
-            align_text = replace_ria_variants(align_text)
+            # ria and punctuation transforms are non-reference-mode only.
+            if not reference_only:
+                align_text = replace_ria_variants(align_text)
 
-            # 标点规范化 inline: ASCII→CJK + 相邻合并, 必须在 tokenizer 之前,
-            # 确保 punct entries / .lab / .TextGrid 均为 CJK 标点.
-            align_text = normalize_punct_inline(align_text)
+            # Preserve reference punctuation/order in reference-only mode.
+            if not reference_only:
+                align_text = normalize_punct_inline(align_text)
 
             words_aligned = []  # token 级别时间戳
             speech_tokens = []  # initialize to avoid UnboundLocalError
@@ -411,13 +434,22 @@ def make_patched_inference(ref_texts: dict[str, str],
                     missing_english.append(
                         f"{tok}(expected {count}, got {act_counts.get(tok, 0)})")
 
+            # Blank runs were measured in encoder coordinates; published
+            # pause coordinates are the speech slice [QUERY_FRAMES, total).
+            # A run touching query frames is not a physical speech pause.
+            # Drop it instead of publishing a synthetic pause at speech zero.
+            blank_runs_speech = [(s - QUERY_FRAMES, e - QUERY_FRAMES)
+                                 for s, e in blank_runs
+                                 if s >= QUERY_FRAMES and e > QUERY_FRAMES]
             results.append({
                 "key": key[i],
                 "text_asr": asr_final,
                 "text_asr_clean": asr_clean,
+                "reference_text": ref_texts.get(stem),
+                "reference_only": reference_only,
                 "duration_s": round(duration_s, 3),
                 "words": words_aligned,
-                "blank_runs": blank_runs,
+                "blank_runs": blank_runs_speech,
                 "english_complete": english_complete,
                 "missing_english": missing_english,
                 "ctc_alignment_complete": ctc_alignment_complete,
@@ -486,11 +518,20 @@ def write_textgrid(words_pinyin: list[dict], duration_s: float,
         p_intervals: list[tuple[float, float, str]] = []
         pc = 0.0
         for p in pauses:
-            ps = p["start_ms"] / 1000
-            pe = p["end_ms"] / 1000
+            ps = float(p["start_ms"]) / 1000
+            pe = float(p["end_ms"]) / 1000
+            if (not math.isfinite(ps) or not math.isfinite(pe)
+                    or ps < 0 or pe <= ps or ps >= duration_s):
+                raise ValueError(f"invalid pause endpoint: {ps}..{pe} / {duration_s}")
+            if pe > duration_s:
+                if pe - duration_s > FRAME_MS / 1000 + 1e-6:
+                    raise ValueError(f"pause endpoint exceeds WAV axis: {pe} > {duration_s}")
+                pe = duration_s
+            if pe <= ps:
+                raise ValueError("pause endpoint clips to empty interval")
             if ps > pc + 0.005:
                 p_intervals.append((pc, ps, ""))
-            p_intervals.append((ps, pe, f'{p["duration_ms"]}ms'))
+            p_intervals.append((ps, pe, f'{(pe - ps) * 1000:.1f}ms'))
             pc = pe
         if pc < duration_s - 0.005:
             p_intervals.append((pc, duration_s, ""))
@@ -504,6 +545,23 @@ def write_textgrid(words_pinyin: list[dict], duration_s: float,
             lines.append(f'            text = "{label}"')
 
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _clamp_words_to_wav_axis(words: list[dict], duration_s: float) -> list[dict]:
+    """Keep encoder-derived endpoints inside the authoritative WAV axis."""
+    result = []
+    for word in words:
+        start, end = float(word["start"]), float(word["end"])
+        if not math.isfinite(start) or not math.isfinite(end) or start < 0 or start >= duration_s or end <= start:
+            raise ValueError(f"invalid token endpoint: {word['word']}")
+        if end > duration_s:
+            if end - duration_s > FRAME_MS / 1000 + 1e-6:
+                raise ValueError(f"token endpoint exceeds WAV axis: {word['word']}")
+            end = duration_s
+        if end <= start:
+            raise ValueError(f"token endpoint clips to empty interval: {word['word']}")
+        result.append({**word, "start": start, "end": end})
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -765,7 +823,10 @@ def _normalize_punct(ctc_dir: Path) -> int:
 
 
 def _normalize_numerals(ctc_dir: Path) -> int:
-    """阿拉伯数字→中文数字 (cn2an), 同步更新 _text_cn.txt 和 .lab."""
+    """阿拉伯数字→中文数字，只处理人类可读的 _text_cn.txt。
+
+    .lab 已经是 MFA token 序列；声调数字绝不能再交给 cn2an。
+    """
     try:
         import cn2an as _cn2an
     except ImportError:
@@ -775,44 +836,71 @@ def _normalize_numerals(ctc_dir: Path) -> int:
     changed = 0
     for txt_file in sorted(ctc_dir.glob("*_text_cn.txt")):
         try:
-            text = txt_file.read_text(encoding="utf-8").strip()
+            text = txt_file.read_text(encoding="utf-8-sig").strip()
         except FileNotFoundError:
             continue
 
-        # Protect NVV tokens and non-numeral content from cn2an
-        parts = re.split(r'(\[[^\]]+\]|[A-Z][A-Z0-9-]*[A-Z0-9])', text)
-        for k, part in enumerate(parts):
-            if re.match(r'^(\[[^\]]+\]|[A-Z][A-Z0-9-]*[A-Z0-9])$', part):
-                continue
-            try:
-                parts[k] = _cn2an.transform(part, "an2cn")
-            except Exception:
-                pass
-        normalized = "".join(parts)
+        normalized = normalize_reference_numerals(text, _cn2an.transform)
 
-        if normalized != text:
+        changed_file = normalized != text
+        if changed_file:
             txt_file.write_text(normalized + "\n", encoding="utf-8")
-            lab_file = ctc_dir / txt_file.name.replace("_text_cn.txt", ".lab")
-            if lab_file.exists():
-                try:
-                    lab_text = lab_file.read_text(encoding="utf-8").strip()
-                    lab_parts = re.split(
-                        r'(\[[^\]]+\]|[A-Z][A-Z0-9-]*[A-Z0-9])', lab_text)
-                    for k, part in enumerate(lab_parts):
-                        if re.match(r'^(\[[^\]]+\]|[A-Z][A-Z0-9-]*[A-Z0-9])$', part):
-                            continue
-                        try:
-                            lab_parts[k] = _cn2an.transform(part, "an2cn")
-                        except Exception:
-                            pass
-                    lab_file.write_text("".join(lab_parts) + "\n", encoding="utf-8")
-                except FileNotFoundError:
-                    pass
+        if changed_file:
             changed += 1
 
     if changed:
         print(f"  [normalize_numerals] {changed} files")
     return changed
+
+
+def _validate_all_ctc_bundles(ctc_dir: Path) -> bool:
+    """Validate every successful CTC lab before publishing a v3 marker."""
+    lab_paths = sorted(ctc_dir.glob("*.lab"))
+    invalid: list[tuple[str, list[str]]] = []
+    for lab_path in lab_paths:
+        errors = validate_ctc_transcript_bundle(ctc_dir, lab_path.stem)
+        if errors:
+            invalid.append((lab_path.stem, errors))
+    if invalid:
+        print(f"  ERROR: {len(invalid)} invalid CTC transcript bundle(s)")
+        for stem, errors in invalid[:20]:
+            print(f"    - {stem}: {'; '.join(errors)}")
+        if len(invalid) > 20:
+            print(f"    ... and {len(invalid) - 20} more")
+        return False
+    print(f"  CTC bundle validation: {len(lab_paths)} OK")
+    return bool(lab_paths)
+
+
+def _wav_duration_s(path: Path) -> float:
+    """Return the authoritative physical WAV duration, never encoder length."""
+    with wave.open(str(path), "rb") as handle:
+        if handle.getframerate() <= 0:
+            raise ValueError(f"invalid WAV sample rate: {path}")
+        return handle.getnframes() / handle.getframerate()
+
+
+def _rebuild_final_manifest(ctc_dir: Path, audio_dir: Path) -> None:
+    """Atomically publish a manifest from final normalized CTC artifacts."""
+    entries = []
+    for lab in sorted(ctc_dir.glob("*.lab")):
+        stem = lab.stem; audio = audio_dir / f"{stem}.wav"; tokens = ctc_dir / f"{stem}_tokens.jsonl"
+        if not audio.is_file() or not tokens.is_file():
+            raise ValueError(f"cannot build final manifest for {stem}")
+        rows = [json.loads(line) for line in tokens.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+        duration = _wav_duration_s(audio)
+        punct_path = ctc_dir / f"{stem}_punct.json"
+        try:
+            punct_count = len(json.loads(punct_path.read_text(encoding="utf-8-sig")))
+        except Exception as exc:
+            raise ValueError(f"cannot rebuild final manifest punctuation for {stem}") from exc
+        entries.append({"audio": str(audio), "textgrid": str(ctc_dir / f"{stem}.TextGrid"),
+                        "lab": str(lab), "duration_s": duration, "n_words": len(rows),
+                        "n_punct": punct_count,
+                        "_words": [{"word": row["word"], "start": row["start_s"], "end": row["end_s"]} for row in rows]})
+    temporary = ctc_dir / "manifest.json.tmp"
+    temporary.write_text(json.dumps(entries, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, ctc_dir / "manifest.json")
 
 
 def _merge_ria_tokens(tokens_path: Path) -> bool:
@@ -963,7 +1051,8 @@ def _normalize_ria(ctc_dir: Path) -> int:
     return lab_changed
 
 
-def _normalize_english(ctc_dir: Path, dict_path: Path | None = None) -> int:
+def _normalize_english(ctc_dir: Path, dict_path: Path | None = None,
+                       update_dict: bool = True) -> int:
     """英文 token 碎片合并 (rui4+ya4 → ria), 同步更新 .lab / .TextGrid / _tokens.jsonl."""
     try:
         from normalize_english_tokens import normalize_stem
@@ -988,7 +1077,7 @@ def _normalize_english(ctc_dir: Path, dict_path: Path | None = None) -> int:
         print(f"  [normalize_en] {changed} files")
 
     # Auto-add English tokens to MFA dictionary
-    if dict_path and dict_path.exists() and changed:
+    if update_dict and dict_path and dict_path.exists() and changed:
         english_tokens_found: set[str] = set()
         for lab_path in sorted(ctc_dir.glob("*.lab")):
             tokens = lab_path.read_text(encoding="utf-8").strip().split()
@@ -1035,11 +1124,18 @@ def main():
     parser.add_argument("--all-gpus", action="store_true",
                         help="自动检测所有 GPU 并均匀分片并行处理")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--require-fresh-output", action="store_true",
+                        help="Fail before GPU/model work if --output-dir already exists (v4 gate).")
     parser.add_argument("--nvv-bias", type=float, default=NVV_BIAS_DEFAULT,
                         help=f"NVV blank-frame bias (default: {NVV_BIAS_DEFAULT}).")
     parser.add_argument("--no-nvv", action="store_true",
                         help="禁用 NVV 标签检测, 仅用 CTC 锚点给参考文本做时间戳.")
+    parser.add_argument("--no-dict-update", action="store_true",
+                        help="Do not append discovered English tokens to --dict-path.")
     args = parser.parse_args()
+    if args.require_fresh_output and args.output_dir.exists():
+        print(f"ERROR: --require-fresh-output refuses existing output: {args.output_dir}", file=sys.stderr)
+        return 2
 
     # ── --all-gpus: auto-detect GPUs, split files, launch parallel subprocesses ──
     if args.all_gpus:
@@ -1094,6 +1190,8 @@ def main():
                 _base_argv += ["--audio-dir", str(args.audio_dir)]
             if args.no_nvv:
                 _base_argv += ["--no-nvv"]
+            if args.no_dict_update:
+                _base_argv += ["--no-dict-update"]
 
             for gpu_id in range(num_gpus):
                 offset = gpu_id * per_gpu
@@ -1102,7 +1200,10 @@ def main():
                     break
 
                 shard_dir = args.output_dir / f"_shard_gpu{gpu_id}"
-                shard_dir.mkdir(parents=True, exist_ok=True)
+                if shard_dir.exists():
+                    print(f"ERROR: fresh all-GPU shard already exists: {shard_dir}", file=sys.stderr)
+                    return 2
+                shard_dir.mkdir(parents=True)
 
                 child_argv = list(_base_argv)
                 child_argv += [
@@ -1110,7 +1211,6 @@ def main():
                     "--output-dir", str(shard_dir),
                     "--offset", str(offset),
                     "--limit", str(limit),
-                    "--overwrite",
                 ]
                 # Copy dict to shard dir (avoids concurrent write races on shared dict)
                 if args.dict_path:
@@ -1143,6 +1243,79 @@ def main():
                     print(f"    GPU {gpu_id}: rc={rc}")
                 sys.exit(1)
 
+            # ── Preflight every shard before touching the parent namespace ──
+            # This is the transaction boundary for all-GPU mode: no shard file
+            # may be moved until every shard has an exact namespace, manifest,
+            # summary and mutually exclusive expected stem set.
+            import json as _json
+            _artifact_suffixes = [".TextGrid", ".lab", "_tokens.jsonl",
+                                  "_punct.json", "_text_cn.txt", "_text_raw.txt"]
+            if args.no_nvv:
+                _artifact_suffixes.append("_ref.txt")
+            _preflight_shards = []
+            _seen_shard_stems: set[str] = set()
+            _expected_all_stems: set[str] = set()
+            for _gpu_id, _, _shard_dir in _procs:
+                _start = _gpu_id * per_gpu
+                _expected = {p.stem for p in all_wavs[_start:_start + per_gpu]}
+                _expected_all_stems |= _expected
+                _allowed = {s + suffix for s in _expected for suffix in _artifact_suffixes}
+                _allowed |= {"manifest.json", "summary.txt", ".ctc_normalized"}
+                if args.dict_path:
+                    _allowed.add(args.dict_path.name)
+                _files = list(_shard_dir.iterdir())
+                if any(p.is_symlink() or not p.is_file() for p in _files):
+                    raise RuntimeError(f"shard contains non-regular artifact: {_shard_dir}")
+                if {p.name for p in _files} != _allowed:
+                    raise RuntimeError(f"shard namespace mismatch: {_shard_dir}")
+                try:
+                    _shard_manifest = _json.loads(
+                        (_shard_dir / "manifest.json").read_text(encoding="utf-8"))
+                except Exception as _exc:
+                    raise RuntimeError(f"invalid shard manifest: {_shard_dir}") from _exc
+                if not isinstance(_shard_manifest, list):
+                    raise RuntimeError(f"shard manifest is not a list: {_shard_dir}")
+                _manifest_stems = []
+                for _entry in _shard_manifest:
+                    if not isinstance(_entry, dict):
+                        raise RuntimeError(f"invalid shard manifest entry: {_shard_dir}")
+                    _audio_stem = Path(str(_entry.get("audio", ""))).stem
+                    _manifest_stems.append(_audio_stem)
+                    if _audio_stem not in _expected:
+                        raise RuntimeError(f"shard manifest stem mismatch: {_audio_stem}")
+                    for _key in ("textgrid", "lab"):
+                        _path = Path(str(_entry.get(_key, "")))
+                        if _path.name not in _allowed or not (_shard_dir / _path.name).is_file():
+                            raise RuntimeError(f"shard manifest artifact mismatch: {_entry}")
+                if _manifest_stems != sorted(_expected) or len(_manifest_stems) != len(set(_manifest_stems)):
+                    raise RuntimeError(f"shard manifest stem set mismatch: {_shard_dir}")
+                _summary_text = (_shard_dir / "summary.txt").read_text(encoding="utf-8")
+                _summary_match = re.search(
+                    r"^Files:\s+(\d+)\s+total,\s+(\d+)\s+OK,\s+(\d+)\s+failed$",
+                    _summary_text, re.MULTILINE)
+                if not _summary_match or tuple(map(int, _summary_match.groups())) != (len(_expected), len(_expected), 0):
+                    raise RuntimeError(f"shard summary mismatch: {_shard_dir}")
+                _marker_text = (_shard_dir / ".ctc_normalized").read_text(encoding="utf-8")
+                # Accept v3 (legacy) or v4 (content-identity) marker.
+                _marker_ok = (
+                    _marker_text == CTC_NORMALIZATION_MARKER
+                    or parse_ctc_normalization_marker(_marker_text) is not None
+                )
+                if not _marker_ok:
+                    raise RuntimeError(f"shard normalization marker mismatch: {_shard_dir}")
+                if _seen_shard_stems & _expected:
+                    raise RuntimeError(f"duplicate shard stem set: {_shard_dir}")
+                _seen_shard_stems |= _expected
+                _preflight_shards.append((_shard_dir, _shard_manifest))
+            if _seen_shard_stems != _expected_all_stems or _expected_all_stems != {p.stem for p in all_wavs}:
+                raise RuntimeError("all-GPU shard stem union is not exact")
+            for _shard_dir, _ in _preflight_shards:
+                for _f in _shard_dir.iterdir():
+                    if _f.name in {"manifest.json", "summary.txt", ".ctc_normalized"}:
+                        continue
+                    if (args.output_dir / _f.name).exists() or (args.output_dir / _f.name).is_symlink():
+                        raise FileExistsError(f"all-GPU target collision: {args.output_dir / _f.name}")
+
             # ── Merge shard outputs into main output dir ──
             print(f"\n  合并 {len(_procs)} 个 shard 输出...")
             _merged_entries = 0
@@ -1156,45 +1329,40 @@ def main():
                         _all_manifests.append((_shard_dir, _f))
                     elif _f.name == "summary.txt":
                         _all_summaries.append(_f)
+                    elif _f.name == ".ctc_normalized":
+                        pass  # parent marker is published last, after full validation
                     elif args.dict_path and _f.name == args.dict_path.name:
                         pass  # skip shard-local dict copy
                     else:
                         _dest = args.output_dir / _f.name
-                        if not _dest.exists() or args.overwrite:
-                            _shutil.move(str(_f), str(_dest))
-                            _merged_entries += 1
+                        if _dest.exists() or _dest.is_symlink():
+                            raise FileExistsError(f"all-GPU target collision: {_dest}")
+                        _shutil.move(str(_f), str(_dest))
+                        _merged_entries += 1
 
             # ── Merge manifests with path rewriting (BEFORE shard cleanup) ──
             import json as _json
             _merged = []
             for _shard_dir, _m in sorted(_all_manifests, key=lambda p: p[1].parent.name):
-                try:
-                    _data = _json.loads(_m.read_text(encoding="utf-8"))
-                    _shard_s = str(_shard_dir)
-                    _main_s = str(args.output_dir)
-                    for _entry in _data:
-                        for _key in ("textgrid", "lab"):
-                            if _key in _entry:
-                                _entry[_key] = _entry[_key].replace(_shard_s, _main_s)
-                    _merged.extend(_data)
-                except Exception as _e:
-                    print(f"  WARNING: Failed to read {_m}: {_e}")
-            with open(args.output_dir / "manifest.json", "w", encoding="utf-8") as _f:
-                _json.dump(_merged, _f, ensure_ascii=False, indent=2)
+                _data = _json.loads(_m.read_text(encoding="utf-8"))
+                _shard_s = str(_shard_dir)
+                _main_s = str(args.output_dir)
+                for _entry in _data:
+                    for _key in ("textgrid", "lab"):
+                        if _key in _entry:
+                            _entry[_key] = _entry[_key].replace(_shard_s, _main_s)
+                _merged.extend(_data)
 
             # Extract stats from per-shard summaries
             for _s in _all_summaries:
-                try:
-                    for _line in _s.read_text(encoding="utf-8").splitlines():
-                        if _line.startswith("Files:"):
-                            _p = _line.split()
-                            _total_files += int(_p[1])
-                            _total_ok += int(_p[3])
-                            _total_fail += int(_p[5])
-                        elif _line.startswith("Time:"):
-                            _total_time += float(_line.split()[1].rstrip("s"))
-                except Exception:
-                    pass
+                for _line in _s.read_text(encoding="utf-8").splitlines():
+                    if _line.startswith("Files:"):
+                        _p = _line.split()
+                        _total_files += int(_p[1])
+                        _total_ok += int(_p[3])
+                        _total_fail += int(_p[5])
+                    elif _line.startswith("Time:"):
+                        _total_time += float(_line.split()[1].rstrip("s"))
 
             # Write combined summary
             _summary = (
@@ -1204,10 +1372,10 @@ def main():
                 f"Time: {_total_time:.1f}s (wall-clock total)\n\n"
                 f"Output: {args.output_dir}\n"
             )
-            (args.output_dir / "summary.txt").write_text(_summary, encoding="utf-8")
+            # summary/manifest are published only after final bundle validation.
 
             # ── Collect English tokens from merged manifest → shared dict ──
-            if args.dict_path and args.dict_path.exists():
+            if not args.no_dict_update and args.dict_path and args.dict_path.exists():
                 _english_tokens: set[str] = set()
                 for _entry in _merged:
                     for _w in _entry.get("_words", []):
@@ -1244,7 +1412,19 @@ def main():
             # Tells run_pipeline.py that normalize_* steps were already done
             # by ctc_prealign. pad_silence only shifts timestamps, doesn't
             # change token content, so re-normalizing is redundant.
-            (args.output_dir / ".ctc_normalized").touch()
+            if not _validate_all_ctc_bundles(args.output_dir):
+                print("ERROR: refusing to write CTC normalization marker")
+                sys.exit(1)
+            _rebuild_final_manifest(args.output_dir, audio_dir)
+            (args.output_dir / "summary.txt.tmp").write_text(_summary, encoding="utf-8")
+            os.replace(args.output_dir / "summary.txt.tmp", args.output_dir / "summary.txt")
+            _stem_count = len(list(args.output_dir.glob("*.lab")))
+            _manifest_digest = hashlib.sha256(
+                (args.output_dir / "manifest.json").read_bytes()).hexdigest()
+            (args.output_dir / ".ctc_normalized").write_text(
+                make_ctc_normalization_marker(_stem_count, _manifest_digest),
+                encoding="utf-8",
+            )
             print(f"完成! 输出: {args.output_dir}")
             sys.exit(0)
 
@@ -1283,7 +1463,16 @@ def main():
     if skipped.get("japanese"):
         print(f"  跳过日语: {len(skipped['japanese'])} 个文件 (含假名, 管线不支持)")
     if missing_ref:
-        print(f"  注意: {len(missing_ref)} 个文件无参考文本, 将纯靠 ASR 文本")
+        if args.no_nvv:
+            # 参考文本模式下, 无参考的 stem 直接跳过, 不做 ASR fallback
+            missing_set = set(missing_ref)
+            wav_files = [p for p in wav_files if p.stem not in missing_set]
+            print(f"  参考文本模式: 跳过 {len(missing_ref)} 个无参考文本的音频")
+            if not wav_files:
+                print("ERROR: 所有音频均无参考文本, 无任何可处理的 stem", file=sys.stderr)
+                return 2
+        else:
+            print(f"  注意: {len(missing_ref)} 个文件无参考文本, 将纯靠 ASR 文本")
     print(f"  已索引 {len(ref_texts)} 个参考文本, 共 {len(wav_files)} 个音频")
 
     # ── 加载 NVASR 模型 ──
@@ -1292,7 +1481,8 @@ def main():
     model = AutoModel(model=args.model_path, device=args.device, disable_update=True)
     orig_inf = model.model.inference
     patched = make_patched_inference(ref_texts, args.nvv_bias,
-                                      enable_nvv=not args.no_nvv)
+                                      enable_nvv=not args.no_nvv,
+                                      reference_only=args.no_nvv)
     model.model.inference = patched.__get__(model.model, type(model.model))
 
     # ── 处理所有音频文件 (有参考文本用参考, 无则纯靠 ASR) ──
@@ -1373,7 +1563,9 @@ def main():
         seen_result_stems.add(result_stem)
         stem = result_stem
         words_aligned = r["words"]
-        duration_s = r["duration_s"]
+        # Encoder frame duration can differ at its endpoint.  Every published
+        # artifact is instead clamped to the physical WAV header duration.
+        duration_s = _wav_duration_s(audio_dir / f"{stem}.wav")
 
         # ── Reject incomplete target alignment before writing any anchor ──
         # A zero-frame target cannot be repaired by shifting the following
@@ -1463,7 +1655,8 @@ def main():
             #   只保留白名单内的标点, 其余单字符符号 (」『』【】等) 直接丢弃.
             if token_clean and len(token_clean) == 1 and token_clean in ALLOWED_PUNCT:
                 # ASCII→CJK 标点 inline 转换 (安全网: align_text 已规范化, 兜底 tokenizer 输出的 ASCII)
-                word_cjk = _ASCII_TO_CJK_PUNCT.get(token_clean, token_clean)
+                word_cjk = (token_clean if args.no_nvv else
+                            _ASCII_TO_CJK_PUNCT.get(token_clean, token_clean))
                 punct_entries.append({
                     "word": word_cjk,
                     "start": w["start"],
@@ -1514,7 +1707,7 @@ def main():
         # ASR output where punctuation between two identical NVV tags is
         # stripped.  Keep the first token, extend its end to cover the
         # last duplicate so the time span encompasses the full event.
-        if words_pinyin:
+        if words_pinyin and not args.no_nvv:
             deduped_pinyin = []
             i = 0
             while i < len(words_pinyin):
@@ -1543,7 +1736,9 @@ def main():
         # Merge any remaining ria fragments that survived single-letter
         # merge (e.g. "R"+"ia"), normalise case ("RIA"→"ria").
         # Regression Case 31 Fix-4d.
-        words_pinyin = _protect_ria(words_pinyin)
+        if not args.no_nvv:
+            words_pinyin = _protect_ria(words_pinyin)
+        words_pinyin = _clamp_words_to_wav_axis(words_pinyin, duration_s)
 
         # 写 TextGrid — 含 pauses tier
         try:
@@ -1565,8 +1760,8 @@ def main():
             # Detect it early so we can drop the CTC anchor before _punct.json
             # is written.  The text_asr string itself is cleaned in part B below.
             # Subsequent word timestamps are NOT shifted.
-            _raw_text_check = re.sub(r"<\|[^|]+\|>", "",
-                                     r.get("text_asr", "")).strip()
+            _raw_text_check = "" if args.no_nvv else re.sub(
+                r"<\|[^|]+\|>", "", r.get("text_asr", "")).strip()
             _leading_punct = None
             if _raw_text_check and is_punct(_raw_text_check[0]):
                 _leading_punct = _raw_text_check[0]
@@ -1634,7 +1829,7 @@ def main():
                 # pause-marking function.  NVV tokens must be preserved.
                 non_ellipsis = [p for p in punct_data if p["word"] != "…"]
                 ellipsis_only = [p for p in punct_data if p["word"] == "…"]
-                if non_ellipsis and ellipsis_only:
+                if not args.no_nvv and non_ellipsis and ellipsis_only:
                     kept_ellipsis = []
                     for ep in ellipsis_only:
                         overlap = any(
@@ -1647,16 +1842,24 @@ def main():
 
                 punct_path.write_text(json.dumps(punct_data, ensure_ascii=False),
                                      encoding="utf-8")
+            else:
+                # v4 requires a deterministic sidecar for every rerun stem.
+                punct_path.write_text("[]", encoding="utf-8")
 
-            # 含情绪标签的原始文本 (保留 <|HAPPY|> <|zh|> 等, NVV 保持 [Bracket] 格式)
-            text_asr = r.get("text_asr", "")
+            # Required sidecars never receive free ASR content in
+            # reference-only mode, even transiently before the canonical
+            # overwrite below.  ASR remains diagnostic in the manifest only.
+            text_asr = (ref_texts.get(stem) if args.no_nvv
+                        else r.get("text_asr", ""))
+            if text_asr is None:
+                raise ValueError(f"reference-only stem has no canonical reference: {stem}")
             text_asr = clean_unsupported_punct(text_asr)
             # ── Strip leading punctuation (part B: remove from text_asr) ──
             # Detection mirroring part A above; now that text_asr is available,
             # delete the leading punct character so _text_raw.txt / _text_cn.txt
             # are clean.  Subsequent token positions are not shifted.
             _text_clean_b = re.sub(r"<\|[^|]+\|>", "", text_asr).strip()
-            if _text_clean_b and is_punct(_text_clean_b[0]):
+            if not args.no_nvv and _text_clean_b and is_punct(_text_clean_b[0]):
                 _lp = _text_clean_b[0]
                 _tag_end = 0
                 for _m in re.finditer(r"<\|[^|]+\|>", text_asr):
@@ -1696,6 +1899,18 @@ def main():
             cn_path = args.output_dir / f"{stem}_text_cn.txt"
             cn_path.write_text(text_cn + "\n", encoding="utf-8")
 
+            # Reference-only required sidecars are canonical reference content;
+            # free ASR text remains diagnostic only.
+            if args.no_nvv:
+                canonical = ref_texts.get(stem)
+                if canonical is None:
+                    raise ValueError(f"reference-only stem has no canonical reference: {stem}")
+                canonical_bytes = canonical.strip() + "\n"
+                raw_path.write_text(canonical_bytes, encoding="utf-8")
+                cn_path.write_text(canonical_bytes, encoding="utf-8")
+                (args.output_dir / f"{stem}_ref.txt").write_text(
+                    canonical_bytes, encoding="utf-8")
+
             # Preserve the source transcript beside CTC output.  The ASR
             # text above is diagnostic only; downstream normalization and
             # post-processing must be able to recover the authoritative
@@ -1709,6 +1924,9 @@ def main():
                 "textgrid": str(out_tg),
                 "lab": str(out_lab),
                 "text_asr": r.get("text_asr", ""),
+                "nvv_mode": "reference_only" if args.no_nvv else "asr_added_allowed",
+                "asr_nvv_bias": False if args.no_nvv else bool(args.nvv_bias),
+                "content_authority": "reference" if args.no_nvv else "asr_or_reference",
                 "duration_s": duration_s,
                 "n_words": len(words_pinyin),
                 "n_pauses": len(pauses),
@@ -1725,7 +1943,7 @@ def main():
     # English tokens (like "li", "ve", "A", "I") are self-referential
     # in the MFA dict — MFA can't model them acoustically, so they get
     # CTC-only boundaries like NVV tokens.
-    if args.dict_path and args.dict_path.exists():
+    if not args.no_dict_update and args.dict_path and args.dict_path.exists():
         english_tokens_found: set[str] = set()
         for entry in manifest:
             for w in entry.get("_words", []):
@@ -1749,10 +1967,6 @@ def main():
                 mfa_words = load_mfa_word_set(args.dict_path)
             else:
                 print(f"  English tokens already in MFA dict: {', '.join(sorted(english_tokens_found))}")
-
-    # ── 保存 manifest + 逐词 tokens JSONL ──
-    with open(args.output_dir / "manifest.json", "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
 
     for entry in manifest:
         stem = Path(entry["audio"]).stem
@@ -1832,12 +2046,25 @@ def main():
     # ── 输出后处理 (等价于 run_pipeline.py 的 normalize_punct → normalize → normalize_en) ──
     if ok > 0:
         print("\n── 输出后处理 ──")
-        _normalize_punct(args.output_dir)
-        _normalize_numerals(args.output_dir)
-        _normalize_ria(args.output_dir)
-        _normalize_english(args.output_dir, args.dict_path)
-        # Marker: downstream pipeline steps can skip re-normalization
-        (args.output_dir / ".ctc_normalized").touch()
+        if not args.no_nvv:
+            _normalize_punct(args.output_dir)
+            _normalize_numerals(args.output_dir)
+            _normalize_ria(args.output_dir)
+            _normalize_english(args.output_dir, args.dict_path,
+                               update_dict=not args.no_dict_update)
+        if _validate_all_ctc_bundles(args.output_dir):
+            _rebuild_final_manifest(args.output_dir, audio_dir)
+            # Marker: downstream pipeline steps can skip re-normalization.
+            _stem_count = len(list(args.output_dir.glob("*.lab")))
+            _manifest_digest = hashlib.sha256(
+                (args.output_dir / "manifest.json").read_bytes()).hexdigest()
+            (args.output_dir / ".ctc_normalized").write_text(
+                make_ctc_normalization_marker(_stem_count, _manifest_digest),
+                encoding="utf-8",
+            )
+        else:
+            print("ERROR: refusing to write CTC normalization marker")
+            fail += 1
 
     # ── 恢复模型 ──
     model.model.inference = orig_inf

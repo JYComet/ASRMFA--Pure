@@ -27,6 +27,69 @@ from pipeline_utils import find_wav
 _TG_TIME_RE = re.compile(r'^\s*(xmin|xmax)\s*=\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$')
 
 
+def load_exact_stems_file(path: Path) -> list[str]:
+    """Load the immutable runner denominator without normalizing any line."""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"stems file must be an ordinary file: {path}")
+    try:
+        stems = path.read_text(encoding="utf-8").splitlines()
+    except UnicodeError as exc:
+        raise ValueError("stems file must be UTF-8") from exc
+    if (not stems or any(not stem or stem.strip() != stem or Path(stem).name != stem
+                         for stem in stems)):
+        raise ValueError("stems file contains an empty, altered, or unsafe stem")
+    if stems != sorted(stems) or len(stems) != len(set(stems)):
+        raise ValueError("stems file must be sorted and unique")
+    return stems
+
+
+def validate_completion(expected_stems: list[str], results: list[dict],
+                        padded_dir: Path, dry_run: bool,
+                        output_dir: Path | None = None) -> list[str]:
+    """Return fail-closed padding contract violations."""
+    expected = set(expected_stems)
+    issues: list[str] = []
+    returned = [result.get("stem") for result in results if isinstance(result, dict)]
+    returned_set = {stem for stem in returned if isinstance(stem, str)}
+    if len(returned) != len(results) or len(returned) != len(returned_set):
+        issues.append("worker results contain a missing/duplicate stem")
+    if returned_set != expected:
+        issues.append(
+            f"worker result set mismatch: missing={len(expected - returned_set)}, "
+            f"extra={len(returned_set - expected)}")
+    errored = sorted(
+        str(result.get("stem")) if isinstance(result, dict) else "<invalid-result>"
+        for result in results
+        if not isinstance(result, dict) or result.get("error")
+    )
+    if errored:
+        issues.append(f"worker errors={len(errored)}: {errored[:10]}")
+    if not dry_run:
+        expected_names = {f"{stem}.wav" for stem in expected}
+        if not padded_dir.is_dir():
+            issues.append(f"padded output directory missing: {padded_dir}")
+        else:
+            entries = list(padded_dir.iterdir())
+            ordinary_names = {entry.name for entry in entries
+                              if entry.is_file() and not entry.is_symlink()}
+            if (ordinary_names != expected_names or len(entries) != len(expected_names)
+                    or any(entry.is_symlink() or not entry.is_file() for entry in entries)):
+                issues.append(
+                    f"padded WAV set mismatch: expected={len(expected_names)}, "
+                    f"ordinary_files={len(ordinary_names)}, entries={len(entries)}")
+        if output_dir is not None:
+            if not output_dir.is_dir():
+                issues.append(f"secondary audio output directory missing: {output_dir}")
+            else:
+                entries = list(output_dir.iterdir())
+                ordinary_names = {entry.name for entry in entries
+                                  if entry.is_file() and not entry.is_symlink()}
+                if (ordinary_names != expected_names or len(entries) != len(expected_names)
+                        or any(entry.is_symlink() or not entry.is_file() for entry in entries)):
+                    issues.append("secondary padded WAV set mismatch")
+    return issues
+
+
 def shift_textgrid_timestamps(tg_path: Path, offset_s: float) -> None:
     """Shift all xmin/xmax values in a Praat TextGrid by *offset_s* seconds."""
     if offset_s == 0.0:
@@ -194,7 +257,10 @@ def main():
     parser.add_argument("--target-silence-sec", type=float, default=0.5)
     parser.add_argument("--silence-threshold", type=float, default=0.001)
     parser.add_argument("--frame-length", type=int, default=1024)
-    parser.add_argument("--stem", default=None, help="Process a single stem")
+    stem_group = parser.add_mutually_exclusive_group()
+    stem_group.add_argument("--stem", default=None, help="Process a single stem")
+    stem_group.add_argument("--stems-file", default=None,
+                            help="Sorted UTF-8 denominator supplied by the strict runner")
     parser.add_argument("--wav-index", default=None, help="Pre-built wav_index.json (avoids slow glob on CIFS)")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -202,6 +268,8 @@ def main():
     # Load pre-built wav index if available
     wav_index: dict[str, str] | None = None
     if args.wav_index:
+        if args.stems_file:
+            parser.error("--wav-index is forbidden with --stems-file")
         wav_index = json.loads(Path(args.wav_index).read_text(encoding='utf-8'))
         print(f"Loaded wav index: {len(wav_index)} stems")
 
@@ -211,7 +279,24 @@ def main():
     output_dir = Path(args.output_audio_dir) if args.output_audio_dir else None
 
     # Discover stems from .lab files in ctc_dir
-    if args.stem:
+    if args.stems_file:
+        try:
+            stems = load_exact_stems_file(Path(args.stems_file))
+        except ValueError as exc:
+            parser.error(str(exc))
+        actual_labs = {
+            path.stem for path in ctc_dir.iterdir()
+            if path.is_file() and not path.is_symlink() and path.suffix == ".lab"
+        }
+        unsafe_labs = [path for path in ctc_dir.iterdir()
+                       if path.name.endswith(".lab")
+                       and (path.is_symlink() or not path.is_file())]
+        if unsafe_labs or actual_labs != set(stems):
+            print("ERROR: CTC .lab set does not equal the supplied denominator")
+            print(f"  missing={len(set(stems) - actual_labs)}, "
+                  f"extra={len(actual_labs - set(stems))}, unsafe={len(unsafe_labs)}")
+            return 1
+    elif args.stem:
         stems = [args.stem]
     else:
         stems = []
@@ -234,6 +319,9 @@ def main():
     import multiprocessing as _mp
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
+    if not stems:
+        print("ERROR: no stems to process")
+        return 1
     _n_workers = min(_mp.cpu_count(), 64, len(stems))
     print(f"  并行 workers: {_n_workers}")
 
@@ -242,39 +330,47 @@ def main():
     _n = len(stems)
     if _n_workers <= 1 or _n <= 100:
         for stem in stems:
-            r = process_one(stem=stem, audio_dir=audio_dir, ctc_dir=ctc_dir,
-                          padded_audio_dir=padded_dir, output_audio_dir=output_dir,
-                          target_silence_sec=args.target_silence_sec,
-                          silence_threshold=args.silence_threshold,
-                          frame_length=args.frame_length,
-                          dry_run=args.dry_run, wav_index=wav_index)
+            try:
+                r = process_one(stem=stem, audio_dir=audio_dir, ctc_dir=ctc_dir,
+                                padded_audio_dir=padded_dir, output_audio_dir=output_dir,
+                                target_silence_sec=args.target_silence_sec,
+                                silence_threshold=args.silence_threshold,
+                                frame_length=args.frame_length,
+                                dry_run=args.dry_run, wav_index=wav_index)
+            except Exception as exc:
+                r = {"stem": stem, "error": f"worker exception: {exc}"}
             results.append(r)
             _done += 1
             if _done % 1000 == 0:
                 print(f"  进度: {_done}/{_n}")
     else:
         with ProcessPoolExecutor(max_workers=_n_workers) as _pool:
-            _futures = []
+            _futures = {}
             for s in stems:
                 _fut = _pool.submit(
                     process_one, s, audio_dir, ctc_dir, padded_dir, output_dir,
                     args.target_silence_sec, args.silence_threshold,
                     args.frame_length, args.dry_run, wav_index)
-                _futures.append(_fut)
+                _futures[_fut] = s
             for _fut in as_completed(_futures):
                 try:
                     r = _fut.result()
-                    results.append(r)
                 except Exception as _e:
-                    print(f"  ERROR: {_e}")
+                    stem = _futures[_fut]
+                    r = {"stem": stem, "error": f"worker exception: {_e}"}
+                    print(f"  ERROR [{stem}]: {_e}")
+                results.append(r)
                 _done += 1
                 if _done % 1000 == 0:
                     print(f"  进度: {_done}/{_n}")
 
+    issues = validate_completion(stems, results, padded_dir, args.dry_run, output_dir)
     ok = sum(1 for r in results if "error" not in r)
     fail = len(results) - ok
     print(f"\nDone. ok={ok}, fail={fail}, total={len(results)}")
-    return 0 if fail == 0 else 1
+    for issue in issues:
+        print(f"  ERROR: {issue}")
+    return 0 if not issues else 1
 
 
 if __name__ == "__main__":

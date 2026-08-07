@@ -5,6 +5,8 @@
 被 run_pipeline.py 和 streaming_pipeline.py 共同导入。
 """
 
+import hashlib
+import json
 import os
 import platform
 import re
@@ -561,12 +563,203 @@ def sync_tree_back(src: Path, dst: Path) -> bool:
     return False
 
 
+def write_publish_manifest(src: Path) -> Path:
+    """Write a manifest for one run-specific output staging directory."""
+    src = src.resolve()
+    payload = []
+    for path in sorted(src.rglob("*")):
+        if not path.is_file() or path.name == ".publish_manifest.json":
+            continue
+        rel = path.relative_to(src).as_posix()
+        payload.append({
+            "path": rel,
+            "size": path.stat().st_size,
+            "sha256": _sha256_file(path),
+        })
+    manifest = {
+        "schema": 2,
+        "source": str(src),
+        "files": payload,
+    }
+    manifest_path = src / ".publish_manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def publish_output_versioned(src: Path, dst: Path) -> bool:
+    """Publish validated staging to a new, empty versioned destination.
+
+    The function never deletes or overwrites a pre-existing result directory.
+    Callers must select a fresh versioned destination for every publication.
+    The source is retained so a failed upload remains recoverable.
+    """
+    try:
+        src = src.resolve(strict=True)
+        dst = dst.resolve(strict=False)
+    except OSError as exc:
+        print(f"  Publish path resolution failed: {exc}")
+        return False
+    if src == dst or not dst.is_absolute() or len(dst.parts) < 3:
+        print(f"  Refusing unsafe publish target: {dst}")
+        return False
+    if not dst.parent.name.endswith(".runs"):
+        print(f"  Refusing non-versioned strict publish target: {dst}")
+        return False
+    try:
+        from verify_strict_ok import verify as _verify_strict_ok
+        strict_errors = _verify_strict_ok(src / "strict_ok_manifest.json", src)
+    except Exception as exc:
+        print(f"  Strict manifest verification could not run: {exc}")
+        return False
+    if strict_errors:
+        print("  Refusing publish: strict manifest invalid: " + ", ".join(strict_errors))
+        return False
+    if dst.exists():
+        # Even an empty pre-created directory is not a fresh run target.  This
+        # prevents a retry from silently reusing a version identifier.
+        print(f"  Refusing existing publish target: {dst}")
+        return False
+
+    manifest_path = src / ".publish_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest["schema"] != 2:
+            raise ValueError("publish manifest schema must be 2")
+        entries = manifest["files"]
+        expected_payload = {
+            entry["path"]: (int(entry["size"]), str(entry["sha256"]))
+            for entry in entries
+        }
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"  Invalid publish manifest {manifest_path}: {exc}")
+        return False
+
+    for rel in expected_payload:
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            print(f"  Unsafe path in publish manifest: {rel}")
+            return False
+    actual_payload = {
+        path.relative_to(src).as_posix(): (path.stat().st_size, _sha256_file(path))
+        for path in src.rglob("*")
+        if path.is_file() and path.name != ".publish_manifest.json"
+    }
+    if actual_payload != expected_payload:
+        print("  Publish manifest does not match staging size/hash contents")
+        return False
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if _has_rsync():
+        result = subprocess.run(
+            ["rsync", "-a", "--no-inc-recursive",
+             str(src) + "/", str(dst) + "/"],
+            capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode != 0:
+            print(f"  Mirror publish failed (rsync rc={result.returncode}): "
+                  f"{result.stderr[-1000:]}")
+            return False
+    else:
+        try:
+            dst.mkdir(parents=True, exist_ok=True)
+            for source in src.rglob("*"):
+                if source.is_file():
+                    rel = source.relative_to(src)
+                    target = dst / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target)
+        except OSError as exc:
+            print(f"  Versioned publish failed: {exc}")
+            return False
+
+    expected_files = set(expected_payload) | {".publish_manifest.json"}
+    published_files = {
+        path.relative_to(dst).as_posix()
+        for path in dst.rglob("*") if path.is_file()
+    }
+    if published_files != expected_files:
+        print("  Published file set does not match the run manifest")
+        return False
+    for rel, (size, digest) in expected_payload.items():
+        try:
+            if (dst / rel).stat().st_size != size:
+                print(f"  Published size mismatch: {rel}")
+                return False
+            if _sha256_file(dst / rel) != digest:
+                print(f"  Published SHA-256 mismatch: {rel}")
+                return False
+        except OSError:
+            return False
+    try:
+        destination_errors = _verify_strict_ok(dst / "strict_ok_manifest.json", dst)
+    except Exception as exc:
+        print(f"  Published strict manifest verification could not run: {exc}")
+        return False
+    if destination_errors:
+        print("  Published strict manifest invalid: " + ", ".join(destination_errors))
+        return False
+    return True
+
+
 # ═══════════════════════════════════════════════════════════════
 # Shared constants — canonical definitions used across the pipeline.
 # Edit HERE when adding/changing NVV names, IPA mappings, etc.
 # ═══════════════════════════════════════════════════════════════
 
 import re as _re
+
+# Versioned contract for CTC-side transcript normalization.  A marker from an
+# older schema must never make a newer pipeline skip validation/recovery.
+CTC_NORMALIZATION_MARKER = "reference-authority-v3-safe-transcript\n"
+
+# v4 marker embeds content identity (stem count + manifest digest) so a
+# marker leftover from a different run or tampered data cannot be mistaken
+# for a valid normalization certificate.
+_CTC_MARKER_V4_HEADER = "reference-authority-v4-safe-transcript"
+
+
+def make_ctc_normalization_marker(stem_count: int, manifest_sha256: str) -> str:
+    """Build a v4 marker that binds content identity to the certificate."""
+    return (
+        f"{_CTC_MARKER_V4_HEADER}\n"
+        f"stems={stem_count}\n"
+        f"manifest_sha256={manifest_sha256}\n"
+    )
+
+
+def parse_ctc_normalization_marker(text: str) -> dict | None:
+    """Extract content identity from a v4 marker.
+
+    Returns a dict with keys ``stems`` (int) and ``manifest_sha256`` (str),
+    or ``None`` when the marker is missing, unparseable, or from an older
+    schema version.
+    """
+    lines = text.strip().split("\n")
+    if not lines or lines[0] != _CTC_MARKER_V4_HEADER:
+        return None
+    info: dict = {}
+    for line in lines[1:]:
+        if "=" in line:
+            k, v = line.split("=", 1)
+            info[k.strip()] = v.strip()
+    if "stems" not in info or "manifest_sha256" not in info:
+        return None
+    try:
+        info["stems"] = int(info["stems"])
+    except ValueError:
+        return None
+    return info
 
 # ── Silence / pause tokens ──────────────────────────────────────
 SILENCE_LABELS: set[str] = {"<eps>", "<sil>", "sil", "<sp0>", "<sp1>", "<sp2>", "<sp3>", "spn"}
@@ -748,7 +941,7 @@ def normalize_punct_inline(text: str) -> str:
 
 def is_cjk(ch: str) -> bool:
     """True if *ch* is a single CJK Unified Ideograph character."""
-    return '一' <= ch <= '鿿'
+    return ('一' <= ch <= '鿿') or ('㐀' <= ch <= '䶿')
 
 
 def is_nvv_token(token: str) -> bool:
@@ -756,11 +949,22 @@ def is_nvv_token(token: str) -> bool:
     return token.strip().strip('<>').upper() in NVV_NAMES
 
 
+def is_unknown_token(token: str) -> bool:
+    """True only for explicit MFA unknown placeholders.
+
+    A bare ``unk`` can be real English lexical content.  Its validity needs
+    authority and English-phone context, which the strict auditor supplies.
+    """
+    return token.strip().lower() in {"<unk>", "[bracketed]"}
+
+
 def is_english_token(token: str) -> bool:
     """Token is English alpha: not NVV, not CJK, not pinyin syllable with tone."""
     if not token or not token.isalpha():
         return False
     if not token.isascii():
+        return False
+    if is_unknown_token(token):
         return False
     if is_nvv_token(token):
         return False
@@ -778,12 +982,176 @@ def is_word_like(s: str) -> bool:
     """True for CJK chars, pinyin syllables, English words, digits, NVV labels."""
     if not s:
         return False
-    return is_cjk(s) or s[0].isalpha() or s.isdigit() or is_nvv_token(s)
+    return (is_unknown_token(s) or is_cjk(s) or s[0].isalpha()
+            or s.isdigit() or is_nvv_token(s))
 
 
 def is_punct(s: str) -> bool:
     """True if *s* is a non-word token (punctuation / symbol)."""
     return bool(s.strip()) and not is_word_like(s)
+
+
+# ── CTC transcript bundle integrity ────────────────────────────
+
+_MIXED_PINYIN_TONE_RE = _re.compile(r"^[a-z]+[一二三四五]$")
+_NUMERAL_PROTECTED_RE = _re.compile(
+    r"(\[[^\]]+\]|<[^>]+>|(?<![A-Za-z0-9])[a-z]+[1-5](?![A-Za-z0-9])"
+    r"|[A-Z][A-Z0-9-]*[A-Z0-9])"
+)
+
+
+def normalize_reference_numerals(text: str, transform) -> str:
+    """Apply a numeral transform while preserving lexical control tokens.
+
+    This helper is for human/reference text, never for an already-tokenized
+    MFA lab transcript.  Pinyin tone digits, bracketed/NVV labels and uppercase
+    identifiers are protected defensively.
+    """
+    parts = _NUMERAL_PROTECTED_RE.split(text)
+    for index, part in enumerate(parts):
+        if not part or _NUMERAL_PROTECTED_RE.fullmatch(part):
+            continue
+        try:
+            parts[index] = transform(part, "an2cn")
+        except Exception:
+            # cn2an can reject mixed strings.  Preserve the source rather than
+            # changing a transcript on a best-effort guess.
+            parts[index] = part
+    return "".join(parts)
+
+
+def load_ctc_token_entries(tokens_path: Path) -> list[dict]:
+    """Load and validate one CTC tokens JSONL file.
+
+    Token order and timing are part of the CTC/MFA hand-off contract.  The
+    validator deliberately permits adjacent-token overlap, but starts and ends
+    must each be monotonic and every duration must be positive.
+    """
+    if not tokens_path.exists():
+        raise FileNotFoundError(f"Missing CTC tokens: {tokens_path}")
+
+    entries: list[dict] = []
+    prev_start = -1.0
+    prev_end = -1.0
+    for line_no, line in enumerate(
+            tokens_path.read_text(encoding="utf-8-sig").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"{tokens_path.name}:{line_no}: invalid JSON: {exc}"
+            ) from exc
+        word = entry.get("word")
+        if not isinstance(word, str) or not word.strip():
+            raise ValueError(
+                f"{tokens_path.name}:{line_no}: missing/non-string word"
+            )
+        try:
+            start = float(entry["start_s"])
+            end = float(entry["end_s"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{tokens_path.name}:{line_no}: invalid start_s/end_s"
+            ) from exc
+        if start < 0 or end <= start:
+            raise ValueError(
+                f"{tokens_path.name}:{line_no}: invalid interval {start}..{end}"
+            )
+        if start + 1e-6 < prev_start or end + 1e-6 < prev_end:
+            raise ValueError(
+                f"{tokens_path.name}:{line_no}: non-monotonic interval"
+            )
+        prev_start, prev_end = start, end
+        entries.append(entry)
+
+    if not entries:
+        raise ValueError(f"No CTC tokens in {tokens_path}")
+    return entries
+
+
+def read_ctc_textgrid_words(textgrid_path: Path) -> list[str]:
+    """Read the lexical words tier from an NVASR CTC TextGrid."""
+    if not textgrid_path.exists():
+        raise FileNotFoundError(f"Missing CTC TextGrid: {textgrid_path}")
+    content = textgrid_path.read_text(encoding="utf-8-sig")
+    words_match = _re.search(
+        r'^\s*name\s*=\s*"words"\s*$', content, _re.MULTILINE)
+    if words_match is None:
+        raise ValueError(f"Missing words tier in {textgrid_path}")
+    pauses_match = _re.search(
+        r'^\s*name\s*=\s*"pauses"\s*$',
+        content[words_match.end():],
+        _re.MULTILINE,
+    )
+    end = (words_match.end() + pauses_match.start()
+           if pauses_match is not None else len(content))
+    segment = content[words_match.end():end]
+    words = [m.group(1).replace('""', '"') for m in _re.finditer(
+        r'^\s*text\s*=\s*"(.*)"\s*$', segment, _re.MULTILINE
+    ) if m.group(1)]
+    if not words:
+        raise ValueError(f"Empty words tier in {textgrid_path}")
+    return words
+
+
+def rebuild_lab_from_tokens(tokens_path: Path, lab_path: Path) -> list[str]:
+    """Atomically rebuild an MFA lab transcript from validated CTC words."""
+    words = [entry["word"].strip()
+             for entry in load_ctc_token_entries(tokens_path)]
+    lab_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = lab_path.with_name(f".{lab_path.name}.tmp")
+    tmp_path.write_text(" ".join(words) + "\n", encoding="utf-8")
+    tmp_path.replace(lab_path)
+    return words
+
+
+def validate_ctc_transcript_bundle(ctc_dir: Path, stem: str) -> list[str]:
+    """Return contract violations for lab/tokens/CTC words of stem."""
+    lab_path = ctc_dir / f"{stem}.lab"
+    tokens_path = ctc_dir / f"{stem}_tokens.jsonl"
+    textgrid_path = ctc_dir / f"{stem}.TextGrid"
+    errors: list[str] = []
+
+    try:
+        token_words = [entry["word"].strip()
+                       for entry in load_ctc_token_entries(tokens_path)]
+    except (OSError, ValueError) as exc:
+        return [str(exc)]
+
+    if not lab_path.exists():
+        errors.append(f"Missing MFA transcript: {lab_path}")
+        lab_words: list[str] = []
+    else:
+        try:
+            lab_words = lab_path.read_text(
+                encoding="utf-8-sig").strip().split()
+        except OSError as exc:
+            errors.append(f"Cannot read {lab_path}: {exc}")
+            lab_words = []
+        if lab_words != token_words:
+            errors.append(
+                f"lab/tokens mismatch ({len(lab_words)} != {len(token_words)})"
+            )
+
+    try:
+        tg_words = read_ctc_textgrid_words(textgrid_path)
+    except (OSError, ValueError) as exc:
+        errors.append(str(exc))
+    else:
+        if tg_words != token_words:
+            errors.append(
+                f"TextGrid/tokens mismatch ({len(tg_words)} != {len(token_words)})"
+            )
+
+    contaminated = [word for word in lab_words
+                    if _MIXED_PINYIN_TONE_RE.fullmatch(word)]
+    if contaminated:
+        errors.append(
+            "tone digit converted to CJK numeral: " + ", ".join(contaminated[:5])
+        )
+    return errors
 
 
 # ── English MFA phone classification ─────────────────────────────

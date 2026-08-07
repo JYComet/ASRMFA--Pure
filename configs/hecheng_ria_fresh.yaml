@@ -1,41 +1,34 @@
-# ─────────────────────────────────────────────────────────────────
-# 新版合成英文数据 — ria 单 speaker 全量 (参考文本模式 + 全流程)
-# ─────────────────────────────────────────────────────────────────
+# 新版合成数据 — 3 speaker 全量 54,000 条 (参考文本模式 + 全流程)
+# 2026-08-07 fresh workspace, 避免旧 0805 工作区污染
 #
-# 数据源: \\RS3621\Research_TTS\Data\Raw\新版合成英文数据\ria
-#   参考文本: {stem}.txt (已存在, NVASR 参考文本模式对齐)
-#   音频布局: flat (WAV + txt 在 ria 子目录下, ≈18000 条)
+# 数据: /mnt/nvme3/mfa_audio_cache_ria/{ria,花礼,雪狐桑}
+#   每个子目录 = 一个 speaker, flat 布局 WAV + .txt
 #
-# 输出: \\RS3621\Research_TTS\Data\Raw\0805test
-#
-# ═══════════════════════════════════════════════════════════════
 # 运行:
 #   python3 scripts/run_pipeline.py \
-#       --config configs/hecheng_ria_0805.yaml \
-#       --python /home/user/miniconda3/envs/mfa-dev/bin/python \
-#       --overwrite --force
-# ═══════════════════════════════════════════════════════════════
+#       --config configs/hecheng_ria_fresh.yaml \
+#       --python /home/user/miniconda3/envs/mfa-dev/bin/python
 
 mode: nvrasr_fallback
 
 # ── 路径配置 ──────────────────────────────────────────────────
 
-# 输入: ria speaker 子目录 (WAV + 参考文本 .txt, flat 布局, 全 NVMe)
-data_dir: /mnt/nvme3/mfa_audio_cache_ria/ria
+# 输入: 父目录, 管线自动发现子目录 (ria/花礼/雪狐桑) 下的 WAV + .txt
+data_dir: /mnt/nvme3/mfa_audio_cache_ria
 
-# 工作目录 (NVMe)
-workspace: /mnt/nvme3/mfa_workspace_ria_0805
+# 新工作目录 (避免旧 0805 的 cn2an 污染)
+workspace: /mnt/nvme3/mfa_workspace_54k_fresh
 
-# 最终输出 (NAS)
-output_dir: /mnt/Raw/0805test
+# 最终输出
+output_dir: /mnt/Raw/54k_fresh
 
 # 输出暂存: postprocess 先写 NVMe，完成后 rsync 到 NAS
 output_staging: true
 
-# 保留 16k 音频 (供后续调试/重跑)
+# 保留 16k 音频
 keep_16k_audio: true
 
-# MFA 临时目录 (本地 NVMe 避免 CIFS SQLite 锁死)
+# MFA 临时目录
 temp_dir: /tmp/mfa_temp
 
 # ── 静音补全 ──────────────────────────────────────────────────
@@ -48,9 +41,9 @@ ctc_prealign:
   python: /home/user/miniconda3/envs/asr/bin/python
   model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
   device: cuda:0
-  limit: 0                   # 0 = 全部 18000 条
+  limit: 0
   timeout: 14400
-  nvv_enabled: false         # 参考文本模式: 关闭 NVV, CTC 锚点给参考文本做时间戳
+  nvv_enabled: false         # 参考文本模式: CTC 用 {stem}.txt 做强制对齐
 
 # ── CTC 边界能量修正 ─────────────────────────────────────────
 ctc_adjust:

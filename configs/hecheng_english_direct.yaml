@@ -1,0 +1,74 @@
+# 新版合成英文数据 — ctc_ready 模式，直接跑管线
+# 不使用 strict v4 evidence 校验，跳过 prepare/finalize 流程
+#
+# 运行:
+#   python3 scripts/run_pipeline.py \
+#       --config configs/hecheng_english_direct.yaml \
+#       --python /home/user/miniconda3/envs/mfa-dev/bin/python
+
+mode: ctc_ready
+
+# ── 路径 ──────────────────────────────────────────────────────
+# 音频 (已有 16k WAV)
+data_dir: /mnt/nvme3/mfa_workspace/audio_16k
+
+# CTC 预对齐输出 (已有)
+ctc_ready:
+  ctc_dir: /mnt/nvme3/mfa_workspace/ctc_pretg
+  text_dir: /mnt/nvme3/mfa_workspace/ctc_pretg
+  require_all: false
+  isolate_copy: false
+
+workspace: /mnt/nvme3/mfa_workspace_english_direct
+output_dir: /mnt/Raw/english_direct
+output_staging: true
+keep_16k_audio: false
+temp_dir: /tmp/mfa_temp
+
+# ── 静音补全 ──────────────────────────────────────────────────
+pad_silence:
+  target_edge_silence_sec: 0.5
+
+# ── CTC 边界能量修正 ─────────────────────────────────────────
+ctc_adjust:
+  enabled: true
+  limit: 0
+
+# ── MFA ───────────────────────────────────────────────────────
+models_dir: /mnt/local_E/MFA_Pause/repo/models/mfa
+
+mfa:
+  num_jobs: 64
+  single_speaker: true
+  output_format: long_textgrid
+  clean: false
+  no_tokenization: true
+  skip_validate: true
+  fine_tune: false
+  beam: 20
+  retry_beam: 80
+  timeout: 7200
+
+mfa_en:
+  enabled: true
+  num_jobs: 16
+  padding_ms: 50
+  min_segment_dur_ms: 200
+  max_gap_merge_s: 0.35
+  beam: 10
+  retry_beam: 40
+  fine_tune: false
+  acoustic_model: /mnt/local_E/MFA_Pause/pretrained_models/acoustic/english_us_arpa.zip
+  dictionary: dict/cmudict.dict
+  g2p_model: /mnt/local_E/MFA_Pause/pretrained_models/g2p/english_us_arpa.zip
+
+# ── 后处理 ────────────────────────────────────────────────────
+postprocess:
+  strict_ok: true
+  merge_silence: true
+  min_sil_merge_sec: 0.2
+  fix_short_word: false
+  detect_bgm: true
+  filter_suspicious: true
+  enable_text_correction: true
+  handle_unexpected_sil: true
