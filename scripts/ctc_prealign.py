@@ -104,7 +104,37 @@ from pipeline_utils import (
     RIA_VARIANTS, replace_ria_variants, normalize_punct_inline,
     _ASCII_TO_CJK_PUNCT,
     normalize_reference_numerals, validate_ctc_transcript_bundle,
+    make_pipeline_accounting_receipt, write_pipeline_accounting_receipt,
+    read_pipeline_accounting_receipt, validate_pipeline_accounting_receipt,
+    make_pipeline_run_id,
 )
+
+
+def _reference_inventory(wav_files: list[Path], data_dir: Path,
+                        txt_index: dict[str, Path]) -> tuple[list[Path], dict[str, str], dict[str, str]]:
+    """Freeze the WAV universe before applying reference-only eligibility.
+
+    The returned exclusion map is explicit evidence: a WAV without an
+    authoritative TXT is ``missing_reference`` and is never sent to ASR as a
+    fallback.  Unsupported reference text is kept separate so it cannot be
+    mistaken for a missing source artifact.
+    """
+    by_stem: dict[str, Path] = {}
+    for wav in wav_files:
+        if wav.stem in by_stem:
+            raise ValueError(f"duplicate WAV stem in frozen source universe: {wav.stem}")
+        by_stem[wav.stem] = wav
+    eligible: dict[str, str] = {}
+    exclusions: dict[str, str] = {}
+    for stem in sorted(by_stem):
+        ref = find_ref_text(stem, data_dir, txt_index)
+        if not ref:
+            exclusions[stem] = "missing_reference"
+        elif has_japanese(ref):
+            exclusions[stem] = "unsupported_reference"
+        else:
+            eligible[stem] = clean_unsupported_punct(ref)
+    return [by_stem[s] for s in sorted(eligible)], eligible, exclusions
 
 
 def load_mfa_word_set(dict_path: Path | None) -> set[str] | None:
@@ -880,11 +910,15 @@ def _wav_duration_s(path: Path) -> float:
         return handle.getnframes() / handle.getframerate()
 
 
-def _rebuild_final_manifest(ctc_dir: Path, audio_dir: Path) -> None:
+def _rebuild_final_manifest(ctc_dir: Path, audio_dir: Path,
+                            wav_files: list[Path] | None = None) -> None:
     """Atomically publish a manifest from final normalized CTC artifacts."""
     # Build stem→WAV mapping (supports subdirectory layout)
     wav_map: dict[str, Path] = {}
-    for p in audio_dir.rglob("*.wav"):
+    # Callers that already discovered the input bundle can pass that immutable
+    # list to avoid rescanning a large audio tree during final publication.
+    # The default keeps the historical standalone-call behaviour unchanged.
+    for p in (wav_files if wav_files is not None else audio_dir.rglob("*.wav")):
         if p.stem not in wav_map:
             wav_map[p.stem] = p
 
@@ -1108,6 +1142,43 @@ def _normalize_english(ctc_dir: Path, dict_path: Path | None = None,
     return changed
 
 
+def _plan_all_gpu_shard(output_dir: Path, gpu_id: int, limit: int) -> tuple[Path, bool, bool]:
+    """Plan a shard directory without filesystem mutation.
+
+    Returns ``(path, reused, recovered)``.  ``recovered`` denotes a clean
+    staging replacement for an incomplete ``_shard_gpuN``.  An existing
+    staging directory is treated as ambiguous active/stale ownership and is
+    rejected; callers must resolve it explicitly.
+    """
+    canonical = output_dir / f"_shard_gpu{gpu_id}"
+    if not canonical.exists():
+        return canonical, False, False
+
+    existing_labs = len(list(canonical.glob("*.lab")))
+    if existing_labs >= limit:
+        return canonical, True, False
+
+    staging = output_dir / f"_shard_gpu{gpu_id}_staging"
+    if staging.exists():
+        raise RuntimeError(
+            "incomplete shard and existing recovery staging directory require "
+            f"explicit operator resolution: {canonical} ({existing_labs}/{limit} labs), "
+            f"{staging}"
+        )
+    return staging, False, True
+
+
+def _plan_all_gpu_shards(
+    output_dir: Path, shard_specs: list[tuple[int, int]]
+) -> list[tuple[int, int, Path, bool, bool]]:
+    """Read-only plan for every shard; no earlier plan may mutate state."""
+    plans: list[tuple[int, int, Path, bool, bool]] = []
+    for gpu_id, limit in shard_specs:
+        shard_dir, reused, recovered = _plan_all_gpu_shard(output_dir, gpu_id, limit)
+        plans.append((gpu_id, limit, shard_dir, reused, recovered))
+    return plans
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="CTC Pre-alignment: NVASR → MFA anchor TextGrids (pinyin)")
@@ -1194,8 +1265,24 @@ def main():
                           " normalization may be skipped.")
 
             audio_dir = args.audio_dir or args.data_dir
-            all_wavs = sorted(audio_dir.rglob("*.wav"))
+            # Freeze the complete source WAV universe before any reference
+            # filtering.  Children receive only eligible stems; the parent
+            # publishes the single authoritative v2 receipt after merge.
+            _source_wavs = sorted(audio_dir.rglob("*.wav"))
+            _txt_index = _build_txt_index(args.data_dir)
+            try:
+                all_wavs, _all_ref_texts, _all_exclusions = _reference_inventory(
+                    _source_wavs, args.data_dir, _txt_index)
+            except ValueError as _exc:
+                print(f"ERROR: {_exc}", file=sys.stderr)
+                return 2
+            if _all_exclusions:
+                print(f"  Frozen source: {len(_source_wavs)} WAVs; "
+                      f"eligible={len(all_wavs)}, exclusions={len(_all_exclusions)}")
             total = len(all_wavs)
+            if total == 0:
+                print("ERROR: no eligible WAVs with authoritative references", file=sys.stderr)
+                return 2
             per_gpu = (total + num_gpus - 1) // num_gpus
             print(f"--all-gpus: {num_gpus} GPUs detected, {total} WAVs → ~{per_gpu}/GPU")
 
@@ -1216,17 +1303,40 @@ def main():
             if args.no_dict_update:
                 _base_argv += ["--no-dict-update"]
 
-            for gpu_id in range(num_gpus):
-                offset = gpu_id * per_gpu
-                limit = min(per_gpu, total - offset)
-                if limit <= 0:
-                    break
+            _shard_specs = [
+                (gpu_id, min(per_gpu, total - gpu_id * per_gpu))
+                for gpu_id in range(num_gpus)
+                if min(per_gpu, total - gpu_id * per_gpu) > 0
+            ]
+            try:
+                _shard_plans = _plan_all_gpu_shards(args.output_dir, _shard_specs)
+            except RuntimeError as _exc:
+                print(f"ERROR: {_exc}", file=sys.stderr)
+                return 2
 
-                shard_dir = args.output_dir / f"_shard_gpu{gpu_id}"
+            # Materialize and launch only after every GPU's read-only plan
+            # succeeds.  A race that changes a planned fresh path is loud and
+            # leaves all prior plans untouched.
+            for gpu_id, limit, shard_dir, _reused, _recovered in _shard_plans:
+                offset = gpu_id * per_gpu
+                if _reused:
+                    _existing_labs = len(list(shard_dir.glob("*.lab")))
+                    print(f"  GPU {gpu_id}: reuse existing shard ({_existing_labs} labs)")
+                    _procs.append((gpu_id, None, shard_dir))
+                    continue
                 if shard_dir.exists():
-                    print(f"ERROR: fresh all-GPU shard already exists: {shard_dir}", file=sys.stderr)
+                    print(f"ERROR: planned fresh shard path became occupied: {shard_dir}",
+                          file=sys.stderr)
                     return 2
                 shard_dir.mkdir(parents=True)
+                if _recovered:
+                    _legacy = args.output_dir / f"_shard_gpu{gpu_id}"
+                    _existing_labs = len(list(_legacy.glob("*.lab")))
+                    print(
+                        f"  GPU {gpu_id}: incomplete legacy shard preserved "
+                        f"({_legacy}, {_existing_labs}/{limit} labs); "
+                        f"clean recovery staged at {shard_dir}"
+                    )
 
                 child_argv = list(_base_argv)
                 child_argv += [
@@ -1253,6 +1363,9 @@ def main():
             print(f"\n  等待 {len(_procs)} 个 GPU 完成...")
             failed: list[tuple[int, int]] = []
             for gpu_id, _proc, _shard_dir in _procs:
+                if _proc is None:
+                    print(f"  GPU {gpu_id}: REUSED")
+                    continue
                 _rc = _proc.wait()
                 if _rc != 0:
                     failed.append((gpu_id, _rc))
@@ -1283,7 +1396,9 @@ def main():
                 _expected = {p.stem for p in all_wavs[_start:_start + per_gpu]}
                 _expected_all_stems |= _expected
                 _allowed = {s + suffix for s in _expected for suffix in _artifact_suffixes}
-                _allowed |= {"manifest.json", "summary.txt", ".ctc_normalized"}
+                _allowed |= {"manifest.json", "summary.txt", ".ctc_normalized",
+                             ".ctc_run_receipt.json",
+                             ".pipeline_run_receipt_v2.json"}
                 if args.dict_path:
                     _allowed.add(args.dict_path.name)
                 _files = list(_shard_dir.iterdir())
@@ -1355,148 +1470,211 @@ def main():
                 raise RuntimeError("all-GPU shard stem union is not exact")
             for _shard_dir, _ in _preflight_shards:
                 for _f in _shard_dir.iterdir():
-                    if _f.name in {"manifest.json", "summary.txt", ".ctc_normalized"}:
+                    if _f.name in {"manifest.json", "summary.txt",
+                                   ".ctc_normalized", ".ctc_run_receipt.json",
+                                   ".pipeline_run_receipt_v2.json"}:
                         continue
                     if (args.output_dir / _f.name).exists() or (args.output_dir / _f.name).is_symlink():
                         raise FileExistsError(f"all-GPU target collision: {args.output_dir / _f.name}")
 
-            # ── Merge shard outputs into main output dir ──
-            print(f"\n  合并 {len(_procs)} 个 shard 输出...")
-            _merged_entries = 0
-            _total_files = _total_ok = _total_fail = _total_time = 0
-            _all_manifests: list[tuple[Path, Path]] = []
-            _all_summaries: list[Path] = []
-
-            for _gpu_id, _, _shard_dir in _procs:
-                for _f in _shard_dir.glob("*"):
-                    if _f.name == "manifest.json":
-                        _all_manifests.append((_shard_dir, _f))
-                    elif _f.name == "summary.txt":
-                        _all_summaries.append(_f)
-                    elif _f.name == ".ctc_normalized":
-                        pass  # parent marker is published last, after full validation
-                    elif args.dict_path and _f.name == args.dict_path.name:
-                        pass  # skip shard-local dict copy
-                    else:
-                        _dest = args.output_dir / _f.name
-                        if _dest.exists() or _dest.is_symlink():
-                            raise FileExistsError(f"all-GPU target collision: {_dest}")
-                        _shutil.move(str(_f), str(_dest))
-                        _merged_entries += 1
-
-            # ── Merge manifests with path rewriting (BEFORE shard cleanup) ──
-            import json as _json
-            _merged = []
-            for _shard_dir, _m in sorted(_all_manifests, key=lambda p: p[1].parent.name):
-                _data = _json.loads(_m.read_text(encoding="utf-8"))
-                _shard_s = str(_shard_dir)
-                _main_s = str(args.output_dir)
-                for _entry in _data:
-                    for _key in ("textgrid", "lab"):
-                        if _key in _entry:
-                            _entry[_key] = _entry[_key].replace(_shard_s, _main_s)
-                _merged.extend(_data)
-
-            # Extract stats from per-shard summaries
-            for _s in _all_summaries:
-                for _line in _s.read_text(encoding="utf-8").splitlines():
-                    if _line.startswith("Files:"):
-                        _p = _line.split()
-                        _total_files += int(_p[1])
-                        _total_ok += int(_p[3])
-                        _total_fail += int(_p[5])
-                    elif _line.startswith("Time:"):
-                        _total_time += float(_line.split()[1].rstrip("s"))
-
-            # Write combined summary
-            _summary = (
-                f"CTC Pre-alignment Report (--all-gpus, {num_gpus}x GPU)\n"
-                f"{'=' * 40}\n"
-                f"Files: {_total_files} total, {_total_ok} OK, {_total_fail} failed\n"
-                f"Time: {_total_time:.1f}s (wall-clock total)\n\n"
-                f"Output: {args.output_dir}\n"
+            # ── Merge shard outputs into an isolated publish candidate ──
+            # Never move a shard artifact into the live output namespace.  A
+            # later validation failure must leave the original output path
+            # untouched and recoverable.
+            _merge_output_dir = args.output_dir.parent / (
+                f".{args.output_dir.name}.merge-{os.getpid()}"
             )
-            # summary/manifest are published only after final bundle validation.
+            if _merge_output_dir.exists():
+                raise RuntimeError(
+                    f"merge staging already exists: {_merge_output_dir}"
+                )
+            _merge_output_dir.mkdir(parents=False)
+            _merge_lock = args.output_dir / ".merge_lock"
+            if _merge_lock.exists():
+                raise RuntimeError(
+                    f"all-GPU merge lock exists — another merge may be in progress: {_merge_lock}"
+                )
+            _merge_lock.write_text("")  # acquire lock
+            try:
+                print(f"\n  合并 {len(_procs)} 个 shard 输出...")
+                _merged_entries = 0
+                _total_files = _total_ok = _total_fail = _total_time = 0
+                _all_manifests: list[tuple[Path, Path]] = []
+                _all_summaries: list[Path] = []
 
-            # ── Collect English tokens from merged manifest → shared dict ──
-            if not args.no_dict_update and args.dict_path and args.dict_path.exists():
-                _english_tokens: set[str] = set()
-                for _entry in _merged:
-                    for _w in _entry.get("_words", []):
-                        _token = _w["word"]
-                        if is_english_token(_token):
-                            _english_tokens.add(_token)
-                if _english_tokens:
-                    _existing: set[str] = set()
-                    with open(args.dict_path, encoding='utf-8-sig') as _f:
-                        for _line in _f:
-                            _line = _line.strip()
-                            if _line:
-                                _existing.add(_line.split()[0])
-                    _new_tokens = sorted(t for t in _english_tokens if t not in _existing)
-                    if _new_tokens:
-                        with open(args.dict_path, 'a', encoding='utf-8') as _f:
-                            for t in _new_tokens:
-                                _f.write(f"{t} {t}\n")
-                        print(f"  Added {len(_new_tokens)} English tokens to dict")
+                for _gpu_id, _, _shard_dir in _procs:
+                    for _f in _shard_dir.glob("*"):
+                        if _f.name == "manifest.json":
+                            _all_manifests.append((_shard_dir, _f))
+                        elif _f.name == "summary.txt":
+                            _all_summaries.append(_f)
+                        elif _f.name == ".ctc_normalized":
+                            pass  # parent marker is published last, after full validation
+                        elif _f.name == ".ctc_run_receipt.json":
+                            pass  # parent receipt is published last, after full validation
+                        elif args.dict_path and _f.name == args.dict_path.name:
+                            pass  # skip shard-local dict copy
+                        else:
+                            _dest = _merge_output_dir / _f.name
+                            if _dest.exists() or _dest.is_symlink():
+                                raise FileExistsError(f"all-GPU target collision: {_dest}")
+                            _shutil.copy2(str(_f), str(_dest))
+                            _merged_entries += 1
 
-            # ── Clean up shard dirs (AFTER manifest merge) ──
-            for _gpu_id, _, _shard_dir in _procs:
+                # ── Merge manifests with path rewriting (BEFORE shard cleanup) ──
+                import json as _json
+                _merged = []
+                for _shard_dir, _m in sorted(_all_manifests, key=lambda p: p[1].parent.name):
+                    _data = _json.loads(_m.read_text(encoding="utf-8"))
+                    _shard_s = str(_shard_dir)
+                    _main_s = str(args.output_dir)
+                    for _entry in _data:
+                        for _key in ("textgrid", "lab"):
+                            if _key in _entry:
+                                _entry[_key] = _entry[_key].replace(_shard_s, _main_s)
+                    _merged.extend(_data)
+
+                # Extract stats from per-shard summaries
+                for _s in _all_summaries:
+                    for _line in _s.read_text(encoding="utf-8").splitlines():
+                        if _line.startswith("Files:"):
+                            _p = _line.split()
+                            _total_files += int(_p[1])
+                            _total_ok += int(_p[3])
+                            _total_fail += int(_p[5])
+                        elif _line.startswith("Time:"):
+                            _total_time += float(_line.split()[1].rstrip("s"))
+
+                # Write combined summary
+                _summary = (
+                    f"CTC Pre-alignment Report (--all-gpus, {num_gpus}x GPU)\n"
+                    f"{'=' * 40}\n"
+                    f"Files: {_total_files} total, {_total_ok} OK, {_total_fail} failed\n"
+                    f"Time: {_total_time:.1f}s (wall-clock total)\n\n"
+                    f"Output: {args.output_dir}\n"
+                )
+                # summary/manifest are published only after final bundle validation.
+
+                # ── Collect English tokens from merged manifest → shared dict ──
+                if not args.no_dict_update and args.dict_path and args.dict_path.exists():
+                    _english_tokens: set[str] = set()
+                    for _entry in _merged:
+                        for _w in _entry.get("_words", []):
+                            _token = _w["word"]
+                            if is_english_token(_token):
+                                _english_tokens.add(_token)
+                    if _english_tokens:
+                        _existing: set[str] = set()
+                        with open(args.dict_path, encoding='utf-8-sig') as _f:
+                            for _line in _f:
+                                _line = _line.strip()
+                                if _line:
+                                    _existing.add(_line.split()[0])
+                        _new_tokens = sorted(t for t in _english_tokens if t not in _existing)
+                        if _new_tokens:
+                            with open(args.dict_path, 'a', encoding='utf-8') as _f:
+                                for t in _new_tokens:
+                                    _f.write(f"{t} {t}\n")
+                            print(f"  Added {len(_new_tokens)} English tokens to dict")
+
+                # Keep the shard evidence under the quarantined partial tree
+                # until the final publish is complete.  This is useful for
+                # diagnosing a failed GPU without mutating the old evidence.
+
+                print(f"  Merged {len(_merged)} manifest entries, {_merged_entries} files")
+                print(f"\n{_summary}")
+
+                # ── Write normalization marker ──
+                # Tells run_pipeline.py that normalize_* steps were already done
+                # by ctc_prealign. pad_silence only shifts timestamps, doesn't
+                # change token content, so re-normalizing is redundant.
+                if not _validate_all_ctc_bundles(_merge_output_dir):
+                    print("ERROR: refusing to write CTC normalization marker")
+                    sys.exit(1)
+                _rebuild_final_manifest(_merge_output_dir, audio_dir,
+                                        wav_files=all_wavs)
+                (_merge_output_dir / "summary.txt.tmp").write_text(_summary, encoding="utf-8")
+                os.replace(_merge_output_dir / "summary.txt.tmp", _merge_output_dir / "summary.txt")
+                _stem_count = len(list(_merge_output_dir.glob("*.lab")))
+                _manifest_digest = hashlib.sha256(
+                    (_merge_output_dir / "manifest.json").read_bytes()).hexdigest()
+                (_merge_output_dir / ".ctc_normalized").write_text(
+                    make_ctc_normalization_marker(_stem_count, _manifest_digest),
+                    encoding="utf-8",
+                )
+                # ── Parent run receipt (Case 99 / R5) ──────────────────
+                _all_stems = sorted({p.stem for p in _source_wavs})
+                write_ctc_run_receipt(
+                    _merge_output_dir,
+                    actual_argv=sys.argv,
+                    asr_python=sys.executable,
+                    model_path=_model_path,
+                    model_tree_digest=_model_tree_digest,
+                    model_file_manifest=_model_file_manifest,
+                    dict_path=Path(args.dict_path) if args.dict_path else Path(""),
+                    dict_digest=_dict_digest,
+                    input_stems=_all_stems,
+                    output_stems=_all_stems,
+                )
+                _eligible_stems = sorted(p.stem for p in all_wavs)
+                _output_stems_v2 = sorted(p.stem for p in _merge_output_dir.glob("*.lab"))
+                _filtered_stems_v2 = sorted(set(_eligible_stems) - set(_output_stems_v2))
+                _shard_rows = [
+                    {"shard_id": f"gpu{_gpu_id}", "stems": sorted(
+                        p.stem for p in all_wavs[_gpu_id * per_gpu:
+                                                  _gpu_id * per_gpu + per_gpu])}
+                    for _gpu_id, _, _ in _procs
+                ]
+                _accounting = make_pipeline_accounting_receipt(
+                    source_stems=_all_stems,
+                    eligible_stems=_eligible_stems,
+                    exclusions=_all_exclusions,
+                    output_stems=_output_stems_v2,
+                    filtered_stems=_filtered_stems_v2,
+                    run_id=make_pipeline_run_id(), mode="ctc_prealign",
+                    route=["ctc_prealign", "all_gpus"],
+                    paths={"output": str(args.output_dir), "filtered": str(args.output_dir)},
+                    shards=_shard_rows,
+                    extra={"source_frozen": True, "reference_only": True},
+                )
+                write_pipeline_accounting_receipt(_merge_output_dir, _accounting)
+                _partial_output_dir = args.output_dir.parent / (
+                    f"{args.output_dir.name}.partial-{os.getpid()}"
+                )
+                if _partial_output_dir.exists():
+                    raise RuntimeError(
+                        f"partial publish quarantine already exists: {_partial_output_dir}"
+                    )
+                os.replace(args.output_dir, _partial_output_dir)
+                os.replace(_merge_output_dir, args.output_dir)
+                print(f"  Published atomically; partial shard evidence retained at {_partial_output_dir}")
+                # ─────────────────────────────────────────────────────────
+            finally:
                 try:
-                    for _leftover in _shard_dir.iterdir():
-                        _leftover.unlink()
-                    _shard_dir.rmdir()
+                    _merge_lock.unlink()
                 except OSError:
                     pass
-
-            print(f"  Merged {len(_merged)} manifest entries, {_merged_entries} files")
-            print(f"\n{_summary}")
-
-            # ── Write normalization marker ──
-            # Tells run_pipeline.py that normalize_* steps were already done
-            # by ctc_prealign. pad_silence only shifts timestamps, doesn't
-            # change token content, so re-normalizing is redundant.
-            if not _validate_all_ctc_bundles(args.output_dir):
-                print("ERROR: refusing to write CTC normalization marker")
-                sys.exit(1)
-            _rebuild_final_manifest(args.output_dir, audio_dir)
-            (args.output_dir / "summary.txt.tmp").write_text(_summary, encoding="utf-8")
-            os.replace(args.output_dir / "summary.txt.tmp", args.output_dir / "summary.txt")
-            _stem_count = len(list(args.output_dir.glob("*.lab")))
-            _manifest_digest = hashlib.sha256(
-                (args.output_dir / "manifest.json").read_bytes()).hexdigest()
-            (args.output_dir / ".ctc_normalized").write_text(
-                make_ctc_normalization_marker(_stem_count, _manifest_digest),
-                encoding="utf-8",
-            )
-            # ── Parent run receipt (Case 99 / R5) ──────────────────
-            _all_stems = sorted({p.stem for p in all_wavs})
-            write_ctc_run_receipt(
-                args.output_dir,
-                actual_argv=sys.argv,
-                asr_python=sys.executable,
-                model_path=_model_path,
-                model_tree_digest=_model_tree_digest,
-                model_file_manifest=_model_file_manifest,
-                dict_path=Path(args.dict_path) if args.dict_path else Path(""),
-                dict_digest=_dict_digest,
-                input_stems=_all_stems,
-                output_stems=_all_stems,
-            )
-            # ─────────────────────────────────────────────────────────
             print(f"完成! 输出: {args.output_dir}")
+            sys.exit(0)
             sys.exit(0)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 扫描音频文件 ──
     audio_dir = args.audio_dir or args.data_dir
-    wav_files = sorted(audio_dir.rglob("*.wav"))
-    if args.offset > 0:
-        wav_files = wav_files[args.offset:]
-    if args.limit > 0:
-        wav_files = wav_files[:args.limit]
-    print(f"扫描到 {len(wav_files)} 个 WAV 文件")
+    # Freeze the complete WAV universe before reference-only prefiltering.
+    source_wav_files = sorted(audio_dir.rglob("*.wav"))
+    print(f"扫描到 {len(source_wav_files)} 个 WAV 文件")
+    txt_index = _build_txt_index(args.data_dir)
+    try:
+        wav_files, ref_texts, source_exclusions = _reference_inventory(
+            source_wav_files, args.data_dir, txt_index)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if source_exclusions:
+        print(f"  冻结来源: {len(source_wav_files)} WAV; "
+              f"eligible={len(wav_files)}, exclusions={len(source_exclusions)}")
 
     # 建立 stem → WAV 路径映射 (支持子目录布局)
     wav_map: dict[str, Path] = {}
@@ -1504,40 +1682,21 @@ def main():
         if p.stem not in wav_map:
             wav_map[p.stem] = p
 
-    # ── 构建参考文本查找表 {stem: chinese_text} ──
-    print("构建参考文本查找表...")
-    ref_texts: dict[str, str] = {}
-    missing_ref = []
+    # Reference text is authoritative for every eligible stem.  Missing
+    # references are explicit exclusions; ASR fallback is intentionally not
+    # used for accounting-safe runs.
     skipped: dict[str, list[str]] = {}  # reason → stems (unified skip tracking)
-    # Build text index once (O(1) lookup per stem, no repeated rglob)
-    txt_index = _build_txt_index(args.data_dir)
+    for _stem, _reason in source_exclusions.items():
+        skipped.setdefault(_reason, []).append(_stem)
     print(f"  已索引 {len(txt_index)} 个文本文件")
-
-    for wav_path in wav_files:
-        stem = wav_path.stem
-        ref = find_ref_text(stem, args.data_dir, txt_index)
-        if ref:
-            if has_japanese(ref):
-                skipped.setdefault("japanese", []).append(stem)
-                continue
-            ref = clean_unsupported_punct(ref)
-            ref_texts[stem] = ref
-        else:
-            missing_ref.append(stem)
-
-    if skipped.get("japanese"):
-        print(f"  跳过日语: {len(skipped['japanese'])} 个文件 (含假名, 管线不支持)")
-    if missing_ref:
-        if args.no_nvv:
-            # 参考文本模式下, 无参考的 stem 直接跳过, 不做 ASR fallback
-            missing_set = set(missing_ref)
-            wav_files = [p for p in wav_files if p.stem not in missing_set]
-            print(f"  参考文本模式: 跳过 {len(missing_ref)} 个无参考文本的音频")
-            if not wav_files:
-                print("ERROR: 所有音频均无参考文本, 无任何可处理的 stem", file=sys.stderr)
-                return 2
-        else:
-            print(f"  注意: {len(missing_ref)} 个文件无参考文本, 将纯靠 ASR 文本")
+    if not wav_files:
+        print("ERROR: 所有音频均无可用权威参考文本", file=sys.stderr)
+        return 2
+    # Apply offset/limit AFTER filtering so they count processable stems
+    if args.offset > 0:
+        wav_files = wav_files[args.offset:]
+    if args.limit > 0:
+        wav_files = wav_files[:args.limit]
     print(f"  已索引 {len(ref_texts)} 个参考文本, 共 {len(wav_files)} 个音频")
 
     # ── 加载 NVASR 模型 ──
@@ -2080,6 +2239,8 @@ def main():
     # ── Build skip summary lines ──
     skip_lines = ""
     skip_labels = {
+        "missing_reference": "无权威参考文本 (missing_reference)",
+        "unsupported_reference": "参考文本不受支持",
         "japanese": "含假名 (管线不支持)",
         "incomplete_english": "英文碎片不完整",
         "incomplete_ctc_alignment": "CTC 目标 token 未完整对齐",
@@ -2118,7 +2279,8 @@ def main():
             _normalize_english(args.output_dir, args.dict_path,
                                update_dict=not args.no_dict_update)
         if _validate_all_ctc_bundles(args.output_dir):
-            _rebuild_final_manifest(args.output_dir, audio_dir)
+            _rebuild_final_manifest(args.output_dir, audio_dir,
+                                    wav_files=wav_files)
             # Marker: downstream pipeline steps can skip re-normalization.
             _stem_count = len(list(args.output_dir.glob("*.lab")))
             _manifest_digest = hashlib.sha256(
@@ -2131,7 +2293,7 @@ def main():
             _all_output_stems = sorted(
                 p.stem for p in args.output_dir.glob("*.lab")
             )
-            _all_input_stems = sorted(p.stem for p in paths)
+            _all_input_stems = sorted(Path(p).stem for p in paths)
             write_ctc_run_receipt(
                 args.output_dir,
                 actual_argv=sys.argv,
@@ -2144,6 +2306,26 @@ def main():
                 input_stems=_all_input_stems,
                 output_stems=_all_output_stems,
             )
+            # v2 source-denominator receipt: the source universe was frozen
+            # before filtering, and skipped eligible stems are explicit
+            # filtered evidence rather than silent loss.
+            _eligible_all = sorted(ref_texts)
+            _output_v2 = sorted(_all_output_stems)
+            _filtered_v2 = sorted(set(_eligible_all) - set(_output_v2))
+            _accounting = make_pipeline_accounting_receipt(
+                source_stems=sorted(p.stem for p in source_wav_files),
+                eligible_stems=_eligible_all,
+                exclusions=source_exclusions,
+                output_stems=_output_v2,
+                filtered_stems=_filtered_v2,
+                run_id=make_pipeline_run_id(), mode="ctc_prealign",
+                route=["ctc_prealign"],
+                paths={"output": str(args.output_dir), "filtered": str(args.output_dir)},
+                shards=[{"shard_id": "single", "stems": _eligible_all}],
+                extra={"source_frozen": True, "reference_only": True,
+                       "processed_stems": sorted(Path(p).stem for p in paths)},
+            )
+            write_pipeline_accounting_receipt(args.output_dir, _accounting)
         else:
             print("ERROR: refusing to write CTC normalization marker")
             fail += 1

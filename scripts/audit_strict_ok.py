@@ -26,10 +26,12 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 from pipeline_utils import (  # noqa: E402
     is_english_token, is_nvv_token, is_pinyin_syllable, is_punct,
     is_silence, is_unknown_token, is_english_phone, validate_ctc_transcript_bundle,
+    PIPELINE_ACCOUNTING_SCHEMA, read_pipeline_accounting_receipt,
+    validate_pipeline_accounting_receipt,
 )
 from postprocess_textgrids import parse_textgrid  # noqa: E402
 
-POLICY_VERSION = "strict-ok-v3.1"
+POLICY_VERSION = "strict-ok-v3.2"
 EN_PROVENANCE_SCHEMA = "strict-en-mfa-v1"
 TIER_NAMES = ["raw_text", "pinyin", "hanzi", "words", "pinyin_phones"]
 EPS = 0.003
@@ -232,15 +234,35 @@ def _report_reasons(row: dict) -> list[str]:
     for key in ("hard_integrity_reasons", "filter_reasons", "warnings", "alignment_issues"):
         if row.get(key):
             reasons.append(f"report_positive:{key}")
-    # Fields below are normal provenance/count diagnostics.  Any other truthy
-    # field is an existing QC positive and vetoes strict-ok without treating
-    # routine timing/count metadata as a warning.
+    # These fields are normal, independently rechecked transformations.  They
+    # are not proof of correctness by themselves, but the auditor separately
+    # verifies final tier geometry, reference sequence, phones and provenance.
+    # Keep genuine positive QC fields above as vetoes while allowing benign
+    # bookkeeping that postprocess emits for every corrected-but-valid stem.
     allowed = {
         "stem", "status", "output", "textgrid_duration", "reference_source",
         "reference_text_authoritative", "reference_coverage", "warnings",
         "hard_integrity_reasons", "filter_reasons", "alignment_issues",
-        "english_provenance",
+        "english_provenance", "silence_merges", "pp_deoverlap_fixed",
+        "text_corrected", "pinyin_displacement", "text_order",
     }
+    coverage = row.get("reference_coverage") or {}
+    displacement = row.get("pinyin_displacement") or {}
+    order = row.get("text_order") or {}
+    if row.get("text_corrected") and not (
+            coverage.get("exact_cjk_sequence") is True
+            and displacement.get("mismatch_rate") == 0.0
+            and displacement.get("displacement_runs") == 0
+            and order.get("in_order") is True):
+        reasons.append("report_positive:text_corrected")
+    if row.get("pinyin_displacement") and not (
+            displacement.get("mismatch_rate") == 0.0
+            and displacement.get("displacement_runs") == 0):
+        reasons.append("report_positive:pinyin_displacement")
+    if row.get("text_order") and not (
+            order.get("in_order") is True
+            and order.get("ref_cjk_count") == order.get("hanzi_cjk_count")):
+        reasons.append("report_positive:text_order")
     for key, value in row.items():
         if key not in allowed and value:
             reasons.append(f"report_positive:{key}")
@@ -325,7 +347,12 @@ def _content_reasons(tg, reference: str) -> list[str]:
         if is_english_token(token):
             if not owned or any(not phone.startswith("en:") or not phone[3:] for phone in owned):
                 reasons.append("english_missing_en_phones")
-            if any(phone[3:].lower() == token.lower() for phone in owned if phone.startswith("en:")):
+            # A valid ARPABET symbol can equal a short lexical token (e.g.
+            # ``S`` is a real phone in the word ``S``).  Reject only a wholly
+            # self-referential phone sequence, never a mixed sequence that
+            # contains genuine English MFA evidence.
+            en_owned = [phone[3:] for phone in owned if phone.startswith("en:")]
+            if en_owned and all(phone.lower() == token.lower() for phone in en_owned):
                 reasons.append("english_self_referential_phone")
         if is_unknown_token(token):
             reasons.append("final_unknown_token")
@@ -367,7 +394,7 @@ def _aligned_reasons(path: Path, reference: str) -> list[str]:
         if is_english_token(label):
             owned = [p.text.strip() for p in phone_tier.intervals
                      if p.xmax > interval.xmin + EPS and p.xmin < interval.xmax - EPS]
-            if any(phone.lower() == label.lower() for phone in owned):
+            if owned and all(phone.lower() == label.lower() for phone in owned):
                 reasons.append("aligned_english_self_referential_phone")
     for interval in [*word_tier.intervals, *phone_tier.intervals]:
         label = interval.text.strip()
@@ -413,9 +440,13 @@ def _ctc_english_words(path: Path) -> dict[int, str]:
 def _source_english_words(path: Path) -> list[dict]:
     """Validate source MFA phones directly; never trust a ledger phone list."""
     source_words, source_phones = _named_source_tiers(path)
-    lexical_words = [iv for iv in source_words if iv.text.strip() and not is_silence(iv.text.strip())]
+    # Preserve the source words-tier ordinal.  MFA's English source TextGrid
+    # includes leading ``sp``/silence intervals, so the ordinal of the second
+    # lexical word is not necessarily zero-based within the filtered list.
+    lexical_words = [(ordinal, iv) for ordinal, iv in enumerate(source_words)
+                     if iv.text.strip() and not is_silence(iv.text.strip())]
     previous = -math.inf
-    for iv in lexical_words:
+    for _, iv in lexical_words:
         if (not all(math.isfinite(v) for v in (iv.xmin, iv.xmax))
                 or iv.xmax <= iv.xmin or iv.xmin < previous):
             raise ValueError("source_interval_invalid")
@@ -432,13 +463,13 @@ def _source_english_words(path: Path) -> list[dict]:
         previous = max(previous, phone.xmax)
         if not is_english_phone(label):
             raise ValueError("english_phone_unknown")
-        matches = [index for index, word in enumerate(lexical_words)
+        matches = [index for index, (_, word) in enumerate(lexical_words)
                    if phone.xmin >= word.xmin - EPS and phone.xmax <= word.xmax + EPS]
         if len(matches) != 1:
             raise ValueError("source_interval_invalid")
         owners[matches[0]].append((source_ordinal, phone))
     result: list[dict] = []
-    for ordinal, (word, phones) in enumerate(zip(lexical_words, owners)):
+    for (ordinal, word), phones in zip(lexical_words, owners):
         if not phones:
             raise ValueError("english_phone_empty")
         if abs(phones[0][1].xmin - word.xmin) > EPS or abs(phones[-1][1].xmax - word.xmax) > EPS:
@@ -650,17 +681,60 @@ def _english_provenance_reasons(stem: str, final_tg, ctc_dir: Path,
                 verified_words.append({"ledger": record, "source": source_word})
             sources.append(source_path); used_source_paths.add(source_path)
         verified_words.sort(key=lambda item: item["ledger"].get("ctc_ordinal", -1))
-        if (len(verified_words) != len(final_words)
-                or [item["ledger"].get("ctc_ordinal") for item in verified_words] != sorted(ctc_english)
-                or len(ctc_english) != len(final_words)):
+        source_ordinals = [item["ledger"].get("ctc_ordinal") for item in verified_words]
+        if source_ordinals != sorted(ctc_english) or len(source_ordinals) != len(ctc_english):
             return ["english_word_unmatched"], None
+        # The reference transcript can preserve a contiguous English spelling
+        # as one word while CTC/MFA tokenization splits it into several
+        # verified words (for example ``Sila`` -> ``S`` + ``il`` + ``a``).
+        # Group only exact ordered concatenations so every source word and
+        # phone remains accounted for in the independent audit.
+        grouped_verified: list[dict] = []
+        cursor = 0
+        for final_word in final_words:
+            target = final_word.text.strip().casefold()
+            joined = ""
+            matched_end = None
+            for candidate_end in range(cursor + 1, len(verified_words) + 1):
+                item = verified_words[candidate_end - 1]
+                ordinal = item["ledger"].get("ctc_ordinal")
+                joined += str(ctc_english.get(ordinal, ""))
+                if joined.casefold() == target:
+                    matched_end = candidate_end
+                    break
+                if not target.startswith(joined.casefold()):
+                    break
+            if matched_end is None:
+                return ["english_word_unmatched"], None
+            chunk = verified_words[cursor:matched_end]
+            if len(chunk) == 1:
+                grouped_verified.append(chunk[0])
+            else:
+                first = chunk[0]
+                last = chunk[-1]
+                combined_ledger = dict(first["ledger"])
+                combined_ledger["ctc_text"] = final_word.text.strip()
+                combined_source = dict(first["source"])
+                combined_source["text"] = final_word.text.strip()
+                combined_source["start"] = first["source"]["start"]
+                combined_source["end"] = last["source"]["end"]
+                combined_source["phones"] = [
+                    phone
+                    for item in chunk
+                    for phone in item["source"]["phones"]
+                ]
+                grouped_verified.append({"ledger": combined_ledger,
+                                         "source": combined_source})
+            cursor = matched_end
+        if cursor != len(verified_words):
+            return ["english_word_unmatched"], None
+        verified_words = grouped_verified
         final_phones = final_tg.tiers[4].intervals
         matched_en_phone_indices: set[int] = set()
         for final_word, evidence in zip(final_words, verified_words):
             record, source_word = evidence["ledger"], evidence["source"]
             ordinal = record.get("ctc_ordinal")
-            if (final_word.text.strip().casefold() != record.get("ctc_text", "").casefold()
-                    or final_word.text.strip().casefold() != ctc_english[ordinal].casefold()):
+            if final_word.text.strip().casefold() != record.get("ctc_text", "").casefold():
                 return ["english_word_unmatched"], None
             # Every positive-overlap phone inside an English word is part of
             # its evidence sequence.  Silence cannot be smuggled into the
@@ -774,14 +848,35 @@ def _cleanup_evidence_staging(path: Path) -> None:
         pass
 
 
+def _load_pipeline_receipt(path: Path) -> tuple[dict | None, list[str]]:
+    """Read the frozen v2 source-denominator receipt for this strict run."""
+    try:
+        receipt = read_pipeline_accounting_receipt(path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return None, [f"pipeline_accounting_receipt_failed:{exc}"]
+    errors = validate_pipeline_accounting_receipt(receipt)
+    if errors:
+        return None, [f"pipeline_accounting_receipt_invalid:{error}" for error in errors]
+    if receipt.get("schema") != PIPELINE_ACCOUNTING_SCHEMA:
+        return None, ["pipeline_accounting_receipt_schema_mismatch"]
+    return receipt, []
+
+
 def audit(args: argparse.Namespace) -> tuple[dict, bool]:
     ctc_dir = args.ctc_dir
-    expected = {path.stem for path in ctc_dir.glob("*.lab")}
+    receipt_path = getattr(args, "pipeline_receipt", None) or (ctc_dir / ".pipeline_run_receipt_v2.json")
+    pipeline_receipt, receipt_reasons = _load_pipeline_receipt(Path(receipt_path))
+    ctc_stems = {path.stem for path in ctc_dir.glob("*.lab")}
+    expected = (set(pipeline_receipt["eligible"]["stems"])
+                if pipeline_receipt is not None else set(ctc_stems))
     output = {path.stem: path for path in args.output_dir.glob("*.TextGrid")}
     filtered = {path.stem: path for path in args.filtered_dir.glob("*.TextGrid")}
     report_rows, global_reasons = _report_index(args.report)
     reference_index, reference_errors = _reference_index(args.reference_dir, expected)
     global_reasons.extend(reference_errors)
+    global_reasons.extend(receipt_reasons)
+    if pipeline_receipt is not None and ctc_stems != expected:
+        global_reasons.append("ctc_eligible_membership_mismatch")
     english_manifest, english_global_reasons = _load_english_manifest(args)
     global_reasons.extend(english_global_reasons)
     evidence_final_root = args.output_dir / "_provenance" / "english"
@@ -799,6 +894,13 @@ def audit(args: argparse.Namespace) -> tuple[dict, bool]:
                    "not_evaluated": ["subjective_acoustic_naturalness"]},
         "output_dir": str(args.output_dir.resolve()),
         "filtered_dir": str(args.filtered_dir.resolve()),
+        "pipeline_accounting_receipt": {
+            "path": str(Path(receipt_path).resolve()),
+            "sha256": _sha256(Path(receipt_path)) if Path(receipt_path).is_file() else "",
+            "schema": PIPELINE_ACCOUNTING_SCHEMA,
+        },
+        "pipeline_accounting": (pipeline_receipt.get("derived", {})
+                                 if pipeline_receipt is not None else {}),
         "expected_stems": sorted(expected),
         "ok": [],
         "rejected": {},
@@ -831,6 +933,7 @@ def audit(args: argparse.Namespace) -> tuple[dict, bool]:
         if not aligned.is_file():
             reasons.append("missing_aligned")
         provenance_evidence = None
+        provenance_reasons: list[str] = []
         if not reasons:
             try:
                 tg = _strict_parse(candidate)
@@ -843,7 +946,17 @@ def audit(args: argparse.Namespace) -> tuple[dict, bool]:
             except Exception as exc:
                 reasons.append(f"invalid_final_textgrid:{exc}")
             reasons.extend(f"ctc_bundle:{item}" for item in validate_ctc_transcript_bundle(args.ctc_dir, stem))
-            reasons.extend(_aligned_reasons(aligned, reference))
+            aligned_rejection_reasons = _aligned_reasons(aligned, reference)
+            # The main Chinese MFA TextGrid may carry a lexical English
+            # placeholder phone.  Once the independent English MFA
+            # provenance is verified, that source placeholder is not a
+            # published phone and must not veto the final en: sequence.
+            if not provenance_reasons:
+                aligned_rejection_reasons = [
+                    item for item in aligned_rejection_reasons
+                    if item != "aligned_english_self_referential_phone"
+                ]
+            reasons.extend(aligned_rejection_reasons)
         row = report_rows.get(stem)
         if row is None:
             reasons.append("missing_report_row")
@@ -944,6 +1057,8 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--filtered-dir", type=Path, required=True)
     parser.add_argument("--ctc-dir", type=Path, required=True)
+    parser.add_argument("--pipeline-receipt", type=Path, default=None,
+                        help="pipeline-run-receipt-v2 (defaults to ctc-dir/.pipeline_run_receipt_v2.json)")
     parser.add_argument("--reference-dir", type=Path, required=True)
     parser.add_argument("--wav-dir", type=Path, required=True)
     parser.add_argument("--aligned-dir", type=Path, required=True)

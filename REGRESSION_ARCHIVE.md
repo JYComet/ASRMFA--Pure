@@ -110,8 +110,101 @@
 | 99 | 2026-08-06 | ctc_prealign.py, prepare_hecheng_english_ctc_ready.py, verify_hecheng_english_ctc_ready_v4.py | 仅固定模型路径而未固定实际模型文件树，CTC 声学 provenance 可被同路径替换（P1，生产 prepare 前必须修复） |
 | 100 | 2026-08-06 | ctc_prealign.py | blank-run pause 未移除 4 个 query frame，停顿时间整体偏移约 240ms（P0，已阻断声学 canary/生产） |
 | 101 | 2026-08-06 | ctc_prealign.py | all-GPU 父合并静默跳过碰撞/坏 manifest，并可能提前合入 shard marker（P0，已阻断声学 canary/生产） |
+| 102 | 2026-08-07 | ctc_prealign.py | reference-only `--no-nvv` 仍允许 ASR 内容污染 required sidecar |
+| 103 | 2026-08-07 | run_pipeline.py, ctc_prealign.py | `run_pipeline.py` 未支持 `--all-gpus` 多卡 CTC 推理（待实施） |
+| 104 | 2026-08-07 | run_pipeline.py | MFA Popen OSError 引用未初始化变量 |
+| 105 | 2026-08-07 | streaming_pipeline.py | 父进程 MFA jobs 计算值未传递到子进程 |
+| 106 | 2026-08-07 | streaming_pipeline.py, launch_8gpu.py | 硬编码 `--force --overwrite` 覆盖配置禁止 |
+| 107 | 2026-08-07 | ctc_prealign.py | all-GPU shard 合并存在 TOCTOU 竞态窗口 |
+| 108 | 2026-08-07 | streaming_pipeline.py | 批量上传共享目录导致跨批次文件覆盖 |
+| 109 | 2026-08-07 | streaming_pipeline.py | Checkpoint 在上传完成前标记成功 |
+| 110 | 2026-08-07 | streaming_pipeline.py, run_pipeline.py | `strict_ok` 输出路径与流式上传器不匹配 |
+| 111 | 2026-08-07 | streaming_pipeline.py | 断点续跑丢失批次级进度 |
+| 112 | 2026-08-07 | ctc_prealign.py | all-GPU preflight namespace 拒绝 `.ctc_run_receipt.json` |
+| 113 | 2026-08-07 | run_pipeline.py | `step_prealign` 陈旧 `.TextGrid` 存在性短路导致分母缩小 |
+| 114 | 2026-08-07 | run_pipeline.py | `step_adjust_ctc` 陈旧 `.TextGrid` 存在性短路 |
+| 115 | 2026-08-07 | run_pipeline.py | `step_link_ctc` 可解析旧 manifest 直接短路 |
+| 116 | 2026-08-07 | run_pipeline.py | `--skip-to` 静默追加不属于当前模式的步骤 |
+| 117 | 2026-08-07 | streaming_pipeline.py | `--scan-only` 在 full 模式下执行破坏性 trim |
+| 118 | 2026-08-07 | run_pipeline.py | `--validate` 失败不影响最终退出码 |
+| 119 | 2026-08-07 | run_pipeline.py | `_run_direct` 丢弃子进程 return code |
+| 120 | 2026-08-07 | streaming_pipeline.py | `_prefetch_worker` 忽略 copy failures 并允许失败 batch 进入 process queue |
+| 121 | 2026-08-07 | streaming_pipeline.py | `StreamingPipeline.run()` 失败 batch 仍被推入 upload queue |
+| 122 | 2026-08-07 | streaming_pipeline.py | `run_batch` / `run_pipelined_batch` 返回 None 导致主调无法感知失败 |
+| 123 | 2026-08-07 | streaming_pipeline.py | staged CPU upload 对 rsync/copy 失败仅告警并返回 True |
+| 124 | 2026-08-07 | streaming_pipeline.py | batch_ctc_ready 缺失音频数据集被 skip 而不进入 fail_list |
+| 125 | 2026-08-07 | run_pipeline.py | 非 strict 模式输出路径无 run-specific 隔离 |
+| 126 | 2026-08-07 | run_pipeline.py | 无统一 config schema 校验 |
+| 127 | 2026-08-07 | postprocess_textgrids.py, pipeline_utils.py | 权威标点/连字符英文投影与 phone 越界 |
+| 128 | 2026-08-07 | ctc_prealign.py, run_pipeline.py | CTC 全 GPU 合并隔离与输入副本安全 |
+| 129 | 2026-08-10 | audit_strict_ok.py, verify_strict_ok.py | strict manifest 未绑定 `pipeline-run-receipt-v2` |
+
+### 索引完整性与非 Case 章节
+
+截至 2026-08-10，Case 索引已覆盖 Case 1–129，每个编号各出现一次；Case 标题与正文
+均可按同一编号定位。除 Case 条目外，文档还包含以下纳入索引范围的专题章节：
+
+| 章节 | 内容 |
+|------|------|
+| `2026-08-10 当前全量运行总结` | 本次 54k 全量运行的输入隔离、CTC、音频、中文/英文 MFA、后处理、strict audit、过滤和发布证据 |
+| `项目管线结构 / Pipeline Architecture` | full、ctc_ready、streaming 等模式的入口、输入输出和步骤关系 |
+| `修改点汇总` | 跨 Case 的代码修改、验证方法和当前遗留风险汇总 |
+
+索引中的日期、文件和标题是导航信息；每个 Case 的实际状态、验证结果和未闭环项以对应
+正文为准。`filtered`、`rejected`、`missing` 或“待修复/待复跑”条目不代表成功通过。
 
 ---
+
+## 2026-08-10 当前全量运行总结
+
+本节只记录 `/mnt/nvme3/mfa_workspace_54k_full_20260810` 这次当前全量运行的证据，
+并明确区分“代码已实现”和“本次运行已验证”。运行配置为
+`/mnt/local_E/MFA_Pause/repo/configs/hecheng_ria_fresh.yaml`；所有输出使用
+run-specific 目录（例如 `strict_ok_runs/20260810T032955Z_2109063/`），不把历史
+workspace 或 NAS 旧结果作为本次输入。
+
+### 代码已实现的契约
+
+- source/input isolation：CTC 输入来自 `data_dir`/reference sidecar，CTC 运行在
+  run-local staging/merge namespace；`--no-nvv --all-gpus` 的 argv、分片 receipt 和
+  `/mnt/nvme3/mfa_workspace_54k_full_20260810/ctc_pretg/manifest.json` 提供来源记录。
+- CTC reference mode：reference 文本是 required sidecar、CTC words 与后续 MFA 的内容
+  权威；`--no-nvv` 仅禁止自由解码新增 NVV，不删除 reference 中已有 NVV。
+- `padded_audio/` 与 `audio_16k/` 用途分离：前者保留 48 kHz padded WAV 作为音频侧/最终
+  交付语义，后者是 MFA 使用的 16 kHz WAV；二者不是同一目录的替代品。
+- partial MFA、English MFA provenance、strict audit、filtered integrity、run-specific
+  output 和 versioned publish 均已有代码路径/验证器；有效结果必须保留 English 对齐、
+  NVV 标签、句首 `<sp>`/`sp` 和标点，filtered 结果永远不是成功结果。
+
+### 本次运行已验证的结果
+
+- CTC：53998 输入、53998 输出、0 failed；运行参数含 `--no-nvv --all-gpus`。
+- 音频：`padded_audio/` 有 53998 个 48 kHz WAV；`audio_16k/` 有 53998 个 16 kHz MFA WAV。
+- 中文 MFA：53998 expected、53392 produced、606 missing；缺失统一归类为
+  `missing_mfa_alignment`，见
+  `/mnt/nvme3/mfa_workspace_54k_full_20260810/mfa_logs/20260810T024653Z_2045521/mfa_output_manifest.json`。
+- English MFA：135003 expected segments、131700 produced、3303 rejected；281617 verified
+  words、4004 rejected words。来源链见
+  `/mnt/nvme3/mfa_workspace_54k_full_20260810/en_phones/en_alignment_manifest.json`。
+- 后处理：53998 rows，17959 ok、36039 filtered、0 error；报告为
+  `/mnt/nvme3/mfa_workspace_54k_full_20260810/strict_ok_runs/20260810T032955Z_2109063/output/postprocess_report.jsonl`。
+- `strict-ok-v3.2`：17640 ok、36358 rejected，互斥且并集为 53998；另有 313
+  out-of-bounds candidates、6 reference semantic sequence mismatch。strict manifest 为
+  `/mnt/nvme3/mfa_workspace_54k_full_20260810/strict_ok_runs/20260810T032955Z_2109063/output/strict_ok_manifest.json`。
+- 发布清单 `/mnt/nvme3/mfa_workspace_54k_full_20260810/strict_ok_runs/20260810T032955Z_2109063/output/.publish_manifest.json`
+  含 17640 个顶层 TextGrid、English provenance 和元数据，但不含 WAV；它不是 NAS
+  音频复制完成证明。root 复制监控快照仅记录截至快照的活动标记：16 workers，
+  `max_current=042817_弹幕互动_互动游戏.wav`；不能由此换算完成率、目标总数或 ETA，
+  本次记录未复核、控制或操作复制进程。
+
+### 门禁状态与残余风险
+
+当前代码要求 `pipeline-run-receipt-v2`，但这次旧运行 artifact 使用
+`pipeline-run-receipt-v1`（证据：
+`/mnt/nvme3/mfa_workspace_54k_full_20260810/ctc_pretg/.ctc_run_receipt.json`）。因此
+不能宣称旧运行通过新的 v2 发布门禁；上述 strict/filtered 数字是运行审计结果，
+不是 v2 publish approval。发布前仍需以 v2 receipt 重新满足 source/eligible/exclusion
+守恒，并再次确认 English provenance、NVV、句首静音与标点保留。
 
 ## 项目管线结构 / Pipeline Architecture
 
@@ -6096,6 +6189,8 @@ python scripts/verify_tier_discontinuity.py
 
 状态：已修复。
 
+---
+
 ### 现象
 
 2,150 个内容文件中 88 个 (4.1%) 的 `pinyin_phones` 层存在相邻 phone 区间重叠：
@@ -7481,3 +7576,994 @@ Cases 80（单条 CTC 重跑 051809）、81（ria 三方原子同步集成）、
 | `scripts/run_pipeline.py` ~line 838 | `if pc.get("all_gpus", False): prealign_args.append("--all-gpus")` |
 
 状态：已实施。`configs/hecheng_ria_fresh.yaml` 增加 `all_gpus: true`；`run_pipeline.py::step_prealign` line ~845 传递 `--all-gpus`。
+
+---
+
+## Case 104: MFA Popen OSError 引用未初始化变量 (mfa_popen_uninit)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/run_pipeline.py
+
+### 现象
+
+`_run_mfa_sharded` 中 Popen OSError handler（~line 1474-1483）引用 `_return_codes` 和 `_failed`，
+但这两个变量在 Popen 循环结束后才初始化（原 line 1491-1492）。若 `subprocess.Popen()` 抛出
+OSError（如可执行文件缺失、资源耗尽），会先触发 `UnboundLocalError` 掩盖真实错误。
+
+修复前：OSError → NameError: name '_return_codes' is not defined
+修复后：OSError → 正确记录 `os_error:<errno>`，保留 shard 现场
+
+### 根因链
+
+1. `_run_mfa_sharded` Popen 启动循环（~line 1434）
+2. OSError handler 引用 `_return_codes[_si]` 和 `_failed.append(_si)`（~line 1476-1477）
+3. 变量初始化位于 wait 循环之前（~line 1491-1492）— 在引用之后
+4. Python 在函数内赋值即视为局部变量，引用未赋值局部变量 → `UnboundLocalError`
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/run_pipeline.py` ~line 1433 | `_failed` 和 `_return_codes` 初始化移至 Popen 循环之前 |
+| `scripts/run_pipeline.py` ~line 1491 | 移除重复初始化（避免覆盖 OSError 收集的数据）|
+
+### 验证方法
+
+```python
+# 模拟：mock subprocess.Popen 抛出 OSError
+# 预期：shard 记录为 os_error，循环继续，不抛 NameError
+```
+
+状态：已修复。
+
+---
+
+## Case 105: 父进程 MFA jobs 计算值未传递到子进程 (mfa_jobs_contract_mismatch)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/streaming_pipeline.py
+
+### 现象
+
+`run_batch`（~line 1775-1803）根据 CPU 核数、batch 大小和并行度计算 `_effective_mfa_jobs`，
+但只存储在内存 `args._effective_mfa_jobs` 和 in-memory config dict 中。子进程通过
+`subprocess.run` 启动 `run_pipeline.py` 时，命令中不包含 `--mfa-jobs` 参数，
+子进程从磁盘 YAML 读取原始配置值，父进程的自动缩放计算被丢弃。
+
+修复前：子进程使用 config YAML 中的 `mfa.num_jobs: 64`（可能超过安全限制）
+修复后：子进程命令包含 `--mfa-jobs {calculated_value}`，尊重父进程的资源预算
+
+### 根因链
+
+1. `run_batch` 计算 `_effective_mfa_jobs` → 存到 `args._effective_mfa_jobs`
+2. `_execute_staged` → `process_worker` → `_process_one_batch` 构建子进程命令
+3. 子进程命令未包含 `--mfa-jobs` → `run_pipeline.py` 重新从 YAML 读取 → 使用原始配置值
+4. 父进程的 CPU 预算、batch 上限约束全部失效
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/streaming_pipeline.py` `_process_one_batch` | 接受 `mfa_num_jobs`/`mfa_en_num_jobs` 参数，追加到子进程命令 |
+| `scripts/streaming_pipeline.py` `_execute_staged` | 签名增加 `mfa_num_jobs`/`mfa_en_num_jobs`，传递到 `_process_one_batch` |
+| `scripts/streaming_pipeline.py` `run_batch` | 计算 `_effective_mfa_en_jobs`，传递到 `_execute_staged` |
+| `scripts/streaming_pipeline.py` `_run_cpu_phase` | 接受并传递 MFA jobs 参数 |
+| `scripts/streaming_pipeline.py` `StreamingPipeline` | 类增加 `mfa_num_jobs`/`mfa_en_num_jobs` 属性 |
+
+### 验证方法
+
+```bash
+# 运行 dry-run / --plan-json，检查子进程命令包含 --mfa-jobs N
+python scripts/streaming_pipeline.py --config configs/batch_all.yaml --plan-json /tmp/plan.json
+python -c "import json; plan=json.load(open('/tmp/plan.json')); assert any('--mfa-jobs' in c for c in plan['commands'])"
+```
+
+状态：已修复。
+
+---
+
+## Case 106: 硬编码 --force --overwrite 覆盖配置禁止 (force_overwrite_hardcoded)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/streaming_pipeline.py, scripts/launch_8gpu.py
+
+### 现象
+
+`streaming_pipeline.py` 和 `launch_8gpu.py` 中所有子进程命令无条件包含 `--overwrite --force`。
+`configs/hecheng_english_mfa.yaml` 明确禁止这些参数，但硬编码导致配置禁止无效。
+子进程会覆盖已有输出和 workspace，破坏 strict 不变量。
+
+修复前：所有子进程强制 `--overwrite --force`，配置 `allow_overwrite: false` 被忽略
+修复后：子进程命令根据 config `pipeline.allow_overwrite` / `pipeline.allow_force` 决定是否追加
+
+### 根因链
+
+1. `_process_one_batch`、`_run_gpu_phase`、`_run_cpu_phase`、`StreamingPipeline._process_batch` 硬编码 flags
+2. `launch_8gpu.py` 同样硬编码
+3. 无 CLI 或 config 读取逻辑来覆盖
+4. strict 配置的禁止声明被绕过
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/streaming_pipeline.py` | 添加 `--no-overwrite`/`--no-force` CLI flags；在 `run_batch` 中读取 config 解析策略；所有子进程命令条件化 |
+| `scripts/launch_8gpu.py` ~line 91 | 读取 config `pipeline.allow_overwrite`/`allow_force`，条件化 flags |
+
+### 验证方法
+
+```bash
+python scripts/streaming_pipeline.py --config configs/hecheng_english_mfa.yaml --no-overwrite --no-force --plan-json /tmp/plan.json
+python -c "import json; plan=json.load(open('/tmp/plan.json')); assert not any('--overwrite' in c for c in plan['commands'])"
+```
+
+状态：已修复。
+
+---
+
+## Case 107: all-GPU shard 合并存在 TOCTOU 竞态窗口 (ctc_shard_merge_toctou)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/ctc_prealign.py
+
+### 现象
+
+`ctc_prealign.py` all-GPU merge 阶段有 preflight 碰撞检查（~line 1356-1361）和
+每文件移动前二次检查（~line 1382），但两次检查和 `shutil.move` 之间没有原子保护。
+外部进程可在窗口期写入目标目录导致覆盖。
+
+修复前：preflight 检查通过 → 窗口期 → move（可能覆盖外部写入）
+修复后：增加 `.merge_lock` sentinel 文件，合并前获取，完成后释放
+
+### 根因链
+
+1. preflight 碰撞检查遍历所有文件
+2. 无文件级或目录级锁
+3. `shutil.move` 在检查之后执行
+4. 外部并发写入可导致覆盖
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/ctc_prealign.py` ~line 1362 | merge 前创建 `.merge_lock`；已存在则拒绝重复合并 |
+| `scripts/ctc_prealign.py` ~line 1478 | `try/finally` 确保 lock 释放 |
+
+### 验证方法
+
+代码审计：确认 merge 代码块被 `try/finally` 包裹，lock 在异常路径也会释放。
+
+状态：已修复。
+
+---
+
+## Case 108: 批量上传共享目录导致跨批次文件覆盖 (batch_shared_upload_dirs)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/streaming_pipeline.py
+
+### 现象
+
+`_upload_one_batch` 将多个 batch 的输出直接合并到同一个 `output/`、`filtered/` 目录。
+同一数据集的 batch_0000 和 batch_0001 上传到相同的 NAS 路径，`rsync -a` 合并时
+同名文件被后上传的 batch 覆盖。`_upload_worker` 更严重：所有数据集的所有 batch
+合并到单一 `output` 目录。
+
+修复前：多个 batch 写入同一 NAS 目录，文件合并结果取决于上传顺序
+修复后：每个 batch 上传到隔离的 `.staging/batch_XXXX/` 目录，合并由显式 reducer 步骤完成
+
+### 根因链
+
+1. `_upload_one_batch` 目的地 = `nas_output_root/ds_name/output`（所有 batch 共享）
+2. `_upload_worker` 目的地 = `nas_output_root/output`（所有数据集共享）
+3. 不同 batch 产生的同名 TextGrid/lab 文件相互覆盖
+4. 最终结果取决于最后完成的 batch
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/streaming_pipeline.py` `_upload_one_batch` | 目的地改为 `ds_name/.staging/batch_XXXX/`，增加 `batch_idx` 参数 |
+| `scripts/streaming_pipeline.py` 调用点 | 传递 `batch_idx` 到 `_upload_one_batch` |
+
+### 验证方法
+
+```python
+# 处理 2 个 batch，验证 .staging/ 下有两个独立目录
+# 验证 batch_0000/output/ 和 batch_0001/output/ 互不包含对方文件
+```
+
+状态：已修复。
+
+---
+
+## Case 109: Checkpoint 在上传完成前标记成功 (checkpoint_before_upload)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/streaming_pipeline.py
+
+### 现象
+
+`_execute_staged` Phase 2 完成后立即将数据集写入 `completed_set` 并保存 checkpoint
+（原 ~line 1677），然后才执行 Phase 3 上传。若上传阶段进程崩溃（网络故障、NAS 满），
+已写入磁盘的 checkpoint 显示数据集"已完成"，但实际结果未到达 NAS。
+重启时 `_load_checkpoint` 跳过该数据集，导致数据丢失。
+
+修复前：Phase 2 完成 → checkpoint 标记 completed → Phase 3 上传（可能崩溃）
+修复后：Phase 2 完成 → 临时记录 _phase2_ok → Phase 3 上传成功 → checkpoint 标记 completed
+
+### 根因链
+
+1. Phase 2 处理成功后立即 `completed_set.add(ds_name)`
+2. `_save_checkpoint` 写入磁盘
+3. Phase 3 上传期间崩溃 → checkpoint 已永久标记 completed
+4. 重启后跳过该数据集 → 结果从未到达 NAS
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/streaming_pipeline.py` `_execute_staged` | Phase 2 使用临时 `_phase2_ok` 集合；Phase 3 成功后才 `completed_set.add` |
+| `scripts/streaming_pipeline.py` `_execute_staged` | ok_count 基于 `_phase2_ok` 减 upload_failures 计算 |
+
+### 验证方法
+
+```python
+# 模拟：Phase 3 中 kill 进程；重启后确认该数据集未在 completed_set 中
+# 预期：checkpoint 不包含该数据集，重新处理 Phase 2（跳过已完成的 batch）+ Phase 3
+```
+
+状态：已修复。
+
+---
+
+## Case 110: strict_ok 输出路径与流式上传器不匹配 (strict_output_path_mismatch)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/streaming_pipeline.py, scripts/run_pipeline.py
+
+### 现象
+
+`run_pipeline.py` strict_ok 模式将输出重定向到 `workspace/strict_ok_runs/{run_id}/output`，
+但 `_upload_one_batch` 从 `local_dir/output` 读取。若配置的 output-dir 为空（strict 模式常见），
+上传器上传空目录，strict 实际结果留在 NVMe 后被 cleanup 删除。
+
+修复前：strict 结果写入 `workspace/strict_ok_runs/{run_id}/output`，上传器读 `batch_dir/output`（空）
+修复后：上传器检测 strict_ok 输出，自动从 `strict_ok_runs/{run_id}/output` 读取
+
+### 根因链
+
+1. `run_pipeline.py` `strict_run_paths()` 返回重定向的 output_dir
+2. `_process_one_batch` 传递 `--output-dir batch_dir/output`，但 `run_pipeline.py` 内部重定向
+3. `_upload_one_batch` 从 `batch_dir/output` 读取 → 空目录
+4. cleanup 删除 batch_dir → strict 结果永久丢失
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/streaming_pipeline.py` | 新增 `_detect_strict_output(workspace)` 函数 |
+| `scripts/streaming_pipeline.py` `_upload_one_batch` | 若 configured output 为空，自动检测并使用 strict_ok output |
+
+### 验证方法
+
+```python
+# strict_ok=True 的配置运行 batch；验证上传器从 strict_ok_runs/ 读取
+# 预期：strict output 被正确上传到 staging 目录
+```
+
+状态：已修复。
+
+---
+
+## Case 111: 断点续跑丢失批次级进度 (batch_level_resume_lost)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/streaming_pipeline.py
+
+### 现象
+
+`_save_batch_progress` 将每数据集批次数写入 `.batch_progress.json`，但 `_load_checkpoint`
+只恢复数据集名集合，`.batch_progress.json` 从未被加载。若数据集有 50 个 batch、已处理 27 个后
+崩溃，重启时整个数据集的 50 个 batch 全部重新处理。
+
+修复前：已处理 27/50 batch → 崩溃 → 重启后全部 50 个重新处理
+修复后：已处理 27/50 batch → 崩溃 → 重启后跳过前 27 个，仅处理剩余 23 个
+
+### 根因链
+
+1. `_save_batch_progress` 写入 `.batch_progress.json`（best-effort）
+2. 无对应的 `_load_batch_progress` 函数
+3. `run_batch` 构建 `all_batches` 时不检查已完成的 batch 数
+4. 每个数据集从 batch 0 重新开始
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/streaming_pipeline.py` | 新增 `_load_batch_progress(ckpt_path)` 函数 |
+| `scripts/streaming_pipeline.py` `run_batch` | 加载 batch progress；构建 `all_batches` 时跳过已完成的 batch |
+
+### 验证方法
+
+```python
+# 1. 创建包含 {'ds1': {'done': 3, 'fail': 0, 'total': 10}} 的 .batch_progress.json
+# 2. 重启 run_batch
+# 3. 验证 ds1 的前 3 个 ctc_ready batch 被跳过
+```
+
+---
+
+## Case 112: all-GPU preflight namespace 拒绝 `.ctc_run_receipt.json` (allgpu_namespace_receipt_conflict)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/ctc_prealign.py
+
+### 现象
+
+all-GPU preflight 校验在 `scripts/ctc_prealign.py:1285-1288` 构建的 `_allowed` namespace 集合
+不包含 `.ctc_run_receipt.json`，但同一个 preflight 循环在 `scripts/ctc_prealign.py:1330-1332`
+强制要求该文件存在且可解析。结果是任何成功写出 shard receipt 的正常 shard 都会因
+namespace mismatch 被拒绝。
+
+修复前：所有 all-GPU shard 在 preflight 阶段被误判为失败
+修复后：`.ctc_run_receipt.json` 在 namespace 校验中作为合法 artifact 被接受
+
+### 根因链
+
+1. Case 99 (R5) 实现为每个 shard 写入 `.ctc_run_receipt.json` 以记录模型/字典 identity
+2. all-GPU preflight（line 1285-1288）定义 `_allowed` namespace = artifact suffixes ∪ {manifest.json, summary.txt, .ctc_normalized}
+3. 同一 preflight（line 1330-1332）要求 `_receipt_path = _shard_dir / ".ctc_run_receipt.json"` 存在
+4. `{p.name for p in _files} != _allowed` 在 line 1292 因 `_allowed` 缺少 `.ctc_run_receipt.json` 而抛出 RuntimeError
+5. 两个校验要求矛盾：namespace 排除该文件，但文件必须存在
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/ctc_prealign.py` line 1286 | `_allowed` 集合增加 `".ctc_run_receipt.json"` |
+
+### 验证方法
+
+```python
+# 模拟 all-GPU shard 目录包含 manifest.json、summary.txt、.ctc_normalized、.ctc_run_receipt.json
+# 和所有 stem 的 artifacts
+# import json, ast; ast.parse(Path("scripts/ctc_prealign.py").read_text())  # 确认语法正确
+# 预期：namespace 校验通过（不再抛出 RuntimeError("shard namespace mismatch")）
+```
+
+---
+
+## Case 113: `step_prealign` 陈旧 .TextGrid 存在性短路导致分母缩小 (prealign_stale_shortcut)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/run_pipeline.py
+
+### 现象
+
+`step_prealign` 在 `run_pipeline.py:810-813` 仅检查 `ctc_out.exists() and any(ctc_out.glob("*.TextGrid"))`
+即返回成功。这会接受：
+- 部分完成（仅 50% stems 有 .TextGrid）的陈旧输出
+- 缺少 `.ctc_normalized` marker 的不完整 bundle
+- v3/v4 marker manifest digest 不匹配的篡改/陈旧数据
+
+修复后：必须通过 v4 marker content identity 校验（stem count + manifest SHA-256），或接受 v3 legacy marker
+但标注警告。无 marker 的目录视为不完整，触发重跑。
+
+### 根因链
+
+1. `step_prealign` 的 fast path 用 `any()` 判断存在性 — 任意一个 .TextGrid 即视为完成
+2. CTC 预对齐可能被中断（如 OOM、超时），留下部分产物
+3. 后续 `step_mfa_align` 以 `.lab` 子集建立 alignment 分母 — 静默缩小 stem 集
+4. 最终 output 计数小于实际输入，但管线报告成功
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/run_pipeline.py` line 810-839 | 替换 `any(ctc_out.glob("*.TextGrid"))` 为 v4 marker + manifest digest 校验 |
+
+### 验证方法
+
+```python
+# 1. 创建仅含 1 个 .TextGrid 的 ctc_out 目录（无 .ctc_normalized marker）
+# 2. 运行 step_prealign（无 --overwrite）
+# 3. 预期：报告 "incomplete bundle"，触发重跑（不返回 0）
+```
+
+---
+
+## Case 114: `step_adjust_ctc` 陈旧 .TextGrid 存在性短路 (adjust_ctc_stale_shortcut)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/run_pipeline.py
+
+### 现象
+
+`step_adjust_ctc` 在 `run_pipeline.py:1275-1278` 仅检查 `ctc_out.exists() and any(ctc_out.glob("*.TextGrid"))`
+即返回成功并设置 `ctx["ctc_pretg_adj"]`。部分完成或与输入 stem 集不一致的输出被当作完整结果复用。
+
+修复后：验证输出 stem 集合与输入 stem 集合完全一致（通过 .lab 文件名匹配），否则触发重跑。
+
+### 根因链
+
+1. `step_adjust_ctc` 检查输出目录存在且包含任意 .TextGrid 就跳过
+2. 未校验输出 stem 是否覆盖全部输入 stem
+3. 缺失/额外的 .TextGrid 导致后续 MFA 使用不对齐的锚点集合
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/run_pipeline.py` line 1301-1321 | 替换 `any()` 为 input/output stem 集合交集校验 |
+
+### 验证方法
+
+```python
+# 1. 在 ctc_pretg_adj 中仅保留部分 stem 的 .TextGrid
+# 2. 运行 step_adjust_ctc（无 --overwrite）
+# 3. 预期：报告 "incomplete ... re-running"，输入/输出 stem 集合不匹配触发重跑
+```
+
+---
+
+## Case 115: `step_link_ctc` 可解析旧 manifest 直接短路 (link_ctc_manifest_shortcut)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/run_pipeline.py
+
+### 现象
+
+`step_link_ctc` 在 `run_pipeline.py:2948-2959` 发现旧 `ctc_ready_manifest.json` 可解析为 JSON
+且包含非空 stems 列表即返回成功。manifest 中的 stems 可能对应已删除的 .lab 文件、或被意外清空的
+CTC workspace。
+
+修复后：逐条验证 manifest 中每个 stem 的 .lab 文件确实存在于 workspace 中，任何缺失都触发重新扫描。
+
+### 根因链
+
+1. ctc_ready_manifest.json 被解析 → `prev.get("stems", [])` 非空 → 直接返回 0
+2. 实际链接阶段（line 3180-3202）中缺失文件仅 warning，不阻断
+3. 后续步骤在残缺链接的 workspace 上运行，分母远小于预期
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/run_pipeline.py` line 2990-3007 | 增加逐 stem .lab 文件存在性校验 |
+
+### 验证方法
+
+```python
+# 1. 创建合法的 ctc_ready_manifest.json（包含 10 个 stems）
+# 2. 删除其中 3 个 stem 的 .lab 文件
+# 3. 运行 step_link_ctc（无 --overwrite）
+# 4. 预期：报告 "3/10 missing .lab files — re-scanning"
+```
+
+---
+
+## Case 116: `--skip-to` 静默追加不属于当前模式的步骤 (skipto_cross_mode_append)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/run_pipeline.py
+
+### 现象
+
+`run_pipeline.py:3849-3855` 的 `--skip-to` 处理在目标步骤不属于当前模式的 step_order 时，
+执行 `step_order.append(args.skip_to)` 静默追加。这可能导致：
+- `ctc_ready` 模式下 `--skip-to trim` 追加 trim 到 pipeline
+- `full` 模式下 `--skip-to link` 追加不存在的 link 步骤
+- 跨模式 route 组合产生未定义行为
+
+修复后：`--skip-to` 指向非当前模式步骤时直接返回非零错误，列出允许的步骤。
+
+### 根因链
+
+1. `args.skip_to` 传入步骤名
+2. `args.skip_to not in step_order` 为 True（步骤属于其他模式）
+3. `step_order.append(args.skip_to)` 静默修改 route
+4. 执行混合 route，无任何警告
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/run_pipeline.py` line 3853-3857 | `step_order.append` 替换为 error + return 1 |
+
+### 验证方法
+
+```python
+# python scripts/run_pipeline.py --config configs/hecheng_ria_test1.yaml --mode ctc_ready --skip-to trim
+# 预期：非零退出，输出 "ERROR: --skip-to 'trim' is not in the 'ctc_ready' route"
+```
+
+---
+
+## Case 117: `--scan-only` 在 full 模式下执行破坏性 trim (scan_only_full_trim)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/run_pipeline.py
+
+### 现象
+
+`run_pipeline.py:3859-3865` 的 `--scan-only` 在 `full` 模式下因 route 中无 `link` 步骤，
+执行 `run_list[:1]` = `["trim"]`。trim 是破坏性步骤（裁剪静音、归一化音频），
+违背 `--scan-only` 的"只读扫描"语义。
+
+修复后：`full` + `--scan-only` 直接返回错误，提示使用 `ctc_ready` 模式做只读扫描。
+
+### 根因链
+
+1. `--scan-only` 设计用于 `ctc_ready` 模式的 link 步骤（只读扫描）
+2. `full` 模式的 route 以 `trim` 开头（破坏性）
+3. `run_list[:1]` 无条件取第一个步骤
+4. trim 修改原始音频文件
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/run_pipeline.py` line 3861-3868 | full + no-link → error 而非 run_list[:1] |
+
+### 验证方法
+
+```python
+# python scripts/run_pipeline.py --config configs/hecheng_ria_test1.yaml --mode full --scan-only
+# 预期：非零退出，输出 "ERROR: --scan-only in full mode without link would run trim"
+```
+
+---
+
+## Case 118: `--validate` 失败不影响最终退出码 (validate_no_exit_code)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/run_pipeline.py
+
+### 现象
+
+`run_pipeline.py:3968-3976` 的 `--validate` 检查在步骤成功后调用 `validate_step_output()`，
+但检查失败仅打印 `[VALIDATE] ... failed` 而不将错误加入 `failed` 列表。
+管线报告 "DONE: Success" 但 validate 实际检测到输出规范违反。
+
+修复后：validate 失败加入 `failed` 列表（以 `validate:{step_name}` 形式），
+非零退出；`--force` 下继续收集所有 validate 错误。
+
+### 根因链
+
+1. 步骤执行返回 `rc == 0` → 进入 `elif args.validate` 分支
+2. `validate_step_output()` 返回非空 issues 列表
+3. issues 仅被打印，`failed` 列表不变
+4. 管线最终 `return 0` — 假阳性
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/run_pipeline.py` line 3974-3981 | validate 失败追加到 `failed` 列表 + 非 force 时 break |
+
+### 验证方法
+
+```python
+# python scripts/run_pipeline.py --config configs/hecheng_ria_test1.yaml --mode ctc_ready --validate
+# 若 postprocess 输出不符合 output_spec：
+# 预期：非零退出，"FAILED: validate:postprocess"
+```
+
+---
+
+## Case 119: `_run_direct` 丢弃子进程 return code (direct_subprocess_rc_lost)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/streaming_pipeline.py
+
+### 现象
+
+`streaming_pipeline.py:966-983` 的 `_run_direct` 调用 `subprocess.run(cmd)` 但不检查 return code。
+子进程（run_pipeline.py）失败时 streaming_pipeline 仍退出 0。
+
+修复后：`_run_direct` 检查 `subprocess.run(cmd).returncode`，非零时 `sys.exit(rc)` 传播错误。
+
+### 根因链
+
+1. `_run_direct` 调用 `subprocess.run(cmd)` — 正确的 API 调用但丢弃结果
+2. 返回的 `CompletedProcess` 包含 `returncode` 但未使用
+3. `main()` 在 `_run_direct` 之后隐式返回 None → 进程退出码 0
+4. 即使 run_pipeline.py 内部失败，上游调用者也看不到
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/streaming_pipeline.py` line 983-986 | `subprocess.run(cmd)` → `rc = subprocess.run(cmd).returncode; if rc: sys.exit(rc)` |
+
+### 验证方法
+
+```python
+# 模拟：传入不存在的数据目录触发 run_pipeline.py 失败
+# python scripts/streaming_pipeline.py --data-dir /nonexistent --direct
+# 预期：非零退出（传播 run_pipeline.py 的错误码）
+```
+
+---
+
+## Case 120: `_prefetch_worker` 忽略 copy failures 并允许失败 batch 进入 process queue (prefetch_fail_open)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/streaming_pipeline.py
+
+### 现象
+
+`streaming_pipeline.py:780-783` 的 `_prefetch_worker` 做两个决策错误：
+1. `ok = (missing_audio == 0)` — 忽略 `failed`（文件拷贝失败数）
+2. prefetch 失败仍递增 `prefetched` 计数（不递增 `prefetch_fail`）
+
+修复后：`ok = (missing_audio == 0 and failed == 0)`；prefetch 失败正确记录到 `prefetch_fail`。
+
+### 根因链
+
+1. 文件拷贝失败加入 `failed` 计数器
+2. `ok` 仅检查 `missing_audio`，不检查 `failed`
+3. 拷贝失败的 batch 进入 `prefetch_queue` → process queue
+4. process 在残缺数据上运行 → 子进程失败 → 但根因被隐藏
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/streaming_pipeline.py` line 782-783 | `ok = (missing_audio == 0 and failed == 0)` |
+| `scripts/streaming_pipeline.py` line 790-798 | prefetch 失败记录到 `prefetch_fail` 而非 `prefetched` |
+
+### 验证方法
+
+```python
+# 模拟：对只读源文件系统触发 PermissionError，使部分 copy 失败
+# 预期：batch 不进入 prefetch_queue；stats.prefetch_fail += 1
+```
+
+---
+
+## Case 121: `StreamingPipeline.run()` 失败 batch 仍被推入 upload queue (process_fail_upload_leak)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/streaming_pipeline.py
+
+### 现象
+
+`streaming_pipeline.py:936-937` 无论 `_process_batch` 成功或失败，都将 batch_idx 推入
+`upload_queue`。失败 batch 的残缺/空输出被上传到 NAS，覆盖之前的有效结果。
+同时 `all_ok`（line 944）仅检查 `process_fail`，忽略 `prefetch_fail` 和 `upload_fail`。
+
+修复后：失败 batch 不进入 upload queue；`all_ok` 综合检查 three-phase failures。
+
+### 根因链
+
+1. `_process_batch(batch_idx)` 返回 False
+2. `self.upload_queue.put(batch_idx)` 无条件执行
+3. `_upload_worker` 上传可能为空或残缺的本地输出
+4. `_merge_to_nas` 可能覆盖之前正确上传的 NAS 数据
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/streaming_pipeline.py` line 937 | `upload_queue.put(batch_idx)` 移至 `if ok:` 块内 |
+| `scripts/streaming_pipeline.py` line 944-946 | `all_ok` 增加 `prefetch_fail == 0 and upload_fail == 0` |
+
+### 验证方法
+
+```python
+# 模拟：使 _process_batch 返回 False
+# 预期：upload_queue 不包含该 batch_idx；all_ok 为 False
+```
+
+---
+
+## Case 122: `run_batch` / `run_pipelined_batch` 返回 None 导致主调无法感知失败 (batch_return_none)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/streaming_pipeline.py
+
+### 现象
+
+`streaming_pipeline.py` 的 `run_batch`（line 1824）和 `run_pipelined_batch`（line 2639）
+签名均为 `-> None`。内部打印 `"BATCH COMPLETE: X/Y OK"` 但未将失败状态传递给调用者。
+`main()` 在 `run_batch(args)` 后执行 `return`（隐式返回 None）→ 进程退出码 0。
+
+修复后：两个函数返回 `bool`（all_ok）；`main()` 在 batch 失败时 `sys.exit(1)`。
+
+### 根因链
+
+1. `run_batch` 内部收集 `ok_count` 和 `fail_list`，打印汇总
+2. 函数无 return 语句 → 调用者收到 None
+3. `main()` 的 `return` 导致进程退出 0
+4. 批处理失败在退出码层面不可见
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/streaming_pipeline.py` line 1824 | `-> None` → `-> bool` |
+| `scripts/streaming_pipeline.py` line 2320-2322 | 汇总后 `return all_ok` |
+| `scripts/streaming_pipeline.py` line 1979-1980 | 传播 `run_pipelined_batch` 返回值 |
+| `scripts/streaming_pipeline.py` line 2639 | `-> None` → `-> bool` |
+| `scripts/streaming_pipeline.py` line 2901-2908 | 汇总后 `return all_ok` |
+| `scripts/streaming_pipeline.py` line 1188-1191 | `if not run_batch(args): sys.exit(1)` |
+
+### 验证方法
+
+```python
+# 模拟：batch_cache 中包含一个不存在的数据集
+# python scripts/streaming_pipeline.py --batch-cache cache/test_fail.cache.json
+# 预期：非零退出；输出 "BATCH COMPLETE ... WITH FAILURES"
+```
+
+---
+
+## Case 123: staged CPU upload 对 rsync/copy 失败仅告警并返回 True (staged_upload_fail_open)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/streaming_pipeline.py
+
+### 现象
+
+`streaming_pipeline.py:2616-2631` 的 `_run_cpu_phase` 在 rsync 非零退出、超时、异常时仅打印
+`WARNING`，函数继续执行 cleanup 并返回 True。完整的 output/filtered/ctc_pretg_adj 未被上传
+到 NAS，但调用者（CPU worker）将其视为成功，进而将数据集标记为 DONE。
+
+修复后：所有上传错误改为 `ERROR`；`_upload_ok` flag 收集失败；任何上传失败返回 False 并保留本地目录。
+
+### 根因链
+
+1. rsync 返回非零 / 超时 / 抛异常
+2. `print("WARNING: ...")` — 不改变控制流
+3. `shutil.rmtree(local_dir)` 删除本地证据
+4. `return True` → caller 标记数据集 DONE → 永久丢失数据
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/streaming_pipeline.py` line 2601-2641 | WARNING → ERROR + `_upload_ok = False`；失败返回 False 并保留 local_dir |
+
+### 验证方法
+
+```python
+# 模拟：mock rsync 返回非零或设为不存在的路径
+# 预期：函数返回 False；local_dir 被保留（.FAILED 重命名或原位保留）
+```
+
+---
+
+## Case 124: batch_ctc_ready 缺失音频数据集被 skip 而不进入 fail_list (batch_missing_audio_skip)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/run_pipeline.py
+
+### 现象
+
+`run_pipeline.py:3589-3592` 在 `batch_ctc_ready` 模式下，当数据集的 `audiodir` 不存在时，
+仅打印 `SKIP (no audio)` 并 `continue`，不将数据集名加入 `fail_list`。
+结果是缺失音频的静默遗漏 — 分母包含该数据集但处理结果中无其踪迹。
+
+修复后：缺失音频的数据集加入 `fail_list`，计入最终失败汇总。
+
+### 根因链
+
+1. 扫描得到 datasets 列表（来自 cache 或 discovery）
+2. `audiodir = audio_root / ds_name / "wavs"` 不存在
+3. `continue` — 跳过但不记录失败
+4. `ok_count / len(datasets)` 显示部分成功，但缺失项不可见
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/run_pipeline.py` line 3592 | SKIP 前增加 `fail_list.append(ds_name)` |
+
+### 验证方法
+
+```python
+# 在 batch cache 中引用一个不存在音频目录的数据集
+# python scripts/run_pipeline.py --config configs/batch_test.yaml --mode batch_ctc_ready
+# 预期：输出 "Failed: missing_dataset_name"；非零退出
+```
+
+---
+
+## Case 125: 非 strict 模式输出路径无 run-specific 隔离 (flat_output_no_isolation)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/run_pipeline.py, scripts/pipeline_utils.py
+
+### 现象
+
+当 `strict_ok` 和 `output_staging` 均未启用时，`output_dir` 和 `filtered_dir` 直接指向
+`workspace / "output"` 和 `workspace / "filtered"`。两次运行之间新旧产物混合，无隔离边界。
+
+修复后：默认使用 `workspace/runs/<run_id>/output` 和 `workspace/runs/<run_id>/filtered`，
+每次运行写入独立目录；运行结束时写入 `.pipeline_run_receipt.json` 记录实际路径、stem 集合
+和失败步骤。
+
+### 根因链
+
+1. 非 strict 非 staging 路径进入 else 分支（line 3810-3811）
+2. 仅 `filtered_dir` 被初始化，`output_dir` 使用配置的扁平路径
+3. 无 run ID 注入 → 多次运行共享同一输出目录
+4. 无收据证明某次运行的输入→输出映射
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/run_pipeline.py` line 3810-3817 | else 分支使用 `workspace/runs/<run_id>/output|filtered` |
+| `scripts/run_pipeline.py` line 4088-4105 | 写入 `.pipeline_run_receipt.json` |
+| `scripts/pipeline_utils.py` line 1872-1946 | 新增 `make_pipeline_run_id()` 和 `write_pipeline_run_receipt()` |
+| `scripts/run_pipeline.py` line 44-53 | 导入 `make_pipeline_run_id`, `write_pipeline_run_receipt` |
+
+### 验证方法
+
+```python
+# 运行两次同一管线（无 --overwrite）：
+# python scripts/run_pipeline.py --config configs/hecheng_ria_test1.yaml --mode ctc_ready
+# python scripts/run_pipeline.py --config configs/hecheng_ria_test1.yaml --mode ctc_ready
+# 预期：两次输出位于不同的 workspace/runs/<run_id>/ 子目录
+# 预期：每个 output/ 目录包含 .pipeline_run_receipt.json
+```
+
+---
+
+## Case 126: 无统一 config schema 校验 (config_schema_missing)
+
+**日期**: 2026-08-07
+**涉及文件**: scripts/run_pipeline.py
+
+### 现象
+
+`load_config`（`run_pipeline.py:324-334`）仅做递归字典合并，不对以下做任何校验：
+- 未知顶层键（typo 被静默忽略）
+- 类型不匹配（如 `mfa: "string"` 而非 dict）
+- 跨字段矛盾（all-GPU + wrong mode、NVV bias + disabled、strict + pad_silence）
+- 必填路径或资源缺失
+
+修复后：新增 `validate_config()` 在模式解析完成后立即运行，检查 9 类规则；
+发现错误非零退出（`--force` 可覆盖）。
+
+### 根因链
+
+1. YAML 中打错配置键名 → `cfg.get("ctc_prelaign")` 返回 None，无提示
+2. 将 dict 字段误写为字符串 → 后续 `.get()` 在 str 上调取 → AttributeError（离 config 加载点很远）
+3. 矛盾配置（all_gpus + ctc_ready mode）→ 运行时才暴露
+
+### 涉及修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `scripts/run_pipeline.py` line 3393-3503 | 新增 `validate_config(cfg, mode) -> list[str]` |
+| `scripts/run_pipeline.py` line 3588 | 占位注释 |
+| `scripts/run_pipeline.py` line 3628-3641 | 模式解析后立即调用 `validate_config` |
+
+### 验证方法
+
+```python
+# 测试 config 包含未知键 + 类型错误 + 逻辑矛盾：
+# python scripts/run_pipeline.py --config configs/bad_config.yaml --mode ctc_ready
+# 预期：非零退出，输出 "ERROR: Config validation failed (N issues):"
+# python scripts/run_pipeline.py --config configs/bad_config.yaml --mode ctc_ready --force
+# 预期：打印错误但继续执行
+
+from run_pipeline import validate_config
+errors = validate_config({'unknown_key': 1, 'mfa': 'not_dict'}, 'full')
+assert len(errors) >= 2  # unknown key + type mismatch
+errors = validate_config({'ctc_prealign': {'all_gpus': True}}, 'ctc_ready')
+assert any('all_gpus' in e and 'full' in e for e in errors)
+```
+
+状态：已修复。
+
+---
+
+## Case 127: 权威标点/连字符英文投影与 phone 越界 (reference_projection_contract)
+
+**日期**: 2026-08-07
+**涉及文件**: `scripts/postprocess_textgrids.py`, `scripts/pipeline_utils.py`, `scripts/audit_strict_ok.py`
+
+### 现象
+
+独立 canary 中发现三类相互独立的问题：
+
+1. CTC 将 `K-Pop` 切成 `kp`/`op`，导致 hanzi 与权威英文拼写不一致；
+2. CTC 长停顿或后处理边界扩展使 `pinyin_phones` 跨越相邻 words，产生
+   `phone_outside_word`，并在严格英文注入后留下中文 phone 重叠；
+3. CTC 标点缺失或额外终止标点会反向修改 `_ref.txt` 的 raw 文本，破坏权威标点。
+
+### 修复约束
+
+- reference text 是 raw/标点/英文表面形式的唯一权威；CTC 标点只提供局部时间锚点；
+- 连字符英文的 words/strict English phone 实例保持 MFA ledger 的原始分段，hanzi/pinyin
+  投影恢复完整参考拼写，不伪造英文 phone；
+- derived phone 只裁回其最大重叠 word，严格英文 `en:` phone 的 affine 时间不被非英文
+  de-overlap 改写；
+- 每轮最终发布前重新检查五层 TextGrid、reference sequence、phone ownership 和
+  strict English provenance。
+
+### 验证
+
+```bash
+python3 scripts/verify_reference_authority.py
+python3 -B -m compileall -q scripts check_ipa_mapping.py verify_risks.py
+```
+
+独立 128 条 canary 的最终结果：`70/128 = 54.69%` 进入 strict-ok 发布集；其余 58 条
+均进入过滤集，严格审计没有发现新的 phone 越界、语义序列或 phone 重叠违规。
+
+---
+
+## Case 128: CTC 全 GPU 合并隔离与输入副本安全 (canary_transaction_isolation)
+
+**日期**: 2026-08-07
+**涉及文件**: `scripts/ctc_prealign.py`, `scripts/run_pipeline.py`
+
+### 现象
+
+共享临时目录和 symlink/hardlink 输入会使并发 canary 或 CTC-ready 后处理修改权威
+CTC 文件；全 GPU 合并若直接写入 live output，则失败时会留下不完整 namespace。
+
+### 修复
+
+- 每次 pipeline 使用 run-local `temp`；CTC-ready 输入统一独立 `copy2`；
+- all-GPU merge 先在带 PID 的 staging 目录完成 manifest/receipt/完整性校验，再原子
+  发布；失败时保留隔离的 shard evidence，不污染 live 输出；
+- 原 54k workspace 只读保留，canary/recovery 使用独立 workspace 和 versioned publish。
+
+### 验证
+
+```bash
+python3 scripts/verify_strict_ctc_ready_import.py
+python3 scripts/verify_reference_only_ctc.py
+python3 scripts/verify_reference_authority.py
+```
+
+状态：已修复并通过可运行回归测试；54k 全量仍受 canary 放行线约束，未启动。
+
+---
+
+## Case 129: strict manifest 未绑定 pipeline-run-receipt-v2 (strict_receipt_publish_gate)
+
+**日期**: 2026-08-10
+**涉及文件**: scripts/audit_strict_ok.py, scripts/verify_strict_ok.py,
+scripts/prepare_hecheng_english_ctc_ready.py, scripts/verify_hecheng_english_ctc_ready_v4.py
+
+### 现象
+
+严格清单原先仅由 `*.lab` 推导 expected 集合，54000 个 WAV 中缺少 TXT 的
+stem 可能被误当作可处理输入；发布前也没有可验证的 source/eligible/exclusion
+守恒证据。现在 strict audit 要求有效的 `pipeline-run-receipt-v2`，并令
+`expected_stems == receipt.eligible.stems`。缺失、legacy v1、字段/摘要篡改或
+集合不匹配均在目标目录创建前失败；`missing_reference` 只能出现在 exclusions，
+处理后的质量拒绝只能出现在 filtered。
+
+### 回归覆盖
+
+```text
+R129-a expected == eligible
+R129-b 54000 == 53998 eligible + 2 missing_reference exclusions
+R129-c missing/legacy/tampered receipt => verify failure and no target
+R129-d exclusion vs processed rejection bucket separation
+```
+
+### 验证命令
+
+```bash
+python scripts/verify_receipt_accounting.py
+python scripts/verify_strict_ok.py
+python scripts/verify_prepare_hecheng_english_ctc_ready.py
+python scripts/verify_hecheng_english_ctc_ready_v4.py --help
+```
+
+### 遗留集成要求
+
+`pipeline_utils.publish_output_versioned()` 仍可被其他调用方直接调用；其所有者
+必须在复制/创建 target 之前调用 strict manifest verifier，并验证 v2 receipt 的
+source conservation、eligible membership 与 exclusion/filtered 分区。此文件未修改
+该公共发布函数，避免越权改变其接口。

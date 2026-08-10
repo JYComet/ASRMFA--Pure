@@ -38,6 +38,10 @@ from postprocess_textgrids import (
     TextGrid,
     Tier,
     _finalize_textgrid,
+    _reference_pinyin_text,
+    _restore_reference_punctuation,
+    _clip_pinyin_phones_to_words,
+    _fix_non_english_pp_overlaps,
     _normalize_word_spellings,
     _snap_to_ctc,
     assess_reference_coverage,
@@ -55,6 +59,8 @@ from pipeline_utils import (
     make_ctc_normalization_marker,
     parse_ctc_normalization_marker,
     publish_output_versioned,
+    make_pipeline_accounting_receipt,
+    write_pipeline_accounting_receipt,
     validate_ctc_transcript_bundle,
     write_publish_manifest,
 )
@@ -484,9 +490,16 @@ def _case_versioned_publish_refuses_nonempty_destination() -> None:
         source.mkdir()
         write_pure_chinese_textgrid(source / "demo.TextGrid")
         (source / "demo_ref.txt").write_text("demo\n", encoding="utf-8")
+        receipt_path = source / ".pipeline_run_receipt_v2.json"
+        write_pipeline_accounting_receipt(
+            receipt_path,
+            make_pipeline_accounting_receipt(
+                source_stems=["demo"], eligible_stems=["demo"],
+                exclusions={}, output_stems=["demo"], filtered_stems=[],
+                run_id="reference-authority-fixture", mode="strict"))
         digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
         (source / "strict_ok_manifest.json").write_text(json.dumps({
-            "policy_version": "strict-ok-v3.1",
+            "policy_version": "strict-ok-v3.2",
             "english_provenance_policy": {
                 "schema": "strict-en-mfa-v1", "required": True,
                 "evidence_root": "_provenance/english",
@@ -504,6 +517,11 @@ def _case_versioned_publish_refuses_nonempty_destination() -> None:
                     "sha256": digest(source / "demo_ref.txt"),
                 },
             }],
+            "pipeline_accounting_receipt": {
+                "schema": "pipeline-run-receipt-v2",
+                "path": str(receipt_path),
+                "sha256": digest(receipt_path),
+            },
         }) + "\n", encoding="utf-8")
         write_publish_manifest(source)
         assert publish_output_versioned(source, destination)
@@ -528,6 +546,61 @@ def _case_versioned_publish_refuses_nonempty_destination() -> None:
         assert not publish_output_versioned(source, destination)
         assert (destination / "demo.TextGrid").exists()
         assert not (destination / "new.TextGrid").exists()
+
+
+def _case_publish_v2_receipt_fail_closed_before_target() -> None:
+    """Missing/legacy/tampered/mismatched accounting never creates a target."""
+    def build(root: Path) -> tuple[Path, Path, Path]:
+        from postprocess_textgrids import write_textgrid
+        source = root / "source"
+        source.mkdir()
+        grid = TextGrid(0.0, 1.0, [
+            Tier("raw_text", 0.0, 1.0, [Interval(0.0, 1.0, "<sp1>你")]),
+            Tier("pinyin", 0.0, 1.0, [Interval(0.0, 1.0, "<sp1> ni3")]),
+            Tier("hanzi", 0.0, 1.0, [Interval(0.0, 0.1, "<sp1>"), Interval(0.1, 1.0, "你")]),
+            Tier("words", 0.0, 1.0, [Interval(0.0, 0.1, "<sp1>"), Interval(0.1, 1.0, "ni3")]),
+            Tier("pinyin_phones", 0.0, 1.0, [Interval(0.0, 0.1, "<sp1>"), Interval(0.1, 1.0, "n")]),
+        ])
+        write_textgrid(grid, source / "demo.TextGrid")
+        ref = source / "demo_ref.txt"; ref.write_text("demo\n", encoding="utf-8")
+        receipt = source / ".pipeline_run_receipt_v2.json"
+        write_pipeline_accounting_receipt(
+            receipt, make_pipeline_accounting_receipt(
+                source_stems=["demo"], eligible_stems=["demo"], exclusions={},
+                output_stems=["demo"], filtered_stems=[]))
+        digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+        (source / "strict_ok_manifest.json").write_text(json.dumps({
+            "policy_version": "strict-ok-v3.2",
+            "english_provenance_policy": {"schema": "strict-en-mfa-v1", "required": True,
+                                            "evidence_root": "_provenance/english"},
+            "safe_empty": False, "global_reasons": [], "output_dir": str(source),
+            "expected_stems": ["demo"], "rejected": [],
+            "ok": [{"stem": "demo", "textgrid_sha256": digest(source / "demo.TextGrid"),
+                    "reference": {"path": str(ref), "sha256": digest(ref)}}],
+            "pipeline_accounting_receipt": {"schema": "pipeline-run-receipt-v2",
+                                              "path": str(receipt), "sha256": digest(receipt)},
+        }), encoding="utf-8")
+        write_publish_manifest(source)
+        return source, receipt, source / "strict_ok_manifest.json"
+
+    for label in ("missing", "legacy", "tampered", "strict_mismatch"):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); source, receipt, manifest_path = build(root)
+            if label == "missing":
+                receipt.unlink()
+            elif label == "legacy":
+                receipt.write_text(json.dumps({"schema": "pipeline-run-receipt-v1"}), encoding="utf-8")
+            elif label == "tampered":
+                payload = json.loads(receipt.read_text(encoding="utf-8"))
+                payload["eligible"]["stems"] = []
+                receipt.write_text(json.dumps(payload), encoding="utf-8")
+            else:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest["expected_stems"] = ["other"]
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            destination = root / "publish.runs" / label
+            assert not publish_output_versioned(source, destination), label
+            assert not destination.exists(), label
 
 
 def _case_link_keeps_optional_bundled_reference() -> None:
@@ -913,6 +986,40 @@ def _case_strict_mfa_textgrid_validator_rejects_damaged_tiers() -> None:
         assert len(errors) > 0, f"domain-violating TextGrid should be rejected, got {errors}"
 
 
+def _case_reference_projection_preserves_hyphen_punctuation_and_phone_ownership() -> None:
+    """Case 127: reference projection keeps K-Pop/punctuation and clips
+    derived phones that cross a word boundary without touching English phones."""
+    assert is_english_token("K-Pop")
+    rendered = _reference_pinyin_text("喂K-Pop！", "wei4 kp op")
+    assert "K-Pop" in rendered and "！" in rendered
+
+    words = Tier("words", 0.0, 1.0, [
+        Interval(0.0, 0.45, "jia3"),
+        Interval(0.45, 0.55, "，"),
+        Interval(0.55, 1.0, "yi3"),
+    ])
+    restored = _restore_reference_punctuation(
+        words, "甲，乙！",
+        [{"word": "，", "start_s": 0.45, "end_s": 0.55},
+         {"word": "！", "start_s": 0.94, "end_s": 1.0}])
+    assert restored == 2
+    assert [iv.text for iv in words.intervals if is_punct(iv.text)] == ["，", "！"]
+
+    pp = Tier("pinyin_phones", 0.0, 1.0, [
+        Interval(0.0, 0.50, "a1"),
+        Interval(0.50, 0.60, "en:K"),
+        Interval(0.59, 0.75, "i3"),
+    ])
+    # The Chinese phone is clipped to its owner; strict English geometry is
+    # not changed by the non-English overlap repair.
+    changed = _clip_pinyin_phones_to_words(pp, words)
+    assert changed >= 1
+    en_before = next(iv for iv in pp.intervals if iv.text == "en:K")
+    _fix_non_english_pp_overlaps(pp)
+    en_after = next(iv for iv in pp.intervals if iv.text == "en:K")
+    assert (en_before.xmin, en_before.xmax) == (en_after.xmin, en_after.xmax)
+
+
 def main() -> int:
     cases = [
         _case_ref_fragment_uses_reference,
@@ -928,6 +1035,7 @@ def main() -> int:
         _case_postprocess_rejects_missing_aligned_denominator,
         _case_postprocess_contract_passes_tone_ref_to_run,
         _case_versioned_publish_refuses_nonempty_destination,
+        _case_publish_v2_receipt_fail_closed_before_target,
         _case_link_keeps_optional_bundled_reference,
         _case_stale_normalization_marker_is_invalidated,
         # Phase D: extended coverage (Cases 80, 81, 97, 98, 100, 102)
@@ -942,6 +1050,7 @@ def main() -> int:
         _case_v4_marker_encodes_stem_count_and_manifest_digest,
         # Case 83 (R7): strict MFA TextGrid validator
         _case_strict_mfa_textgrid_validator_rejects_damaged_tiers,
+        _case_reference_projection_preserves_hyphen_punctuation_and_phone_ownership,
     ]
     failures = 0
     for case in cases:

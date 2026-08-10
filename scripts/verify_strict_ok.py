@@ -15,8 +15,43 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
-POLICY_VERSION = "strict-ok-v3.1"
+POLICY_VERSION = "strict-ok-v3.2"
 EN_PROVENANCE_SCHEMA = "strict-en-mfa-v1"
+
+
+def _verify_pipeline_accounting(manifest: dict, expected: set[str], rejected: set[str]) -> list[str]:
+    """Require a valid v2 receipt and bind its eligible set to strict output."""
+    try:
+        from pipeline_utils import (PIPELINE_ACCOUNTING_SCHEMA,
+                                    read_pipeline_accounting_receipt,
+                                    validate_pipeline_accounting_receipt)
+        binding = manifest["pipeline_accounting_receipt"]
+        if (not isinstance(binding, dict)
+                or binding.get("schema") != PIPELINE_ACCOUNTING_SCHEMA):
+            return ["pipeline_accounting_receipt_binding_missing"]
+        receipt_path = Path(binding["path"])
+        if receipt_path.is_symlink() or not receipt_path.is_file():
+            return ["pipeline_accounting_receipt_not_regular"]
+        receipt = read_pipeline_accounting_receipt(receipt_path)
+        errors = validate_pipeline_accounting_receipt(receipt)
+        if errors:
+            return [f"pipeline_accounting_receipt_invalid:{error}" for error in errors]
+        if _sha256(receipt_path) != binding.get("sha256"):
+            return ["pipeline_accounting_receipt_hash_mismatch"]
+        eligible = set(receipt["eligible"]["stems"])
+        excluded = {row["stem"] for row in receipt.get("exclusions", [])}
+        source = set(receipt["source"]["stems"])
+        if eligible != expected:
+            return ["pipeline_accounting_eligible_manifest_mismatch"]
+        if excluded & (expected | rejected):
+            return ["pipeline_accounting_exclusion_leaked_into_strict_set"]
+        if source != eligible | excluded:
+            return ["pipeline_accounting_source_conservation_mismatch"]
+        if set(receipt["output"]["stems"]) | set(receipt["filtered"]["stems"]) != eligible:
+            return ["pipeline_accounting_processed_set_mismatch"]
+        return []
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return [f"pipeline_accounting_receipt_failed:{exc}"]
 
 
 def _safe_stem(value: object) -> bool:
@@ -162,6 +197,7 @@ def verify(path: Path, output_dir: Path | None = None) -> list[str]:
         errors.append("ok_rejected_overlap")
     if expected_manifest != expected | rejected_stems:
         errors.append("expected_ok_rejected_set_mismatch")
+    errors.extend(_verify_pipeline_accounting(manifest, expected_manifest, rejected_stems))
     actual = {file.stem for file in root.glob("*.TextGrid")}
     if actual != expected:
         errors.append("output_textgrid_set_mismatch")
@@ -207,6 +243,10 @@ def _write_fixture(root: Path, stem: str = "demo") -> dict[str, Path]:
     ]), aligned / f"{stem}.TextGrid")
     (output / "postprocess_report.jsonl").write_text(
         json.dumps({"stem": stem, "status": "ok", "warnings": []}) + "\n", encoding="utf-8")
+    from pipeline_utils import write_pipeline_accounting_receipt
+    write_pipeline_accounting_receipt(
+        ctc, source_stems=[stem], eligible_stems=[stem], exclusions=[],
+        output_stems=[stem], filtered_stems=[], run_id="fixture", mode="strict")
     en_manifest = en_phones / "en_alignment_manifest.json"
     en_manifest.write_text(json.dumps({
         "schema": EN_PROVENANCE_SCHEMA, "status": "no_english", "strict_provenance": True,
@@ -216,7 +256,8 @@ def _write_fixture(root: Path, stem: str = "demo") -> dict[str, Path]:
     }), encoding="utf-8")
     return {"output": output, "filtered": filtered, "ctc": ctc, "refs": refs, "wavs": wavs,
             "aligned": aligned, "en_phones": en_phones, "en_aligned": en_aligned,
-            "en_manifest": en_manifest}
+            "en_manifest": en_manifest,
+            "pipeline_receipt": ctc / ".pipeline_run_receipt_v2.json"}
 
 
 def _write_english_unk_fixture(root: Path) -> dict[str, Path]:
@@ -326,6 +367,7 @@ def _self_test() -> int:
             wav_dir=paths["wavs"], aligned_dir=paths["aligned"],
             en_phones_dir=paths["en_phones"], en_aligned_dir=paths["en_aligned"],
             en_manifest=paths["en_manifest"],
+            pipeline_receipt=paths["pipeline_receipt"],
             report=paths["output"] / "postprocess_report.jsonl", isolate=True,
         ))
 
@@ -365,6 +407,12 @@ def _self_test() -> int:
                                   (paths["wavs"], ".wav"), (paths["aligned"], ".TextGrid")):
             shutil.copy2(directory / f"demo{suffix}", directory / f"other{suffix}")
         shutil.copy2(paths["output"] / "demo.TextGrid", paths["filtered"] / "other.TextGrid")
+        from pipeline_utils import write_pipeline_accounting_receipt
+        write_pipeline_accounting_receipt(
+            paths["ctc"], source_stems=["demo", "other"],
+            eligible_stems=["demo", "other"], exclusions=[],
+            output_stems=["demo"], filtered_stems=["other"], run_id="fixture",
+            mode="strict")
         (paths["ctc"] / "other_tokens.jsonl").write_text(
             (paths["ctc"] / "other_tokens.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
         (paths["output"] / "postprocess_report.jsonl").write_text(
@@ -747,6 +795,44 @@ def _self_test() -> int:
             failures += 1
         else:
             print("OK same-length non-TextGrid publish tampering")
+    # Pipeline receipt publish-gate regressions: every invalid receipt must be
+    # rejected before a destination target is created.
+    for label, mutate in (
+            ("missing", lambda path: path.unlink()),
+            ("legacy", lambda path: path.write_text(json.dumps({"schema": "pipeline-run-receipt-v1"}), encoding="utf-8")),
+            ("tampered", lambda path: path.write_text(path.read_text(encoding="utf-8").replace('"eligible"', '"eligible_tampered"', 1), encoding="utf-8")),
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            paths = _write_fixture(Path(td))
+            manifest, clean = audit_fixture(paths)
+            manifest_path = paths["output"] / "strict_ok_manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            mutate(paths["pipeline_receipt"])
+            errors = verify(manifest_path, paths["output"])
+            target = Path(td) / "publish-target"
+            if not errors or target.exists():
+                print(f"FAIL publish gate {label} receipt/no-target")
+                failures += 1
+            else:
+                print(f"OK publish gate {label} receipt/no-target")
+    with tempfile.TemporaryDirectory() as td:
+        from pipeline_utils import make_pipeline_accounting_receipt, write_pipeline_accounting_receipt
+        root = Path(td)
+        receipt_path = root / ".pipeline_run_receipt_v2.json"
+        write_pipeline_accounting_receipt(
+            receipt_path,
+            make_pipeline_accounting_receipt(
+                source_stems=["ok", "missing"], eligible_stems=["ok"],
+                exclusions={"missing": "missing_reference"},
+                output_stems=["ok"], filtered_stems=[]))
+        binding = {"schema": "pipeline-run-receipt-v2", "path": str(receipt_path),
+                   "sha256": _sha256(receipt_path)}
+        accounting_manifest = {"pipeline_accounting_receipt": binding}
+        if _verify_pipeline_accounting(accounting_manifest, {"ok"}, set()):
+            print("FAIL exclusion-versus-rejection accounting separation")
+            failures += 1
+        else:
+            print("OK exclusion-versus-rejection accounting separation")
     return 1 if failures else 0
 
 

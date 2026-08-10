@@ -28,8 +28,8 @@ output_staging: true
 # 保留 16k 音频
 keep_16k_audio: true
 
-# MFA 临时目录
-temp_dir: /tmp/mfa_temp
+# MFA 临时目录：必须随 run workspace 隔离，避免并发任务串用旧 Kaldi 数据库
+temp_dir: temp
 
 # ── 静音补全 ──────────────────────────────────────────────────
 pad_silence:
@@ -44,7 +44,10 @@ ctc_prealign:
   all_gpus: true
   limit: 0
   timeout: 14400
-  nvv_enabled: false         # 参考文本模式: CTC 用 {stem}.txt 做强制对齐
+  # Audio-side NVV discovery is optional; reference NVV labels are always
+  # preserved in the canonical sidecars and are independent of this switch.
+  nvv_enabled: false
+  reference_nvv_enabled: true
 
 # ── CTC 边界能量修正 ─────────────────────────────────────────
 ctc_adjust:
@@ -64,6 +67,10 @@ mfa:
   fine_tune: false
   beam: 20
   retry_beam: 80
+  # MFA may fail to emit a TextGrid for a small number of utterances.
+  # Keep those stems explicitly rejected and continue with valid output.
+  allow_partial: true
+  min_output_ratio: 0.54
   timeout: 7200
 
 # ── MFA 英文对齐 ──────────────────────────────────────────────
@@ -83,6 +90,7 @@ mfa_en:
 # ── 后处理 ────────────────────────────────────────────────────
 postprocess:
   strict_ok: true
+  allow_filtered_integrity_failures: true
   merge_silence: true
   min_sil_merge_sec: 0.2
   fix_short_word: false

@@ -104,11 +104,52 @@ def test_wav_axis_pause_gate() -> None:
             raise AssertionError("large pause overrun was silently clipped")
 
 
+def test_incomplete_all_gpu_shard_uses_isolated_staging() -> None:
+    """Read-only planning defers all recovery work until every GPU is safe."""
+    with tempfile.TemporaryDirectory(prefix="all-gpu-shard-recovery-") as temp:
+        root = Path(temp)
+        legacy = root / "_shard_gpu0"
+        legacy.mkdir()
+        sentinel = legacy / "partial.lab"
+        sentinel.write_text("legacy\n", encoding="utf-8")
+
+        staged, reused, recovered = ctc._plan_all_gpu_shard(root, 0, 2)
+        assert recovered and not reused
+        assert staged.name == "_shard_gpu0_staging"
+        assert not staged.exists(), "planning must not create recovery staging"
+        assert sentinel.read_text(encoding="utf-8") == "legacy\n"
+
+        # GPU 1 is ambiguous. Planning the full set must fail before GPU 0's
+        # planned recovery staging is materialized or any worker is started.
+        legacy_1 = root / "_shard_gpu1"
+        legacy_1.mkdir()
+        (legacy_1 / "partial.lab").write_text("legacy\n", encoding="utf-8")
+        (root / "_shard_gpu1_staging").mkdir()
+        try:
+            ctc._plan_all_gpu_shards(root, [(0, 2), (1, 2)])
+        except RuntimeError as exc:
+            assert "explicit operator resolution" in str(exc)
+        else:
+            raise AssertionError("ambiguous later shard was silently accepted")
+        assert not staged.exists(), "GPU 0 staging was created before GPU 1 validation"
+        assert sentinel.read_text(encoding="utf-8") == "legacy\n"
+
+    with tempfile.TemporaryDirectory(prefix="all-gpu-shard-reuse-") as temp:
+        root = Path(temp)
+        complete = root / "_shard_gpu0"
+        complete.mkdir()
+        for stem in ("a", "b"):
+            (complete / f"{stem}.lab").write_text("ok\n", encoding="utf-8")
+        selected, reused, recovered = ctc._plan_all_gpu_shard(root, 0, 2)
+        assert selected == complete and reused and not recovered
+
+
 def main() -> int:
     test_logits_mask_isolated()
     test_reference_projection_and_faults()
     test_command_has_single_no_nvv()
     test_wav_axis_pause_gate()
+    test_incomplete_all_gpu_shard_uses_isolated_staging()
     print("reference-only CTC fault tests: OK")
     return 0
 

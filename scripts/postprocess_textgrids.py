@@ -740,7 +740,8 @@ def _count_internal_pp_gaps(pp_tier: Tier | None, words_tier: Tier | None,
     content_ranges = [
         (iv.xmin, iv.xmax)
         for iv in words_tier.intervals
-        if iv.text.strip() and not is_silence(iv.text)
+        if (iv.text.strip() and not is_silence(iv.text)
+            and not is_english_token(iv.text.strip()))
     ]
     gaps = 0
     for left, right in zip(pp_tier.intervals, pp_tier.intervals[1:]):
@@ -1626,6 +1627,212 @@ def _extract_word_chars(text: str) -> list[str]:
     return result
 
 
+def _reference_pinyin_text(reference_text: str, source_pinyin: str) -> str:
+    """Render the pinyin tier from the authoritative reference sequence.
+
+    The lab is an acoustic alignment input and can contain tokenizer
+    fragments (for example ``kp op`` for the reference spelling ``K-Pop``).
+    Those fragments must not rewrite the user-facing lexical text.  Consume
+    only the toned CJK syllables from the lab, while taking English/NVV and
+    punctuation spellings from the reference itself.
+    """
+    source_cjk = [token for token in source_pinyin.split()
+                  if is_pinyin_syllable(token)]
+    cjk_index = 0
+    rendered: list[str] = []
+    for unit in _extract_word_chars(reference_text):
+        if is_cjk(unit):
+            if cjk_index >= len(source_cjk):
+                # The later coverage audit will reject a genuinely truncated
+                # lab; do not invent a tone here.
+                rendered.append(unit)
+            else:
+                rendered.append(source_cjk[cjk_index])
+                cjk_index += 1
+        elif is_nvv_token(unit):
+            rendered.append(f"<{unit.strip('<>').upper()}>")
+        else:
+            rendered.append(unit)
+    return "<sp1> " + " ".join(rendered)
+
+
+def _restore_reference_punctuation(words_tier: Tier, reference_text: str,
+                                   punct_entries: list[dict] | None = None) -> int:
+    """Make the words tier's punctuation sequence equal the authority.
+
+    CTC punctuation is an alignment anchor, not lexical authority.  When a
+    broad CTC pause has swallowed a reference comma or produced an extra
+    terminal full stop, rebuilding only from CTC punctuation can silently
+    change the transcript.  This pass keeps lexical word intervals, removes
+    the current punctuation projection, and restores the reference sequence.
+    Anchor timing is used only when it lies in the local word gap; otherwise
+    the local gap/boundary is used so a long pause cannot erase neighbouring
+    words.
+    """
+    ref_puncts: list[tuple[str, int]] = []
+    lexical_count = 0
+    for unit in _extract_word_chars(reference_text):
+        if is_punct(unit):
+            if unit.strip() in '，。…！？、；：,.!?;:～':
+                ref_puncts.append((unit, lexical_count))
+        elif is_word_like(unit):
+            lexical_count += 1
+
+    current = list(words_tier.intervals)
+    current_puncts = [iv.text.strip() for iv in current
+                      if iv.text.strip() in '，。…！？、；：,.!?;:～']
+    desired_puncts = [char for char, _ in ref_puncts]
+    if current_puncts == desired_puncts:
+        return 0
+
+    lexical = [iv for iv in current
+               if iv.text.strip() and not is_silence(iv.text)
+               and iv.text.strip() not in '，。…！？、；：,.!?;:～']
+    # Map reference lexical boundaries onto the current timed intervals.  A
+    # hyphenated authority unit can occupy several strict-English intervals
+    # (K-Pop -> kp/op), but reference punctuation belongs after the group.
+    ref_lexical = [unit for unit in _extract_word_chars(reference_text)
+                   if is_word_like(unit)]
+    current_boundary = [0]
+    current_index = 0
+    for unit in ref_lexical:
+        target = re.sub(r'[^a-z0-9]', '', unit.lower())
+        if '-' in unit and target:
+            compact = ''
+            start = current_index
+            while current_index < len(lexical):
+                probe = lexical[current_index].text.strip()
+                if not is_english_token(probe):
+                    break
+                compact += re.sub(r'[^a-z0-9]', '', probe.lower())
+                current_index += 1
+                if compact == target:
+                    break
+            if current_index == start and current_index < len(lexical):
+                current_index += 1
+        elif current_index < len(lexical):
+            current_index += 1
+        current_boundary.append(current_index)
+    existing = [iv for iv in current if iv.text.strip() in desired_puncts]
+    anchors_by_char: dict[str, list[tuple[float, float]]] = {}
+    for entry in punct_entries or []:
+        char = str(entry.get('word', '')).strip()
+        if char in desired_puncts:
+            try:
+                start, end = float(entry['start_s']), float(entry['end_s'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(start) and math.isfinite(end) and end > start:
+                anchors_by_char.setdefault(char, []).append((start, end))
+
+    used_anchor: dict[str, int] = {}
+    punctuation: list[tuple[int, Interval]] = []
+    for ref_index, (char, boundary) in enumerate(ref_puncts):
+        mapped_boundary = (current_boundary[boundary]
+                           if boundary < len(current_boundary)
+                           else len(lexical))
+        prev = (lexical[mapped_boundary - 1]
+                if mapped_boundary > 0 and mapped_boundary <= len(lexical)
+                else None)
+        nxt = (lexical[mapped_boundary]
+               if mapped_boundary < len(lexical) else None)
+        gap_start = prev.xmax if prev is not None else words_tier.xmin
+        gap_end = nxt.xmin if nxt is not None else words_tier.xmax
+        if gap_end < gap_start:
+            gap_start = gap_end = max(words_tier.xmin, min(words_tier.xmax, gap_start))
+
+        # Reuse an existing interval of the same ordinal first.  Otherwise
+        # use the corresponding CTC anchor only if it is local to the gap.
+        occurrence = sum(1 for c, _ in ref_puncts[:ref_index] if c == char)
+        candidates = anchors_by_char.get(char, [])
+        anchor = candidates[occurrence] if occurrence < len(candidates) else None
+        if anchor is not None and anchor[0] >= gap_start - 0.01 and anchor[1] <= gap_end + 0.01:
+            start, end = anchor
+        elif gap_end - gap_start > 0.001:
+            start, end = gap_start, gap_end
+        else:
+            center = gap_start
+            width = min(0.060, max(0.010, words_tier.xmax - words_tier.xmin))
+            start, end = center - width / 2.0, center + width / 2.0
+            if prev is not None:
+                start = max(start, prev.xmin + 0.001)
+            if nxt is not None:
+                end = min(end, nxt.xmax - 0.001)
+        start = max(words_tier.xmin, start)
+        end = min(words_tier.xmax, end)
+        if end <= start + 0.001:
+            continue
+        punctuation.append((mapped_boundary, Interval(start, end, char)))
+
+    # Clip lexical intervals around the restored punctuation.  The labels and
+    # English MFA word instances stay untouched; only their ownership ranges
+    # are shortened where a punctuation anchor crosses a word boundary.
+    for boundary, punct in punctuation:
+        for index, iv in enumerate(lexical):
+            if index < boundary and iv.xmax > punct.xmin:
+                lexical[index] = Interval(iv.xmin, min(iv.xmax, punct.xmin), iv.text)
+            elif index >= boundary and iv.xmin < punct.xmax:
+                lexical[index] = Interval(max(iv.xmin, punct.xmax), iv.xmax, iv.text)
+    lexical = [iv for iv in lexical if iv.xmax > iv.xmin + 0.001]
+
+    # Preserve silence intervals and replace only punctuation/lexical content.
+    silences = [iv for iv in current if is_silence(iv.text) or not iv.text.strip()]
+    words_tier.intervals = sorted(lexical + silences + [iv for _, iv in punctuation],
+                                  key=lambda iv: (iv.xmin, iv.xmax, iv.text))
+    return len(punctuation)
+
+
+def _clip_pinyin_phones_to_words(pp_tier: Tier, words_tier: Tier) -> int:
+    """Keep each derived phone inside its strongest-overlap word owner."""
+    words = [iv for iv in words_tier.intervals if iv.text.strip()]
+    changed = 0
+    clipped: list[Interval] = []
+    for phone in pp_tier.intervals:
+        if not phone.text.strip() or is_silence(phone.text):
+            clipped.append(phone)
+            continue
+        owners = [word for word in words
+                  if phone.xmax > word.xmin and phone.xmin < word.xmax]
+        if not owners:
+            clipped.append(phone)
+            continue
+        owner = max(owners, key=lambda word:
+                    max(0.0, min(phone.xmax, word.xmax)
+                        - max(phone.xmin, word.xmin)))
+        start = max(phone.xmin, owner.xmin)
+        end = min(phone.xmax, owner.xmax)
+        if end <= start + 0.001:
+            clipped.append(phone)
+            continue
+        if start != phone.xmin or end != phone.xmax:
+            changed += 1
+        clipped.append(Interval(start, end, phone.text))
+    pp_tier.intervals = [iv for iv in clipped if iv.xmax > iv.xmin + 0.001
+                         or not iv.text.strip()]
+    return changed
+
+
+def _fix_non_english_pp_overlaps(pp_tier: Tier) -> int:
+    """De-overlap Chinese/punctuation phones without rewriting strict English."""
+    intervals = list(pp_tier.intervals)
+    fixed = 0
+    for index in range(len(intervals) - 1):
+        cur, nxt = intervals[index], intervals[index + 1]
+        if (cur.xmax <= nxt.xmin + 0.001
+                or cur.text.strip().startswith(EN_PHONE_PREFIX)
+                or nxt.text.strip().startswith(EN_PHONE_PREFIX)):
+            continue
+        midpoint = round((cur.xmax + nxt.xmin) / 2.0, 4)
+        if midpoint <= cur.xmin + 0.001 or nxt.xmax <= midpoint + 0.001:
+            continue
+        intervals[index] = Interval(cur.xmin, midpoint, cur.text)
+        intervals[index + 1] = Interval(midpoint, nxt.xmax, nxt.text)
+        fixed += 1
+    pp_tier.intervals = [iv for iv in intervals if iv.xmax > iv.xmin + 0.001
+                         or not iv.text.strip()]
+    return fixed
+
+
 # ---------------------------------------------------------------------------
 # Sequence alignment: CTC/MFA word tokens -> reference word units
 # ---------------------------------------------------------------------------
@@ -1634,8 +1841,10 @@ def _word_matches(ctc_token: str, ref_unit: str) -> bool:
     """Check if a word-tier token plausibly matches a reference word unit.
 
     CJK units must match their pinyin reading exactly.
-    Alpha-group units (English / NVV) use fuzzy substring matching to
-    handle tokenizer fragmentation and phonetic rendering.
+    Alpha-group units (English / NVV) use deterministic textual matching.
+    CTC pinyin is never a substitute for a reference English word: raw CTC
+    fragments remain provenance only and canonical reference projection owns
+    the English MFA surface.
     """
     c = ctc_token.strip().lower()
     r = ref_unit.lower()
@@ -1666,14 +1875,11 @@ def _word_matches(ctc_token: str, ref_unit: str) -> bool:
     if c_clean in r_clean or r_clean in c_clean:
         return True
 
-    # Pinyin-syllable phonetic rendering of an English word.
-    # Only accept when the English reference has ≥2 vowels — prevents
-    # short words like "OH"/"OP"/"in"/"up" from matching pinyin syllables
-    # (e.g. qie4↔OH cost 0 → NW gap-first picks OH over CJK 切).
-    # Examples that still match: "ai4"↔"idol" (2 vowels), "rui4"↔"ria" (2 vowels).
+    # Never infer an English reference word from a pinyin syllable.  Named
+    # variants such as rui4+ya4 -> ria are handled only by the explicit,
+    # reference-bound RIA canonicalization path before English MFA.
     if len(c) >= 2 and c[-1].isdigit() and c[:-1].isalpha():
-        vowel_count = sum(1 for ch in r if ch in 'aeiou')
-        return vowel_count >= 2
+        return False
 
     return False
 
@@ -1736,16 +1942,17 @@ def _align_word_sequences(ctc_seq: list[str],
 def _alpha_text_matches(token: str, ref: str) -> bool:
     """Check if an alpha-group word token matches a reference word unit.
 
-    Uses fuzzy substring matching to handle tokenizer fragmentation
-    and phonetic rendering.  Used by :func:`_build_hanzi_tier` for
-    greedy consumption of English / NVV reference units.
-
-    Pinyin-syllable fallback: only accepts when the English reference
-    has ≥2 vowels — prevents short words like ``OH`` / ``OP`` / ``in``
-    from matching pinyin syllables (e.g. ``qie4`` ↔ ``OH``).
+    Uses textual matching only.  It is deliberately not a pinyin-to-English
+    transliterator: English lexical authority comes from the canonical
+    reference projection, not CTC phonetic guesses.
     """
     c = token.strip().lower()
     r = ref.lower()
+
+    c_compact = re.sub(r'[^a-z0-9]', '', c)
+    r_compact = re.sub(r'[^a-z0-9]', '', r)
+    if c_compact and r_compact and c_compact == r_compact:
+        return True
 
     # Direct substring containment
     if c in r or r in c:
@@ -1761,11 +1968,9 @@ def _alpha_text_matches(token: str, ref: str) -> bool:
     if c_clean in r_clean or r_clean in c_clean:
         return True
 
-    # Pinyin-syllable phonetic rendering of an English word.
-    # Only accept when the reference has ≥2 vowels.
+    # Do not turn a pinyin token into an English reference word.
     if len(c) >= 2 and c[-1].isdigit() and c[:-1].isalpha():
-        vowel_count = sum(1 for ch in r if ch in 'aeiou')
-        return vowel_count >= 2
+        return False
 
     return False
 
@@ -1811,12 +2016,19 @@ def _build_hanzi_tier(words_tier: Tier, raw_text: str,
     intervals: list[Interval] = []
     cjk_idx = 0
     alpha_idx = 0
+    hidden_hyphen_fragments: set[int] = set()
 
     # Track pinyin-syllable count for defensive mismatch detection
     pinyin_count = 0
 
-    for iv in words_tier.intervals:
+    for word_index, iv in enumerate(words_tier.intervals):
         token = iv.text.strip()
+
+        if word_index in hidden_hyphen_fragments:
+            # Keep the strict-English word instance and its phone ledger, but
+            # render a split hyphenated reference spelling only once.
+            intervals.append(Interval(iv.xmin, iv.xmax, ""))
+            continue
 
         # Silence → keep silence label
         if is_silence(iv.text) or not token:
@@ -1852,6 +2064,40 @@ def _build_hanzi_tier(words_tier: Tier, raw_text: str,
         # pollution in the hanzi tier and misaligned cursors.
         clean_token = token.strip('<>')
         matched_refs: list[str] = []
+
+        # A tokenizer can split one reference spelling (K-Pop) into adjacent
+        # strict-English instances (kp/op).  This is projection-only: words
+        # and strict phone provenance remain unchanged.
+        if (alpha_idx < len(ref_alpha)
+                and '-' in ref_alpha[alpha_idx]
+                and is_english_token(clean_token)):
+            target = ref_alpha[alpha_idx]
+            target_compact = re.sub(r'[^a-z0-9]', '', target.lower())
+            compact = ""
+            group_indices: list[int] = []
+            for probe_index in range(word_index,
+                                     min(word_index + 6, len(words_tier.intervals))):
+                probe = words_tier.intervals[probe_index].text.strip()
+                if not is_english_token(probe):
+                    break
+                compact += re.sub(r'[^a-z0-9]', '', probe.lower())
+                group_indices.append(probe_index)
+                if compact == target_compact:
+                    matched_refs.append(target)
+                    alpha_idx += 1
+                    hidden_hyphen_fragments.update(group_indices[1:])
+                    break
+                # CTC fragments need not be contiguous inside a hyphenated
+                # spelling (``kp`` is a subsequence of ``kpop``).
+                probe_iter = iter(target_compact)
+                if not all(any(ch == target_ch for target_ch in probe_iter)
+                           for ch in compact):
+                    break
+
+        if matched_refs:
+            intervals.append(Interval(iv.xmin, iv.xmax, matched_refs[0]))
+            continue
+
         while alpha_idx < len(ref_alpha):
             ref_unit = ref_alpha[alpha_idx]
             if _alpha_text_matches(clean_token, ref_unit):
@@ -2831,7 +3077,7 @@ def detect_issues(textgrid: TextGrid, args, wav_path: Path | None = None,
             (_prev_w and (is_english_token(_prev_w.text) or is_nvv_token(_prev_w.text)))
             or (_next_w and (is_english_token(_next_w.text) or is_nvv_token(_next_w.text)))
         )
-        if (not _is_en_nvv and not _near_en_nvv
+        if (not _is_en_nvv and not is_punct(w.text) and not _near_en_nvv
                 and args.filter_word_energy_ratio > 0 and noise_floor > 1e-8):
             w_energy = _word_rms(audio, sr, w.xmin, w.xmax) if (wav_path and wav_path.exists()) else 999
             if 0 < w_energy < noise_floor * args.filter_word_energy_ratio:
@@ -2891,9 +3137,51 @@ def detect_issues(textgrid: TextGrid, args, wav_path: Path | None = None,
 # Main processing
 # ---------------------------------------------------------------------------
 
-def find_original_text(stem: str, raw_text_dir: Path | None) -> str:
+def _build_original_text_index(raw_text_dir: Path | None) -> dict[str, Path]:
+    """Build a one-shot basename index for recursive reference lookup.
+
+    Post-processing invokes :func:`find_original_text` once per TextGrid.  A
+    recursive ``rglob`` for every stem turns that otherwise linear discovery
+    step into repeated directory walks.  Keep the first path yielded for each
+    basename, matching the legacy search's first-candidate behaviour while
+    allowing O(1) lookups in workers.
+    """
+    if not raw_text_dir or not raw_text_dir.exists():
+        return {}
+    index: dict[str, Path] = {}
+    try:
+        for path in raw_text_dir.rglob("*.txt"):
+            index.setdefault(path.name, path)
+    except OSError:
+        return {}
+    return index
+
+
+def find_original_text(stem: str, raw_text_dir: Path | None,
+                       text_index: dict[str, Path] | None = None) -> str:
     """Find the original Chinese text for a given output stem (searches recursively)."""
     if not raw_text_dir or not raw_text_dir.exists():
+        return ""
+    if text_index is not None:
+        names = [f"{stem}.txt", f"{stem}_ref.txt"]
+        names.extend(f"{stem}{suffix}.txt"
+                     for suffix in ("_qwen3-api", "_qwen3", "_firered"))
+        m = re.search(r"_(firered|qwen3|qwen3-api)$", stem)
+        if m:
+            base = stem[:m.start()]
+            names.extend([f"{base}.txt", f"{base}_ref.txt"])
+            names.extend(f"{base}{suffix}.txt"
+                         for suffix in ("_qwen3-api", "_qwen3", "_firered"))
+        for name in names:
+            path = text_index.get(name)
+            if path is not None:
+                try:
+                    return path.read_text(encoding="utf-8").strip()
+                except OSError:
+                    # Preserve legacy behaviour if a source disappears after
+                    # indexing: retry the original recursive search rather
+                    # than silently changing the reference fallback result.
+                    return find_original_text(stem, raw_text_dir, None)
         return ""
     # Prefer the exact source transcript.  ``*_ref.txt`` is emitted by
     # ctc_prealign/step_link_ctc when the original text lives outside the
@@ -4653,14 +4941,85 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
         return _strict_en_fail(required, "strict_en_ledger_segment_partition_invalid",
                                ledger_sha256=actual_hash)
 
+    # The authoritative transcript may keep a contiguous English spelling as
+    # one word (e.g. ``Sila``), while CTC/MFA tokenization can split the same
+    # acoustic span into verified records (``S`` + ``il`` + ``a``).  Reconcile
+    # only exact, ordered concatenations; never drop a record or synthesize a
+    # phone.  This preserves every MFA phone as provenance for the final word.
     if len(records) != required:
-        return _strict_en_fail(required, "strict_en_word_count_mismatch", ledger_sha256=actual_hash,
-                               failed_word_ids=[str(item.get("word_id", "")) for item in records
-                                                if isinstance(item, dict)])
+        grouped_records: list[dict] = []
+        record_cursor = 0
+        for final_word in english_words:
+            target = final_word.text.strip().casefold()
+            joined = ""
+            matched_end = None
+            for candidate_end in range(record_cursor + 1, len(records) + 1):
+                candidate = records[candidate_end - 1]
+                if not isinstance(candidate, dict):
+                    break
+                joined += str(candidate.get("ctc_text", "")).strip()
+                if joined.casefold() == target:
+                    matched_end = candidate_end
+                    break
+                if not target.startswith(joined.casefold()):
+                    break
+            if matched_end is None:
+                return _strict_en_fail(
+                    required, "strict_en_word_count_mismatch", ledger_sha256=actual_hash,
+                    failed_word_ids=[str(item.get("word_id", "")) for item in records
+                                     if isinstance(item, dict)])
+            chunk = records[record_cursor:matched_end]
+            if len(chunk) == 1:
+                grouped_records.append(chunk[0])
+            else:
+                first = chunk[0]
+                last = chunk[-1]
+                first_word = first.get("mfa_word")
+                last_word = last.get("mfa_word")
+                if (not isinstance(first_word, dict) or not isinstance(last_word, dict)
+                        or any(item.get("word_id", "").rsplit(":w", 1)[0]
+                               != first.get("word_id", "").rsplit(":w", 1)[0]
+                               for item in chunk if isinstance(item, dict))):
+                    return _strict_en_fail(
+                        required, "strict_en_word_count_mismatch", ledger_sha256=actual_hash,
+                        failed_word_ids=[str(item.get("word_id", "")) for item in chunk
+                                         if isinstance(item, dict)])
+                combined = dict(first)
+                combined["ctc_text"] = final_word.text.strip()
+                combined["ctc_ordinal"] = last.get("ctc_ordinal")
+                combined["mfa_word"] = {
+                    "ordinal": first_word.get("ordinal"),
+                    "text": final_word.text.strip(),
+                    "start": first_word.get("start"),
+                    "end": last_word.get("end"),
+                }
+                combined_phones: list[dict] = []
+                for item in chunk:
+                    for phone in item.get("phones", []):
+                        if not isinstance(phone, dict):
+                            continue
+                        copied = dict(phone)
+                        ordinal = len(combined_phones)
+                        copied["ordinal"] = ordinal
+                        copied["mfa_phone_ordinal"] = ordinal
+                        combined_phones.append(copied)
+                combined["phones"] = combined_phones
+                grouped_records.append(combined)
+            record_cursor = matched_end
+        if record_cursor != len(records):
+            return _strict_en_fail(
+                required, "strict_en_word_count_mismatch", ledger_sha256=actual_hash,
+                failed_word_ids=[str(item.get("word_id", "")) for item in records[record_cursor:]
+                                 if isinstance(item, dict)])
+        records = grouped_records
     pairs: list[tuple[Interval, dict]] = []
     previous_ctc_ordinal = -1
     seen_word_ids: set[str] = set()
-    seen_mfa_phone_ordinals: set[int] = set()
+    # MFA phone ordinals restart at zero for each English segment.  Scope the
+    # uniqueness check by segment; treating them as stem-global rejects every
+    # stem containing more than one English segment even when the ledger and
+    # source TextGrids are valid.
+    seen_mfa_phone_ordinals: set[tuple[str, int]] = set()
     for final_word, record in zip(english_words, records):
         if not isinstance(record, dict):
             return _strict_en_fail(required, "strict_en_word_invalid", ledger_sha256=actual_hash)
@@ -4679,6 +5038,7 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
             return _strict_en_fail(required, "strict_en_word_identity_or_evidence_invalid",
                                    ledger_sha256=actual_hash, failed_word_ids=[str(word_id or "")])
         seen_word_ids.add(word_id); previous_ctc_ordinal = ordinal
+        segment_key = word_id.rsplit(":w", 1)[0]
         try:
             if (not isinstance(mfa_word.get("ordinal"), int)
                     or mfa_word["ordinal"] < 0
@@ -4697,12 +5057,13 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
                 return _strict_en_fail(required, "strict_en_phone_unordered", ledger_sha256=actual_hash,
                                        failed_word_ids=[word_id])
             prior_end = float(phone["end"])
+            phone_key = (segment_key, phone.get("mfa_phone_ordinal"))
             if (not isinstance(phone.get("mfa_phone_ordinal"), int)
                     or phone["mfa_phone_ordinal"] < 0
-                    or phone["mfa_phone_ordinal"] in seen_mfa_phone_ordinals):
+                    or phone_key in seen_mfa_phone_ordinals):
                 return _strict_en_fail(required, "strict_en_mfa_phone_ordinal_invalid",
                                        ledger_sha256=actual_hash, failed_word_ids=[word_id])
-            seen_mfa_phone_ordinals.add(phone["mfa_phone_ordinal"])
+            seen_mfa_phone_ordinals.add(phone_key)
         pairs.append((final_word, record))
     return _strict_en_report("verified", required, required, [], actual_hash), pairs
 
@@ -5042,7 +5403,8 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                 output_dir: Path, filtered_dir: Path, args,
                 ipa_to_pinyin: dict[str, str],
                 pinyin_dict: dict[str, list[str]],
-                pinyin_case: dict[str, str] | None = None) -> dict:
+                pinyin_case: dict[str, str] | None = None,
+                raw_text_index: dict[str, Path] | None = None) -> dict:
     """Post-process a single MFA-aligned TextGrid into 5-tier output.
 
     PROCESSING ORDER IS CRITICAL.  The function is organised in 5 phases:
@@ -5101,7 +5463,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # Tier 1: original/reference Chinese text.  This flag is intentionally
     # captured before ASR fallback: CTC may provide boundaries and language
     # hints, but it must not replace a supplied reference transcript.
-    raw_text = find_original_text(stem, args.raw_text_dir)
+    raw_text = find_original_text(stem, args.raw_text_dir, raw_text_index)
     reference_text_authoritative = bool(raw_text)
     reference_source = "original_or_ref" if reference_text_authoritative else ""
     if not raw_text:
@@ -5118,6 +5480,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
 
     # Tier 2: pinyin with punctuation (from corpus txt)
     pinyin_text = txt_path.read_text(encoding="utf-8").strip()
+    pinyin_text_original = pinyin_text
 
     # Fix <unk>/[bracketed] from MFA: self-referential NVV / English tokens
     # (BREATHING, li, ve etc.).  MFA replaces unknown tokens with <unk> or
@@ -5677,7 +6040,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                             iv.text = p_char  # 用原标点替换省略号
                             replaced = True
                             break
-                if not replaced:
+                if not replaced and not reference_text_authoritative:
                     # 删除 raw_text 中第 seq 个 p_char, 不是第一个
                     raw_text = _remove_nth_char(raw_text, p_char, seq)
                     pinyin_text = _remove_nth_char(pinyin_text, p_char, seq)
@@ -5704,6 +6067,21 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         #    the reference.  raw_text from the original .txt is ground truth.
         #    Regression Case 62.
         _normalize_word_spellings(final_words_tier, raw_text)
+
+        # Reference punctuation is lexical authority.  CTC punctuation may
+        # be missing, swallowed by a broad pause, or spuriously appended at
+        # the end; repair the words tier before rebuilding all derived tiers.
+        if reference_text_authoritative:
+            _restore_reference_punctuation(
+                final_words_tier, reference_text_original, punct_entries)
+            _sync_derived_tiers(
+                new_tg, ipa_to_pinyin, pinyin_dict,
+                raw_text=reference_text_original,
+                en_mfa_windows=en_mfa_windows,
+                report_warnings=report.get("warnings", []))
+            final_words_tier = tier_by_name(new_tg, "words")
+            raw_text = reference_text_original
+            pinyin_text = pinyin_text_original
         # 2. Rebuild hanzi from normalised words.
         hanzi_tier = _build_hanzi_tier(final_words_tier, raw_text,
                                         report.get("warnings", []))
@@ -6107,6 +6485,32 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                                 new_tg.tiers[_i] = _t_new
                                 break
 
+    # Final authoritative reconciliation: terminal-punctuation recovery above
+    # may have reintroduced a CTC-only mark.  Reapply the reference contract
+    # immediately before strict English injection and publication.
+    if reference_text_authoritative:
+        _final_words = tier_by_name(new_tg, "words")
+        if _final_words is not None:
+            _restore_reference_punctuation(
+                _final_words, reference_text_original, punct_entries)
+            _sync_derived_tiers(
+                new_tg, ipa_to_pinyin, pinyin_dict,
+                raw_text=reference_text_original,
+                en_mfa_windows=en_mfa_windows,
+                report_warnings=report.get("warnings", []))
+            _derived_pp = tier_by_name(new_tg, "pinyin_phones")
+            _derived_words = tier_by_name(new_tg, "words")
+            if _derived_pp is not None and _derived_words is not None:
+                _clip_pinyin_phones_to_words(_derived_pp, _derived_words)
+        _raw_authoritative = tier_by_name(new_tg, "raw_text")
+        if _raw_authoritative and _raw_authoritative.intervals:
+            _raw_authoritative.intervals[0].text = (
+                "<sp1>" + reference_text_original.replace("<sp1>", ""))
+        _pinyin_authoritative = tier_by_name(new_tg, "pinyin")
+        if _pinyin_authoritative and _pinyin_authoritative.intervals:
+            _pinyin_authoritative.intervals[0].text = _reference_pinyin_text(
+                reference_text_original, pinyin_text_original)
+
     # ── Final de-overlap: pinyin_phones tier (must be after ALL
     #     Phase 5 phone modifications including _apply_en_stress) ──
     _pp = tier_by_name(new_tg, "pinyin_phones")
@@ -6160,6 +6564,16 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                     if _tier.name == "pinyin_phones":
                         new_tg.tiers[_index] = stripped
                         break
+
+    # Strict English injection is intentionally last for English intervals;
+    # clean any remaining Chinese/punctuation overlap without touching the
+    # immutable ``en:`` phone geometry.
+    _post_strict_pp = tier_by_name(new_tg, "pinyin_phones")
+    if _post_strict_pp is not None:
+        _post_fixed = _fix_non_english_pp_overlaps(_post_strict_pp)
+        if _post_fixed:
+            report["pp_deoverlap_fixed"] = int(
+                report.get("pp_deoverlap_fixed", 0)) + _post_fixed
 
     # ================================================================
     # 最终筛选: 所有处理完成后再统一判断 (用最终的边界和静音结构)
@@ -6404,7 +6818,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             for idx, iv in enumerate(words_tier.intervals):
                 if is_silence(iv.text) or not iv.text.strip():
                     continue
-                if iv.text.strip() in '，。…！？、；：':
+                if is_punct(iv.text):
                     continue
                 if is_english_token(iv.text) or is_nvv_token(iv.text):
                     continue  # MFA can't model acoustically, CTC boundaries authoritative
@@ -6976,29 +7390,34 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                         # Regr. Case 48: CMUdict entry shown for diagnostics.
                         _en_deficit_examples.append(
                             f"{_wt}→got {_n_got} phones, cmu:{_dp} ({_n_exp})")
-    if _en_deficit_count > 0:
+    # A verified English MFA ledger is authoritative for both word identity
+    # and phone sequence.  CMUdict is retained as a diagnostic fallback, but
+    # must not reject a result whose exact provenance was already verified.
+    _en_provenance_verified = (
+        isinstance(report.get("english_provenance"), dict)
+        and report["english_provenance"].get("status") == "verified"
+    )
+    if _en_deficit_count > 0 and not _en_provenance_verified:
         filter_reasons.append("english_phone_deficit")
         report["english_phone_deficit"] = {"count": _en_deficit_count,
                                             "examples": _en_deficit_examples}
 
-    # ── Case 34: pp_tier_gaps — pinyin_phones tier has gaps > 10 ms
-    #     between adjacent intervals. ──
-    _pp_gap_count = 0
+    # ── Case 34: pp_tier_gaps — pinyin_phones has uncovered gaps *inside*
+    #     one content word.  This tier is intentionally sparse across
+    #     natural pauses, punctuation, and English words whose phones live in
+    #     the provenance-backed English alignment.
     _PP_GAP_THRESHOLD_S = 0.010
-    if pp_tier is not None and len(pp_tier.intervals) >= 2:
-        for _i in range(len(pp_tier.intervals) - 1):
-            _gap = round(pp_tier.intervals[_i + 1].xmin
-                         - pp_tier.intervals[_i].xmax, 4)
-            if _gap > _PP_GAP_THRESHOLD_S:
-                _pp_gap_count += 1
+    _pp_gap_count = _count_internal_pp_gaps(
+        pp_tier, words_tier, _PP_GAP_THRESHOLD_S)
     if _pp_gap_count > 0:
         _record_filterable_qc(
             report, filter_reasons, args.filter_suspicious,
             "pp_tier_gaps", {"count": _pp_gap_count}
         )
 
-    # ── Case 35: words_tier_gaps — words tier has gaps > 20 ms between
-    #     adjacent non-silence words. ──
+    # ── Case 35: words_tier_gaps — direct gaps between content words.
+    #     Punctuation and explicit silence intervals own their boundary gaps;
+    #     those are not alignment holes and must remain preserved.
     _wt_gap_count = 0
     _wt_gap_examples: list[str] = []
     _WT_GAP_THRESHOLD_S = 0.020
@@ -7008,7 +7427,8 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             _nxt = words_tier.intervals[_i + 1]
             _cl = _cur.text.strip() if _cur.text else ""
             _nl = _nxt.text.strip() if _nxt.text else ""
-            if is_silence(_cl) or is_silence(_nl):
+            if (not _cl or not _nl or is_silence(_cl) or is_silence(_nl)
+                    or is_punct(_cl) or is_punct(_nl)):
                 continue
             _gap = round(_nxt.xmin - _cur.xmax, 4)
             if _gap > _WT_GAP_THRESHOLD_S:
@@ -7073,19 +7493,22 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
 _W = None
 
 
-def _worker_init(_ipa, _py_dict, _py_case, _a, _txt_d, _wav_d, _out_d, _filt_d):
+def _worker_init(_ipa, _py_dict, _py_case, _a, _txt_d, _wav_d, _out_d,
+                 _filt_d, _raw_text_index):
     import os as _os
     for ev in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
                 "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         _os.environ[ev] = "1"
     global _W
-    _W = (_ipa, _py_dict, _py_case, _a, _txt_d, _wav_d, _out_d, _filt_d)
+    _W = (_ipa, _py_dict, _py_case, _a, _txt_d, _wav_d, _out_d, _filt_d,
+          _raw_text_index)
 
 
 def _worker_fn(tgp):
-    _ipa, _py_dict, _py_case, _a, _txt_d, _wav_d, _out_d, _filt_d = _W
+    (_ipa, _py_dict, _py_case, _a, _txt_d, _wav_d, _out_d, _filt_d,
+     _raw_text_index) = _W
     return process_one(tgp, _txt_d, _wav_d, _out_d, _filt_d, _a,
-                       _ipa, _py_dict, _py_case)
+                       _ipa, _py_dict, _py_case, _raw_text_index)
 
 
 def main() -> int:
@@ -7166,6 +7589,8 @@ def main() -> int:
     parser.add_argument("--filter-min-phone-coverage", type=float, default=0.35)
     parser.add_argument("--filter-edge-gap-sec", type=float, default=0.25)
     parser.add_argument("--copy-errors", action="store_true")
+    parser.add_argument("--allow-filtered-integrity-failures", action="store_true",
+                        help="Continue when mandatory-integrity failures were isolated in filtered/.")
     parser.add_argument("--strict-ok", action="store_true",
                         help="Treat every executed QC positive and warning as filterable.")
     parser.add_argument("--enable-text-correction", action=argparse.BooleanOptionalAction, default=True,
@@ -7181,6 +7606,10 @@ def main() -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.filtered_dir.mkdir(parents=True, exist_ok=True)
+    # Discover reference transcripts once and share the immutable index with
+    # serial/parallel workers.  This avoids one recursive directory walk per
+    # TextGrid while preserving deterministic first-match precedence.
+    raw_text_index = _build_original_text_index(args.raw_text_dir)
 
     # Load dictionaries and build IPA->pinyin mapping
     print("Loading dictionaries...")
@@ -7226,7 +7655,8 @@ def main() -> int:
             try:
                 reports.append(process_one(tgp, args.txt_dir, args.wav_dir,
                                            args.output_dir, args.filtered_dir, args,
-                                           ipa_to_pinyin, pinyin_dict, pinyin_case))
+                                           ipa_to_pinyin, pinyin_dict, pinyin_case,
+                                           raw_text_index))
             except Exception as exc:
                 reports.append({"stem": tgp.stem, "status": "error", "error": str(exc)})
                 if args.copy_errors:
@@ -7253,7 +7683,7 @@ def main() -> int:
             # ThreadPool: set globals once, then all threads see them
             _worker_init(ipa_to_pinyin, pinyin_dict, pinyin_case,
                          args, args.txt_dir, args.wav_dir,
-                         args.output_dir, args.filtered_dir)
+                         args.output_dir, args.filtered_dir, raw_text_index)
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
                 futures = {pool.submit(_worker_fn, tgp): tgp for tgp in tg_paths}
                 for fut in as_completed(futures):
@@ -7271,7 +7701,8 @@ def main() -> int:
                                      initializer=_worker_init,
                                      initargs=(ipa_to_pinyin, pinyin_dict, pinyin_case,
                                                args, args.txt_dir, args.wav_dir,
-                                               args.output_dir, args.filtered_dir)) as pool:
+                                               args.output_dir, args.filtered_dir,
+                                               raw_text_index)) as pool:
                 futures = {pool.submit(_worker_fn, tgp): tgp for tgp in tg_paths}
                 for fut in as_completed(futures):
                     tgp = futures[fut]
@@ -7298,7 +7729,9 @@ def main() -> int:
     hard_integrity_count = sum(1 for row in reports if row.get("hard_integrity_reasons"))
     if hard_integrity_count:
         print(f"  {hard_integrity_count} mandatory-integrity failures isolated in filtered/")
-    return 1 if hard_integrity_count else 0
+    if hard_integrity_count and not args.allow_filtered_integrity_failures:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

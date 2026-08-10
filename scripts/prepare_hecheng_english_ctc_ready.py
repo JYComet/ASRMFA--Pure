@@ -20,7 +20,13 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
-from pipeline_utils import CTC_SUFFIXES, load_ctc_token_entries, validate_ctc_transcript_bundle, compute_model_tree_digest
+from pipeline_utils import (CTC_SUFFIXES, load_ctc_token_entries,
+                            validate_ctc_transcript_bundle,
+                            compute_model_tree_digest,
+                            PIPELINE_ACCOUNTING_SCHEMA,
+                            read_pipeline_accounting_receipt,
+                            validate_pipeline_accounting_receipt,
+                            write_pipeline_accounting_receipt)
 from postprocess_textgrids import Interval, TextGrid, Tier, parse_textgrid, write_textgrid
 
 SCHEMA = "hecheng-english-ctc-ready-v3"
@@ -800,6 +806,46 @@ def _v4_expected_copies(args,r):
         out += [("audio_view",s,r["wav_paths"][s],str((root/"audio_view"/(s+".wav")).resolve())),("reference_view",s,r["txt_paths"][s],str((root/"reference_view"/(s+".txt")).resolve()))]
     return out+[("run_local_dict","",str(args.dictionary_source.resolve()),str((root/"dict"/"mfa_ipa.dict").resolve()))]
 
+
+def _v4_pipeline_receipt(args, report: dict) -> tuple[dict, Path]:
+    """Freeze source/eligible/exclusion accounting before any CTC target exists."""
+    path = args.run_root / ".pipeline_run_receipt_v2.json"
+    receipt = write_pipeline_accounting_receipt(
+        path,
+        source_stems=sorted(set(report["authoritative_stems"]) | set(report["missing_reference"])),
+        eligible_stems=report["authoritative_stems"],
+        exclusions={stem: "missing_reference" for stem in report["missing_reference"]},
+        output_stems=report["authoritative_stems"], filtered_stems=[],
+        run_id=str(args.run_root.name), mode="strict_ctc_ready_v4",
+        paths={"source_dir": str(Path(report["source_dir"]).resolve()),
+               "run_root": str(args.run_root.resolve())},
+    )
+    return receipt, path
+
+
+def _v4_load_pipeline_receipt(args, report: dict, expected_hash: str | None = None) -> tuple[dict, Path]:
+    path = args.run_root / ".pipeline_run_receipt_v2.json"
+    try:
+        receipt = read_pipeline_accounting_receipt(path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"pipeline accounting receipt invalid: {exc}") from exc
+    errors = validate_pipeline_accounting_receipt(receipt)
+    if errors:
+        raise ValueError("pipeline accounting receipt invalid: " + "; ".join(errors))
+    if expected_hash is not None and sha256(path) != expected_hash:
+        raise ValueError("pipeline accounting receipt hash changed")
+    source = set(receipt["source"]["stems"])
+    eligible = set(receipt["eligible"]["stems"])
+    exclusions = {row["stem"] for row in receipt["exclusions"]}
+    expected_source = set(report["authoritative_stems"]) | set(report["missing_reference"])
+    if source != expected_source or eligible != set(report["authoritative_stems"]):
+        raise ValueError("pipeline accounting source/eligible mismatch")
+    if exclusions != set(report["missing_reference"]):
+        raise ValueError("pipeline accounting exclusions mismatch")
+    if source != eligible | exclusions:
+        raise ValueError("pipeline accounting source conservation mismatch")
+    return receipt, path
+
 def _v4_verify_copies(items,args,r):
     actual=[(x.get("kind"),x.get("stem"),x.get("source",{}).get("path"),x.get("destination",{}).get("path")) for x in items]
     if actual != _v4_expected_copies(args,r): raise ValueError("prepared copy mapping not exact")
@@ -827,7 +873,8 @@ def prepare(args,r):
         raise FileNotFoundError(f"ASR model path is not a directory: {_model_path}")
     _model_tree_digest, _model_file_manifest = compute_model_tree_digest(_model_path)
     # ────────────────────────────────────────────────────────────────
-    m={"schema":V4_SCHEMA,"state":"awaiting_acoustic_rerun","inventory_sha256":r["inventory_sha256"],"stem_count":len(r["authoritative_stems"]),"authoritative_stems":r["authoritative_stems"],"missing_reference":r["missing_reference"],"txt_only":r["txt_only"],"final_audio_axis":V4_AXIS,"padding_policy":"forbidden","action_counts":r["action_counts"],"taxonomy":r["taxonomy"],"taxonomy_sha256":r["taxonomy_sha256"],"prepared_files":items,"prepared_files_sha256":stable_hash(items),"source_dictionary":_v4_evidence(args.dictionary_source),"run_local_dictionary":_v4_evidence(args.run_root/"dict"/"mfa_ipa.dict"),"rerun_command":render_rerun_command(args),"nvv_mode":V4_NVV_MODE,"asr_nvv_bias":V4_ASR_NVV_BIAS,"content_authority":V4_CONTENT_AUTHORITY,"asr_model_path":str(_model_path),"asr_model_tree_digest":_model_tree_digest,"asr_model_files":_model_file_manifest}
+    _pipeline_receipt, _pipeline_receipt_path = _v4_pipeline_receipt(args, r)
+    m={"schema":V4_SCHEMA,"state":"awaiting_acoustic_rerun","inventory_sha256":r["inventory_sha256"],"stem_count":len(r["authoritative_stems"]),"authoritative_stems":r["authoritative_stems"],"missing_reference":r["missing_reference"],"txt_only":r["txt_only"],"final_audio_axis":V4_AXIS,"padding_policy":"forbidden","action_counts":r["action_counts"],"taxonomy":r["taxonomy"],"taxonomy_sha256":r["taxonomy_sha256"],"prepared_files":items,"prepared_files_sha256":stable_hash(items),"source_dictionary":_v4_evidence(args.dictionary_source),"run_local_dictionary":_v4_evidence(args.run_root/"dict"/"mfa_ipa.dict"),"rerun_command":render_rerun_command(args),"nvv_mode":V4_NVV_MODE,"asr_nvv_bias":V4_ASR_NVV_BIAS,"content_authority":V4_CONTENT_AUTHORITY,"asr_model_path":str(_model_path),"asr_model_tree_digest":_model_tree_digest,"asr_model_files":_model_file_manifest,"pipeline_accounting_receipt":{"path":str(_pipeline_receipt_path.resolve()),"sha256":sha256(_pipeline_receipt_path),"schema":PIPELINE_ACCOUNTING_SCHEMA}}
     p=args.run_root/"prepare_manifest.json"; temporary=p.with_name(p.name+".tmp"); temporary.write_text(json.dumps(m,ensure_ascii=False,indent=2)+"\n",encoding="utf-8"); os.replace(temporary,p); return p
 
 def _v4_load(args,r):
@@ -835,7 +882,7 @@ def _v4_load(args,r):
     try:m=json.loads(p.read_text(encoding="utf-8"))
     except Exception as e: raise ValueError("missing/corrupt prepare manifest") from e
     binds={"schema":V4_SCHEMA,"state":"awaiting_acoustic_rerun","inventory_sha256":r["inventory_sha256"],"stem_count":len(r["authoritative_stems"]),"authoritative_stems":r["authoritative_stems"],"missing_reference":r["missing_reference"],"txt_only":r["txt_only"],"final_audio_axis":V4_AXIS,"padding_policy":"forbidden","action_counts":r["action_counts"],"taxonomy":r["taxonomy"],"taxonomy_sha256":r["taxonomy_sha256"],"rerun_command":render_rerun_command(args),"nvv_mode":V4_NVV_MODE,"asr_nvv_bias":V4_ASR_NVV_BIAS,"content_authority":V4_CONTENT_AUTHORITY}
-    expected_keys=set(binds)|{"prepared_files","prepared_files_sha256","source_dictionary","run_local_dictionary","asr_model_path","asr_model_tree_digest","asr_model_files"}
+    expected_keys=set(binds)|{"prepared_files","prepared_files_sha256","source_dictionary","run_local_dictionary","asr_model_path","asr_model_tree_digest","asr_model_files","pipeline_accounting_receipt"}
     if set(m)!=expected_keys or any(m.get(k)!=v for k,v in binds.items()) or m.get("prepared_files_sha256")!=stable_hash(m.get("prepared_files",[])): raise ValueError("prepare binding invalid")
     source_dict=_v4_evidence(args.dictionary_source); run_dict=_v4_evidence(args.run_root/"dict"/"mfa_ipa.dict")
     if m.get("source_dictionary")!=source_dict or m.get("run_local_dictionary")!=run_dict or (source_dict["size"],source_dict["sha256"])!=(run_dict["size"],run_dict["sha256"]): raise ValueError("dictionary evidence invalid")
@@ -843,6 +890,10 @@ def _v4_load(args,r):
     _model_path = Path(args.asr_model).resolve()
     _current_tree_digest, _current_file_manifest = compute_model_tree_digest(_model_path)
     if m.get("asr_model_path") != str(_model_path) or m.get("asr_model_tree_digest") != _current_tree_digest or m.get("asr_model_files") != _current_file_manifest: raise ValueError("ASR model tree changed since prepare")
+    binding = m.get("pipeline_accounting_receipt")
+    if not isinstance(binding, dict) or binding.get("schema") != PIPELINE_ACCOUNTING_SCHEMA:
+        raise ValueError("pipeline accounting receipt binding missing")
+    _v4_load_pipeline_receipt(args, r, binding.get("sha256"))
     # ────────────────────────────────────────────────────────────────
     _v4_verify_copies(m["prepared_files"],args,r); return m,p
 
@@ -880,7 +931,7 @@ def _v4_bundle_stems(root,run_root):
     return sorted(found)
 
 def _v4_rerun_namespace(root,run_root,stems):
-    inside(root,run_root); allowed={s+suf for s in stems for suf in V4_SUFFIXES}|{"manifest.json","summary.txt",".ctc_normalized"}; actual=[]
+    inside(root,run_root); allowed={s+suf for s in stems for suf in V4_SUFFIXES}|{"manifest.json","summary.txt",".ctc_normalized",".ctc_run_receipt.json"}; actual=[]
     for p in root.iterdir():
         if p.is_symlink() or not p.is_file() or p.name not in allowed: raise ValueError(f"unexpected rerun artifact: {p.name}")
         actual.append(p.name)
@@ -904,6 +955,23 @@ def _v4_rerun_manifest(root,run_root,stems):
 
 def finalize(args,r):
     enforce_counts(r,args);m,mpath=_v4_load(args,r); stems=r["authoritative_stems"]; rerun=args.run_root/"ctc_rerun_output"; inside(rerun,args.run_root); _v4_rerun_namespace(rerun,args.run_root,stems); _v4_rerun_manifest(rerun,args.run_root,stems)
+    receipt_path = rerun / ".ctc_run_receipt.json"
+    require_regular(receipt_path)
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError("invalid CTC run receipt") from exc
+    expected_model = {
+        "path": m["asr_model_path"],
+        "tree_digest": m["asr_model_tree_digest"],
+        "files": m["asr_model_files"],
+    }
+    if (receipt.get("schema") != "ctc-run-receipt-v1"
+            or receipt.get("model") != expected_model
+            or sorted(receipt.get("input_stems", [])) != stems
+            or sorted(receipt.get("output_stems", [])) != stems):
+        raise ValueError("CTC run receipt does not bind frozen model/stem identity")
+    receipt_digest = sha256(receipt_path)
     if _v4_bundle_stems(rerun,args.run_root)!=stems: raise ValueError("rerun namespace not exact")
     for s in stems:
         validate_standard_bundle(rerun,s,args.run_root/"audio_view"/(s+".wav"))
@@ -918,7 +986,7 @@ def finalize(args,r):
     for s in stems:
         audio=args.run_root/"audio_view"/(s+".wav"); ref=args.run_root/"reference_view"/(s+".txt"); validate_standard_bundle(ready,s,audio)
         art[s]={"origin_action":V4_ACTION,"audio":_v4_evidence(audio,True),"reference":_v4_evidence(ref),"authoritative_audio":_v4_evidence(Path(r["wav_paths"][s]),True),"authoritative_reference":_v4_evidence(Path(r["txt_paths"][s])),"ctc":{suf:_v4_evidence(ready/(s+suf)) for suf in V4_SUFFIXES}}
-    e={"schema":V4_SCHEMA,"state":"ready","independent_verifier_signature":V4_SIGNATURE,"prepare_manifest_sha256":sha256(mpath),"inventory_sha256":r["inventory_sha256"],"stem_count":len(stems),"authoritative_stems":stems,"missing_reference":r["missing_reference"],"txt_only":r["txt_only"],"final_audio_axis":V4_AXIS,"padding_policy":"forbidden","action_counts":r["action_counts"],"taxonomy":r["taxonomy"],"taxonomy_sha256":r["taxonomy_sha256"],"nvv_mode":V4_NVV_MODE,"asr_nvv_bias":V4_ASR_NVV_BIAS,"content_authority":V4_CONTENT_AUTHORITY,"roots":{"run":str(args.run_root.resolve()),"audio_view":str((args.run_root/"audio_view").resolve()),"reference_view":str((args.run_root/"reference_view").resolve()),"ctc_ready":str(ready.resolve())},"source_dictionary":m["source_dictionary"],"run_local_dictionary":m["run_local_dictionary"],"artifacts":art,"rerun_files":copied,"rerun_files_sha256":stable_hash(copied)}
+    e={"schema":V4_SCHEMA,"state":"ready","independent_verifier_signature":V4_SIGNATURE,"prepare_manifest_sha256":sha256(mpath),"inventory_sha256":r["inventory_sha256"],"stem_count":len(stems),"authoritative_stems":stems,"missing_reference":r["missing_reference"],"txt_only":r["txt_only"],"final_audio_axis":V4_AXIS,"padding_policy":"forbidden","action_counts":r["action_counts"],"taxonomy":r["taxonomy"],"taxonomy_sha256":r["taxonomy_sha256"],"nvv_mode":V4_NVV_MODE,"asr_nvv_bias":V4_ASR_NVV_BIAS,"content_authority":V4_CONTENT_AUTHORITY,"roots":{"run":str(args.run_root.resolve()),"audio_view":str((args.run_root/"audio_view").resolve()),"reference_view":str((args.run_root/"reference_view").resolve()),"ctc_ready":str(ready.resolve())},"source_dictionary":m["source_dictionary"],"run_local_dictionary":m["run_local_dictionary"],"artifacts":art,"rerun_files":copied,"rerun_files_sha256":stable_hash(copied),"asr_model_path":m["asr_model_path"],"asr_model_tree_digest":m["asr_model_tree_digest"],"asr_model_files":m["asr_model_files"],"ctc_run_receipt_digest":receipt_digest,"pipeline_accounting_receipt":m["pipeline_accounting_receipt"]}
     out=args.run_root/"ctc_ready_evidence.json"; temporary=out.with_name(out.name+".tmp"); temporary.write_text(json.dumps(e,ensure_ascii=False,indent=2)+"\n",encoding="utf-8"); os.replace(temporary,out)
     from verify_hecheng_english_ctc_ready_v4 import verify
     verify(args.run_root,args.source_dir,args.dictionary_source,

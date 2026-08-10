@@ -1,6 +1,8 @@
 """Verify risks using core string-based functions (no TextGrid needed)."""
 import sys
-sys.path.insert(0, "/mnt/project/MFA_Pause/repo/scripts")
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
 
 from postprocess_textgrids import (
     _word_matches,
@@ -84,12 +86,12 @@ tests = [
     ("qie4", "OP",        False, "1 vowel → blocked"),
     ("qie4", "in",        False, "1 vowel → blocked"),
     ("qie4", "up",        False, "1 vowel → blocked"),
-    ("qie4", "SURPRISE",  True,  "3 vowels → allowed (RISK!)"),
-    ("qie4", "hello",     True,  "2 vowels → allowed (RISK!)"),
-    ("qie4", "video",     True,  "3 vowels → allowed (RISK!)"),
-    ("qie4", "people",    True,  "3 vowels → allowed (RISK!)"),
-    ("ai4",  "idol",      True,  "2 vowels → allowed (correct: phonetic)"),
-    ("rui4", "ria",       True,  "2 vowels → allowed (correct: phonetic)"),
+    ("qie4", "SURPRISE",  False, "pinyin→English inference is forbidden"),
+    ("qie4", "hello",     False, "pinyin→English inference is forbidden"),
+    ("qie4", "video",     False, "pinyin→English inference is forbidden"),
+    ("qie4", "people",    False, "pinyin→English inference is forbidden"),
+    ("ai4",  "idol",      False, "canonical reference must supply English"),
+    ("rui4", "ria",       False, "explicit RIA canonicalization owns this case"),
     ("qie4", "切",         True,  "CJK exact match (not vowel path)"),
     ("pian4","片",         True,  "CJK exact match"),
     ("shi4", "世",         True,  "CJK exact match"),
@@ -240,7 +242,8 @@ def check_nw_misalignment(scenarios):
                 ctc_tok = ctc[ctc_i]
                 ref_tok = ref[ref_i]
                 # Check: if CTC token is pinyin but ref is English (not CJK)
-                if is_pinyin_syllable(ctc_tok) and not is_cjk(ref_tok):
+                if (is_pinyin_syllable(ctc_tok) and not is_cjk(ref_tok)
+                        and _word_matches(ctc_tok, ref_tok)):
                     issues.append((name, ctc_i, ctc_tok, ref_tok))
     return issues
 

@@ -180,11 +180,29 @@ def source_inventory(source):
 def verify(run_root,source_dir=SOURCE,dictionary_source=DEFAULT_DICT,
            asr_python=DEFAULT_ASR_PYTHON,asr_model=DEFAULT_ASR_MODEL):
  root=run_root.resolve(); e=json.loads((root/'ctc_ready_evidence.json').read_text(encoding='utf-8')); stems=e.get('authoritative_stems')
- expected_keys={'schema','state','independent_verifier_signature','prepare_manifest_sha256','inventory_sha256','stem_count','authoritative_stems','missing_reference','txt_only','final_audio_axis','padding_policy','action_counts','taxonomy','taxonomy_sha256','nvv_mode','asr_nvv_bias','content_authority','roots','source_dictionary','run_local_dictionary','artifacts','rerun_files','rerun_files_sha256','asr_model_path','asr_model_tree_digest','asr_model_files','ctc_run_receipt_digest'}
+ expected_keys={'schema','state','independent_verifier_signature','prepare_manifest_sha256','inventory_sha256','stem_count','authoritative_stems','missing_reference','txt_only','final_audio_axis','padding_policy','action_counts','taxonomy','taxonomy_sha256','nvv_mode','asr_nvv_bias','content_authority','roots','source_dictionary','run_local_dictionary','artifacts','rerun_files','rerun_files_sha256','asr_model_path','asr_model_tree_digest','asr_model_files','ctc_run_receipt_digest','pipeline_accounting_receipt'}
  if set(e)!=expected_keys:raise ValueError('evidence top-level keys')
  if e.get('schema')!=SCHEMA or e.get('state')!='ready' or e.get('independent_verifier_signature')!=SIGNATURE or e.get('final_audio_axis')!='authoritative_wav' or e.get('padding_policy')!='forbidden' or e.get('nvv_mode')!=NVV_MODE or e.get('asr_nvv_bias') is not ASR_NVV_BIAS or e.get('content_authority')!=CONTENT_AUTHORITY:raise ValueError('schema/axis/reference-only metadata')
  wavs,txts,expected_stems,expected_missing,expected_only,source_report=source_inventory(Path(source_dir))
  if not isinstance(stems,list) or stems!=expected_stems or e.get('inventory_sha256')!=source_report['inventory_sha256'] or e.get('stem_count')!=len(expected_stems) or e.get('missing_reference')!=expected_missing or e.get('txt_only')!=expected_only or e.get('action_counts')!={'acoustic_rerun':len(expected_stems)}:raise ValueError('stem/action list')
+ # Frozen source-denominator receipt: missing-reference WAVs are explicit
+ # exclusions and can never enter the strict ready set.
+ try:
+  from pipeline_utils import (PIPELINE_ACCOUNTING_SCHEMA,
+                              read_pipeline_accounting_receipt,
+                              validate_pipeline_accounting_receipt)
+  binding=e.get('pipeline_accounting_receipt')
+  if not isinstance(binding,dict) or binding.get('schema')!=PIPELINE_ACCOUNTING_SCHEMA: raise ValueError('pipeline accounting receipt binding')
+  receipt_path=Path(binding.get('path',''))
+  if receipt_path.resolve() != (root/'.pipeline_run_receipt_v2.json').resolve(): raise ValueError('pipeline accounting receipt path')
+  receipt=read_pipeline_accounting_receipt(receipt_path)
+  if digest(receipt_path)!=binding.get('sha256'): raise ValueError('pipeline accounting receipt hash')
+  receipt_errors=validate_pipeline_accounting_receipt(receipt)
+  if receipt_errors: raise ValueError('pipeline accounting receipt: '+ '; '.join(receipt_errors))
+  excluded={x['stem'] for x in receipt['exclusions']}; source=set(receipt['source']['stems']); eligible=set(receipt['eligible']['stems'])
+  if source != set(wavs) or eligible != set(expected_stems) or excluded != set(expected_missing) or source != eligible | excluded: raise ValueError('pipeline accounting source conservation')
+ except (OSError,TypeError,ValueError,KeyError,json.JSONDecodeError) as ex:
+  raise ValueError(str(ex)) from ex
  if not isinstance(e.get('taxonomy'),list) or e.get('taxonomy_sha256')!=hashlib.sha256(json.dumps(e['taxonomy'],ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest() or e['taxonomy'] != [{'stem':s,'reason':'legacy_audio_provenance_unbound','action':'acoustic_rerun'} for s in stems]:raise ValueError('taxonomy')
  roots=e.get('roots',{}); expected={'run':str(root),'audio_view':str((root/'audio_view').resolve()),'reference_view':str((root/'reference_view').resolve()),'ctc_ready':str((root/'ctc_ready').resolve())}
  if roots!=expected:raise ValueError('roots')
@@ -195,11 +213,11 @@ def verify(run_root,source_dir=SOURCE,dictionary_source=DEFAULT_DICT,
    if p.is_symlink() or not p.is_file():raise ValueError('namespace nonordinary')
    actual.append(p.name)
   if sorted(actual)!=sorted(names):raise ValueError('namespace extra/missing')
- exact_dir(root/'audio_view',[s+'.wav' for s in stems]);exact_dir(root/'reference_view',[s+'.txt' for s in stems]);exact_dir(root/'dict',['mfa_ipa.dict']);exact_dir(root/'ctc_ready',[s+q for s in stems for q in REQUIRED_SUFFIXES]);exact_dir(root/'ctc_rerun_output',[s+q for s in stems for q in REQUIRED_SUFFIXES]+['manifest.json','summary.txt','.ctc_normalized'])
+ exact_dir(root/'audio_view',[s+'.wav' for s in stems]);exact_dir(root/'reference_view',[s+'.txt' for s in stems]);exact_dir(root/'dict',['mfa_ipa.dict']);exact_dir(root/'ctc_ready',[s+q for s in stems for q in REQUIRED_SUFFIXES]);exact_dir(root/'ctc_rerun_output',[s+q for s in stems for q in REQUIRED_SUFFIXES]+['manifest.json','summary.txt','.ctc_normalized','.ctc_run_receipt.json'])
  try:m=json.loads((root/'prepare_manifest.json').read_text(encoding='utf-8'))
  except Exception as ex:raise ValueError('prepare manifest') from ex
- manifest_keys={'schema','state','inventory_sha256','stem_count','authoritative_stems','missing_reference','txt_only','final_audio_axis','padding_policy','action_counts','taxonomy','taxonomy_sha256','prepared_files','prepared_files_sha256','source_dictionary','run_local_dictionary','rerun_command','nvv_mode','asr_nvv_bias','content_authority'}
- if set(m)!=manifest_keys or m.get('schema')!=SCHEMA or m.get('state')!='awaiting_acoustic_rerun' or m.get('inventory_sha256')!=source_report['inventory_sha256'] or m.get('stem_count')!=len(stems) or m.get('authoritative_stems')!=stems or m.get('missing_reference')!=expected_missing or m.get('txt_only')!=expected_only or m.get('final_audio_axis')!='authoritative_wav' or m.get('padding_policy')!='forbidden' or m.get('action_counts')!=e['action_counts'] or m.get('taxonomy')!=e['taxonomy'] or m.get('taxonomy_sha256')!=e['taxonomy_sha256'] or m.get('source_dictionary')!=e['source_dictionary'] or m.get('run_local_dictionary')!=e['run_local_dictionary'] or m.get('nvv_mode')!=NVV_MODE or m.get('asr_nvv_bias') is not ASR_NVV_BIAS or m.get('content_authority')!=CONTENT_AUTHORITY:raise ValueError('prepare manifest binding')
+ manifest_keys={'schema','state','inventory_sha256','stem_count','authoritative_stems','missing_reference','txt_only','final_audio_axis','padding_policy','action_counts','taxonomy','taxonomy_sha256','prepared_files','prepared_files_sha256','source_dictionary','run_local_dictionary','rerun_command','nvv_mode','asr_nvv_bias','content_authority','asr_model_path','asr_model_tree_digest','asr_model_files'}
+ if set(m)!=manifest_keys | {'pipeline_accounting_receipt'} or m.get('schema')!=SCHEMA or m.get('state')!='awaiting_acoustic_rerun' or m.get('inventory_sha256')!=source_report['inventory_sha256'] or m.get('stem_count')!=len(stems) or m.get('authoritative_stems')!=stems or m.get('missing_reference')!=expected_missing or m.get('txt_only')!=expected_only or m.get('final_audio_axis')!='authoritative_wav' or m.get('padding_policy')!='forbidden' or m.get('action_counts')!=e['action_counts'] or m.get('taxonomy')!=e['taxonomy'] or m.get('taxonomy_sha256')!=e['taxonomy_sha256'] or m.get('source_dictionary')!=e['source_dictionary'] or m.get('run_local_dictionary')!=e['run_local_dictionary'] or m.get('nvv_mode')!=NVV_MODE or m.get('asr_nvv_bias') is not ASR_NVV_BIAS or m.get('content_authority')!=CONTENT_AUTHORITY or m.get('pipeline_accounting_receipt')!=e.get('pipeline_accounting_receipt'):raise ValueError('prepare manifest binding')
  expected_prepared=[]
  for s in stems:
   expected_prepared += [('audio_view',s,str(wavs[s].resolve()),str((root/'audio_view'/(s+'.wav')).resolve()),True),('reference_view',s,str(txts[s].resolve()),str((root/'reference_view'/(s+'.txt')).resolve()),False)]
@@ -241,6 +259,11 @@ def verify(run_root,source_dir=SOURCE,dictionary_source=DEFAULT_DICT,
   raise ValueError('CTC run receipt input stems do not match expected')
  if _receipt_output != stems:
   raise ValueError('CTC run receipt output stems do not match expected')
+ if (e.get('asr_model_path') != str(_model_p)
+     or e.get('asr_model_tree_digest') != _current_tree_digest
+     or e.get('asr_model_files') != _current_tree_manifest
+     or e.get('ctc_run_receipt_digest') != digest(_receipt_path)):
+  raise ValueError('ready evidence model/receipt binding mismatch')
  # ──────────────────────────────────────────────────────────────────
  art=e.get('artifacts');
  if not isinstance(art,dict) or sorted(art)!=stems:raise ValueError('artifacts')

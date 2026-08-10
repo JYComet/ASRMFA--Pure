@@ -15,6 +15,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 import prepare_hecheng_english_ctc_ready as prep
 import ctc_prealign as ctc
 import normalize_english_tokens
+from pipeline_utils import compute_model_tree_digest, write_ctc_run_receipt
 from postprocess_textgrids import Interval, TextGrid, Tier, parse_textgrid, write_textgrid
 
 def ok(value, label): print(("OK " if value else "FAIL ") + label); return not value
@@ -35,8 +36,12 @@ def fixture(root):
     bundle(legacy,"good1", token_end=.9); bundle(legacy,"good2"); bundle(legacy,"bad",False)
     return source, legacy, dictionary
 def args(source, legacy, dictionary, run):
+    # The v4 preparer fingerprints the model tree before any run-root write.
+    # Keep this fixture hermetic while exercising that production gate.
+    model = run.parent / "model"
+    model.mkdir(exist_ok=True)
     return SimpleNamespace(run_root=run,source_dir=source,legacy_ctc=legacy,rerun_ctc=None,dictionary_source=dictionary,
-      require_expected_counts=True,expected_wavs=4,expected_txts=3,expected_authoritative=3,expected_missing_refs=1,expected_txt_only=0,expected_standard=2,expected_canonicalize=0,expected_rerun=1,expected_missing_stems=["noref"],asr_python="python",asr_model="model",asr_device="cuda:7")
+      require_expected_counts=True,expected_wavs=4,expected_txts=3,expected_authoritative=3,expected_missing_refs=1,expected_txt_only=0,expected_standard=2,expected_canonicalize=0,expected_rerun=1,expected_missing_stems=["noref"],asr_python="python",asr_model=str(model),asr_device="cuda:7")
 def malformed_textgrid(path, *, bad_tail=False, token_end=.999, word_index=0, word_domain=False):
     lines = ['File type = "ooTextFile"', 'Object class = "TextGrid"', '', 'xmin = 0', 'xmax = 1', 'tiers? <exists>', 'size = 2', 'item []:', '    item [1]:', '        class = "IntervalTier"', '        name = "words"']
     if word_domain: lines += ['        xmin = 0', '        xmax = 1']
@@ -206,6 +211,10 @@ def v4_main():
     for stem in ('a','b'): (rerun/f'{stem}_ref.txt').write_text((source/f'{stem}.txt').read_text())
     manifest=[{'audio':str((a.run_root/'audio_view'/f'{stem}.wav').resolve()),'textgrid':str((rerun/f'{stem}.TextGrid').resolve()),'lab':str((rerun/f'{stem}.lab').resolve()),'duration_s':1.0,'n_words':1,'_words':[{'word':'ni3','start':0.0}]} for stem in ('a','b')]
     (rerun/'manifest.json').write_text(json.dumps(manifest)); (rerun/'summary.txt').write_text('Files: 2 total, 2 OK, 0 failed\n'); (rerun/'.ctc_normalized').write_text('reference-authority-v3-safe-transcript\n')
+    model_digest, model_files = compute_model_tree_digest(Path(a.asr_model))
+    write_ctc_run_receipt(rerun, [a.asr_python], a.asr_python, Path(a.asr_model),
+                          model_digest, model_files, a.run_root/'dict'/'mfa_ipa.dict',
+                          prep.sha256(a.run_root/'dict'/'mfa_ipa.dict'), ['a', 'b'], ['a', 'b'])
     evidence=prep.finalize(a,report); prep.verify_ready(a,report)
     verifier_command=[sys.executable,str(PROJECT_ROOT/'scripts'/'verify_hecheng_english_ctc_ready_v4.py'),'--run-root',str(a.run_root),'--source-dir',str(source),'--dictionary-source',str(dictionary),'--asr-python',a.asr_python,'--asr-model',a.asr_model]
     independent=subprocess.run(verifier_command,text=True,capture_output=True)

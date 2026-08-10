@@ -1,0 +1,68 @@
+# 单条 canary 测试 — 验证全管线通路
+#
+# 运行:
+#   python3 scripts/run_pipeline.py \
+#       --config configs/hecheng_ria_test1.yaml \
+#       --python /home/user/miniconda3/envs/mfa-dev/bin/python
+
+mode: nvrasr_fallback
+
+data_dir: /mnt/nvme3/mfa_audio_cache_ria
+workspace: /mnt/nvme3/mfa_workspace_test1
+output_dir: /mnt/Raw/test1
+output_staging: false
+keep_16k_audio: false
+temp_dir: /tmp/mfa_temp
+
+pad_silence:
+  target_edge_silence_sec: 0.5
+
+ctc_prealign:
+  enabled: true
+  python: /home/user/miniconda3/envs/asr/bin/python
+  model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
+  device: cuda:0
+  limit: 1
+  timeout: 600
+  nvv_enabled: false
+
+ctc_adjust:
+  enabled: false
+
+models_dir: /mnt/local_E/MFA_Pause/repo/models/mfa
+
+mfa:
+  num_jobs: 1
+  single_speaker: true
+  output_format: long_textgrid
+  clean: true
+  no_tokenization: true
+  skip_validate: true
+  fine_tune: false
+  beam: 20
+  retry_beam: 80
+  timeout: 600
+
+mfa_en:
+  enabled: true
+  num_jobs: 1
+  padding_ms: 50
+  min_segment_dur_ms: 200
+  max_gap_merge_s: 0.35
+  beam: 10
+  retry_beam: 40
+  fine_tune: false
+  acoustic_model: /mnt/local_E/MFA_Pause/pretrained_models/acoustic/english_us_arpa.zip
+  dictionary: dict/cmudict.dict
+  g2p_model: /mnt/local_E/MFA_Pause/pretrained_models/g2p/english_us_arpa.zip
+  timeout: 600
+
+postprocess:
+  strict_ok: true
+  merge_silence: true
+  min_sil_merge_sec: 0.2
+  fix_short_word: false
+  detect_bgm: false
+  filter_suspicious: false
+  enable_text_correction: true
+  handle_unexpected_sil: false

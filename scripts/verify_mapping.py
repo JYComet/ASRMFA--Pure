@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+STRUCTURAL_TOKENS = {"[PAUSE]"}
 
 from pipeline_utils import IPA_CONSONANT_MAP, IPA_TONE_TO_DIGIT, IPA_VOWEL_BASE_MAP, FINAL_DECOMPOSE, FINAL_TONE_INDEX
 
@@ -125,7 +126,8 @@ def main():
         # Compare
         if reverse_mapped != decomposed_original:
             # Only report if this isn't an English/special entry
-            if not any(re.match(r'^[A-Z]+\d$', p) for p in pinyin_phones):
+            if (token not in STRUCTURAL_TOKENS
+                    and not any(re.match(r'^[A-Z]+\d$', p) for p in pinyin_phones)):
                 errors.append({
                     'token': token,
                     'pinyin_original': pinyin_phones,

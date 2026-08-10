@@ -51,6 +51,85 @@ from pipeline_utils import (
 )
 
 
+def _index_wavs_for_stems(audio_dir: Path, stems: list[str]) -> dict[str, Path]:
+    """Resolve explicit stems with one directory scan plus narrow fallbacks.
+
+    ``find_wav`` performs several filesystem probes (and may recurse) for every
+    stem.  Explicit-stem datasets commonly contain thousands of stems, so scan
+    the flat directory and its immediate subdirectories once, retaining the
+    same precedence as ``find_wav`` (flat, then ``stem/stem.wav``).  Ambiguous
+    or deeper layouts still use ``find_wav`` so path-selection semantics are
+    unchanged.
+    """
+    wanted = set(stems)
+    if not wanted:
+        return {}
+
+    flat: dict[str, Path] = {}
+    nested_direct: dict[str, Path] = {}
+    nested_other: dict[str, list[Path]] = {}
+    try:
+        with os.scandir(str(audio_dir)) as entries:
+            top_entries = list(entries)
+    except OSError:
+        top_entries = []
+
+    for entry in top_entries:
+        try:
+            is_file = entry.is_file()
+            is_dir = entry.is_dir()
+        except OSError:
+            continue
+        if is_file and entry.name.endswith(".wav"):
+            stem = entry.name[:-4]
+            if stem in wanted and stem not in flat:
+                flat[stem] = Path(entry.path)
+        elif is_dir:
+            try:
+                with os.scandir(entry.path) as children:
+                    for child in children:
+                        try:
+                            child_is_file = child.is_file()
+                        except OSError:
+                            continue
+                        if not child_is_file or not child.name.endswith(".wav"):
+                            continue
+                        stem = child.name[:-4]
+                        if stem not in wanted:
+                            continue
+                        child_path = Path(child.path)
+                        if entry.name == stem:
+                            nested_direct.setdefault(stem, child_path)
+                        else:
+                            nested_other.setdefault(stem, []).append(child_path)
+            except OSError:
+                continue
+
+    resolved: dict[str, Path] = {}
+    unresolved: list[str] = []
+    for stem in stems:
+        if stem in resolved:
+            continue
+        path = flat.get(stem) or nested_direct.get(stem)
+        # A unique one-level nested candidate is equivalent to find_wav's
+        # recursive fallback; defer ambiguous candidates to preserve its choice.
+        if path is None:
+            candidates = nested_other.get(stem, [])
+            if len(candidates) == 1:
+                path = candidates[0]
+        if path is not None:
+            resolved[stem] = path
+        else:
+            unresolved.append(stem)
+
+    # Preserve zero-padded/numeric and deeply nested fallback behaviour.
+    for stem in unresolved:
+        path = find_wav(audio_dir, stem)
+        if path is not None:
+            resolved[stem] = path
+    return resolved
+
+
 # ═══════════════════════════════════════════════════════════════
 # Batch-level processing — single batch (2000 stems), no threading
 # ═══════════════════════════════════════════════════════════════
@@ -218,6 +297,10 @@ def _process_one_batch(
     device: str = "",
     restore_cache: bool = True,
     persist_cache_on_failure: bool = True,
+    mfa_num_jobs: int = 0,
+    mfa_en_num_jobs: int = 0,
+    allow_overwrite: bool = True,
+    allow_force: bool = True,
 ) -> bool:
     """Phase 2: NVMe → NVMe. Run run_pipeline.py on locally-staged data.
 
@@ -258,12 +341,19 @@ def _process_one_batch(
         "--output-dir", str(local_output),
         "--workspace", str(local_workspace),
         "--python", str(mfa_python),
-        "--overwrite", "--force",
     ]
+    if allow_overwrite:
+        cmd.append("--overwrite")
+    if allow_force:
+        cmd.append("--force")
     if not is_fallback:
         cmd += ["--ctc-ready", str(local_ctc)]
     if device:
         cmd += ["--device", "cuda:0"]
+    if mfa_num_jobs > 0:
+        cmd += ["--mfa-jobs", str(mfa_num_jobs)]
+    if mfa_en_num_jobs > 0:
+        cmd += ["--mfa-en-jobs", str(mfa_en_num_jobs)]
 
     t0 = time.time()
     env = get_mfa_env(mfa_python, models_dir)
@@ -287,31 +377,70 @@ def _process_one_batch(
               f"({elapsed:.0f}s)")
         if persist_cache_on_failure:
             _persist_ctc_adj_cache(local_workspace, nas_output)
-        _cleanup_one_batch_dir(local_dir)
+        # Preserve failed batch directory for forensic analysis
+        _failed_dir = local_dir.with_name(local_dir.name + ".FAILED")
+        if _failed_dir.exists():
+            shutil.rmtree(_failed_dir, ignore_errors=True)
+        shutil.move(str(local_dir), str(_failed_dir))
+        print(f"  [PROC  {batch_idx:04d}] Preserved: {_failed_dir}")
         return False
 
     print(f"  [PROC  {batch_idx:04d}] {ds['name']} OK ({elapsed:.0f}s)")
     return True
 
 
+def _detect_strict_output(workspace: Path) -> Path | None:
+    """Detect if strict_ok redirected output to a run-specific directory.
+
+    When postprocess.strict_ok is True, run_pipeline.py writes results to
+    workspace/strict_ok_runs/{run_id}/output instead of the configured
+    output-dir. Returns the run-specific output path, or None.
+    """
+    strict_root = workspace / "strict_ok_runs"
+    if not strict_root.exists():
+        return None
+    # Find the most recent run directory
+    run_dirs = sorted(strict_root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+    for run_dir in run_dirs:
+        if run_dir.is_dir() and (run_dir / "output").exists():
+            return run_dir / "output"
+    return None
+
+
 def _upload_one_batch(
     local_dir: Path, nas_output_root: Path, ds_name: str,
+    batch_idx: int = 0,
 ) -> bool:
-    """Phase 3: NVMe → NAS. rsync batch results to NAS.
+    """Phase 3: NVMe → NAS. rsync batch results to per-batch staging.
+
+    Each batch uploads to .staging/batch_XXXX/ to prevent cross-batch
+    file collisions. A separate merge step combines all batch staging
+    dirs into the final output.
 
     Returns True on success, False if any upload failed.
     """
     local_output = local_dir / "output"
     local_workspace = local_dir / "workspace"
-    nas_output = nas_output_root / ds_name
+    nas_dataset = nas_output_root / ds_name
+    # Per-batch isolation: upload to staging, merge happens after all batches
+    staging_dir = nas_dataset / ".staging" / f"batch_{batch_idx:04d}"
 
     t0 = time.time()
     upload_ok = True
 
+    # Detect strict_ok output redirect: if configured output-dir is empty,
+    # check workspace/strict_ok_runs/{run_id}/output
+    _strict_output = None
+    if local_output.exists() and not any(local_output.iterdir()):
+        _strict_output = _detect_strict_output(local_workspace)
+    if _strict_output:
+        print(f"    strict_ok output detected: {_strict_output}")
+
     for local_src, nas_rel in [
-        (local_output, nas_output / "output"),
-        (local_workspace / "filtered", nas_output / "filtered"),
-        (local_workspace / "ctc_pretg_adj", nas_output / "ctc_pretg_adj"),
+        (_strict_output if _strict_output else local_output,
+         staging_dir / "output"),
+        (local_workspace / "filtered", staging_dir / "filtered"),
+        (local_workspace / "ctc_pretg_adj", staging_dir / "ctc_pretg_adj"),
     ]:
         if not local_src.exists() or not any(local_src.iterdir()):
             continue
@@ -324,7 +453,9 @@ def _upload_one_batch(
                      str(local_src) + "/", str(nas_rel) + "/"],
                     capture_output=True, text=True, timeout=600).returncode
                 if rc_up != 0:
-                    print(f"    rsync warning: rc={rc_up} for {local_src}")
+                    print(f"    rsync FAILED: rc={rc_up} for {local_src} → {nas_rel}")
+                    upload_ok = False
+                    break
             except subprocess.TimeoutExpired:
                 print(f"    rsync TIMEOUT for {local_src}, falling back to copy")
                 rsync = None
@@ -394,7 +525,7 @@ def run_single_batch(
 
     upload_ok = _upload_one_batch(
         local_dir=local_dir, nas_output_root=nas_output_root,
-        ds_name=ds["name"],
+        ds_name=ds["name"], batch_idx=batch_idx,
     )
     _cleanup_one_batch_dir(local_dir)
 
@@ -421,6 +552,8 @@ def _merge_to_nas(src: Path, dst: Path) -> bool:
                 capture_output=True, text=True, timeout=300).returncode
             if rc == 0:
                 return True
+            print(f"  rsync failed (rc={rc}) for {src} → {dst}")
+            return False
         except subprocess.TimeoutExpired:
             print(f"  rsync timed out after 300s — falling back to file-by-file copy")
     # Fallback: copy file-by-file
@@ -622,13 +755,22 @@ class StreamingPipeline:
                  mfa_python: Path, models_dir: Path,
                  nas_output_root: Path,
                  prefetch_buffer: int = 4,
-                 upload_buffer: int = 4):
+                 upload_buffer: int = 4,
+                 mfa_num_jobs: int = 0,
+                 mfa_en_num_jobs: int = 0,
+                 allow_overwrite: bool = True,
+                 allow_force: bool = True):
         self.bm = batch_mgr
         self.pipeline_script = pipeline_script
         self.config_path = config_path
         self.mfa_python = mfa_python
         self.models_dir = models_dir
         self.nas_output_root = nas_output_root
+
+        self.mfa_num_jobs = mfa_num_jobs
+        self.mfa_en_num_jobs = mfa_en_num_jobs
+        self.allow_overwrite = allow_overwrite
+        self.allow_force = allow_force
 
         # Backpressure: prefetch N batches ahead to keep processing saturated
         # while bounding local NVMe usage; upload queue backpressure prevents
@@ -715,9 +857,9 @@ class StreamingPipeline:
                         failed += 1
 
             if failed:
-                print(f"    WARNING: {failed}/{len(copy_tasks)} file copies failed")
+                print(f"    ERROR: {failed}/{len(copy_tasks)} file copies failed")
 
-            ok = (missing_audio == 0)
+            ok = (missing_audio == 0 and failed == 0)
 
             # 写 manifest
             manifest = {"stems": stems, "n_stems": len(stems)}
@@ -726,9 +868,15 @@ class StreamingPipeline:
 
             elapsed = time.time() - t0
             with self.stats_lock:
-                self.stats["prefetched"] += 1
-                print(f"  [PREFETCH] batch {batch_idx+1} done "
-                      f"({elapsed:.1f}s, {len(stems)} stems)")
+                if ok:
+                    self.stats["prefetched"] += 1
+                    print(f"  [PREFETCH] batch {batch_idx+1} done "
+                          f"({elapsed:.1f}s, {len(stems)} stems)")
+                else:
+                    self.stats["prefetch_fail"] += 1
+                    print(f"  [PREFETCH] batch {batch_idx+1} FAIL"
+                          f" ({elapsed:.1f}s, {len(stems)} stems)"
+                          f" — {missing_audio} missing audio, {failed} copy errors")
 
             if ok:
                 self.prefetch_queue.put(batch_idx)
@@ -809,9 +957,15 @@ class StreamingPipeline:
             "--workspace", str(local_workspace),
             "--ctc-ready", str(local_ctc),
             "--python", str(self.mfa_python),
-            "--overwrite",
-            "--force",
         ]
+        if self.allow_overwrite:
+            cmd.append("--overwrite")
+        if self.allow_force:
+            cmd.append("--force")
+        if self.mfa_num_jobs > 0:
+            cmd += ["--mfa-jobs", str(self.mfa_num_jobs)]
+        if self.mfa_en_num_jobs > 0:
+            cmd += ["--mfa-en-jobs", str(self.mfa_en_num_jobs)]
 
         t0 = time.time()
         try:
@@ -865,14 +1019,17 @@ class StreamingPipeline:
                 else:
                     self.stats["process_fail"] += 1
 
-            self.upload_queue.put(batch_idx)
+            if ok:
+                self.upload_queue.put(batch_idx)
             completed += 1
 
         self.upload_queue.put(None)
         upload_thread.join(timeout=600)
         prefetch_thread.join(timeout=60)
 
-        all_ok = self.stats["process_fail"] == 0
+        all_ok = (self.stats["process_fail"] == 0
+                  and self.stats["prefetch_fail"] == 0
+                  and self.stats["upload_fail"] == 0)
         with self.stats_lock:
             print(f"\n{'#'*60}")
             print(f"  PIPELINE COMPLETE")
@@ -911,7 +1068,10 @@ def _run_direct(args, data_dir: Path, ctc_dir: Path, output_dir: Path | None):
     if args.python:
         cmd += ["--python", args.python]
     print(f"  CMD: {' '.join(cmd)}")
-    subprocess.run(cmd)
+    rc = subprocess.run(cmd).returncode
+    if rc != 0:
+        print(f"  ERROR: run_pipeline.py returned {rc}")
+        sys.exit(rc)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1015,6 +1175,10 @@ Examples:
     parser.add_argument("--python", type=str, default=None,
                         help="MFA Python path (auto-detect).")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--no-overwrite", action="store_true",
+                        help="Disable --overwrite in child processes (respect strict configs).")
+    parser.add_argument("--no-force", action="store_true",
+                        help="Disable --force in child processes (respect strict configs).")
     args = parser.parse_args()
 
     # ── Load config for streaming defaults ──
@@ -1101,7 +1265,9 @@ Examples:
 
     # ── Batch mode ──
     if args.batch_cache:
-        run_batch(args)
+        ok = run_batch(args)
+        if not ok:
+            sys.exit(1)
         return
 
     # ── Single-dataset mode ──
@@ -1351,6 +1517,7 @@ def run_single_dataset(
             local_dir=local_dir,
             nas_output_root=nas_output_root,
             ds_name=ds["name"],
+            batch_idx=bi,
         ):
             up_ok += 1
         else:
@@ -1396,6 +1563,20 @@ def _save_checkpoint(ckpt_path: Path, completed: set[str], failed: set[str]) -> 
     tmp.replace(ckpt_path)
 
 
+def _load_batch_progress(ckpt_path: Path) -> dict[str, dict]:
+    """Return per-dataset batch progress from .batch_progress.json.
+
+    Returns {ds_name: {done: int, fail: int, total: int}}.
+    """
+    progress_path = ckpt_path.with_name(ckpt_path.stem + ".batch_progress.json")
+    if not progress_path.exists():
+        return {}
+    try:
+        return json.loads(progress_path.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+
+
 def _save_batch_progress(ckpt_path: Path, ds_name: str,
                          done: int, fail: int, total: int) -> None:
     """Atomically write per-dataset batch progress (non-blocking best-effort)."""
@@ -1421,6 +1602,10 @@ def _execute_staged(
     usable_drives: list, mfa_python: Path, models_dir: Path,
     parallel: int, ds_batch_tracker: dict,
     batch_size: int,
+    mfa_num_jobs: int = 0,
+    mfa_en_num_jobs: int = 0,
+    allow_overwrite: bool = True,
+    allow_force: bool = True,
 ) -> tuple[int, list[str]]:
     """Three-phase staged execution: Stage All → Process All → Upload All.
 
@@ -1562,6 +1747,10 @@ def _execute_staged(
                     mode=batch_mode, device=device_str,
                     restore_cache=False,           # NO NAS I/O
                     persist_cache_on_failure=False, # upload in Phase 3
+                    mfa_num_jobs=mfa_num_jobs,
+                    mfa_en_num_jobs=mfa_en_num_jobs,
+                    allow_overwrite=allow_overwrite,
+                    allow_force=allow_force,
                 )
             except Exception as _exc:
                 print(f"  [W{wid}] CRASH {ds_name}/{batch_idx:04d}: {_exc}")
@@ -1600,15 +1789,23 @@ def _execute_staged(
             fail_list.extend(w_fails)
     proc_elapsed = time.time() - t_proc_start
 
-    # Checkpoint datasets that completed in Phase 2
+    # Record datasets that passed Phase 2 processing (NOT yet published).
+    # Checkpoint is deferred until Phase 3 upload+merge succeeds.
+    _phase2_ok: set[str] = set()
+    _phase2_fail: set[str] = set()
     for ds_name in list(ds_batch_tracker.keys()):
         t = ds_batch_tracker[ds_name]
         if t["done"] + t["fail"] >= t["total"]:
             if t["fail"] == 0:
-                completed_set.add(ds_name)
+                _phase2_ok.add(ds_name)
             else:
+                _phase2_fail.add(ds_name)
                 failed_set.add(ds_name)
+    # Save interim progress (Phase 2 done, not yet Phase 3)
     _save_checkpoint(ckpt_path, completed_set, failed_set)
+    if _phase2_fail:
+        print(f"  PHASE 2: {len(_phase2_fail)} datasets FAILED processing,"
+              f" {len(_phase2_ok)} datasets OK (pending upload)")
     print(f"\n  PHASE 2 DONE: {ok_count} datasets OK, "
           f"{n_to_process} batches processed ({proc_elapsed:.0f}s)")
 
@@ -1640,11 +1837,12 @@ def _execute_staged(
     def upload_dataset(ds_name: str, batches: list[tuple[int, Path]]) -> bool:
         nonlocal upload_done
         ok = True
-        for gidx, local_dir in batches:
+        for seq_idx, (gidx, local_dir) in enumerate(batches):
             if not _upload_one_batch(
                 local_dir=local_dir,
                 nas_output_root=nas_output_root,
                 ds_name=ds_name,
+                batch_idx=seq_idx,
             ):
                 ok = False
             _cleanup_one_batch_dir(local_dir)
@@ -1681,10 +1879,13 @@ def _execute_staged(
         if local_dir.exists():
             _cleanup_one_batch_dir(local_dir)
 
-    # Remove failed uploads from completed set
-    for ds_name in upload_failures:
-        completed_set.discard(ds_name)
-        failed_set.add(ds_name)
+    # Only mark datasets as completed if upload succeeded.
+    # Datasets with any upload failure are NOT added to completed_set.
+    for ds_name in _phase2_ok:
+        if ds_name in upload_failures:
+            failed_set.add(ds_name)
+        else:
+            completed_set.add(ds_name)
     _save_checkpoint(ckpt_path, completed_set, failed_set)
 
     total_elapsed = time.time() - t_stage_start
@@ -1694,16 +1895,18 @@ def _execute_staged(
           f"process={proc_elapsed:.0f}s + upload={upload_elapsed:.0f}s "
           f"= {total_elapsed:.0f}s")
 
-    # Recalculate ok_count excluding upload failures
-    ok_count = len([d for d in completed_set
-                    if d not in upload_failures])
+    # Recalculate ok_count based on published datasets
+    ok_count = len([d for d in _phase2_ok if d not in upload_failures])
     fail_list = list(failed_set)
 
     return ok_count, fail_list
 
 
-def run_batch(args) -> None:
-    """Iterate over all datasets from batch cache with checkpoint/resume support."""
+def run_batch(args) -> bool:
+    """Iterate over all datasets from batch cache with checkpoint/resume support.
+
+    Returns True when all datasets complete successfully, False otherwise.
+    """
     import concurrent.futures
 
     cache_path = args.batch_cache
@@ -1797,10 +2000,34 @@ def run_batch(args) -> None:
             print(f"     Use --mfa-jobs {_rec_jobs} for safe memory (~{_rec_jobs * parallel * 1.5:.0f} GB)")
     except ImportError:
         pass
+    # English MFA jobs — read from config directly (smaller job count)
+    _config_mfa_en_jobs = _cfg.get("mfa_en", {}).get("num_jobs", 0) if _cfg else 0
+    if _config_mfa_en_jobs <= 0:
+        _config_mfa_en_jobs = max(1, cpu_count // 16)  # default: fewer for English
+    _effective_mfa_en_jobs = _config_mfa_en_jobs
+    print(f"  MFA EN num_jobs/worker: {_effective_mfa_en_jobs}"
+          f" (config={_config_mfa_en_jobs})")
     # Update config for child processes
     if _cfg:
         _cfg.setdefault("mfa", {})["num_jobs"] = _effective_mfa_jobs
+        _cfg.setdefault("mfa_en", {})["num_jobs"] = _effective_mfa_en_jobs
     args._effective_mfa_jobs = _effective_mfa_jobs
+    args._effective_mfa_en_jobs = _effective_mfa_en_jobs
+
+    # ── Resolve overwrite/force policy ──
+    # CLI --no-overwrite/--no-force override config; default True for backward compat.
+    args._allow_overwrite = (
+        not getattr(args, 'no_overwrite', False)
+        and _cfg.get("pipeline", {}).get("allow_overwrite", True) if _cfg else True
+    )
+    args._allow_force = (
+        not getattr(args, 'no_force', False)
+        and _cfg.get("pipeline", {}).get("allow_force", True) if _cfg else True
+    )
+    if not args._allow_overwrite:
+        print("  --overwrite DISABLED (config or --no-overwrite)")
+    if not args._allow_force:
+        print("  --force DISABLED (config or --no-force)")
 
     print(f"\n{'#'*60}")
     print(f"  BATCH MODE: {len(datasets)} datasets from {cache_path}")
@@ -1829,8 +2056,7 @@ def run_batch(args) -> None:
     print(f"MFA Python: {mfa_python}")
 
     if args.pipelined:
-        run_pipelined_batch(args)
-        return
+        return run_pipelined_batch(args)
 
     if parallel <= 1:
         _run_batch_sequential(args, datasets, cache, ckpt_path, completed_set, failed_set)
@@ -1846,6 +2072,13 @@ def run_batch(args) -> None:
 
     # Phase 1: pre-scan all datasets → build batch task list
     print(f"\n  Pre-scanning {len(datasets)} datasets ...")
+
+    # Load batch-level progress for resume (which batches within each dataset are done)
+    _batch_progress = _load_batch_progress(ckpt_path) if not getattr(args, 'no_resume', False) else {}
+    if _batch_progress:
+        _total_skipped = sum(p.get("done", 0) for p in _batch_progress.values())
+        print(f"  Batch progress: {_total_skipped} batches already done across"
+              f" {len(_batch_progress)} datasets")
 
     # Load scan cache to avoid re-scanning on restart (expensive SMB find_wav calls)
     scan_cache_path = cache_path.with_name(cache_path.stem + ".scan.json")
@@ -1967,14 +2200,24 @@ def run_batch(args) -> None:
         batch_size_eff = args.batch_size
 
         # ── Enqueue ctc_ready batches (complete stems) ──
+        _bp = _batch_progress.get(ds_name, {})
+        _already_done = _bp.get("done", 0)
         if complete_stems:
             batches_ctc = [complete_stems[i:i + batch_size_eff]
                            for i in range(0, len(complete_stems), batch_size_eff)]
+            _skipped_ctc = 0
             for batch_idx, batch_stems in enumerate(batches_ctc):
+                if _already_done > 0:
+                    _already_done -= 1
+                    _skipped_ctc += 1
+                    continue
                 all_batches.append(
                     ("ctc_ready", ds, batch_idx, batch_stems, layout_map, wav_index, None))
             total_stems += len(complete_stems)
-            print(f"  {ds_name}: {len(complete_stems)} stems → {len(batches_ctc)} ctc_ready batches")
+            _info = f"  {ds_name}: {len(complete_stems)} stems → {len(batches_ctc)} ctc_ready batches"
+            if _skipped_ctc:
+                _info += f" (skipped {_skipped_ctc} already done)"
+            print(_info)
 
         # ── Enqueue nvrasr_fallback batches (incomplete stems) ──
         if incomplete_stems:
@@ -1985,12 +2228,20 @@ def run_batch(args) -> None:
                       f"have no reference .txt — NVASR will use ASR-only")
             batches_fb = [incomplete_stems[i:i + batch_size_eff]
                           for i in range(0, len(incomplete_stems), batch_size_eff)]
+            _skipped_fb = 0
             for batch_idx, batch_stems in enumerate(batches_fb):
+                if _already_done > 0:
+                    _already_done -= 1
+                    _skipped_fb += 1
+                    continue
                 all_batches.append(
                     ("nvrasr_fallback", ds, batch_idx, batch_stems,
                      layout_map, incomplete_wav_index, text_index))
             total_incomplete += len(incomplete_stems)
-            print(f"  {ds_name}: {len(incomplete_stems)} stems → {len(batches_fb)} nvrasr_fallback batches")
+            _info = f"  {ds_name}: {len(incomplete_stems)} stems → {len(batches_fb)} nvrasr_fallback batches"
+            if _skipped_fb:
+                _info += f" (skipped {_skipped_fb} already done)"
+            print(_info)
 
         if not complete_stems and not incomplete_stems:
             print(f"  SKIP {ds_name}: no valid stems")
@@ -2046,6 +2297,10 @@ def run_batch(args) -> None:
             mfa_python=mfa_python, models_dir=models_dir,
             parallel=parallel, ds_batch_tracker=ds_batch_tracker,
             batch_size=args.batch_size,
+            mfa_num_jobs=getattr(args, '_effective_mfa_jobs', 0),
+            mfa_en_num_jobs=getattr(args, '_effective_mfa_en_jobs', 0),
+            allow_overwrite=getattr(args, '_allow_overwrite', True),
+            allow_force=getattr(args, '_allow_force', True),
         )
     else:
         # ── STREAMING MODE: interleave prefetch/process/upload per batch ──
@@ -2137,11 +2392,14 @@ def run_batch(args) -> None:
                 fail_list.extend(w_fails)
 
     # ── Final summary ──
+    all_ok = len(fail_list) == 0
     print(f"\n{'#'*60}")
-    print(f"  BATCH COMPLETE: {ok_count}/{len(datasets)} OK")
+    print(f"  BATCH COMPLETE: {ok_count}/{len(datasets)} OK"
+          f"{' — ALL OK' if all_ok else ' — WITH FAILURES'}")
     if fail_list:
         print(f"  Failed: {', '.join(fail_list)}")
     print(f"{'#'*60}")
+    return all_ok
 
 
 def _save_progress(cache_path: Path, cache: dict, ds_name: str, ok: bool):
@@ -2223,6 +2481,8 @@ def _run_gpu_phase(
     batch_size: int, python_path: str | None,
     device: str,
     nas_output_dir: Path | None = None,
+    allow_overwrite: bool = True,
+    allow_force: bool = True,
 ) -> bool:
     """GPU phase: prefetch WAVs + NVASR prealign + normalize -> CTC output.
 
@@ -2265,8 +2525,11 @@ def _run_gpu_phase(
         "--workspace", str(local_workspace),
         "--python", str(mfa_python),
         "--stop-after", "normalize_en",
-        "--overwrite", "--force",
     ]
+    if allow_overwrite:
+        cmd.append("--overwrite")
+    if allow_force:
+        cmd.append("--force")
     if device:
         cmd += ["--device", "cuda:0"]  # CUDA_VISIBLE_DEVICES remaps this
     env = get_mfa_env(mfa_python, models_dir)
@@ -2281,7 +2544,12 @@ def _run_gpu_phase(
         rc = 1
 
     if rc != 0:
-        shutil.rmtree(local_dir, ignore_errors=True)
+        # Preserve failed batch directory for forensic analysis
+        _failed_dir = local_dir.with_name(local_dir.name + ".FAILED")
+        if _failed_dir.exists():
+            shutil.rmtree(_failed_dir, ignore_errors=True)
+        shutil.move(str(local_dir), str(_failed_dir))
+        print(f"  [GPU] Preserved: {_failed_dir}")
         return False
 
     # Persist CTC output to NAS for caching.
@@ -2300,6 +2568,10 @@ def _run_cpu_phase(
     mfa_python: Path, models_dir: Path,
     nas_output: Path,
     batch_size: int, python_path: str | None,
+    mfa_num_jobs: int = 0,
+    mfa_en_num_jobs: int = 0,
+    allow_overwrite: bool = True,
+    allow_force: bool = True,
 ) -> bool:
     """CPU phase: read CTC from local workspace + run MFA align + postprocess.
 
@@ -2375,12 +2647,19 @@ def _run_cpu_phase(
         "--output-dir", str(local_output),
         "--workspace", str(local_workspace),
         "--python", str(mfa_python),
-        "--overwrite", "--force",
     ]
+    if allow_overwrite:
+        cmd.append("--overwrite")
+    if allow_force:
+        cmd.append("--force")
     # GPU phase already did pad_silence → skip to avoid double I/O.
     # If GPU didn't run (e.g. standalone ctc_ready), padded_audio won't exist → keep it.
     if (local_workspace / "padded_audio").exists():
         cmd.append("--skip-pad_silence")
+    if mfa_num_jobs > 0:
+        cmd += ["--mfa-jobs", str(mfa_num_jobs)]
+    if mfa_en_num_jobs > 0:
+        cmd += ["--mfa-en-jobs", str(mfa_en_num_jobs)]
     env = get_mfa_env(mfa_python, models_dir)
     try:
         rc = subprocess.run(cmd, env=env, timeout=7200, capture_output=False).returncode
@@ -2390,10 +2669,16 @@ def _run_cpu_phase(
     if rc != 0:
         # Preserve CTC cache even on failure
         _persist_ctc_adj_cache(local_workspace, nas_output)
-        shutil.rmtree(local_dir, ignore_errors=True)
+        # Preserve failed batch directory for forensic analysis
+        _failed_dir = local_dir.with_name(local_dir.name + ".FAILED")
+        if _failed_dir.exists():
+            shutil.rmtree(_failed_dir, ignore_errors=True)
+        shutil.move(str(local_dir), str(_failed_dir))
+        print(f"  [CPU] Preserved: {_failed_dir}")
         return False
 
     # ── Upload results to NAS ──
+    _upload_ok = True
     for local_src, nas_rel in [
         (local_output, nas_output / "output"),
         (local_workspace / "filtered", nas_output / "filtered"),
@@ -2409,11 +2694,14 @@ def _run_cpu_phase(
                     [rsync, "-a", str(local_src) + "/", str(nas_rel) + "/"],
                     capture_output=True, text=True, timeout=300).returncode
                 if rc != 0:
-                    print(f"  WARNING: rsync failed (rc={rc}) for {local_src} → {nas_rel}")
+                    print(f"  ERROR: rsync failed (rc={rc}) for {local_src} → {nas_rel}")
+                    _upload_ok = False
             except subprocess.TimeoutExpired:
-                print(f"  WARNING: rsync timed out for {local_src} → {nas_rel}")
+                print(f"  ERROR: rsync timed out for {local_src} → {nas_rel}")
+                _upload_ok = False
             except Exception as e:
-                print(f"  WARNING: rsync error for {local_src}: {e}")
+                print(f"  ERROR: rsync error for {local_src}: {e}")
+                _upload_ok = False
         else:
             try:
                 for f in local_src.rglob("*"):
@@ -2423,14 +2711,20 @@ def _run_cpu_phase(
                         tgt.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(str(f), str(tgt))
             except Exception as e:
-                print(f"  WARNING: upload copy error for {local_src}: {e}")
+                print(f"  ERROR: upload copy error for {local_src}: {e}")
+                _upload_ok = False
+
+    if not _upload_ok:
+        # Preserve local directory for forensic analysis
+        print(f"  [CPU] Upload failed — preserving {local_dir}")
+        return False
 
     # Cleanup
     shutil.rmtree(local_dir, ignore_errors=True)
     return True
 
 
-def run_pipelined_batch(args) -> None:
+def run_pipelined_batch(args) -> bool:
     """Pipelined GPU/CPU mode: NVASR and MFA run in parallel stages.
 
     GPU workers:  prefetch WAVs → NVASR prealign + normalize → CTC output
@@ -2502,20 +2796,17 @@ def run_pipelined_batch(args) -> None:
         if "stems" in ds:
             all_stems = list(ds["stems"])
             layout_map = {s: "flat" for s in all_stems}
-            wav_index = {}
-            for s in all_stems:
-                w = find_wav(nas_audio, s)
-                if w:
-                    wav_index[s] = w
+            wav_index = _index_wavs_for_stems(nas_audio, all_stems)
             all_stems = [s for s in all_stems if s in wav_index]
             print(f"  {ds_name}: {len(all_stems)} stems (from override)")
         else:
-            _ctc_flat, _ctc_nested = build_ctc_presence(nas_ctc)
-            if _ctc_flat or _ctc_nested:
-                complete_stems, incomplete_stems, layout_map, wav_index = \
-                    discover_stems_separated(nas_ctc, nas_audio, require_all=True)
-                all_stems = complete_stems + incomplete_stems
-            if not (_ctc_flat or _ctc_nested) or not all_stems:
+            # ``discover_stems_separated`` already performs the CTC presence
+            # scan.  Avoid a second identical directory listing here; an empty
+            # result still falls through to the raw-audio discovery path.
+            complete_stems, incomplete_stems, layout_map, wav_index = \
+                discover_stems_separated(nas_ctc, nas_audio, require_all=True)
+            all_stems = complete_stems + incomplete_stems
+            if not all_stems:
                 # Raw audio: discover all WAVs (CTC dir empty or no .lab files found)
                 all_stems = []
                 layout_map = {}
@@ -2601,6 +2892,8 @@ def run_pipelined_batch(args) -> None:
                 batch_size=args.batch_size, python_path=args.python,
                 device=device_str,
                 nas_output_dir=nas_output_root / ds_name,
+                allow_overwrite=getattr(args, '_allow_overwrite', True),
+                allow_force=getattr(args, '_allow_force', True),
             )
             if ok:
                 cpu_queue.put((ds, batch_idx, batch_stems, local_base))
@@ -2637,6 +2930,10 @@ def run_pipelined_batch(args) -> None:
                 mfa_python=mfa_python, models_dir=models_dir,
                 nas_output=nas_output,
                 batch_size=args.batch_size, python_path=args.python,
+                mfa_num_jobs=getattr(args, '_effective_mfa_jobs', 0),
+                mfa_en_num_jobs=getattr(args, '_effective_mfa_en_jobs', 0),
+                allow_overwrite=getattr(args, '_allow_overwrite', True),
+                allow_force=getattr(args, '_allow_force', True),
             )
             with ckpt_lock:
                 tracker = ds_tracker[ds_name]
@@ -2677,11 +2974,14 @@ def run_pipelined_batch(args) -> None:
             ok_count += w_ok
             fail_list.extend(w_fails)
 
+    all_ok = len(fail_list) == 0
     print(f"\n{'#'*60}")
-    print(f"  PIPELINED BATCH COMPLETE: {ok_count}/{len(all_datasets)} OK")
+    print(f"  PIPELINED BATCH COMPLETE: {ok_count}/{len(all_datasets)} OK"
+          f"{' — ALL OK' if all_ok else ' — WITH FAILURES'}")
     if fail_list:
         print(f"  Failed: {', '.join(fail_list)}")
     print(f"{'#'*60}")
+    return all_ok
 
 
 if __name__ == "__main__":

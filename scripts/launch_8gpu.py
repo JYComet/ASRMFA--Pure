@@ -97,8 +97,22 @@ def launch_shard(
         "--skip-normalize_punct", "--skip-normalize",
         "--skip-normalize_ria", "--skip-normalize_en",
         "--skip-adjust",
-        "--overwrite", "--force",
     ]
+    # Respect config: only add --overwrite/--force if allowed
+    _allow_overwrite = True
+    _allow_force = True
+    if config_path.exists():
+        try:
+            import yaml as _yaml
+            _cfg = _yaml.safe_load(config_path.read_text(encoding='utf-8')) or {}
+            _allow_overwrite = _cfg.get("pipeline", {}).get("allow_overwrite", True)
+            _allow_force = _cfg.get("pipeline", {}).get("allow_force", True)
+        except Exception:
+            pass
+    if _allow_overwrite:
+        cmd.append("--overwrite")
+    if _allow_force:
+        cmd.append("--force")
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(shard_id)

@@ -249,6 +249,26 @@ def build_file_index(root: Path, suffix: str) -> dict[str, Path]:
     return index
 
 
+def build_flat_file_names(root: Path, suffix: str) -> set[str]:
+    """Return matching top-level file names with one directory scan.
+
+    This deliberately does not recurse or fall back to ``find``: callers use
+    it for flat-layout manifests where a nested file must not satisfy the
+    manifest's ``{stem}{suffix}`` contract.  ``DirEntry.is_file`` preserves
+    the previous ``Path.is_file`` symlink-following behavior while reducing
+    one metadata syscall per expected stem to a single ``scandir`` pass.
+    """
+    names: set[str] = set()
+    try:
+        with os.scandir(str(root)) as entries:
+            for entry in entries:
+                if entry.is_file() and entry.name.endswith(suffix):
+                    names.add(entry.name[:-len(suffix)])
+    except OSError:
+        pass
+    return names
+
+
 def count_files_fast(dirpath: Path, suffix: str, max_count: int = 10000) -> int:
     """Count files ending with *suffix*, bailing at *max_count*."""
     n = 0
@@ -598,6 +618,51 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_publish_accounting(src: Path, strict_manifest_path: Path) -> list[str]:
+    """Validate frozen v2 accounting and strict membership before publishing."""
+    try:
+        manifest = json.loads(strict_manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return [f"strict manifest unreadable: {exc}"]
+    binding = manifest.get("pipeline_accounting_receipt")
+    if not isinstance(binding, dict):
+        return ["pipeline accounting receipt binding missing"]
+    if binding.get("schema") != PIPELINE_ACCOUNTING_SCHEMA:
+        return ["pipeline accounting receipt must be v2"]
+    raw_path = binding.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return ["pipeline accounting receipt path missing"]
+    receipt_path = Path(raw_path)
+    try:
+        if receipt_path.is_symlink() or not receipt_path.is_file():
+            return ["pipeline accounting receipt is not a regular file"]
+        receipt = read_pipeline_accounting_receipt(receipt_path)
+        if binding.get("sha256") != _sha256_file(receipt_path):
+            return ["pipeline accounting receipt hash mismatch"]
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return [f"pipeline accounting receipt invalid: {exc}"]
+    errors = validate_pipeline_accounting_receipt(receipt)
+    if errors:
+        return [f"pipeline accounting receipt invalid: {error}" for error in errors]
+    try:
+        expected_raw = manifest["expected_stems"]
+        ok_raw = manifest["ok"]
+        rejected_raw = manifest["rejected"]
+        expected = set(_accounting_stems(expected_raw, "strict expected_stems"))
+        strict_ok = {entry["stem"] for entry in ok_raw}
+        strict_rejected = set(rejected_raw)
+    except (KeyError, TypeError, ValueError) as exc:
+        return [f"strict accounting evidence malformed: {exc}"]
+    eligible = set(receipt["eligible"]["stems"])
+    output = set(receipt["output"]["stems"])
+    filtered = set(receipt["filtered"]["stems"])
+    if expected != eligible:
+        return ["strict expected stems do not equal receipt eligible stems"]
+    if strict_ok != output or strict_rejected != filtered:
+        return ["strict output/rejected sets do not equal receipt output/filtered"]
+    return []
+
+
 def publish_output_versioned(src: Path, dst: Path) -> bool:
     """Publish validated staging to a new, empty versioned destination.
 
@@ -616,6 +681,10 @@ def publish_output_versioned(src: Path, dst: Path) -> bool:
         return False
     if not dst.parent.name.endswith(".runs"):
         print(f"  Refusing non-versioned strict publish target: {dst}")
+        return False
+    accounting_errors = _validate_publish_accounting(src, src / "strict_ok_manifest.json")
+    if accounting_errors:
+        print("  Refusing publish: " + "; ".join(accounting_errors))
         return False
     try:
         from verify_strict_ok import verify as _verify_strict_ok
@@ -960,9 +1029,17 @@ def is_unknown_token(token: str) -> bool:
 
 
 def is_english_token(token: str) -> bool:
-    """Token is English alpha: not NVV, not CJK, not pinyin syllable with tone."""
+    """Token is an English lexical token, including hyphenated spellings."""
     if not token or not token.isalpha():
-        return False
+        # Hyphens are lexical inside forms such as ``K-Pop`` and ``V-up``;
+        # reject leading/trailing/repeated hyphens so punctuation is not
+        # accidentally classified as an English word.
+        if (not token or token[0] == '-' or token[-1] == '-'
+                or '--' in token
+                or not all(ch.isascii() and (ch.isalpha() or ch == '-')
+                           for ch in token)
+                or not any(ch.isalpha() for ch in token)):
+            return False
     if not token.isascii():
         return False
     if is_unknown_token(token):
@@ -1865,3 +1942,410 @@ def validate_strict_mfa_textgrid(
         errors.append(f"I/O error: {exc}")
 
     return errors
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Pipeline run receipt — R1/R7 denominator & output path contract
+# ═══════════════════════════════════════════════════════════════════
+
+_PIPELINE_RECEIPT_SCHEMA = "pipeline-run-receipt-v1"
+
+
+def make_pipeline_run_id() -> str:
+    """Generate a unique, sortable run ID for output isolation."""
+    import time as _time
+    return f"{_time.strftime('%Y%m%dT%H%M%SZ', _time.gmtime())}_{os.getpid()}"
+
+
+def write_pipeline_run_receipt(
+    output_dir: Path,
+    run_id: str,
+    mode: str,
+    route: list[str],
+    input_stems: list[str],
+    output_stems: list[str],
+    filtered_stems: list[str],
+    failed_steps: list[str],
+    actual_output_path: Path,
+    actual_filtered_path: Path,
+    extra: dict | None = None,
+) -> dict:
+    """Atomically write a pipeline run receipt binding all output paths.
+
+    The receipt proves what stems went in, what came out, what was filtered,
+    and what failed — forming the denominator-conservation proof (R1).
+
+    Returns the receipt dict.
+    """
+    import time as _time
+    receipt: dict = {
+        "schema": _PIPELINE_RECEIPT_SCHEMA,
+        "run_id": run_id,
+        "timestamp_utc": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+        "mode": mode,
+        "route": route,
+        "input_stems": sorted(input_stems),
+        "input_count": len(input_stems),
+        "output_stems": sorted(output_stems),
+        "output_count": len(output_stems),
+        "filtered_stems": sorted(filtered_stems),
+        "filtered_count": len(filtered_stems),
+        "failed_steps": failed_steps,
+        "paths": {
+            "output": str(actual_output_path),
+            "filtered": str(actual_filtered_path),
+        },
+    }
+    if extra:
+        receipt["extra"] = extra
+    receipt_path = output_dir / ".pipeline_run_receipt.json"
+    tmp = receipt_path.with_name(".pipeline_run_receipt.json.tmp")
+    tmp.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, receipt_path)
+    return receipt
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Source-denominator accounting contract (v2)
+# ═══════════════════════════════════════════════════════════════════
+
+# v1 receipts contain only counts inferred from whichever directories happened
+# to exist at the end of a run.  They are deliberately not upgraded here: a
+# complete source denominator requires frozen stem evidence and explicit
+# exclusions.  Consumers that need a resumable/strict receipt must use v2.
+PIPELINE_ACCOUNTING_SCHEMA = "pipeline-run-receipt-v2"
+PIPELINE_ACCOUNTING_RECEIPT_NAME = ".pipeline_run_receipt_v2.json"
+_ACCOUNTING_REASONS_DISALLOWED = {
+    "filtered", "quality_rejection", "processed_quality_rejection",
+}
+
+
+def _accounting_stems(value: object, field: str) -> list[str]:
+    """Normalize and validate a stem sequence without silently deduplicating."""
+    if not isinstance(value, (list, tuple, set)):
+        raise ValueError(f"{field} must be a stem sequence")
+    stems = list(value)
+    if any(not isinstance(stem, str) or not stem or Path(stem).name != stem
+           for stem in stems):
+        raise ValueError(f"{field} contains invalid stem")
+    if len(stems) != len(set(stems)):
+        raise ValueError(f"{field} contains duplicate stems")
+    return sorted(stems)
+
+
+def _accounting_digest(stems: list[str]) -> str:
+    return _stable_json_digest(stems)
+
+
+def _normalize_exclusions(exclusions: object) -> list[dict[str, str]]:
+    """Accept mapping, ``(stem, reason)`` pairs, or row dictionaries."""
+    if exclusions is None:
+        return []
+    rows: list[dict[str, str]] = []
+    if isinstance(exclusions, dict):
+        iterable = exclusions.items()
+    else:
+        iterable = exclusions
+    try:
+        for item in iterable:  # type: ignore[union-attr]
+            if isinstance(item, dict):
+                stem, reason = item.get("stem"), item.get("reason")
+                extra = set(item) - {"stem", "reason"}
+                if extra:
+                    raise ValueError(f"exclusion has unknown fields: {sorted(extra)}")
+            else:
+                try:
+                    stem, reason = item
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("exclusions must contain stem/reason pairs") from exc
+            if (not isinstance(stem, str) or not stem
+                    or Path(stem).name != stem):
+                raise ValueError(f"invalid exclusion stem: {stem!r}")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError(f"invalid exclusion reason for {stem!r}")
+            reason = reason.strip()
+            if reason in _ACCOUNTING_REASONS_DISALLOWED:
+                raise ValueError(
+                    f"processed quality rejection belongs in filtered, not exclusions: {stem}")
+            rows.append({"stem": stem, "reason": reason})
+    except TypeError as exc:
+        raise ValueError("exclusions must be a mapping or sequence") from exc
+    if len({row["stem"] for row in rows}) != len(rows):
+        raise ValueError("exclusions contain duplicate stems")
+    return sorted(rows, key=lambda row: row["stem"])
+
+
+def _normalize_shards(shards: object) -> list[dict[str, object]]:
+    if not isinstance(shards, list):
+        raise ValueError("shards must be a list")
+    normalized: list[dict[str, object]] = []
+    ids: set[str] = set()
+    for index, shard in enumerate(shards):
+        if not isinstance(shard, dict):
+            raise ValueError(f"shard {index} must be an object")
+        shard_id = shard.get("shard_id", str(index))
+        if not isinstance(shard_id, str) or not shard_id:
+            raise ValueError(f"shard {index} has invalid shard_id")
+        if shard_id in ids:
+            raise ValueError(f"duplicate shard_id: {shard_id}")
+        ids.add(shard_id)
+        stems = _accounting_stems(shard.get("stems"), f"shard {index}")
+        normalized.append({
+            "shard_id": shard_id,
+            "count": len(stems),
+            "stems": stems,
+            "stems_digest": _accounting_digest(stems),
+        })
+    return normalized
+
+
+def classify_receipt_accounting(receipt: dict) -> dict[str, object]:
+    """Return derived loss/health fields after validating a v2 receipt.
+
+    ``silent_loss`` is the number of source stems that are neither explicitly
+    excluded nor present in output/filtered.  A healthy run has zero silent
+    loss and no accounting violations.
+    """
+    errors = validate_pipeline_accounting_receipt(receipt, check_derived=False)
+    source_raw = receipt.get("source")
+    eligible_raw = receipt.get("eligible")
+    output_raw = receipt.get("output")
+    filtered_raw = receipt.get("filtered")
+    source = set(source_raw.get("stems", [])) if isinstance(source_raw, dict) else set()
+    eligible = (set(eligible_raw.get("stems", []))
+                if isinstance(eligible_raw, dict) else set())
+    output = set(output_raw.get("stems", [])) if isinstance(output_raw, dict) else set()
+    filtered = (set(filtered_raw.get("stems", []))
+                if isinstance(filtered_raw, dict) else set())
+    exclusions_raw = receipt.get("exclusions", [])
+    excluded = {row.get("stem") for row in exclusions_raw
+                if isinstance(row, dict)}
+    silent = len(source - eligible - excluded)
+    health = "healthy" if not errors and silent == 0 else "accounting_error"
+    return {
+        "silent_loss": silent,
+        "run_health": health,
+        "source_count": len(source),
+        "eligible_count": len(eligible),
+        "excluded_count": len(excluded),
+        "output_count": len(output),
+        "filtered_count": len(filtered),
+    }
+
+
+def make_pipeline_accounting_receipt(
+    source_stems: list[str],
+    eligible_stems: list[str],
+    exclusions: object,
+    output_stems: list[str],
+    filtered_stems: list[str],
+    *,
+    run_id: str = "",
+    mode: str = "",
+    route: list[str] | None = None,
+    paths: dict[str, str] | None = None,
+    shards: list[dict] | None = None,
+    extra: dict | None = None,
+) -> dict:
+    """Build a machine-readable v2 source-denominator receipt.
+
+    Stems are frozen evidence, not inferred from counts.  Validation is run
+    before returning so callers cannot write an internally inconsistent
+    receipt.  ``missing_reference`` is an ordinary explicit exclusion reason;
+    processed quality failures must be represented by ``filtered_stems``.
+    """
+    source = _accounting_stems(source_stems, "source_stems")
+    eligible = _accounting_stems(eligible_stems, "eligible_stems")
+    output = _accounting_stems(output_stems, "output_stems")
+    filtered = _accounting_stems(filtered_stems, "filtered_stems")
+    exclusion_rows = _normalize_exclusions(exclusions)
+    exclusions_by_reason: dict[str, list[str]] = {}
+    for row in exclusion_rows:
+        exclusions_by_reason.setdefault(row["reason"], []).append(row["stem"])
+    def bucket(stems: list[str]) -> dict[str, object]:
+        return {"count": len(stems), "stems": stems,
+                "stems_digest": _accounting_digest(stems)}
+    receipt: dict[str, object] = {
+        "schema": PIPELINE_ACCOUNTING_SCHEMA,
+        "run_id": run_id,
+        "mode": mode,
+        "route": list(route or []),
+        "source": bucket(source),
+        "eligible": bucket(eligible),
+        "exclusions": exclusion_rows,
+        "exclusions_by_reason": {
+            reason: sorted(stems)
+            for reason, stems in sorted(exclusions_by_reason.items())
+        },
+        "output": bucket(output),
+        "filtered": bucket(filtered),
+        "paths": dict(paths or {}),
+    }
+    if shards is not None:
+        receipt["shards"] = _normalize_shards(shards)
+    if extra:
+        receipt["extra"] = dict(extra)
+    derived = classify_receipt_accounting(receipt)
+    receipt["derived"] = derived
+    # Flat count aliases make the contract convenient for shell/audit callers.
+    receipt.update(derived)
+    errors = validate_pipeline_accounting_receipt(receipt)
+    if errors:
+        raise ValueError("invalid accounting receipt: " + "; ".join(errors))
+    return receipt
+
+
+def validate_pipeline_accounting_receipt(
+    receipt: dict, *, check_derived: bool = True,
+    expected_shard_stems: list[str] | None = None,
+) -> list[str]:
+    """Return diagnostics for a v2 receipt (empty means valid).
+
+    Validation rejects duplicate/cross-shard stems, overlap between accounting
+    buckets, stale digest evidence, and any source stem that disappears.  A v1
+    receipt is always rejected; callers may inspect it separately but must not
+    promote it by inference.
+    """
+    errors: list[str] = []
+    if not isinstance(receipt, dict):
+        return ["receipt must be an object"]
+    if receipt.get("schema") != PIPELINE_ACCOUNTING_SCHEMA:
+        return ["receipt schema is not pipeline-run-receipt-v2"]
+    buckets: dict[str, set[str]] = {}
+    for name in ("source", "eligible", "output", "filtered"):
+        raw = receipt.get(name)
+        if not isinstance(raw, dict):
+            errors.append(f"{name} bucket missing")
+            continue
+        try:
+            stems = _accounting_stems(raw.get("stems"), name)
+        except ValueError as exc:
+            errors.append(str(exc)); continue
+        buckets[name] = set(stems)
+        if raw.get("count") != len(stems):
+            errors.append(f"{name} count mismatch")
+        if raw.get("stems_digest") != _accounting_digest(stems):
+            errors.append(f"{name} stems digest mismatch")
+    exclusions = receipt.get("exclusions")
+    try:
+        rows = _normalize_exclusions(exclusions)
+    except ValueError as exc:
+        errors.append(str(exc)); rows = []
+    excluded = {row["stem"] for row in rows}
+    grouped: dict[str, list[str]] = {}
+    for row in rows:
+        grouped.setdefault(row["reason"], []).append(row["stem"])
+    grouped = {reason: sorted(stems)
+               for reason, stems in sorted(grouped.items())}
+    if "exclusions_by_reason" in receipt:
+        raw_grouped = receipt.get("exclusions_by_reason")
+        if raw_grouped != grouped:
+            errors.append("exclusions_by_reason mismatch")
+    if "source" in buckets and not excluded <= buckets["source"]:
+        errors.append("exclusion stem absent from source")
+    if "source" in buckets and "eligible" in buckets:
+        if buckets["eligible"] & excluded:
+            errors.append("eligible/exclusion overlap")
+        if buckets["source"] != buckets["eligible"] | excluded:
+            errors.append("source != eligible disjoint-union exclusions")
+    if "eligible" in buckets and "output" in buckets and "filtered" in buckets:
+        if buckets["output"] & buckets["filtered"]:
+            errors.append("output/filtered overlap")
+        if buckets["output"] | buckets["filtered"] != buckets["eligible"]:
+            errors.append("eligible != output disjoint-union filtered")
+    shards = receipt.get("shards")
+    if shards is not None:
+        if not isinstance(shards, list):
+            errors.append("shards must be a list")
+        else:
+            union: set[str] = set()
+            shard_ids: set[str] = set()
+            for index, shard in enumerate(shards):
+                if not isinstance(shard, dict):
+                    errors.append(f"shard {index} must be an object"); continue
+                try:
+                    shard_stems = set(_accounting_stems(shard.get("stems"),
+                                                        f"shard {index}"))
+                except ValueError as exc:
+                    errors.append(str(exc)); continue
+                shard_id = shard.get("shard_id", str(index))
+                if not isinstance(shard_id, str) or not shard_id:
+                    errors.append(f"shard {index} has invalid shard_id")
+                elif shard_id in shard_ids:
+                    errors.append(f"duplicate shard_id: {shard_id}")
+                else:
+                    shard_ids.add(shard_id)
+                duplicate = union & shard_stems
+                if duplicate:
+                    errors.append(f"cross-shard duplicate stems: {sorted(duplicate)}")
+                union |= shard_stems
+                if "count" not in shard or shard.get("count") != len(shard_stems):
+                    errors.append(f"shard {index} count mismatch")
+                digest = shard.get("stems_digest")
+                if digest != _accounting_digest(sorted(shard_stems)):
+                    errors.append(f"shard {index} stems digest mismatch")
+            if expected_shard_stems is not None:
+                try:
+                    expected = set(_accounting_stems(expected_shard_stems,
+                                                     "expected_shard_stems"))
+                except ValueError as exc:
+                    errors.append(str(exc)); expected = set()
+            else:
+                expected = buckets.get("eligible", set())
+            if union != expected:
+                errors.append("shard union does not exactly match expected stems")
+    if check_derived:
+        expected = classify_receipt_accounting(receipt)
+        if receipt.get("derived") != expected:
+            errors.append("derived accounting mismatch")
+        for key, value in expected.items():
+            if receipt.get(key) != value:
+                errors.append(f"flat derived field mismatch: {key}")
+    return errors
+
+
+def write_pipeline_accounting_receipt(
+    path: Path, receipt: dict | None = None, **kwargs: object,
+) -> dict:
+    """Atomically write a v2 receipt and return its canonical payload.
+
+    ``path`` may be a receipt filename or an output directory.  Passing no
+    *receipt* builds one from the keyword arguments accepted by
+    :func:`make_pipeline_accounting_receipt`.
+    """
+    if receipt is None:
+        receipt = make_pipeline_accounting_receipt(**kwargs)  # type: ignore[arg-type]
+    errors = validate_pipeline_accounting_receipt(receipt)
+    if errors:
+        raise ValueError("invalid accounting receipt: " + "; ".join(errors))
+    target = (path / PIPELINE_ACCOUNTING_RECEIPT_NAME
+              if path.is_dir() or path.suffix == "" else path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, target)
+    return receipt
+
+
+def read_pipeline_accounting_receipt(
+    path: Path, *, allow_legacy: bool = False,
+) -> dict:
+    """Read a v2 receipt; v1 is rejected unless explicitly requested."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema") != PIPELINE_ACCOUNTING_SCHEMA:
+        if allow_legacy and payload.get("schema") == _PIPELINE_RECEIPT_SCHEMA:
+            return payload
+        raise ValueError("legacy or unknown receipt schema; v1 cannot be promoted")
+    errors = validate_pipeline_accounting_receipt(payload)
+    if errors:
+        raise ValueError("invalid accounting receipt: " + "; ".join(errors))
+    return payload
+
+
+# Explicit aliases used by lightweight verifiers and downstream runners.
+make_receipt_accounting = make_pipeline_accounting_receipt
+validate_receipt_accounting = validate_pipeline_accounting_receipt
+read_receipt_accounting = read_pipeline_accounting_receipt
+write_receipt_accounting = write_pipeline_accounting_receipt
