@@ -59,6 +59,49 @@ ALLOWED_PUNCT = set(ALLOWED_PUNCT_CJK + ALLOWED_PUNCT_ASCII)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+def validate_selected_stems_manifest(path: Path, expected: set[str]) -> str:
+    """Validate shard denominator metadata and return its content digest."""
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"selected stem manifest missing/unsafe: {path}")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if lines != sorted(set(lines)) or set(lines) != set(expected):
+        raise ValueError(f"selected stem manifest mismatch: {path}")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def validate_shard_accounting_receipt(path: Path, expected: set[str],
+                                      eligible_universe: set[str]) -> None:
+    """Validate a child receipt before quarantining it during all-GPU merge.
+
+    A child sees the complete input directory, so its source/eligible buckets
+    describe the parent universe while its output/processed buckets must be
+    exactly the stems assigned to that shard.  The child receipt is evidence,
+    not a merge artifact: the parent writes the sole authoritative receipt.
+    """
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"shard accounting receipt missing/unsafe: {path}")
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"invalid shard accounting receipt JSON: {path}") from exc
+    errors = validate_pipeline_accounting_receipt(receipt)
+    if errors:
+        raise ValueError(
+            f"invalid shard accounting receipt: {path}: {'; '.join(errors)}"
+        )
+    if receipt.get("mode") != "ctc_prealign":
+        raise ValueError(f"shard accounting mode mismatch: {path}")
+    if set(receipt["eligible"]["stems"]) != set(eligible_universe):
+        raise ValueError(f"shard accounting eligible universe mismatch: {path}")
+    if set(receipt["output"]["stems"]) != set(expected):
+        raise ValueError(f"shard accounting output mismatch: {path}")
+    processed = receipt.get("extra", {}).get("processed_stems")
+    if not isinstance(processed, list) or set(processed) != set(expected):
+        raise ValueError(f"shard accounting processed stems mismatch: {path}")
+
+
 # ═══════════════════════════════════════════════════════════════
 # 拼音映射 (汉字 → 拼音音节)
 # ═══════════════════════════════════════════════════════════════
@@ -1199,6 +1242,8 @@ def main():
                         help="限制处理数量, 0=全部")
     parser.add_argument("--offset", type=int, default=0,
                         help="跳过前 N 个文件 (配合 --limit 实现多 GPU 分片)")
+    parser.add_argument("--stems-file", type=Path, default=None,
+                        help="Frozen eligible stem manifest; disables implicit slicing")
     parser.add_argument("--all-gpus", action="store_true",
                         help="自动检测所有 GPU 并均匀分片并行处理")
     parser.add_argument("--overwrite", action="store_true")
@@ -1279,6 +1324,12 @@ def main():
             if _all_exclusions:
                 print(f"  Frozen source: {len(_source_wavs)} WAVs; "
                       f"eligible={len(all_wavs)}, exclusions={len(_all_exclusions)}")
+            # Apply operator offset/limit to the frozen eligible denominator
+            # before shard construction, never inside each child.
+            if args.offset > 0:
+                all_wavs = all_wavs[args.offset:]
+            if args.limit > 0:
+                all_wavs = all_wavs[:args.limit]
             total = len(all_wavs)
             if total == 0:
                 print("ERROR: no eligible WAVs with authoritative references", file=sys.stderr)
@@ -1342,9 +1393,11 @@ def main():
                 child_argv += [
                     "--device", "cuda:0",
                     "--output-dir", str(shard_dir),
-                    "--offset", str(offset),
-                    "--limit", str(limit),
                 ]
+                shard_manifest = shard_dir / "selected_stems.txt"
+                shard_stems = [p.stem for p in all_wavs[offset:offset + limit]]
+                shard_manifest.write_text("\n".join(sorted(shard_stems)) + "\n", encoding="utf-8")
+                child_argv += ["--stems-file", str(shard_manifest)]
                 # Copy dict to shard dir (avoids concurrent write races on shared dict)
                 if args.dict_path:
                     shard_dict = shard_dir / args.dict_path.name
@@ -1391,6 +1444,7 @@ def main():
             _preflight_shards = []
             _seen_shard_stems: set[str] = set()
             _expected_all_stems: set[str] = set()
+            _selected_manifest_digests: dict[str, str] = {}
             for _gpu_id, _, _shard_dir in _procs:
                 _start = _gpu_id * per_gpu
                 _expected = {p.stem for p in all_wavs[_start:_start + per_gpu]}
@@ -1398,7 +1452,7 @@ def main():
                 _allowed = {s + suffix for s in _expected for suffix in _artifact_suffixes}
                 _allowed |= {"manifest.json", "summary.txt", ".ctc_normalized",
                              ".ctc_run_receipt.json",
-                             ".pipeline_run_receipt_v2.json"}
+                             ".pipeline_run_receipt_v2.json", "selected_stems.txt"}
                 if args.dict_path:
                     _allowed.add(args.dict_path.name)
                 _files = list(_shard_dir.iterdir())
@@ -1406,6 +1460,20 @@ def main():
                     raise RuntimeError(f"shard contains non-regular artifact: {_shard_dir}")
                 if {p.name for p in _files} != _allowed:
                     raise RuntimeError(f"shard namespace mismatch: {_shard_dir}")
+                _selected_path = _shard_dir / "selected_stems.txt"
+                try:
+                    _selected_manifest_digests[_shard_dir.name] = validate_selected_stems_manifest(
+                        _selected_path, _expected)
+                except (OSError, ValueError) as _exc:
+                    raise RuntimeError(str(_exc)) from _exc
+                try:
+                    validate_shard_accounting_receipt(
+                        _shard_dir / ".pipeline_run_receipt_v2.json",
+                        _expected,
+                        {p.stem for p in all_wavs},
+                    )
+                except (OSError, ValueError) as _exc:
+                    raise RuntimeError(str(_exc)) from _exc
                 try:
                     _shard_manifest = _json.loads(
                         (_shard_dir / "manifest.json").read_text(encoding="utf-8"))
@@ -1472,7 +1540,7 @@ def main():
                 for _f in _shard_dir.iterdir():
                     if _f.name in {"manifest.json", "summary.txt",
                                    ".ctc_normalized", ".ctc_run_receipt.json",
-                                   ".pipeline_run_receipt_v2.json"}:
+                                   ".pipeline_run_receipt_v2.json", "selected_stems.txt"}:
                         continue
                     if (args.output_dir / _f.name).exists() or (args.output_dir / _f.name).is_symlink():
                         raise FileExistsError(f"all-GPU target collision: {args.output_dir / _f.name}")
@@ -1512,6 +1580,10 @@ def main():
                             pass  # parent marker is published last, after full validation
                         elif _f.name == ".ctc_run_receipt.json":
                             pass  # parent receipt is published last, after full validation
+                        elif _f.name == ".pipeline_run_receipt_v2.json":
+                            pass  # validated child evidence remains quarantined
+                        elif _f.name == "selected_stems.txt":
+                            pass  # shard denominator metadata remains quarantined
                         elif args.dict_path and _f.name == args.dict_path.name:
                             pass  # skip shard-local dict copy
                         else:
@@ -1635,7 +1707,8 @@ def main():
                     route=["ctc_prealign", "all_gpus"],
                     paths={"output": str(args.output_dir), "filtered": str(args.output_dir)},
                     shards=_shard_rows,
-                    extra={"source_frozen": True, "reference_only": True},
+                    extra={"source_frozen": True, "reference_only": True,
+                           "selected_stems_manifest_sha256": _selected_manifest_digests},
                 )
                 write_pipeline_accounting_receipt(_merge_output_dir, _accounting)
                 _partial_output_dir = args.output_dir.parent / (
@@ -1692,6 +1765,19 @@ def main():
     if not wav_files:
         print("ERROR: 所有音频均无可用权威参考文本", file=sys.stderr)
         return 2
+    if args.stems_file:
+        try:
+            selected = [line.strip() for line in args.stems_file.read_text(encoding="utf-8").splitlines()]
+            if not selected or selected != sorted(set(selected)):
+                raise ValueError("stems file must be sorted and unique")
+            available = {p.stem: p for p in wav_files}
+            missing = [stem for stem in selected if stem not in available]
+            if missing:
+                raise ValueError(f"stems file contains unavailable stems: {missing[:5]}")
+            wav_files = [available[stem] for stem in selected]
+        except (OSError, ValueError) as exc:
+            print(f"ERROR: invalid --stems-file: {exc}", file=sys.stderr)
+            return 2
     # Apply offset/limit AFTER filtering so they count processable stems
     if args.offset > 0:
         wav_files = wav_files[args.offset:]

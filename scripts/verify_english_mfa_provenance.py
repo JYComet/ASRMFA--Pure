@@ -100,6 +100,21 @@ def _corpus_cases(root):
         align.build_en_corpus(short, audio, root / "corpus-short", strict=True)
     fails += _expect(short["x"][0].get("reject_reason") == "segment_too_short",
                      "strict short segment reason")
+
+    # The English-MFA attempt floor is 150 ms.  This is only an attempt
+    # eligibility gate; strict provenance still decides publication after MFA.
+    at_floor = _segments(); at_floor["x"][0]["seg_end"] = .150
+    with patch("scipy.io.wavfile.read", return_value=(16000, __import__("numpy").zeros(16000, dtype="int16"))):
+        align.build_en_corpus(at_floor, audio, root / "corpus-at-floor", strict=True)
+    fails += _expect(not at_floor["x"][0].get("skipped")
+                     and (root / "corpus-at-floor" / "x_seg0.wav").is_file(),
+                     "150ms segment is attempted")
+
+    below_floor = _segments(); below_floor["x"][0]["seg_end"] = .149
+    with patch("scipy.io.wavfile.read", return_value=(16000, __import__("numpy").zeros(16000, dtype="int16"))):
+        align.build_en_corpus(below_floor, audio, root / "corpus-below-floor", strict=True)
+    fails += _expect(below_floor["x"][0].get("reject_reason") == "segment_too_short",
+                     "below-150ms segment is rejected")
     return fails
 
 

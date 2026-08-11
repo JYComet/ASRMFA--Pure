@@ -204,13 +204,57 @@ def verify(path: Path, output_dir: Path | None = None) -> list[str]:
     return sorted(set(errors))
 
 
+def _write_axis_receipts(paths: dict[str, Path], stems: list[str] | None = None) -> None:
+    """Write the immutable MFA/TTS axis evidence required by the auditor.
+
+    Fixtures use byte-identical MFA and authoritative-TTS WAVs, so no audio
+    transform receipt is needed.  Keeping this evidence explicit makes the
+    verifier exercise the same contract as a production strict-ok run.
+    """
+    from audit_strict_ok import MFA_ALIGNMENT_AXIS_SCHEMA, MFA_INPUT_AXIS_SCHEMA
+    from pipeline_utils import stable_json_digest
+
+    names = sorted(stems if stems is not None else [path.stem for path in paths["wavs"].glob("*.wav")])
+    audio: list[dict] = []
+    alignments: list[dict] = []
+    for name in names:
+        wav = paths["wavs"] / f"{name}.wav"
+        with wave.open(str(wav), "rb") as handle:
+            rate = handle.getframerate()
+            frames = handle.getnframes()
+        audio.append({"stem": name, "path": str(wav.resolve()), "sha256": _sha256(wav),
+                      "duration_s": frames / rate, "sample_rate": rate, "frames": frames})
+        aligned = paths["aligned"] / f"{name}.TextGrid"
+        from postprocess_textgrids import parse_textgrid
+        alignments.append({"stem": name, "path": str(aligned.resolve()), "sha256": _sha256(aligned),
+                           "xmax": parse_textgrid(aligned).xmax, "audio_sha256": _sha256(wav)})
+    input_axis = {
+        "schema": MFA_INPUT_AXIS_SCHEMA, "source_role": "mfa_axis_audio",
+        "axis_root": str(paths["wavs"].resolve()),
+        "tts_authoritative_audio_root": str(paths["tts"].resolve()),
+        "stems": names, "stems_digest": stable_json_digest(names), "scale": 1.0,
+        "audio": audio, "transform_receipts": [],
+    }
+    input_path = paths["axis_input"]
+    input_path.write_text(json.dumps(input_axis, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    alignment_axis = {
+        "schema": MFA_ALIGNMENT_AXIS_SCHEMA, "alignment_root": str(paths["aligned"].resolve()),
+        "input_axis_schema": MFA_INPUT_AXIS_SCHEMA,
+        "input_axis_digest": stable_json_digest(input_axis),
+        "stems": names, "stems_digest": stable_json_digest(names), "scale": 1.0,
+        "alignments": alignments,
+    }
+    paths["axis_alignment"].write_text(
+        json.dumps(alignment_axis, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def _write_fixture(root: Path, stem: str = "demo") -> dict[str, Path]:
     """Build a tiny complete corpus without MFA/NVASR dependencies."""
     from postprocess_textgrids import Interval, TextGrid, Tier, write_textgrid
 
-    output, filtered, ctc, refs, wavs, aligned, en_phones, en_aligned = [root / name for name in
-        ("output", "filtered", "ctc", "refs", "wavs", "aligned", "en_phones", "en_aligned")]
-    for directory in (output, filtered, ctc, refs, wavs, aligned, en_phones, en_aligned):
+    output, filtered, ctc, refs, wavs, tts, aligned, en_phones, en_aligned = [root / name for name in
+        ("output", "filtered", "ctc", "refs", "wavs", "tts", "aligned", "en_phones", "en_aligned")]
+    for directory in (output, filtered, ctc, refs, wavs, tts, aligned, en_phones, en_aligned):
         directory.mkdir()
     (refs / f"{stem}.txt").write_text("你好!\n", encoding="utf-8")
     (ctc / f"{stem}.lab").write_text("ni3 hao3\n", encoding="utf-8")
@@ -225,6 +269,7 @@ def _write_fixture(root: Path, stem: str = "demo") -> dict[str, Path]:
     with wave.open(str(wavs / f"{stem}.wav"), "wb") as handle:
         handle.setnchannels(1); handle.setsampwidth(2); handle.setframerate(16000)
         handle.writeframes(b"\x00\x00" * 16000)
+    shutil.copy2(wavs / f"{stem}.wav", tts / f"{stem}.wav")
     words = [Interval(0.0, 0.1, "<sp1>"), Interval(0.1, 0.45, "ni3"),
              Interval(0.45, 0.9, "hao3"), Interval(0.9, 1.0, "！")]
     hanzi = [Interval(iv.xmin, iv.xmax, text) for iv, text in zip(words, ("<sp1>", "你", "好", "！"))]
@@ -241,12 +286,15 @@ def _write_fixture(root: Path, stem: str = "demo") -> dict[str, Path]:
         Tier("words", 0.0, 1.0, [Interval(0.1, 0.45, "ni3"), Interval(0.45, 0.9, "hao3")]),
         Tier("phones", 0.0, 1.0, [Interval(0.1, 0.45, "n"), Interval(0.45, 0.9, "h")]),
     ]), aligned / f"{stem}.TextGrid")
-    (output / "postprocess_report.jsonl").write_text(
-        json.dumps({"stem": stem, "status": "ok", "warnings": []}) + "\n", encoding="utf-8")
+    (output / "postprocess_report.jsonl").write_text(json.dumps({
+        "stem": stem, "status": "ok", "output": str((output / f"{stem}.TextGrid").resolve()),
+        "warnings": [], "hard_integrity_reasons": [], "filter_reasons": [],
+    }) + "\n", encoding="utf-8")
     from pipeline_utils import write_pipeline_accounting_receipt
     write_pipeline_accounting_receipt(
         ctc, source_stems=[stem], eligible_stems=[stem], exclusions=[],
-        output_stems=[stem], filtered_stems=[], run_id="fixture", mode="strict")
+        output_stems=[stem], filtered_stems=[], run_id="fixture", mode="strict",
+        paths={"output": str(output.resolve()), "filtered": str(filtered.resolve())})
     en_manifest = en_phones / "en_alignment_manifest.json"
     en_manifest.write_text(json.dumps({
         "schema": EN_PROVENANCE_SCHEMA, "status": "no_english", "strict_provenance": True,
@@ -254,10 +302,14 @@ def _write_fixture(root: Path, stem: str = "demo") -> dict[str, Path]:
         "stem_ledgers": [], "counts": {"english_stems": 0, "english_segments": 0,
             "english_words": 0, "verified_words": 0, "rejected_words": 0}, "reason": "",
     }), encoding="utf-8")
-    return {"output": output, "filtered": filtered, "ctc": ctc, "refs": refs, "wavs": wavs,
-            "aligned": aligned, "en_phones": en_phones, "en_aligned": en_aligned,
+    paths = {"output": output, "filtered": filtered, "ctc": ctc, "refs": refs, "wavs": wavs,
+            "tts": tts, "aligned": aligned, "en_phones": en_phones, "en_aligned": en_aligned,
             "en_manifest": en_manifest,
-            "pipeline_receipt": ctc / ".pipeline_run_receipt_v2.json"}
+            "pipeline_receipt": ctc / ".pipeline_run_receipt_v2.json",
+            "axis_input": root / "mfa_input_axis.json",
+            "axis_alignment": root / "mfa_alignment_axis.json"}
+    _write_axis_receipts(paths)
+    return paths
 
 
 def _write_english_unk_fixture(root: Path) -> dict[str, Path]:
@@ -321,6 +373,7 @@ def _write_english_unk_fixture(root: Path) -> dict[str, Path]:
             "english_segments": 1, "english_words": 1, "verified_words": 1,
             "rejected_words": 0}, "reason": "",
     }), encoding="utf-8")
+    _write_axis_receipts(paths)
     return paths
 
 
@@ -353,6 +406,7 @@ def _write_nvv_fixture(root: Path) -> dict[str, Path]:
         Tier("words", 0.0, 1.0, [Interval(0.1, 0.8, "<LAUGHTER>"), Interval(0.8, 1.0, "，")]),
         Tier("phones", 0.0, 1.0, [Interval(0.1, 0.8, "spn")]),
     ]), paths["aligned"] / "demo.TextGrid")
+    _write_axis_receipts(paths)
     return paths
 
 
@@ -368,6 +422,10 @@ def _self_test() -> int:
             en_phones_dir=paths["en_phones"], en_aligned_dir=paths["en_aligned"],
             en_manifest=paths["en_manifest"],
             pipeline_receipt=paths["pipeline_receipt"],
+            mfa_input_axis_receipt=paths["axis_input"],
+            mfa_alignment_axis_receipt=paths["axis_alignment"],
+            mfa_axis_audio_root=paths["wavs"],
+            tts_authoritative_audio_root=paths["tts"],
             report=paths["output"] / "postprocess_report.jsonl", isolate=True,
         ))
 
@@ -404,7 +462,8 @@ def _self_test() -> int:
         paths = _write_fixture(Path(td))
         for directory, suffix in ((paths["ctc"], ".lab"), (paths["ctc"], "_tokens.jsonl"),
                                   (paths["ctc"], ".TextGrid"), (paths["refs"], ".txt"),
-                                  (paths["wavs"], ".wav"), (paths["aligned"], ".TextGrid")):
+                                  (paths["wavs"], ".wav"), (paths["tts"], ".wav"),
+                                  (paths["aligned"], ".TextGrid")):
             shutil.copy2(directory / f"demo{suffix}", directory / f"other{suffix}")
         shutil.copy2(paths["output"] / "demo.TextGrid", paths["filtered"] / "other.TextGrid")
         from pipeline_utils import write_pipeline_accounting_receipt
@@ -412,12 +471,18 @@ def _self_test() -> int:
             paths["ctc"], source_stems=["demo", "other"],
             eligible_stems=["demo", "other"], exclusions=[],
             output_stems=["demo"], filtered_stems=["other"], run_id="fixture",
-            mode="strict")
+            mode="strict", paths={"output": str(paths["output"].resolve()),
+                                   "filtered": str(paths["filtered"].resolve())})
+        _write_axis_receipts(paths, ["demo", "other"])
         (paths["ctc"] / "other_tokens.jsonl").write_text(
             (paths["ctc"] / "other_tokens.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
         (paths["output"] / "postprocess_report.jsonl").write_text(
-            "\n".join((json.dumps({"stem": "demo", "status": "ok", "warnings": []}),
-                        json.dumps({"stem": "other", "status": "filtered", "warnings": []}))) + "\n",
+            "\n".join((json.dumps({"stem": "demo", "status": "ok",
+                                      "output": str((paths["output"] / "demo.TextGrid").resolve()),
+                                      "warnings": [], "hard_integrity_reasons": [], "filter_reasons": []}),
+                        json.dumps({"stem": "other", "status": "filtered",
+                                    "output": str((paths["filtered"] / "other.TextGrid").resolve()),
+                                    "warnings": [], "hard_integrity_reasons": [], "filter_reasons": []}))) + "\n",
             encoding="utf-8")
         manifest, clean = audit_fixture(paths)
         manifest_path = paths["output"] / "strict_ok_manifest.json"

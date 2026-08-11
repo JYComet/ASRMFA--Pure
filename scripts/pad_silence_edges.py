@@ -152,6 +152,7 @@ def process_one(
     frame_length: int = 1024,
     dry_run: bool = False,
     wav_index: dict[str, str] | None = None,
+    shift_ctc: bool = True,
 ) -> dict:
     """Process one stem: detect → pad/trim → shift timestamps → save."""
 
@@ -218,7 +219,7 @@ def process_one(
             sf.write(str(output_audio_dir / f"{stem}.wav"), audio, sr)
 
         # ── Shift CTC timestamps ──
-        if abs(time_offset) > 0.0001:
+        if shift_ctc and abs(time_offset) > 0.0001:
             # TextGrid
             tg_path = ctc_dir / f"{stem}.TextGrid"
             if tg_path.exists():
@@ -263,6 +264,8 @@ def main():
                             help="Sorted UTF-8 denominator supplied by the strict runner")
     parser.add_argument("--wav-index", default=None, help="Pre-built wav_index.json (avoids slow glob on CIFS)")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--pre-ctc", action="store_true",
+                        help="Consume a physical WAV denominator before CTC exists")
     args = parser.parse_args()
 
     # Load pre-built wav index if available
@@ -291,7 +294,7 @@ def main():
         unsafe_labs = [path for path in ctc_dir.iterdir()
                        if path.name.endswith(".lab")
                        and (path.is_symlink() or not path.is_file())]
-        if unsafe_labs or actual_labs != set(stems):
+        if (not args.pre_ctc) and (unsafe_labs or actual_labs != set(stems)):
             print("ERROR: CTC .lab set does not equal the supplied denominator")
             print(f"  missing={len(set(stems) - actual_labs)}, "
                   f"extra={len(actual_labs - set(stems))}, unsafe={len(unsafe_labs)}")
@@ -336,7 +339,8 @@ def main():
                                 target_silence_sec=args.target_silence_sec,
                                 silence_threshold=args.silence_threshold,
                                 frame_length=args.frame_length,
-                                dry_run=args.dry_run, wav_index=wav_index)
+                                dry_run=args.dry_run, wav_index=wav_index,
+                                shift_ctc=not args.pre_ctc)
             except Exception as exc:
                 r = {"stem": stem, "error": f"worker exception: {exc}"}
             results.append(r)
@@ -350,7 +354,7 @@ def main():
                 _fut = _pool.submit(
                     process_one, s, audio_dir, ctc_dir, padded_dir, output_dir,
                     args.target_silence_sec, args.silence_threshold,
-                    args.frame_length, args.dry_run, wav_index)
+                    args.frame_length, args.dry_run, wav_index, not args.pre_ctc)
                 _futures[_fut] = s
             for _fut in as_completed(_futures):
                 try:

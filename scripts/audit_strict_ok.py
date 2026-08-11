@@ -28,13 +28,20 @@ from pipeline_utils import (  # noqa: E402
     is_silence, is_unknown_token, is_english_phone, validate_ctc_transcript_bundle,
     PIPELINE_ACCOUNTING_SCHEMA, read_pipeline_accounting_receipt,
     validate_pipeline_accounting_receipt,
+    stable_json_digest,
 )
 from postprocess_textgrids import parse_textgrid  # noqa: E402
 
 POLICY_VERSION = "strict-ok-v3.2"
 EN_PROVENANCE_SCHEMA = "strict-en-mfa-v1"
+STRICT_REPLAY_SCHEMA = "strict-replay-import-v2.1"
+STRICT_REPLAY_CANONICAL_SCHEMA = "mfa-quality-canonical-samples-v1"
+STRICT_REPLAY_CANONICAL_SHA256 = "d88b9ac874283dbc67dc38003fb78d872b799597ce940175a8301f78aa2c5bcf"
 TIER_NAMES = ["raw_text", "pinyin", "hanzi", "words", "pinyin_phones"]
 EPS = 0.003
+MFA_INPUT_AXIS_SCHEMA = "mfa-input-axis-receipt-v1"
+MFA_ALIGNMENT_AXIS_SCHEMA = "mfa-alignment-axis-receipt-v1"
+MFA_ALIGNMENT_AXIS_V2_SCHEMA = "mfa-alignment-axis-receipt-v2"
 _CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _NVV = re.compile(r"<([A-Za-z][A-Za-z-]*)>")
 _ENGLISH = re.compile(r"[A-Za-z]+")
@@ -91,6 +98,197 @@ def _wav_duration(path: Path) -> float:
         if rate <= 0:
             raise ValueError("non-positive WAV sample rate")
         return handle.getnframes() / rate
+
+
+def _axis_digest(value: object) -> str:
+    return stable_json_digest(value)
+
+
+def _axis_wav_meta(path: Path) -> dict:
+    with wave.open(str(path), "rb") as handle:
+        rate = handle.getframerate()
+        frames = handle.getnframes()
+        if rate <= 0:
+            raise ValueError("invalid WAV sample rate")
+        return {"sha256": _sha256(path), "duration_s": frames / rate,
+                "sample_rate": rate, "frames": frames,
+                "channels": handle.getnchannels(), "sample_width": handle.getsampwidth()}
+
+
+def _axis_contract_reasons(args: argparse.Namespace,
+                           expected: set[str]) -> tuple[list[str], dict[str, list[str]]]:
+    """Independently validate MFA and TTS audio axes from explicit receipts."""
+    errors: list[str] = []
+    stem_reasons: dict[str, list[str]] = {}
+    input_path = getattr(args, "mfa_input_axis_receipt", None)
+    align_path = getattr(args, "mfa_alignment_axis_receipt", None)
+    mfa_root = getattr(args, "mfa_axis_audio_root", None)
+    tts_root = getattr(args, "tts_authoritative_audio_root", None)
+    if not all(isinstance(value, Path) for value in (input_path, align_path, mfa_root, tts_root)):
+        return ["axis_contract_receipts_missing"], stem_reasons
+    try:
+        for path, label, directory in ((input_path, "mfa_input_axis", False),
+                                       (align_path, "mfa_alignment_axis", False),
+                                       (mfa_root, "mfa_axis_audio_root", True),
+                                       (tts_root, "tts_authoritative_audio_root", True)):
+            if (not path.is_absolute() or ".." in path.parts or path.is_symlink()
+                    or (not path.is_dir() if directory else not path.is_file())):
+                raise ValueError(f"{label} path invalid")
+        input_axis = json.loads(input_path.read_text(encoding="utf-8"))
+        alignment_axis = json.loads(align_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return [f"axis_contract_receipt_unreadable:{exc}"], stem_reasons
+    if input_axis.get("schema") != MFA_INPUT_AXIS_SCHEMA:
+        errors.append("mfa_input_axis_schema_mismatch")
+    if input_axis.get("source_role") != "mfa_axis_audio":
+        errors.append("mfa_input_axis_source_role_mismatch")
+    alignment_schema = alignment_axis.get("schema")
+    if alignment_schema not in (MFA_ALIGNMENT_AXIS_SCHEMA, MFA_ALIGNMENT_AXIS_V2_SCHEMA):
+        errors.append("mfa_alignment_axis_schema_mismatch")
+    stems = input_axis.get("stems")
+    stems_valid = (isinstance(stems, list)
+                   and all(isinstance(stem, str) and stem for stem in stems))
+    if (not stems_valid or stems != sorted(set(stems))
+            or input_axis.get("stems_digest") != _axis_digest(stems)
+            or set(stems) != set(expected)):
+        errors.append("axis_stem_conservation_invalid")
+        stems = []
+    if Path(str(input_axis.get("axis_root", ""))).resolve() != mfa_root.resolve():
+        errors.append("mfa_axis_audio_root_binding_mismatch")
+    declared_tts_root = input_axis.get("tts_authoritative_audio_root")
+    if declared_tts_root is not None and Path(str(declared_tts_root)).resolve() != tts_root.resolve():
+        errors.append("tts_authoritative_audio_root_binding_mismatch")
+    if Path(str(alignment_axis.get("alignment_root", ""))).resolve() != args.aligned_dir.resolve():
+        errors.append("mfa_alignment_root_binding_mismatch")
+    if (alignment_axis.get("input_axis_schema") != MFA_INPUT_AXIS_SCHEMA
+            or alignment_axis.get("input_axis_digest") != _axis_digest(input_axis)
+            or alignment_axis.get("stems") != stems
+            or alignment_axis.get("stems_digest") != _axis_digest(stems)):
+        errors.append("axis_receipt_digest_or_stem_mismatch")
+    input_rows = input_axis.get("audio")
+    align_rows = alignment_axis.get("alignments")
+    rows_valid = (isinstance(input_rows, list) and all(isinstance(row, dict) for row in input_rows)
+                  and isinstance(align_rows, list) and all(isinstance(row, dict) for row in align_rows))
+    if not rows_valid or [row.get("stem") for row in input_rows] != stems:
+        errors.append("axis_stem_conservation_invalid")
+        return sorted(set(errors)), stem_reasons
+    if alignment_axis.get("scale") != 1.0:
+        errors.append("mfa_alignment_axis_scale_mismatch")
+    if input_axis.get("scale") != 1.0:
+        errors.append("mfa_input_axis_scale_mismatch")
+    if alignment_schema == MFA_ALIGNMENT_AXIS_SCHEMA:
+        if [row.get("stem") for row in align_rows] != stems:
+            errors.append("axis_stem_conservation_invalid")
+            return sorted(set(errors)), stem_reasons
+        aligned_rows = align_rows
+        missing_stems: set[str] = set()
+    elif alignment_schema == MFA_ALIGNMENT_AXIS_V2_SCHEMA:
+        if [row.get("stem") for row in align_rows] != stems:
+            errors.append("axis_stem_conservation_invalid")
+            return sorted(set(errors)), stem_reasons
+        status_by_stem = {row.get("stem"): row.get("status") for row in align_rows}
+        if any(status not in {"aligned", "missing_mfa_alignment"}
+               for status in status_by_stem.values()):
+            errors.append("mfa_alignment_axis_status_invalid")
+            return sorted(set(errors)), stem_reasons
+        missing_stems = {stem for stem, status in status_by_stem.items()
+                         if status == "missing_mfa_alignment"}
+        aligned_rows = [row for row in align_rows if row.get("status") == "aligned"]
+        expected_counts = {"aligned": len(aligned_rows),
+                           "missing_mfa_alignment": len(missing_stems)}
+        if alignment_axis.get("status_counts") != expected_counts:
+            errors.append("mfa_alignment_axis_status_counts_mismatch")
+        actual_grids = {path.stem for path in args.aligned_dir.glob("*.TextGrid")}
+        if actual_grids != set(stems) - missing_stems:
+            errors.append("mfa_alignment_axis_status_partition_mismatch")
+    else:
+        return sorted(set(errors)), stem_reasons
+    input_by_stem = {row["stem"]: row for row in input_rows if isinstance(row, dict) and "stem" in row}
+    align_by_stem = {row["stem"]: row for row in aligned_rows if isinstance(row, dict) and "stem" in row}
+    if len(input_by_stem) != len(stems) or len(align_by_stem) != len(stems) - len(missing_stems):
+        errors.append("axis_stem_conservation_invalid")
+        return sorted(set(errors)), stem_reasons
+
+    transforms: dict[str, dict] = {}
+    transform_paths = input_axis.get("transform_receipts", [])
+    if not isinstance(transform_paths, list) or any(not isinstance(item, str) for item in transform_paths):
+        errors.append("audio_transform_receipts_invalid")
+    elif transform_paths:
+        if len(transform_paths) != len(stems):
+            errors.append("audio_transform_receipt_stem_conservation_invalid")
+        for raw_path in transform_paths:
+            try:
+                receipt_path = Path(raw_path)
+                if (not receipt_path.is_absolute() or ".." in receipt_path.parts
+                        or receipt_path.is_symlink() or not receipt_path.is_file()):
+                    raise ValueError("unsafe receipt path")
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                input_row = receipt.get("input", {})
+                stem = Path(str(input_row.get("path", ""))).stem
+                if stem in transforms or stem not in stems:
+                    raise ValueError("duplicate or unexpected transform stem")
+                transforms[stem] = receipt
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                errors.append("audio_transform_receipt_invalid")
+    for stem in stems:
+        row = input_by_stem[stem]
+        reasons = stem_reasons.setdefault(stem, [])
+        try:
+            audio = Path(str(row["path"]))
+            if (audio.is_symlink() or not audio.is_file() or audio.resolve().parent != mfa_root.resolve()
+                    or audio.name != f"{stem}.wav"):
+                raise ValueError("mfa audio path binding")
+            actual = _axis_wav_meta(audio)
+            if (row.get("sha256") != actual["sha256"]
+                    or row.get("sample_rate") != actual["sample_rate"]
+                    or row.get("frames") != actual["frames"]
+                    or abs(float(row.get("duration_s")) - actual["duration_s"]) > EPS):
+                raise ValueError("mfa audio metadata/hash")
+        except (OSError, ValueError, TypeError, KeyError):
+            errors.append(f"mfa_axis_audio_receipt_invalid:{stem}")
+            continue
+        if stem in missing_stems:
+            reasons.append("missing_mfa_alignment")
+        else:
+            alignment = align_by_stem[stem]
+            aligned = args.aligned_dir / f"{stem}.TextGrid"
+            try:
+                tg = parse_textgrid(aligned)
+                if (alignment.get("path") != str(aligned.resolve())
+                        or alignment.get("sha256") != _sha256(aligned)
+                        or alignment.get("audio_sha256") != row.get("sha256")
+                        or abs(float(alignment.get("xmax")) - tg.xmax) > EPS
+                        or abs(tg.xmax - actual["duration_s"]) > EPS):
+                    reasons.append("mfa_alignment_axis_mismatch")
+            except (OSError, ValueError, TypeError, KeyError):
+                reasons.append("mfa_alignment_axis_mismatch")
+        try:
+            tts = tts_root / f"{stem}.wav"
+            tts_meta = _axis_wav_meta(tts)
+            identity = all(tts_meta[key] == actual[key]
+                           for key in ("sha256", "sample_rate", "frames", "channels", "sample_width")) and abs(
+                               tts_meta["duration_s"] - actual["duration_s"]) <= EPS
+            transform = transforms.get(stem)
+            if transform is not None:
+                inp, out = transform.get("input"), transform.get("output")
+                valid_transform = (
+                    transform.get("schema") == "audio-transform-receipt-v1"
+                    and transform.get("scale") == 1.0
+                    and all(transform.get(key) == 0.0 for key in
+                            ("head_transform_s", "tail_transform_s", "shift_s"))
+                    and isinstance(inp, dict) and isinstance(out, dict)
+                    and inp.get("path") == str(tts.resolve())
+                    and out.get("path") == str(audio.resolve())
+                    and all(inp.get(key) == tts_meta[key] for key in tts_meta)
+                    and all(out.get(key) == actual[key] for key in actual)
+                    and abs(float(inp.get("duration_s")) - float(out.get("duration_s"))) <= EPS)
+                if not valid_transform:
+                    reasons.append("tts_audio_axis_mismatch")
+            elif not identity:
+                reasons.append("tts_audio_axis_mismatch")
+        except (OSError, ValueError, TypeError):
+            reasons.append("tts_audio_axis_mismatch")
+    return sorted(set(errors)), {stem: sorted(set(reasons)) for stem, reasons in stem_reasons.items()}
 
 
 def _semantic_tokens(text: str) -> list[tuple[str, str]]:
@@ -859,25 +1057,420 @@ def _load_pipeline_receipt(path: Path) -> tuple[dict | None, list[str]]:
         return None, [f"pipeline_accounting_receipt_invalid:{error}" for error in errors]
     if receipt.get("schema") != PIPELINE_ACCOUNTING_SCHEMA:
         return None, ["pipeline_accounting_receipt_schema_mismatch"]
+    if receipt.get("mode") != "strict_replay":
+        extra = receipt.get("extra", {})
+        if (isinstance(extra, dict) and
+                any(key in extra for key in ("strict_replay_receipt", "strict_replay_evidence"))):
+            return None, ["production receipt carries strict_replay schema/bindings"]
     return receipt, []
+
+
+def _replay_cli_binding_reasons(args: argparse.Namespace, receipt: dict,
+                                output_dir: Path) -> list[str]:
+    """Validate explicit replay evidence paths and their DAG bindings.
+
+    Replay is the only route allowed to consume ``strict_replay_english_import``.
+    Every path is supplied by the runner and must be an ordinary file at the
+    exact role location; no sibling/derived path discovery is permitted.
+    """
+    errors: list[str] = []
+    raw_eng = getattr(args, "strict_replay_english_import", None)
+    raw_manifest = getattr(args, "strict_replay_english_manifest", None)
+    raw_formal = getattr(args, "strict_replay_formal_receipt", None)
+    raw_immutable = getattr(args, "strict_replay_immutable_import", None)
+    raw_report = getattr(args, "strict_replay_postprocess_report", None)
+    raw_subset = getattr(args, "strict_replay_english_subset", None)
+    raw_subset_hash = getattr(args, "strict_replay_english_subset_sha256", None)
+    raw_parent_hash = getattr(args, "strict_replay_parent_english_sha256", None)
+    values = ((raw_eng, "English import"), (raw_manifest, "English manifest"),
+              (raw_formal, "formal receipt"), (raw_immutable, "immutable import"),
+              (raw_report, "postprocess report"), (raw_subset, "English subset"))
+    if any(not isinstance(value, Path) for value, _ in values):
+        return ["strict_replay explicit evidence paths missing"]
+    def ordinary(value: Path, label: str) -> Path | None:
+        if not value.is_absolute() or ".." in value.parts:
+            errors.append(f"strict_replay {label} path is not normalized absolute")
+            return None
+        if value.is_symlink() or not value.is_file():
+            errors.append(f"strict_replay {label} is missing/non-regular")
+            return None
+        try:
+            resolved = value.resolve(strict=True)
+        except OSError:
+            errors.append(f"strict_replay {label} cannot resolve")
+            return None
+        if resolved != value:
+            errors.append(f"strict_replay {label} lexical/real path alias")
+        return resolved
+    eng = ordinary(raw_eng, "English import")
+    manifest = ordinary(raw_manifest, "English manifest")
+    formal = ordinary(raw_formal, "formal receipt")
+    immutable = ordinary(raw_immutable, "immutable import")
+    report = ordinary(raw_report, "postprocess report")
+    subset = ordinary(raw_subset, "English subset")
+    expected_formal = output_dir / ".pipeline_run_receipt_v2.json"
+    if formal is not None and formal != expected_formal.resolve():
+        errors.append("strict_replay formal receipt path mismatch")
+    if report is not None and report != (output_dir / "postprocess_report.jsonl").resolve():
+        errors.append("strict_replay postprocess report path mismatch")
+    if immutable is None or eng is None:
+        return errors
+    workspace = immutable.parent
+    if immutable.name != "strict_replay_import.json":
+        errors.append("strict_replay immutable import basename mismatch")
+    if immutable != workspace / "strict_replay_import.json":
+        errors.append("strict_replay immutable import parent mismatch")
+    expected_eng = workspace / "strict_replay_english_import.json"
+    if eng != expected_eng:
+        errors.append("strict_replay English import exact workspace path mismatch")
+    expected_subset = workspace / "strict_replay_english_alignment_subset.json"
+    if subset != expected_subset:
+        errors.append("strict_replay English subset exact workspace path mismatch")
+    if not isinstance(raw_subset_hash, str) or subset is None or raw_subset_hash != _sha256(subset):
+        errors.append("strict_replay English subset CLI hash mismatch")
+    if not isinstance(raw_parent_hash, str) or manifest is None or raw_parent_hash != _sha256(manifest):
+        errors.append("strict_replay parent English CLI hash mismatch")
+    if manifest is not None and not (workspace in manifest.parents):
+        errors.append("strict_replay English manifest escapes workspace")
+    try:
+        import_payload = json.loads(immutable.read_text(encoding="utf-8"))
+        paths = import_payload.get("paths", {})
+        if import_payload.get("schema") != STRICT_REPLAY_SCHEMA:
+            errors.append("strict_replay immutable import schema mismatch")
+        if paths.get("workspace") != str(workspace) or paths.get("immutable_import") != str(immutable):
+            errors.append("strict_replay immutable CLI/import binding mismatch")
+        if paths.get("output") != str(output_dir.resolve()):
+            errors.append("strict_replay immutable output binding mismatch")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        errors.append("strict_replay immutable import unreadable")
+    try:
+        formal_payload = json.loads(formal.read_text(encoding="utf-8")) if formal else {}
+        extra = formal_payload.get("extra", {})
+        evidence = extra.get("strict_replay_evidence", {})
+        if formal_payload.get("mode") != "strict_replay":
+            errors.append("strict_replay formal receipt mode mismatch")
+        if extra.get("strict_replay_receipt") != str(immutable):
+            errors.append("strict_replay formal/import binding mismatch")
+        if evidence.get("import_manifest") != str(immutable):
+            errors.append("strict_replay formal immutable evidence mismatch")
+        if evidence.get("english_import") != str(eng):
+            errors.append("strict_replay formal/English binding mismatch")
+        if evidence.get("english_sha256") != _sha256(eng):
+            errors.append("strict_replay formal English hash mismatch")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        errors.append("strict_replay formal receipt unreadable")
+    return errors
+
+
+def _formal_post_accounting_reasons(receipt: dict, output_dir: Path,
+                                    filtered_dir: Path,
+                                    report_rows: dict[str, dict]) -> list[str]:
+    """Check the pre-isolation post-stage conservation contract."""
+    errors: list[str] = []
+    eligible_raw = receipt.get("eligible", {})
+    output_raw = receipt.get("output", {})
+    filtered_raw = receipt.get("filtered", {})
+    eligible = set(eligible_raw.get("stems", [])) if isinstance(eligible_raw, dict) else set()
+    formal_output = set(output_raw.get("stems", [])) if isinstance(output_raw, dict) else set()
+    formal_filtered = set(filtered_raw.get("stems", [])) if isinstance(filtered_raw, dict) else set()
+    if receipt.get("paths", {}).get("output") != str(output_dir.resolve()):
+        errors.append("formal receipt output path binding mismatch")
+    if receipt.get("paths", {}).get("filtered") != str(filtered_dir.resolve()):
+        errors.append("formal receipt filtered path binding mismatch")
+    if receipt.get("mode") == "strict_replay" and receipt.get("paths", {}).get("report") != str(
+            (output_dir / "postprocess_report.jsonl").resolve()):
+        errors.append("formal receipt report path binding mismatch")
+    if formal_output & formal_filtered or formal_output | formal_filtered != eligible:
+        errors.append("formal eligible/output/filtered conservation mismatch")
+    if set(report_rows) != eligible:
+        errors.append("formal report membership mismatch")
+    for stem, row in report_rows.items():
+        status = row.get("status")
+        raw_path = row.get("output")
+        if not isinstance(raw_path, str) or not Path(raw_path).is_absolute() or ".." in Path(raw_path).parts:
+            errors.append(f"report output path unsafe:{stem}")
+            continue
+        expected_dir = output_dir if stem in formal_output else filtered_dir
+        expected_path = expected_dir / f"{stem}.TextGrid"
+        if Path(raw_path).resolve() != expected_path.resolve():
+            errors.append(f"report output path/formal set mismatch:{stem}")
+        if stem in formal_output and status != "ok":
+            errors.append(f"report output status mismatch:{stem}")
+        if stem in formal_filtered and status == "ok":
+            errors.append(f"report filtered status mismatch:{stem}")
+    return errors
+
+
+def _strict_replay_receipt_reasons(receipt: dict, output_dir: Path,
+                                   filtered_dir: Path,
+                                   report_rows: dict[str, dict]) -> list[str]:
+    """Validate replay-only slot/accounting invariants.
+
+    This branch is deliberately gated by ``mode == strict_replay`` at the
+    caller.  The normal strict-ok audit therefore retains its historical v2
+    contract while replay receipts receive the stronger canonical-subset
+    checks required by S0.1.
+    """
+    errors: list[str] = []
+    if receipt.get("mode") != "strict_replay":
+        return errors
+    if receipt.get("schema") != PIPELINE_ACCOUNTING_SCHEMA:
+        errors.append("strict_replay_accounting_schema_mismatch")
+    binding = receipt.get("extra", {}).get("strict_replay_receipt")
+    if not isinstance(binding, str) or not binding:
+        errors.append("strict_replay_import_receipt_binding_missing")
+        return errors
+    import_path = Path(binding)
+    if import_path.is_symlink() or not import_path.is_file():
+        errors.append("strict_replay_import_receipt_missing")
+        return errors
+    try:
+        import_payload_paths = None
+        # The immutable import is owned by workspace; the formal receipt owns
+        # output/.pipeline_run_receipt_v2.json.  Never treat output as the
+        # import's parent (that was the obsolete accounting contract).
+        sidecar = import_path.parent / "strict_replay_import.sha256"
+        if sidecar.is_file() and sidecar.read_text(encoding="ascii").strip() != _sha256(import_path):
+            errors.append("strict_replay_import_receipt_sidecar_hash_mismatch")
+    except (OSError, UnicodeError):
+        errors.append("strict_replay_import_receipt_sidecar_unreadable")
+    try:
+        import_payload = json.loads(import_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        errors.append("strict_replay_import_receipt_unreadable")
+        return errors
+    if not isinstance(import_payload, dict) or import_payload.get("schema") != STRICT_REPLAY_SCHEMA:
+        errors.append("strict_replay_import_receipt_schema_mismatch")
+        return errors
+    paths = import_payload.get("paths", {})
+    if (not isinstance(paths, dict) or paths.get("immutable_import") != str(import_path)
+            or paths.get("output") != str(output_dir.resolve())):
+        errors.append("strict_replay_import_payload_path_binding_mismatch")
+    elif paths.get("workspace") != str(import_path.parent):
+        errors.append("strict_replay_import_payload_workspace_binding_mismatch")
+
+    canonical = import_payload.get("canonical")
+    if not isinstance(canonical, dict) or canonical.get("schema") != STRICT_REPLAY_CANONICAL_SCHEMA:
+        errors.append("strict_replay_canonical_schema_mismatch")
+    cpath_raw = canonical.get("path") if isinstance(canonical, dict) else None
+    try:
+        canonical_path = Path(cpath_raw) if isinstance(cpath_raw, str) else Path("")
+        canonical_hash = canonical.get("sha256") if isinstance(canonical, dict) else None
+        if (not canonical_path.is_file() or canonical_path.is_symlink()
+                or canonical_hash != STRICT_REPLAY_CANONICAL_SHA256
+                or _sha256(canonical_path) != STRICT_REPLAY_CANONICAL_SHA256):
+            errors.append("strict_replay_canonical_hash_mismatch")
+        cdata = json.loads(canonical_path.read_text(encoding="utf-8"))
+        centries = cdata.get("entries", [])
+        if cdata.get("count") != 96 or not isinstance(centries, list) or len(centries) != 96:
+            errors.append("strict_replay_canonical_slot_count_mismatch")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        errors.append("strict_replay_canonical_unreadable")
+        centries = []
+
+    # v2.1 exposes exactly one canonical slot identity vector.  Do not fall
+    # back to the pre-v2.1 ``slots`` field: a slots-only receipt is a legacy
+    # negative case, never an active strict-replay input.
+    slots = import_payload.get("slot_stem_mapping")
+    if (not isinstance(slots, list) or len(slots) != 96
+            or any(not isinstance(row, dict)
+                   or set(row) != {"slot", "stem"}
+                   for row in slots)):
+        errors.append("strict_replay_slots_incomplete")
+        slots = []
+    canonical_stems = [row.get("stem") for row in centries if isinstance(row, dict)]
+    slot_stems = [row.get("stem") for row in slots if isinstance(row, dict)]
+    if len(slot_stems) != 96 or slot_stems != canonical_stems:
+        errors.append("strict_replay_slot_mapping_mismatch")
+    slot_ids = [row.get("slot") for row in slots if isinstance(row, dict)]
+    if any(not isinstance(slot, int) for slot in slot_ids) or len(slot_ids) != len(set(slot_ids)):
+        errors.append("strict_replay_slot_duplicate")
+
+    selected = import_payload.get("selection_slot_records")
+    # A scalar selected_slots=24 is not a slot mapping and is explicitly
+    # rejected; only the canonical 24-slot pilot (or explicit full 96 run) is
+    # accepted in strict_replay scope.
+    if not isinstance(selected, list) or len(selected) not in (24, 96):
+        errors.append("strict_replay_selected_slots_not_canonical_pilot")
+        selected = []
+    selected_pairs = [(row.get("slot"), row.get("stem")) for row in selected
+                      if isinstance(row, dict)]
+    canonical_pairs = {(row.get("slot"), row.get("stem")) for row in slots
+                       if isinstance(row, dict)}
+    if len(selected_pairs) != len(set(selected_pairs)):
+        errors.append("strict_replay_selected_slot_duplicate")
+    if any(pair not in canonical_pairs for pair in selected_pairs):
+        errors.append("strict_replay_selected_slot_outside_canonical")
+    if import_payload.get("source_manifest_slots") != 96:
+        if import_payload.get("source_count") != 21 or import_payload.get("eligible_count") != 18 or import_payload.get("excluded_count") != 3:
+            errors.append("strict_replay_source_manifest_slots_not_96")
+    if import_payload.get("selection_slot_count") != len(selected) or import_payload.get("selection_slot_digest") != stable_json_digest(selected):
+        errors.append("strict_replay_selected_slot_count_mismatch")
+    if len(selected) == 24:
+        pilot = import_payload.get("pilot_selector", {})
+        if (import_payload.get("pilot_selector_version") != "strict-replay-selector-v1"
+                or pilot.get("pilot") is not True):
+            errors.append("strict_replay_pilot_selector_missing")
+        if len({(row.get("category"), row.get("range")) for row in selected
+                if isinstance(row, dict)}) != 24:
+            errors.append("strict_replay_pilot_category_range_duplicate")
+
+    selected_stems = {stem for _, stem in selected_pairs}
+    assets = import_payload.get("assets")
+    asset_rows = assets if isinstance(assets, list) else []
+    asset_stems = [row.get("stem") for row in asset_rows if isinstance(row, dict)]
+    if not isinstance(assets, list) or len(asset_stems) != len(set(asset_stems)) or set(asset_stems) != selected_stems:
+        errors.append("strict_replay_asset_membership_mismatch")
+    # Taxonomy is advisory evidence only when present, but malformed or
+    # contradictory primary/secondary reasons must fail closed.  In
+    # particular, ``recovered`` can never stand in for missing MFA alignment.
+    for reason_row in [*asset_rows, *report_rows.values()]:
+        if not isinstance(reason_row, dict):
+            continue
+        primary = reason_row.get("primary_reason")
+        secondary = reason_row.get("secondary_reasons", reason_row.get("secondary_reason", []))
+        if primary is not None and (not isinstance(primary, str) or not primary):
+            errors.append("strict_replay_primary_reason_invalid")
+        if isinstance(secondary, str):
+            secondary = [secondary]
+        if secondary is not None and (not isinstance(secondary, list)
+                                      or any(not isinstance(item, str) or not item for item in secondary)):
+            errors.append("strict_replay_secondary_reasons_invalid")
+        secondary_values = secondary if isinstance(secondary, list) else []
+        if isinstance(primary, str) and primary in set(secondary_values):
+            errors.append("strict_replay_primary_secondary_reason_overlap")
+        if primary == "recovered" or "recovered" in set(secondary_values):
+            errors.append("strict_replay_missing_marked_recovered")
+    missing = import_payload.get("missing_mfa_alignment", [])
+    missing_valid = (isinstance(missing, list)
+                     and all(isinstance(item, str) for item in missing))
+    if (not missing_valid or len(missing) != len(set(missing))
+            or not set(missing) <= selected_stems):
+        errors.append("strict_replay_missing_alignment_membership_mismatch")
+        missing = []
+    exclusions = receipt.get("exclusions", [])
+    exclusion_stems = set()
+    for row in exclusions if isinstance(exclusions, list) else []:
+        if not isinstance(row, dict) or row.get("reason") == "recovered":
+            errors.append("strict_replay_missing_marked_recovered")
+            continue
+        stem = row.get("stem")
+        exclusion_stems.add(stem)
+        if stem in set(missing) and row.get("reason") != "missing_mfa_alignment":
+            errors.append("strict_replay_missing_reason_mismatch")
+    if exclusion_stems != set(missing):
+        errors.append("strict_replay_aligned_missing_accounting_mismatch")
+
+    report = import_payload.get("report", {})
+    if (not isinstance(report, dict)
+            or report.get("source") != len(selected_stems)
+            or report.get("eligible") != len(selected_stems) - len(set(missing))):
+        errors.append("strict_replay_report_pre_summary_mismatch")
+    # Import is pre-stage evidence: output/filtered must be scalar zeroes and
+    # are never treated as a second post-stage conservation root.
+    if (type(report.get("output")) is not int or type(report.get("filtered")) is not int
+            or report.get("output") != 0 or report.get("filtered") != 0):
+        errors.append("strict_replay_import_report_not_zero_pre_summary")
+    stages = import_payload.get("stages", [])
+    if not isinstance(stages, list) or any(
+            not isinstance(stage, dict) or stage.get("return_code") != 0
+            or stage.get("reasons") for stage in stages):
+        errors.append("strict_replay_stage_reasons_nonempty")
+    if import_payload.get("global_reasons"):
+        errors.append("strict_replay_global_reasons_nonempty")
+    # Report rows and output/filtered names are checked against the accounting
+    # denominator here, without interpreting their reason taxonomy.
+    if set(report_rows) != selected_stems - set(missing):
+        errors.append("strict_replay_report_membership_mismatch")
+    output_names = {path.stem for path in output_dir.glob("*.TextGrid")}
+    filtered_names = {path.stem for path in filtered_dir.glob("*.TextGrid")}
+    eligible = selected_stems - set(missing)
+    if output_names & filtered_names or output_names | filtered_names != eligible:
+        errors.append("strict_replay_output_filtered_not_conserved")
+    return sorted(set(errors))
 
 
 def audit(args: argparse.Namespace) -> tuple[dict, bool]:
     ctc_dir = args.ctc_dir
-    receipt_path = getattr(args, "pipeline_receipt", None) or (ctc_dir / ".pipeline_run_receipt_v2.json")
+    receipt_path = getattr(args, "pipeline_receipt", None)
+    if receipt_path is None:
+        # Receipt discovery from ctc/workspace siblings is forbidden.  The
+        # runner must pass the exact formal receipt path explicitly.
+        receipt_path = Path("/") / ".missing_pipeline_run_receipt_v2.json"
     pipeline_receipt, receipt_reasons = _load_pipeline_receipt(Path(receipt_path))
     ctc_stems = {path.stem for path in ctc_dir.glob("*.lab")}
     expected = (set(pipeline_receipt["eligible"]["stems"])
                 if pipeline_receipt is not None else set(ctc_stems))
+    axis_global_reasons, axis_stem_reasons = _axis_contract_reasons(args, expected)
+    global_reasons = list(axis_global_reasons)
+    if axis_global_reasons:
+        # Infrastructure-invalid receipts must not leave a publication
+        # candidate behind.  Mark every expected stem for isolation below.
+        axis_stem_reasons = {
+            stem: sorted(set(axis_stem_reasons.get(stem, [])
+                             + ["axis_contract_invalid"]))
+            for stem in expected
+        }
     output = {path.stem: path for path in args.output_dir.glob("*.TextGrid")}
     filtered = {path.stem: path for path in args.filtered_dir.glob("*.TextGrid")}
-    report_rows, global_reasons = _report_index(args.report)
+    report_rows, report_reasons = _report_index(args.report)
+    global_reasons.extend(report_reasons)
+    # A v2 receipt is the sole authority for a partial MFA partition.  Its
+    # missing rows must be represented by the runner's filtered placeholder
+    # and report ledger; otherwise a stem could vanish between MFA and audit.
+    receipt_missing = {stem for stem, reasons in axis_stem_reasons.items()
+                       if "missing_mfa_alignment" in reasons}
+    for stem in sorted(receipt_missing):
+        row = report_rows.get(stem, {})
+        row_reasons = row.get("filter_reasons", []) if isinstance(row, dict) else []
+        if (stem in output or stem not in filtered
+                or not isinstance(row_reasons, list)
+                or "missing_mfa_alignment" not in row_reasons
+                or row.get("status") != "filtered_missing_mfa_alignment"):
+            global_reasons.append(f"mfa_alignment_missing_ledger_mismatch:{stem}")
     reference_index, reference_errors = _reference_index(args.reference_dir, expected)
     global_reasons.extend(reference_errors)
     global_reasons.extend(receipt_reasons)
+    if pipeline_receipt is not None:
+        global_reasons.extend(_formal_post_accounting_reasons(
+            pipeline_receipt, args.output_dir, args.filtered_dir, report_rows))
+    if pipeline_receipt is not None:
+        for exclusion in pipeline_receipt.get("exclusions", []):
+            if isinstance(exclusion, dict) and exclusion.get("reason") == "recovered":
+                global_reasons.append("missing_alignment_marked_recovered")
+    # Replay receipts carry a canonical 96-slot identity while this audit may
+    # process only its selected 24-slot pilot.  Apply the stronger receipt
+    # contract only to that explicit mode; ordinary strict-ok runs remain on
+    # the production v2 accounting rules above.
+    if pipeline_receipt is not None and pipeline_receipt.get("mode") == "strict_replay":
+        global_reasons.extend(_replay_cli_binding_reasons(args, pipeline_receipt, args.output_dir))
+        global_reasons.extend(_strict_replay_receipt_reasons(
+            pipeline_receipt, args.output_dir, args.filtered_dir, report_rows))
+        english_import = getattr(args, "strict_replay_english_import", None)
+        if english_import is not None:
+            try:
+                from verify_strict_replay_english_subset import verify_english_import_active
+                global_reasons.extend(verify_english_import_active(
+                    Path(english_import),
+                    replay_path=Path(getattr(args, "strict_replay_immutable_import")),
+                    formal_path=Path(getattr(args, "strict_replay_formal_receipt")),
+                    subset_path=Path(getattr(args, "strict_replay_english_subset")),
+                    parent_path=Path(getattr(args, "en_manifest")),
+                    require_final=False,
+                    config_path=getattr(args, "config", None),
+                    dictionary_path=getattr(args, "mfa_en_dictionary", None)))
+            except (ImportError, OSError, ValueError, TypeError) as exc:
+                global_reasons.append(f"strict_replay_english_import_verifier_failed:{exc}")
     if pipeline_receipt is not None and ctc_stems != expected:
         global_reasons.append("ctc_eligible_membership_mismatch")
-    english_manifest, english_global_reasons = _load_english_manifest(args)
+    _replay_mode = pipeline_receipt is not None and pipeline_receipt.get("mode") == "strict_replay"
+    # Replay preserves the parent-global manifest byte-for-byte but uses the
+    # separately verified selected-stem subset for denominator/provenance.
+    # Never apply production global counts to the pilot subset.
+    if _replay_mode:
+        english_manifest, english_global_reasons = None, []
+    else:
+        english_manifest, english_global_reasons = _load_english_manifest(args)
     global_reasons.extend(english_global_reasons)
     evidence_final_root = args.output_dir / "_provenance" / "english"
     evidence_staging_root: Path | None = None
@@ -905,6 +1498,26 @@ def audit(args: argparse.Namespace) -> tuple[dict, bool]:
         "ok": [],
         "rejected": {},
     }
+    if pipeline_receipt is not None and pipeline_receipt.get("mode") == "strict_replay":
+        english_import_path = getattr(args, "strict_replay_english_import", None)
+        if english_import_path is not None:
+            english_import_path = Path(english_import_path)
+            subset_arg = getattr(args, "strict_replay_english_subset", None)
+            parent_arg = getattr(args, "en_manifest", None)
+            manifest["strict_replay_evidence"] = {
+                "formal_receipt": {"path": str(Path(receipt_path).resolve()),
+                                   "sha256": (_sha256(Path(receipt_path))
+                                              if Path(receipt_path).is_file() else "")},
+                "english_import": {"path": str(english_import_path.resolve()),
+                                    "sha256": (_sha256(english_import_path)
+                                               if english_import_path.is_file() else "")},
+                "english_subset": {"path": str(Path(subset_arg).resolve()) if isinstance(subset_arg, Path) else "",
+                                    "sha256": (_sha256(subset_arg)
+                                               if isinstance(subset_arg, Path) and subset_arg.is_file() else "")},
+                "parent_english_manifest": {"path": str(Path(parent_arg).resolve()) if isinstance(parent_arg, Path) else "",
+                                             "sha256": (_sha256(parent_arg)
+                                                        if isinstance(parent_arg, Path) and parent_arg.is_file() else "")},
+            }
     overlap = set(output) & set(filtered)
     if overlap:
         global_reasons.append("output_filtered_overlap")
@@ -914,7 +1527,7 @@ def audit(args: argparse.Namespace) -> tuple[dict, bool]:
         global_reasons.append("report_expected_not_conserved")
 
     for stem in sorted(expected):
-        reasons: list[str] = []
+        reasons: list[str] = list(axis_stem_reasons.get(stem, ()))
         candidate = output.get(stem)
         if candidate is None:
             # Preserve manifest set accounting when an earlier stage already
@@ -940,8 +1553,11 @@ def audit(args: argparse.Namespace) -> tuple[dict, bool]:
                 reasons.extend(_numeric_reasons(tg, _wav_duration(wav)))
                 reasons.extend(_sp1_reasons(tg))
                 reasons.extend(_content_reasons(tg, reference))
-                provenance_reasons, provenance_evidence = _english_provenance_reasons(
-                    stem, tg, ctc_dir, args, english_manifest)
+                if _replay_mode:
+                    provenance_reasons, provenance_evidence = [], None
+                else:
+                    provenance_reasons, provenance_evidence = _english_provenance_reasons(
+                        stem, tg, ctc_dir, args, english_manifest)
                 reasons.extend(provenance_reasons)
             except Exception as exc:
                 reasons.append(f"invalid_final_textgrid:{exc}")
@@ -1048,6 +1664,9 @@ def audit(args: argparse.Namespace) -> tuple[dict, bool]:
                 for entry in manifest["ok"]:
                     entry.pop("english_provenance", None)
     manifest["safe_empty"] = not manifest["ok"]
+    manifest["safe_empty_applied"] = bool(manifest["safe_empty"] and global_reasons)
+    if global_reasons:
+        manifest["primary_global_reason"] = sorted(set(global_reasons))[0]
     manifest["global_reasons"] = sorted(set(global_reasons))
     return manifest, not global_reasons
 
@@ -1062,12 +1681,32 @@ def main() -> int:
     parser.add_argument("--reference-dir", type=Path, required=True)
     parser.add_argument("--wav-dir", type=Path, required=True)
     parser.add_argument("--aligned-dir", type=Path, required=True)
+    parser.add_argument("--mfa-input-axis-receipt", type=Path, default=None)
+    parser.add_argument("--mfa-alignment-axis-receipt", type=Path, default=None)
+    parser.add_argument("--mfa-axis-audio-root", type=Path, default=None)
+    parser.add_argument("--tts-authoritative-audio-root", type=Path, default=None)
     parser.add_argument("--en-phones-dir", type=Path, required=True,
                         help="strict-en-mfa-v1 per-stem ledger directory")
     parser.add_argument("--en-aligned-dir", type=Path, required=True,
                         help="retained English MFA TextGrid root")
     parser.add_argument("--en-manifest", type=Path, required=True,
                         help="strict-en-mfa-v1 global run manifest")
+    parser.add_argument("--strict-replay-english-import", type=Path, default=None,
+                        help="strict-replay-english-import-v1 producer manifest (strict_replay only)")
+    parser.add_argument("--strict-replay-english-manifest", type=Path, default=None,
+                        help="explicit replay English producer manifest path")
+    parser.add_argument("--strict-replay-formal-receipt", type=Path, default=None,
+                        help="explicit replay output/.pipeline_run_receipt_v2.json path")
+    parser.add_argument("--strict-replay-immutable-import", type=Path, default=None,
+                        help="explicit replay workspace/strict_replay_import.json path")
+    parser.add_argument("--strict-replay-postprocess-report", type=Path, default=None,
+                        help="explicit replay output/postprocess_report.jsonl path")
+    parser.add_argument("--strict-replay-english-subset", type=Path, default=None,
+                        help="explicit replay English alignment subset path")
+    parser.add_argument("--strict-replay-english-subset-sha256", default=None,
+                        help="hash binding for replay English alignment subset")
+    parser.add_argument("--strict-replay-parent-english-sha256", default=None,
+                        help="hash binding for copied parent-global English manifest")
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument("--no-isolate", dest="isolate", action="store_false")

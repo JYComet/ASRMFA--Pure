@@ -1,0 +1,63 @@
+{
+  "schema": "strict-replay-interface-fixture-cases-v4.2.3",
+  "scope": "synthetic-only",
+  "production_assets": false,
+  "cases": [
+    {"name": "historical_v1_as_v2", "expected_rc": 1},
+    {"name": "global_hash_mismatch", "expected_rc": 1},
+    {"name": "canonical_external_stem", "expected_rc": 1},
+    {"name": "import_receipt_hash_mismatch", "expected_rc": 1},
+    {"name": "ledger_hash_mismatch", "expected_rc": 1},
+    {"name": "canonical_path_mismatch", "expected_rc": 1},
+    {"name": "membership_count_mismatch", "expected_rc": 1},
+    {"name": "record_order_drift", "expected_rc": 1},
+    {"name": "duplicate_record", "expected_rc": 1},
+    {"name": "missing_record", "expected_rc": 1},
+    {"name": "excluded_record", "expected_rc": 1},
+    {"name": "later_cycle_path", "expected_rc": 1},
+    {"name": "production_scope", "expected_rc": 1},
+    {"name": "lifecycle_positive", "expected_rc": 0},
+    {"name": "lifecycle_existing_target_overwrite", "expected_rc": 1},
+    {"name": "lifecycle_stage_state_binding", "expected_rc": 1},
+    {"name": "lifecycle_upstream_downstream_cycle", "expected_rc": 1},
+    {"name": "lifecycle_tamper_one_byte", "expected_rc": 1},
+    {"name": "lifecycle_rc1_present", "expected_rc": 1},
+    {"name": "lifecycle_tamper_bad_path", "expected_rc": 1},
+    {"name": "lifecycle_tamper_bad_hash", "expected_rc": 1},
+    {"name": "lifecycle_tamper_symlink", "expected_rc": 1},
+    {"name": "lifecycle_tamper_json", "expected_rc": 1},
+    {"name": "lifecycle_missing_not_created", "expected_rc": 1},
+    {"name": "lifecycle_missing_path_exists", "expected_rc": 1},
+    {"name": "lifecycle_unreadable_valid", "expected_rc": 1},
+    {"name": "lifecycle_unreadable_false_claim", "expected_rc": 1},
+    {"name": "lifecycle_unsafe_valid", "expected_rc": 1},
+    {"name": "lifecycle_unsafe_false_claim", "expected_rc": 1},
+    {"name": "lifecycle_rc0_missing", "expected_rc": 1},
+    {"name": "lifecycle_unknown_status", "expected_rc": 1},
+    {"name": "lifecycle_unknown_reason", "expected_rc": 1},
+    {"name": "lifecycle_omitted_fields", "expected_rc": 1},
+    {"name": "lifecycle_missing_with_hash", "expected_rc": 1},
+    {"name": "lifecycle_present_no_hash", "expected_rc": 1}
+    ,{"name": "path_output_parent_import", "expected_rc": 1}
+    ,{"name": "path_import_missing", "expected_rc": 1}
+    ,{"name": "path_bad_basename", "expected_rc": 1}
+    ,{"name": "path_bad_parent", "expected_rc": 1}
+    ,{"name": "path_role_swap", "expected_rc": 1}
+    ,{"name": "path_relative", "expected_rc": 1}
+    ,{"name": "path_dotdot", "expected_rc": 1}
+    ,{"name": "path_workspace_output_collision", "expected_rc": 1}
+    ,{"name": "path_outside_workspace", "expected_rc": 1}
+    ,{"name": "path_payload_actual_mismatch", "expected_rc": 1}
+    ,{"name": "path_hash_change", "expected_rc": 1}
+    ,{"name": "path_run_id_change", "expected_rc": 1}
+    ,{"name": "path_membership_change", "expected_rc": 1}
+    ,{"name": "path_late_output_binding", "expected_rc": 1}
+    ,{"name": "path_production_replay_fields", "expected_rc": 1}
+    ,{"name": "v21_parent_role_swap", "expected_rc": 1}
+    ,{"name": "v21_parent_hash_mismatch", "expected_rc": 1}
+    ,{"name": "v21_missing_binding", "expected_rc": 1}
+    ,{"name": "v21_alias_binding", "expected_rc": 1}
+    ,{"name": "v20_schema_rejected", "expected_rc": 1}
+    ,{"name": "v21_mixed_encoding", "expected_rc": 1}
+  ]
+}

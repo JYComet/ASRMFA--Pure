@@ -644,7 +644,7 @@ def _build_corpus_stem(stem: str, segments: list[dict],
 def build_en_corpus(en_segments: dict[str, list[dict]],
                     audio_dir: Path, corpus_dir: Path,
                     padding_ms: float = 50.0,
-                    min_segment_dur_ms: float = 200.0,
+                    min_segment_dur_ms: float = 150.0,
                     corpus_workers: int = 0,
                     strict: bool = False) -> dict[str, list[dict]]:
     """Extract English audio segments and build MFA corpus.
@@ -1182,7 +1182,7 @@ def main():
                         help="Number of parallel MFA jobs")
     parser.add_argument("--padding-ms", type=float, default=50.0,
                         help="Padding around English segments (ms)")
-    parser.add_argument("--min-segment-dur-ms", type=float, default=200.0,
+    parser.add_argument("--min-segment-dur-ms", type=float, default=150.0,
                         help="Minimum segment duration for MFA (ms)")
     parser.add_argument("--max-gap-merge-s", type=float, default=0.35,
                         help="Max gap between consecutive English words to merge (s)")

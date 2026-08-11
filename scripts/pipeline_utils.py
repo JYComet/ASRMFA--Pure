@@ -1628,8 +1628,14 @@ def compute_model_tree_digest(model_dir: Path) -> tuple[str, list[dict]]:
 # CTC run receipt — Case 99 provenance (R5)
 # ═══════════════════════════════════════════════════════════════════
 
-_CTC_RUN_RECEIPT_SCHEMA = "ctc-run-receipt-v1"
+_CTC_RUN_RECEIPT_SCHEMA = "ctc-run-receipt-v2"
 _SHARD_RECEIPT_SCHEMA = "ctc-shard-receipt-v1"
+CTC_RUN_RECEIPT_SCHEMA = _CTC_RUN_RECEIPT_SCHEMA
+AUDIO_TRANSFORM_RECEIPT_SCHEMA = "audio-transform-receipt-v1"
+MFA_INPUT_AXIS_RECEIPT_SCHEMA = "mfa-input-axis-receipt-v1"
+MFA_ALIGNMENT_AXIS_RECEIPT_SCHEMA = "mfa-alignment-axis-receipt-v1"
+MFA_ALIGNMENT_AXIS_RECEIPT_V2_SCHEMA = "mfa-alignment-axis-receipt-v2"
+AXIS_TIMING_TOLERANCE_S = 0.003
 
 
 def _stable_json_digest(value: object) -> str:
@@ -1638,6 +1644,11 @@ def _stable_json_digest(value: object) -> str:
         json.dumps(value, ensure_ascii=False, sort_keys=True,
                    separators=(",", ":")).encode()
     ).hexdigest()
+
+
+# Public alias for provenance producers that must share the canonical JSON
+# membership digest implementation.
+stable_json_digest = _stable_json_digest
 
 
 def write_ctc_run_receipt(
@@ -1651,6 +1662,7 @@ def write_ctc_run_receipt(
     dict_digest: str,
     input_stems: list[str],
     output_stems: list[str],
+    audio_bindings: list[dict] | None = None,
 ) -> dict:
     """Atomically write a CTC run receipt binding provenance evidence.
 
@@ -1682,6 +1694,7 @@ def write_ctc_run_receipt(
         "input_stems_digest": _stable_json_digest(input_sorted),
         "output_stems": output_sorted,
         "output_stems_digest": _stable_json_digest(output_sorted),
+        "audio_bindings": sorted(audio_bindings or [], key=lambda row: row.get("stem", "")),
     }
     receipt_path = output_dir / ".ctc_run_receipt.json"
     tmp = receipt_path.with_name(".ctc_run_receipt.json.tmp")
@@ -1689,6 +1702,270 @@ def write_ctc_run_receipt(
                    encoding="utf-8")
     os.replace(tmp, receipt_path)
     return receipt
+
+
+def _axis_sha256(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _axis_audio_metadata(path: Path) -> dict:
+    """Read immutable PCM WAV metadata without invoking an audio process."""
+    import wave
+    path = Path(path)
+    with wave.open(str(path), "rb") as handle:
+        frames = handle.getnframes()
+        sample_rate = handle.getframerate()
+        channels = handle.getnchannels()
+        sample_width = handle.getsampwidth()
+    if sample_rate <= 0 or frames < 0:
+        raise ValueError(f"invalid WAV metadata: {path}")
+    return {"sha256": _axis_sha256(path), "duration_s": frames / sample_rate,
+            "sample_rate": sample_rate, "frames": frames,
+            "channels": channels, "sample_width": sample_width}
+
+
+def _textgrid_global_bounds(path: Path) -> tuple[float, float]:
+    """Extract conservative global xmin/xmax across a Praat TextGrid."""
+    values_min: list[float] = []
+    values_max: list[float] = []
+    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("xmin =") or stripped.startswith("xmax ="):
+            try:
+                value = float(stripped.split("=", 1)[1].strip())
+            except ValueError:
+                continue
+            if stripped.startswith("xmin ="):
+                values_min.append(value)
+            else:
+                values_max.append(value)
+    if not values_min or not values_max:
+        raise ValueError(f"TextGrid global bounds missing: {path}")
+    return min(values_min), max(values_max)
+
+
+def make_audio_transform_receipt(
+    input_audio: Path, output_audio: Path, *, head_transform_s: float = 0.0,
+    tail_transform_s: float = 0.0, shift_s: float = 0.0,
+) -> dict:
+    """Build a v1 immutable audio transform identity; no retime is implicit."""
+    inp = _axis_audio_metadata(input_audio)
+    out = _axis_audio_metadata(output_audio)
+    for value in (head_transform_s, tail_transform_s, shift_s):
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise ValueError("audio transform values must be finite numbers")
+    return {"schema": AUDIO_TRANSFORM_RECEIPT_SCHEMA,
+            "input": {"path": str(Path(input_audio).resolve()), **inp},
+            "output": {"path": str(Path(output_audio).resolve()), **out},
+            "head_transform_s": float(head_transform_s),
+            "tail_transform_s": float(tail_transform_s),
+            "shift_s": float(shift_s), "scale": 1.0}
+
+
+def write_audio_transform_receipt(path: Path, receipt: dict) -> dict:
+    if receipt.get("schema") != AUDIO_TRANSFORM_RECEIPT_SCHEMA:
+        raise ValueError("audio transform receipt schema mismatch")
+    Path(path).write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+                          encoding="utf-8")
+    return receipt
+
+
+def validate_audio_transform_receipt(
+    receipt: dict, *, input_audio: Path | None = None,
+    output_audio: Path | None = None,
+) -> list[str]:
+    """Validate an immutable unit-time audio transform and its files."""
+    errors: list[str] = []
+    if receipt.get("schema") != AUDIO_TRANSFORM_RECEIPT_SCHEMA:
+        return ["audio transform receipt schema mismatch"]
+    if receipt.get("scale") != 1.0 or any(
+            receipt.get(key) != 0.0 for key in ("head_transform_s", "tail_transform_s", "shift_s")):
+        errors.append("audio transform must be identity (scale=1, zero offsets)")
+    inp = receipt.get("input")
+    out = receipt.get("output")
+    if not isinstance(inp, dict) or not isinstance(out, dict):
+        return [*errors, "audio transform input/output metadata missing"]
+    for label, row, expected in (("input", inp, input_audio), ("output", out, output_audio)):
+        path = Path(str(row.get("path", "")))
+        if expected is not None and path.resolve() != Path(expected).resolve():
+            errors.append(f"audio transform {label} path mismatch")
+        if not path.is_absolute() or path.is_symlink() or not path.is_file():
+            errors.append(f"audio transform {label} missing/unsafe")
+            continue
+        try:
+            actual = _axis_audio_metadata(path)
+            for key in ("sha256", "sample_rate", "frames"):
+                if actual.get(key) != row.get(key):
+                    errors.append(f"audio transform {label} {key} mismatch")
+            if abs(float(actual["duration_s"]) - float(row.get("duration_s"))) > AXIS_TIMING_TOLERANCE_S:
+                errors.append(f"audio transform {label} duration mismatch")
+        except (OSError, ValueError, TypeError):
+            errors.append(f"audio transform {label} metadata unreadable")
+    if isinstance(inp.get("duration_s"), (int, float)) and isinstance(out.get("duration_s"), (int, float)):
+        if abs(float(inp["duration_s"]) - float(out["duration_s"])) > AXIS_TIMING_TOLERANCE_S:
+            errors.append("audio transform duration drift exceeds tolerance")
+    return errors
+
+
+def validate_ctc_run_receipt_v2(
+    receipt: dict, *, expected_stems: list[str] | None = None,
+    audio_root: Path | None = None,
+) -> list[str]:
+    errors: list[str] = []
+    if receipt.get("schema") != _CTC_RUN_RECEIPT_SCHEMA:
+        return ["CTC run receipt schema mismatch"]
+    stems = sorted(expected_stems if expected_stems is not None
+                   else receipt.get("input_stems", []))
+    rows = receipt.get("audio_bindings")
+    if not isinstance(rows, list) or [row.get("stem") for row in rows] != stems:
+        errors.append("CTC receipt audio stem membership mismatch")
+        rows = []
+    for row in rows:
+        stem = row.get("stem")
+        path = Path(str(row.get("path", "")))
+        if path.is_symlink() or not path.is_file():
+            errors.append(f"CTC receipt audio missing/unsafe:{stem}")
+            continue
+        try:
+            actual = _axis_audio_metadata(path)
+            if actual["sha256"] != row.get("sha256"):
+                errors.append(f"CTC receipt audio hash mismatch:{stem}")
+            if actual["sample_rate"] != row.get("sample_rate") or actual["frames"] != row.get("frames"):
+                errors.append(f"CTC receipt audio sample/frame mismatch:{stem}")
+            if abs(actual["duration_s"] - float(row.get("duration_s"))) > AXIS_TIMING_TOLERANCE_S:
+                errors.append(f"CTC receipt audio duration mismatch:{stem}")
+            bounds = row.get("ctc_bounds", {})
+            if isinstance(bounds, dict) and isinstance(bounds.get("xmax"), (int, float)):
+                if float(bounds["xmax"]) > actual["duration_s"] + AXIS_TIMING_TOLERANCE_S:
+                    errors.append(f"CTC receipt bounds exceed audio:{stem}")
+            token_path = Path(str(row.get("tokens_path", "")))
+            if row.get("tokens_sha256"):
+                if token_path.is_symlink() or not token_path.is_file() or _axis_sha256(token_path) != row.get("tokens_sha256"):
+                    errors.append(f"CTC receipt tokens hash mismatch:{stem}")
+            for field, suffix in (("lab_sha256", ".lab"), ("punct_sha256", "_punct.json"), ("reference_sha256", "_ref.txt")):
+                if row.get(field):
+                    artifact = Path(str(row.get(field + "_path",
+                                             row.get(field[:-7] + "_path", ""))))
+                    if not artifact.is_file() or artifact.is_symlink() or _axis_sha256(artifact) != row.get(field):
+                        errors.append(f"CTC receipt {field} mismatch:{stem}")
+            textgrid_path = Path(str(row.get("textgrid_path", "")))
+            if row.get("textgrid_sha256"):
+                if not textgrid_path.is_file() or textgrid_path.is_symlink() or _axis_sha256(textgrid_path) != row.get("textgrid_sha256"):
+                    errors.append(f"CTC receipt TextGrid hash mismatch:{stem}")
+                else:
+                    try:
+                        xmin, xmax = _textgrid_global_bounds(textgrid_path)
+                        if abs(xmin - float(row.get("textgrid_xmin"))) > AXIS_TIMING_TOLERANCE_S or abs(xmax - float(row.get("textgrid_xmax"))) > AXIS_TIMING_TOLERANCE_S:
+                            errors.append(f"CTC receipt TextGrid bounds mismatch:{stem}")
+                        if xmax > actual["duration_s"] + AXIS_TIMING_TOLERANCE_S:
+                            errors.append(f"CTC receipt TextGrid exceeds audio:{stem}")
+                    except (OSError, ValueError, TypeError):
+                        errors.append(f"CTC receipt TextGrid bounds unreadable:{stem}")
+            for key in ("token_min_s", "token_max_s"):
+                value = row.get(key)
+                if value is not None and (not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < -AXIS_TIMING_TOLERANCE_S or float(value) > actual["duration_s"] + AXIS_TIMING_TOLERANCE_S):
+                    errors.append(f"CTC receipt token bounds invalid:{stem}")
+            if audio_root is not None and path.parent.resolve() != Path(audio_root).resolve():
+                errors.append(f"CTC receipt audio root mismatch:{stem}")
+        except (OSError, ValueError, TypeError):
+            errors.append(f"CTC receipt audio metadata unreadable:{stem}")
+    return errors
+
+
+def make_mfa_input_axis_receipt(
+    stems: list[str], audio_bindings: list[dict], *, axis_root: Path,
+    source_role: str = "mfa_axis_audio", transform_receipts: list[str] | None = None,
+) -> dict:
+    rows = sorted(audio_bindings, key=lambda row: row.get("stem", ""))
+    expected = sorted(stems)
+    if [row.get("stem") for row in rows] != expected:
+        raise ValueError("MFA input axis stem set mismatch")
+    return {"schema": MFA_INPUT_AXIS_RECEIPT_SCHEMA,
+            "source_role": source_role, "axis_root": str(Path(axis_root).resolve()),
+            "stems": expected, "stems_digest": _stable_json_digest(expected),
+            "audio": rows, "transform_receipts": list(transform_receipts or []),
+            "scale": 1.0}
+
+
+def make_mfa_alignment_axis_receipt(
+    input_axis: dict, alignments: list[dict], *, alignment_root: Path,
+) -> dict:
+    rows = sorted(alignments, key=lambda row: row.get("stem", ""))
+    expected = input_axis.get("stems", [])
+    if [row.get("stem") for row in rows] != expected:
+        raise ValueError("MFA alignment axis stem set mismatch")
+    return {"schema": MFA_ALIGNMENT_AXIS_RECEIPT_SCHEMA,
+            "input_axis_schema": input_axis.get("schema"),
+            "input_axis_digest": _stable_json_digest(input_axis),
+            "alignment_root": str(Path(alignment_root).resolve()),
+            "stems": expected, "stems_digest": _stable_json_digest(expected),
+            "alignments": rows, "scale": 1.0}
+
+
+def make_mfa_alignment_axis_receipt_v2(
+    input_axis: dict, aligned: list[dict], missing_stems: list[str], *, alignment_root: Path,
+) -> dict:
+    expected = sorted(input_axis.get("stems", []))
+    rows = sorted(aligned, key=lambda row: row.get("stem", ""))
+    missing = sorted(set(missing_stems))
+    if [row.get("stem") for row in rows] != sorted(set(expected) - set(missing)):
+        raise ValueError("MFA alignment v2 aligned stem set mismatch")
+    if set(missing) - set(expected):
+        raise ValueError("MFA alignment v2 missing stem set mismatch")
+    statuses = ([{"stem": row["stem"], "status": "aligned", **row} for row in rows]
+                + [{"stem": stem, "status": "missing_mfa_alignment"} for stem in missing])
+    statuses.sort(key=lambda row: row["stem"])
+    return {"schema": MFA_ALIGNMENT_AXIS_RECEIPT_V2_SCHEMA,
+            "input_axis_schema": input_axis.get("schema"),
+            "input_axis_digest": _stable_json_digest(input_axis),
+            "alignment_root": str(Path(alignment_root).resolve()),
+            "stems": expected, "stems_digest": _stable_json_digest(expected),
+            "alignments": statuses, "scale": 1.0,
+            "status_counts": {"aligned": len(rows), "missing_mfa_alignment": len(missing)}}
+
+
+def validate_mfa_axis_receipts(
+    input_axis: dict, *, stems: list[str], audio_root: Path,
+    ctc_receipt: dict | None = None, alignment_axis: dict | None = None,
+) -> list[str]:
+    """Fail-closed pre-MFA guard for one immutable audio timeline."""
+    errors: list[str] = []
+    expected = sorted(stems)
+    if input_axis.get("schema") != MFA_INPUT_AXIS_RECEIPT_SCHEMA:
+        errors.append("MFA input axis schema mismatch")
+    if input_axis.get("stems") != expected or input_axis.get("stems_digest") != _stable_json_digest(expected):
+        errors.append("MFA input axis stem membership mismatch")
+    if input_axis.get("scale") != 1.0:
+        errors.append("MFA input axis scale must be 1.0")
+    rows = input_axis.get("audio")
+    if not isinstance(rows, list) or [row.get("stem") for row in rows] != expected:
+        errors.append("MFA input axis audio rows mismatch")
+        rows = []
+    for row in rows:
+        path = Path(str(row.get("path", "")))
+        if not path.is_absolute() or path.is_symlink() or not path.is_file():
+            errors.append(f"MFA axis audio missing/unsafe:{row.get('stem')}")
+            continue
+        try:
+            actual = _axis_audio_metadata(path)
+            if actual.get("sha256") != row.get("sha256"):
+                errors.append(f"MFA axis audio hash mismatch:{row.get('stem')}")
+            if abs(float(actual["duration_s"]) - float(row.get("duration_s"))) > AXIS_TIMING_TOLERANCE_S:
+                errors.append(f"MFA axis audio duration mismatch:{row.get('stem')}")
+            if actual.get("sample_rate") != row.get("sample_rate") or actual.get("frames") != row.get("frames"):
+                errors.append(f"MFA axis audio sample/frame mismatch:{row.get('stem')}")
+            if path.parent.resolve() != Path(audio_root).resolve():
+                errors.append(f"MFA axis audio root mismatch:{row.get('stem')}")
+        except (OSError, ValueError, TypeError):
+            errors.append(f"MFA axis audio metadata unreadable:{row.get('stem')}")
+    if ctc_receipt is not None and ctc_receipt.get("schema") != _CTC_RUN_RECEIPT_SCHEMA:
+        errors.append("CTC receipt schema mismatch")
+    if alignment_axis is not None:
+        if alignment_axis.get("schema") != MFA_ALIGNMENT_AXIS_RECEIPT_SCHEMA:
+            errors.append("MFA alignment axis schema mismatch")
+        if alignment_axis.get("stems") != expected or alignment_axis.get("scale") != 1.0:
+            errors.append("MFA alignment axis binding mismatch")
+    return errors
 
 
 def write_ctc_shard_receipt(

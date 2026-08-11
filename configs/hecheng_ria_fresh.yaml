@@ -35,6 +35,15 @@ temp_dir: temp
 pad_silence:
   target_edge_silence_sec: 0.5
 
+# Single MFA timeline contract.  The CTC v2 receipt binds the producer's input
+# audio; a per-stem identity resample receipt connects it to the actual MFA
+# axis.  Post-CTC padding is forbidden.
+audio_axis:
+  mfa_axis_role: mfa_axis_audio
+  tts_authoritative_role: tts_authoritative_audio
+  reuse_ctc_requires_receipt: true
+  post_ctc_pad_silence: forbidden
+
 # ── CTC/ASR 预对齐 (参考文本模式) ────────────────────────────
 ctc_prealign:
   enabled: true
@@ -78,7 +87,7 @@ mfa_en:
   enabled: true
   num_jobs: 16
   padding_ms: 50
-  min_segment_dur_ms: 200
+  min_segment_dur_ms: 150
   max_gap_merge_s: 0.35
   beam: 10
   retry_beam: 40

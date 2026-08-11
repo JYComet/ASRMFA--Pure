@@ -60,6 +60,259 @@ LONG_PAUSE_TOKEN = "<PAUSE>"
 # legacy producer output without creating an import cycle.
 STRICT_EN_MFA_SCHEMA = "strict-en-mfa-v1"
 _STRICT_EN_SILENCE = {"sil", "sp", "spn", "<eps>"}
+MFA_INPUT_AXIS_SCHEMA = "mfa-input-axis-receipt-v1"
+MFA_ALIGNMENT_AXIS_SCHEMA = "mfa-alignment-axis-receipt-v1"
+MFA_ALIGNMENT_AXIS_V2_SCHEMA = "mfa-alignment-axis-receipt-v2"
+AXIS_EPS = 0.003
+_SEMANTIC_NVV = re.compile(r"<([A-Za-z][A-Za-z-]*)>")
+_SEMANTIC_ENGLISH = re.compile(r"[A-Za-z]+")
+_SEMANTIC_SP1 = re.compile(r"<sp1>", re.I)
+_SEMANTIC_PUNCT_MAP = str.maketrans({
+    ",": "，", ".": "。", "?": "？", "!": "！", ";": "；", ":": "：",
+})
+
+
+def _axis_digest(value: object) -> str:
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False,
+                                     sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _axis_sha(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _axis_wav_meta(path: Path) -> dict:
+    with wave.open(str(path), "rb") as handle:
+        rate = handle.getframerate()
+        frames = handle.getnframes()
+        if rate <= 0:
+            raise ValueError("invalid WAV sample rate")
+        return {"sha256": _axis_sha(path), "duration_s": frames / rate,
+                "sample_rate": rate, "frames": frames,
+                "channels": handle.getnchannels(),
+                "sample_width": handle.getsampwidth()}
+
+
+def _strict_semantic_tokens(text: str) -> list[tuple[str, str]]:
+    """Mirror audit_strict_ok's final reference-sequence token contract.
+
+    Postprocess cannot import the auditor without a cycle, so this is an
+    intentional local copy.  In particular, tier labels are later joined by
+    spaces: separate English labels ``all`` and ``in`` must remain separate,
+    whereas real lexical corruption such as ``N`` becoming ``Noa`` remains a
+    mismatch.
+    """
+    text = _SEMANTIC_SP1.sub("", text).translate(_SEMANTIC_PUNCT_MAP)
+    result: list[tuple[str, str]] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char.isspace():
+            index += 1
+            continue
+        nvv = _SEMANTIC_NVV.match(text, index)
+        if nvv:
+            label = nvv.group(1).upper()
+            result.append(("nvv", label) if is_nvv_token(label)
+                          else ("other", nvv.group(0)))
+            index = nvv.end()
+            continue
+        english = _SEMANTIC_ENGLISH.match(text, index)
+        if english:
+            word = english.group(0)
+            if not is_nvv_token(word) and word.lower() != "sp1":
+                result.append(("english", word.lower()))
+            index = english.end()
+            continue
+        if is_cjk(char):
+            result.append(("cjk", char))
+        elif is_punct(char):
+            result.append(("punct", char))
+        elif char not in "<>[]":
+            result.append(("other", char))
+        index += 1
+    return result
+
+
+def _load_axis_contract(args) -> tuple[list[str], dict[str, list[str]]]:
+    """Read explicit MFA/TTS axis receipts before any candidate is written."""
+    errors: list[str] = []
+    stem_reasons: dict[str, list[str]] = {}
+    input_path = getattr(args, "mfa_input_axis_receipt", None)
+    align_path = getattr(args, "mfa_alignment_axis_receipt", None)
+    mfa_root = getattr(args, "mfa_axis_audio_root", None)
+    tts_root = getattr(args, "tts_authoritative_audio_root", None)
+    if not all(isinstance(value, Path) for value in (input_path, align_path, mfa_root, tts_root)):
+        return ["axis_contract_receipts_missing"], stem_reasons
+    try:
+        for path, label, directory in ((input_path, "mfa_input_axis", False),
+                                       (align_path, "mfa_alignment_axis", False),
+                                       (mfa_root, "mfa_axis_audio_root", True),
+                                       (tts_root, "tts_authoritative_audio_root", True)):
+            if (not path.is_absolute() or ".." in path.parts or path.is_symlink()
+                    or (not path.is_dir() if directory else not path.is_file())):
+                raise ValueError(f"{label} path invalid")
+        input_axis = json.loads(input_path.read_text(encoding="utf-8"))
+        alignment_axis = json.loads(align_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return [f"axis_contract_receipt_unreadable:{exc}"], stem_reasons
+    if input_axis.get("schema") != MFA_INPUT_AXIS_SCHEMA:
+        errors.append("mfa_input_axis_schema_mismatch")
+    if input_axis.get("source_role") != "mfa_axis_audio":
+        errors.append("mfa_input_axis_source_role_mismatch")
+    alignment_schema = alignment_axis.get("schema")
+    if alignment_schema not in (MFA_ALIGNMENT_AXIS_SCHEMA, MFA_ALIGNMENT_AXIS_V2_SCHEMA):
+        errors.append("mfa_alignment_axis_schema_mismatch")
+    stems = input_axis.get("stems")
+    stems_valid = (isinstance(stems, list)
+                   and all(isinstance(stem, str) and stem for stem in stems))
+    if (not stems_valid or stems != sorted(set(stems))
+            or input_axis.get("stems_digest") != _axis_digest(stems)):
+        errors.append("axis_stem_conservation_invalid")
+        stems = []
+    if Path(str(input_axis.get("axis_root", ""))).resolve() != mfa_root.resolve():
+        errors.append("mfa_axis_audio_root_binding_mismatch")
+    declared_tts_root = input_axis.get("tts_authoritative_audio_root")
+    if declared_tts_root is not None and Path(str(declared_tts_root)).resolve() != tts_root.resolve():
+        errors.append("tts_authoritative_audio_root_binding_mismatch")
+    if Path(str(alignment_axis.get("alignment_root", ""))).resolve() != args.textgrid_dir.resolve():
+        errors.append("mfa_alignment_root_binding_mismatch")
+    if (alignment_axis.get("input_axis_schema") != MFA_INPUT_AXIS_SCHEMA
+            or alignment_axis.get("input_axis_digest") != _axis_digest(input_axis)
+            or alignment_axis.get("stems") != stems
+            or alignment_axis.get("stems_digest") != _axis_digest(stems)):
+        errors.append("axis_receipt_digest_or_stem_mismatch")
+    input_rows = input_axis.get("audio")
+    align_rows = alignment_axis.get("alignments")
+    rows_valid = (isinstance(input_rows, list) and all(isinstance(row, dict) for row in input_rows)
+                  and isinstance(align_rows, list) and all(isinstance(row, dict) for row in align_rows))
+    if not rows_valid or [row.get("stem") for row in input_rows] != stems:
+        errors.append("axis_stem_conservation_invalid")
+        return sorted(set(errors)), stem_reasons
+    if alignment_axis.get("scale") != 1.0:
+        errors.append("mfa_alignment_axis_scale_mismatch")
+    if input_axis.get("scale") != 1.0:
+        errors.append("mfa_input_axis_scale_mismatch")
+    if alignment_schema == MFA_ALIGNMENT_AXIS_SCHEMA:
+        if [row.get("stem") for row in align_rows] != stems:
+            errors.append("axis_stem_conservation_invalid")
+            return sorted(set(errors)), stem_reasons
+        aligned_rows = align_rows
+        missing_stems: set[str] = set()
+    elif alignment_schema == MFA_ALIGNMENT_AXIS_V2_SCHEMA:
+        if [row.get("stem") for row in align_rows] != stems:
+            errors.append("axis_stem_conservation_invalid")
+            return sorted(set(errors)), stem_reasons
+        status_by_stem = {row.get("stem"): row.get("status") for row in align_rows}
+        if any(status not in {"aligned", "missing_mfa_alignment"}
+               for status in status_by_stem.values()):
+            errors.append("mfa_alignment_axis_status_invalid")
+            return sorted(set(errors)), stem_reasons
+        missing_stems = {stem for stem, status in status_by_stem.items()
+                         if status == "missing_mfa_alignment"}
+        aligned_rows = [row for row in align_rows if row.get("status") == "aligned"]
+        expected_counts = {"aligned": len(aligned_rows),
+                           "missing_mfa_alignment": len(missing_stems)}
+        if alignment_axis.get("status_counts") != expected_counts:
+            errors.append("mfa_alignment_axis_status_counts_mismatch")
+        actual_grids = {path.stem for path in args.textgrid_dir.glob("*.TextGrid")}
+        if actual_grids != set(stems) - missing_stems:
+            errors.append("mfa_alignment_axis_status_partition_mismatch")
+    else:
+        # Keep all downstream parsing closed while reporting the schema defect.
+        return sorted(set(errors)), stem_reasons
+    input_by_stem = {row["stem"]: row for row in input_rows if isinstance(row, dict) and "stem" in row}
+    align_by_stem = {row["stem"]: row for row in aligned_rows if isinstance(row, dict) and "stem" in row}
+    if len(input_by_stem) != len(stems) or len(align_by_stem) != len(stems) - len(missing_stems):
+        errors.append("axis_stem_conservation_invalid")
+        return sorted(set(errors)), stem_reasons
+
+    transforms: dict[str, dict] = {}
+    transform_paths = input_axis.get("transform_receipts", [])
+    if not isinstance(transform_paths, list) or any(not isinstance(item, str) for item in transform_paths):
+        errors.append("audio_transform_receipts_invalid")
+    elif transform_paths:
+        if len(transform_paths) != len(stems):
+            errors.append("audio_transform_receipt_stem_conservation_invalid")
+        for raw_path in transform_paths:
+            try:
+                receipt_path = Path(raw_path)
+                if (not receipt_path.is_absolute() or ".." in receipt_path.parts
+                        or receipt_path.is_symlink() or not receipt_path.is_file()):
+                    raise ValueError("unsafe receipt path")
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                input_row = receipt.get("input", {})
+                stem = Path(str(input_row.get("path", ""))).stem
+                if stem in transforms or stem not in stems:
+                    raise ValueError("duplicate or unexpected transform stem")
+                transforms[stem] = receipt
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                errors.append("audio_transform_receipt_invalid")
+
+    for stem in stems:
+        row = input_by_stem[stem]
+        reasons = stem_reasons.setdefault(stem, [])
+        try:
+            audio = Path(str(row["path"]))
+            if (audio.is_symlink() or not audio.is_file() or audio.resolve().parent != mfa_root.resolve()
+                    or audio.name != f"{stem}.wav"):
+                raise ValueError("mfa audio path binding")
+            actual = _axis_wav_meta(audio)
+            if (row.get("sha256") != actual["sha256"]
+                    or row.get("sample_rate") != actual["sample_rate"]
+                    or row.get("frames") != actual["frames"]
+                    or abs(float(row.get("duration_s")) - actual["duration_s"]) > AXIS_EPS):
+                raise ValueError("mfa audio metadata/hash")
+        except (OSError, ValueError, TypeError, KeyError):
+            errors.append(f"mfa_axis_audio_receipt_invalid:{stem}")
+            continue
+        if stem in missing_stems:
+            reasons.append("missing_mfa_alignment")
+        else:
+            alignment = align_by_stem[stem]
+            aligned = args.textgrid_dir / f"{stem}.TextGrid"
+            try:
+                tg = parse_textgrid(aligned)
+                xmax = tg.xmax
+                if (alignment.get("path") != str(aligned.resolve())
+                        or alignment.get("sha256") != _axis_sha(aligned)
+                        or alignment.get("audio_sha256") != row.get("sha256")
+                        or abs(float(alignment.get("xmax")) - xmax) > AXIS_EPS
+                        or abs(xmax - actual["duration_s"]) > AXIS_EPS):
+                    reasons.append("mfa_alignment_axis_mismatch")
+            except (OSError, ValueError, TypeError, KeyError):
+                reasons.append("mfa_alignment_axis_mismatch")
+        try:
+            tts = tts_root / f"{stem}.wav"
+            tts_meta = _axis_wav_meta(tts)
+            identity = all(tts_meta[key] == actual[key]
+                           for key in ("sha256", "sample_rate", "frames", "channels", "sample_width")) and abs(
+                               tts_meta["duration_s"] - actual["duration_s"]) <= AXIS_EPS
+            transform = transforms.get(stem)
+            if transform is not None:
+                inp, out = transform.get("input"), transform.get("output")
+                valid_transform = (
+                    transform.get("schema") == "audio-transform-receipt-v1"
+                    and transform.get("scale") == 1.0
+                    and all(transform.get(key) == 0.0 for key in
+                            ("head_transform_s", "tail_transform_s", "shift_s"))
+                    and isinstance(inp, dict) and isinstance(out, dict)
+                    and inp.get("path") == str(tts.resolve())
+                    and out.get("path") == str(audio.resolve())
+                    and all(inp.get(key) == tts_meta[key] for key in tts_meta)
+                    and all(out.get(key) == actual[key] for key in actual)
+                    and abs(float(inp.get("duration_s")) - float(out.get("duration_s"))) <= AXIS_EPS)
+                if not valid_transform:
+                    reasons.append("tts_audio_axis_mismatch")
+            elif not identity:
+                reasons.append("tts_audio_axis_mismatch")
+        except (OSError, ValueError, TypeError):
+            reasons.append("tts_audio_axis_mismatch")
+    return sorted(set(errors)), {stem: sorted(set(reasons)) for stem, reasons in stem_reasons.items()}
 
 @dataclass
 class Interval:
@@ -773,10 +1026,16 @@ def _collect_tier_discontinuities(textgrid: TextGrid,
         tier = tier_by_name(textgrid, tier_name)
         if tier is None or len(tier.intervals) < 5:
             continue
+        # Match Case 35's semantic boundary rule: punctuation and explicit
+        # silence own their adjacent timing space.  A structural hole exists
+        # only when two neighboring content intervals leave time uncovered.
         gaps = sum(
             1
             for left, right in zip(tier.intervals, tier.intervals[1:])
-            if right.xmin - left.xmax > threshold_s
+            if (right.xmin - left.xmax > threshold_s
+                and left.text.strip() and right.text.strip()
+                and not is_silence(left.text) and not is_silence(right.text)
+                and not is_punct(left.text.strip()) and not is_punct(right.text.strip()))
         )
         if gaps > len(tier.intervals) * 0.10:
             discontinuities.append(f"{tier.name}({gaps}/{len(tier.intervals)})")
@@ -787,6 +1046,59 @@ def _collect_tier_discontinuities(textgrid: TextGrid,
         if gaps > len(pp_tier.intervals) * 0.10:
             discontinuities.append(f"{pp_tier.name}({gaps}/{len(pp_tier.intervals)})")
     return discontinuities
+
+
+def _tier_desync_counts(hanzi_tier: Tier | None,
+                         words_tier: Tier | None) -> tuple[int, int]:
+    """Compare semantic hanzi/words units without splitting English words.
+
+    CJK still requires exactly one tone-number pinyin word.  English source
+    labels may be hyphenated (for example ``K-Pop``), while MFA/CTC can emit
+    their contiguous fragments as ``kp`` and ``op``.  Compare that one
+    semantic English unit to the normalized concatenation so it cannot shift
+    every following CJK pair.  Punctuation and silence do not carry lexical
+    identity and are intentionally absent from this check.
+    """
+    if hanzi_tier is None or words_tier is None:
+        return 0, 0
+
+    def content(tier: Tier) -> list[str]:
+        return [iv.text.strip() for iv in tier.intervals
+                if iv.text.strip() and not is_silence(iv.text)
+                and not is_punct(iv.text.strip())]
+
+    def english_key(text: str) -> str:
+        return "".join(char.casefold() for char in text
+                       if char.isascii() and char.isalpha())
+
+    hanzi, words = content(hanzi_tier), content(words_tier)
+    h_index = w_index = mismatches = semantic_words = 0
+    while h_index < len(hanzi):
+        h_text = hanzi[h_index]
+        semantic_words += 1
+        if is_cjk(h_text):
+            if w_index >= len(words) or not re.fullmatch(r"[a-z]+[1-5]", words[w_index]):
+                mismatches += 1
+            else:
+                w_index += 1
+        elif is_english_token(h_text):
+            expected = english_key(h_text)
+            actual = ""
+            while (w_index < len(words) and is_english_token(words[w_index])
+                   and len(actual) < len(expected)):
+                actual += english_key(words[w_index])
+                w_index += 1
+            if actual != expected:
+                mismatches += 1
+        else:
+            if w_index >= len(words) or words[w_index].casefold() != h_text.casefold():
+                mismatches += 1
+            else:
+                w_index += 1
+        h_index += 1
+    extra_words = len(words) - w_index
+    mismatches += extra_words
+    return mismatches, max(len(hanzi), semantic_words + extra_words)
 
 
 def _record_filterable_qc(report: dict, filter_reasons: list[str],
@@ -2169,6 +2481,9 @@ def assess_reference_coverage(
         label for iv in hanzi_intervals
         if len((label := iv.text.strip())) == 1 and is_cjk(label)
     )
+    reference_semantic = _strict_semantic_tokens(reference_text)
+    hanzi_semantic = _strict_semantic_tokens(" ".join(
+        iv.text for iv in hanzi_intervals if iv.text).strip())
 
     lexical_reference = re.sub(r"<sp\d+>", "", reference_text)
     has_lexical_reference = bool(
@@ -2193,6 +2508,12 @@ def assess_reference_coverage(
 
     if reference_cjk != hanzi_cjk:
         reasons.append("cjk_mismatch")
+    # CJK-only equality cannot prove that interleaved English/NVV units kept
+    # their reference position (for example ``第N天，Noa``).  The strict disk
+    # auditor remains the publication authority; this is an earlier,
+    # deterministic postprocess veto for the same lexical corruption.
+    if reference_semantic != hanzi_semantic:
+        reasons.append("reference_semantic_sequence_mismatch")
     if unknown_source_count:
         reasons.append("mfa_unknown_source")
 
@@ -2205,6 +2526,7 @@ def assess_reference_coverage(
         "extra_pinyin_count": max(0, len(pinyin_tokens) - len(reference_cjk)),
         "unknown_source_count": unknown_source_count,
         "exact_cjk_sequence": reference_cjk == hanzi_cjk,
+        "exact_semantic_sequence": reference_semantic == hanzi_semantic,
         "reference_cjk": reference_cjk,
         "hanzi_cjk": hanzi_cjk,
     }
@@ -6579,22 +6901,26 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # 最终筛选: 所有处理完成后再统一判断 (用最终的边界和静音结构)
     # ================================================================
     filter_reasons = []
+    axis_reasons = list(getattr(args, "_axis_stem_reasons", {}).get(stem, ()))
+    if axis_reasons:
+        filter_reasons.extend(axis_reasons)
+        report["axis_reasons"] = axis_reasons
     if strict_en_rejected:
         filter_reasons.append("english_provenance_rejected")
 
     # Hard lexical integrity is independent of optional acoustic filtering.
     # NVV, punctuation and sentence-initial <sp1> are intentionally excluded
     # from the CJK/pinyin denominator.
-    _coverage, _coverage_reasons = assess_reference_coverage(
+    # Retain this pre-finalization snapshot only for the downstream CJK/pinyin
+    # diagnostic below.  It is not publication evidence: `_finalize_textgrid`
+    # still normalizes labels such as a leading `<sp2>` to `<sp1>`.
+    _prewrite_coverage, _ = assess_reference_coverage(
         reference_text_original,
         tier_by_name(new_tg, "words"),
         tier_by_name(new_tg, "hanzi"),
         reference_source=reference_source,
         unknown_source_count=len(mfa_unknown_before_snap),
     )
-    report["reference_coverage"] = _coverage
-    report["hard_integrity_reasons"] = _coverage_reasons
-    filter_reasons.extend(_coverage_reasons)
     if mfa_unknown_before_snap:
         report["mfa_unknown_source"] = {
             "count": len(mfa_unknown_before_snap),
@@ -6644,35 +6970,10 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     _hanzi_t = tier_by_name(new_tg, "hanzi")
     words_tier = tier_by_name(new_tg, "words")
     pp_tier = tier_by_name(new_tg, "pinyin_phones")
-    _tier_mismatches = 0
-    _tier_total = 0
-    if _hanzi_t is not None and words_tier is not None:
-        _h_seq = [(iv.xmin, iv.xmax, iv.text.strip()) for iv in _hanzi_t.intervals
-                  if not is_silence(iv.text) and iv.text.strip()]
-        _w_seq = [(iv.xmin, iv.xmax, iv.text.strip()) for iv in words_tier.intervals
-                  if not is_silence(iv.text) and iv.text.strip()]
-        _n = min(len(_h_seq), len(_w_seq))
-        _tier_total = max(len(_h_seq), len(_w_seq))
-        if _n > 0:
-            import re as _re2
-            for _i in range(_n):
-                _ht = _h_seq[_i][2]
-                _wt = _w_seq[_i][2]
-                # CJK hanzi → words should be pinyin reading
-                if is_cjk(_ht):
-                    if not _re2.match(r'^[a-z]+[1-5]$', _wt):
-                        _tier_mismatches += 1
-                # ASCII/English hanzi → words should be same stem
-                elif _ht.isascii() and _ht.isalpha():
-                    if _wt.lower().rstrip('012') != _ht.lower().rstrip('012'):
-                        _tier_mismatches += 1
-                # Punct/symbol → skip
-        # Also flag if counts differ (extra or missing intervals in one tier)
-        if len(_h_seq) != len(_w_seq):
-            _tier_mismatches += abs(len(_h_seq) - len(_w_seq))
-        if _tier_total > 0 and _tier_mismatches / _tier_total > 0.10:
-            filter_reasons.append("tier_desync")
-            report["tier_desync"] = f"hanzi↔words mismatches: {_tier_mismatches}/{_tier_total}"
+    _tier_mismatches, _tier_total = _tier_desync_counts(_hanzi_t, words_tier)
+    if _tier_total > 0 and _tier_mismatches / _tier_total > 0.10:
+        filter_reasons.append("tier_desync")
+        report["tier_desync"] = f"hanzi↔words mismatches: {_tier_mismatches}/{_tier_total}"
 
     # ── Phone-word alignment: phones must live inside their word intervals ──
     _misaligned_phones = 0
@@ -6961,7 +7262,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         #     CJK chars indicate the alignment dropped or misassigned them.
         # Compare against the immutable source reference, never against the
         # rendered raw tier (which may have been rebuilt or punctuation-edited).
-        raw_cjk = _coverage["reference_cjk"]
+        raw_cjk = _prewrite_coverage["reference_cjk"]
         hanzi_cjk = "".join(iv.text.strip() for iv in hanzi_tier_final.intervals
                            if iv.text.strip()
                            and ("一" <= iv.text.strip() <= "鿿"
@@ -7459,6 +7760,22 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     new_tg.tiers = [t for t in new_tg.tiers if t.name != "phones"]
     _finalize_textgrid(new_tg)
 
+    # Hard lexical publication evidence must describe exactly the finalized
+    # labels that are about to be written.  In particular, `_finalize_textgrid`
+    # converts leading `<sp2>`/`<sp3>` to `<sp1>`; validating earlier would
+    # interpret that provisional marker as literal semantic content and retain
+    # a stale false veto in the report.
+    _coverage, _coverage_reasons = assess_reference_coverage(
+        reference_text_original,
+        tier_by_name(new_tg, "words"),
+        tier_by_name(new_tg, "hanzi"),
+        reference_source=reference_source,
+        unknown_source_count=len(mfa_unknown_before_snap),
+    )
+    report["reference_coverage"] = _coverage
+    report["hard_integrity_reasons"] = _coverage_reasons
+    filter_reasons.extend(_coverage_reasons)
+
     # strict-ok is intentionally stricter than the legacy best-effort mode:
     # every already-computed diagnostic is a veto.  It does not invent a new
     # acoustic judgement; the independent disk auditor records that judgement
@@ -7518,6 +7835,10 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "output")
     parser.add_argument("--filtered-dir", type=Path, default=PROJECT_ROOT / "filtered")
     parser.add_argument("--wav-dir", type=Path, default=PROJECT_ROOT / "corpus_clean" / "wav")
+    parser.add_argument("--mfa-input-axis-receipt", type=Path, default=None)
+    parser.add_argument("--mfa-alignment-axis-receipt", type=Path, default=None)
+    parser.add_argument("--mfa-axis-audio-root", type=Path, default=None)
+    parser.add_argument("--tts-authoritative-audio-root", type=Path, default=None)
     parser.add_argument("--raw-text-dir", type=Path, default=None,
                         help="Directory with original Chinese text files")
     parser.add_argument("--original-txt-dir", type=Path, default=None,
@@ -7598,6 +7919,13 @@ def main() -> int:
     parser.add_argument("--handle-unexpected-sil", action=argparse.BooleanOptionalAction, default=True,
                         help="Merge <sp0> gaps without punct; flag <sp1-3> gaps for filtering.")
     args = parser.parse_args()
+
+    axis_errors, axis_stem_reasons = _load_axis_contract(args)
+    if axis_errors:
+        for error in axis_errors:
+            print(f"ERROR: {error}")
+        return 1
+    args._axis_stem_reasons = axis_stem_reasons
 
     if args.strict_ok:
         # _record_filterable_qc honours this flag.  A configured legacy

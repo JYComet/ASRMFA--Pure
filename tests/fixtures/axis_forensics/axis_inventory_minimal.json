@@ -1,0 +1,385 @@
+{
+  "schema": "mfa-axis-forensics-minimal-v1",
+  "source": "axis_inventory.jsonl",
+  "rows": [
+    {
+      "stem": "000672_直播流程_开场介绍",
+      "mfa_audio16": {
+        "sha256": "3aa9989808965059e632b48d1e0c28d66926a6ccfd7bd0518c8c16ef702371e3",
+        "duration_s": 7.293375,
+        "sample_rate": 16000,
+        "frames": 116694
+      },
+      "aligned_xmax": 7.293375,
+      "authoritative_audio": {
+        "sha256": "6fda33f6aedf178eeedf4aaba99ea5a0b8f9ab72f36657780b253cab0ec37b91",
+        "duration_s": 6.72,
+        "sample_rate": 48000,
+        "frames": 322560
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    },
+    {
+      "stem": "003213_直播流程_谢场告别",
+      "mfa_audio16": {
+        "sha256": "a157435f0762c5d59e02035c4a73a2fe7fefb2ee0f5ded801beb52c1483034fe",
+        "duration_s": 10.952,
+        "sample_rate": 16000,
+        "frames": 175232
+      },
+      "aligned_xmax": 10.952,
+      "authoritative_audio": {
+        "sha256": "e91a694316d77ccc4675c6325058793ab277778b1e85272e8456ad7451766ea6",
+        "duration_s": 11.04,
+        "sample_rate": 48000,
+        "frames": 529920
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    },
+    {
+      "stem": "005921_直播流程_休息",
+      "mfa_audio16": {
+        "sha256": "5371f2a828c9652b18fc59dee7d2c5f213490ab28181a073b7b4c54615b76de2",
+        "duration_s": 9.32,
+        "sample_rate": 16000,
+        "frames": 149120
+      },
+      "aligned_xmax": 9.32,
+      "authoritative_audio": {
+        "sha256": "798ce12010ee933f645a03bced4dbd7d7d81c709138842634a53b15f044ca429",
+        "duration_s": 8.96,
+        "sample_rate": 48000,
+        "frames": 430080
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    },
+    {
+      "stem": "010705_杂谈互动_讲故事",
+      "mfa_audio16": {
+        "sha256": "72dc7f074c6cd65ebb0d559b28fb7b232d27c3cdb2e7fc8b53f4195eeb7f8a84",
+        "duration_s": 9.8960625,
+        "sample_rate": 16000,
+        "frames": 158337
+      },
+      "aligned_xmax": 9.896062,
+      "authoritative_audio": {
+        "sha256": "3882e83cefed59b70e9ec22579dad5b46843156100e6ed70c6a59540d02ad285",
+        "duration_s": 9.92,
+        "sample_rate": 48000,
+        "frames": 476160
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    },
+    {
+      "stem": "013249_杂谈互动_节目后感想",
+      "mfa_audio16": {
+        "sha256": "9e5b73e34ca75a8dd4b2c387d918605b6d767a344a185a8ce7669fc7bc64223e",
+        "duration_s": 11.8266875,
+        "sample_rate": 16000,
+        "frames": 189227
+      },
+      "aligned_xmax": 11.826688,
+      "authoritative_audio": {
+        "sha256": "b11c88ca26a70818913d80e44143b989c654c13b03888b7af2dc8092af962d76",
+        "duration_s": 11.36,
+        "sample_rate": 48000,
+        "frames": 545280
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    },
+    {
+      "stem": "015262_杂谈互动_节目后感想",
+      "mfa_audio16": {
+        "sha256": "04cd06e8749b71d53e52d7ce11c2dd61c86c8d8838b5d1d1e9b26a23d6c9c77c",
+        "duration_s": 10.269375,
+        "sample_rate": 16000,
+        "frames": 164310
+      },
+      "aligned_xmax": 10.269375,
+      "authoritative_audio": {
+        "sha256": "bf6ae0ff8bab93958616212f7d488d3d52260eafa467e902f02e80750612c9ba",
+        "duration_s": 9.76,
+        "sample_rate": 48000,
+        "frames": 468480
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    },
+    {
+      "stem": "020236_杂谈互动_日常分享",
+      "mfa_audio16": {
+        "sha256": "c63d2a674a3344db72b3f8934f00ea75f58f7bee280ccacb9203d6de4bafeefe",
+        "duration_s": 8.989375,
+        "sample_rate": 16000,
+        "frames": 143830
+      },
+      "aligned_xmax": 8.989375,
+      "authoritative_audio": {
+        "sha256": "09271b1d422607a4fef0f860adbfe0f467f86fc71d0cc7aaa79641c1a2bf50d1",
+        "duration_s": 8.8,
+        "sample_rate": 48000,
+        "frames": 422400
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    },
+    {
+      "stem": "024942_杂谈互动_与特定人物对话",
+      "mfa_audio16": {
+        "sha256": "4561503a7045dcaf4705defdb7ac405e96d15b7135ce11a90a641e369bec0602",
+        "duration_s": 9.768,
+        "sample_rate": 16000,
+        "frames": 156288
+      },
+      "aligned_xmax": 9.768,
+      "authoritative_audio": {
+        "sha256": "1d3558ccbdb533d03ef437d89f502931e8d69a28c127177a40e1040412ed9628",
+        "duration_s": 8.96,
+        "sample_rate": 48000,
+        "frames": 430080
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    },
+    {
+      "stem": "028721_杂谈互动_与特定人物对话",
+      "mfa_audio16": {
+        "sha256": "3b26619ac7846d4be51fc6292354b8f25d0c7bc24ca484438f353978429b5735",
+        "duration_s": 9.181375,
+        "sample_rate": 16000,
+        "frames": 146902
+      },
+      "aligned_xmax": 9.181375,
+      "authoritative_audio": {
+        "sha256": "dc5441fb40af28acb3dacdf4fae803ffff150d9427850ff8b5bfc144dd5fd397",
+        "duration_s": 8.8,
+        "sample_rate": 48000,
+        "frames": 422400
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    },
+    {
+      "stem": "029359_杂谈互动_与特定人物对话",
+      "mfa_audio16": {
+        "sha256": "c147d2971c3898e53f0740da577197ab47f3348dba38b3ebc1dd028a4138c432",
+        "duration_s": 10.184,
+        "sample_rate": 16000,
+        "frames": 162944
+      },
+      "aligned_xmax": 10.184,
+      "authoritative_audio": {
+        "sha256": "e5d95f35a70a4cedc7226d8efacd65569311a5e05e49cdfe444cb286e1249886",
+        "duration_s": 9.76,
+        "sample_rate": 48000,
+        "frames": 468480
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    },
+    {
+      "stem": "031308_杂谈互动_推荐音乐",
+      "mfa_audio16": {
+        "sha256": "e3eb8a5fea4f33196e8b104f5c5eeaa879839f7a494bdcef555505c76c20b8aa",
+        "duration_s": 10.0666875,
+        "sample_rate": 16000,
+        "frames": 161067
+      },
+      "aligned_xmax": 10.066688,
+      "authoritative_audio": {
+        "sha256": "b6a227ee3e26cc098f29dcaa7b89b910c80de75191cfd0b152c903626e351855",
+        "duration_s": 9.6,
+        "sample_rate": 48000,
+        "frames": 460800
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    },
+    {
+      "stem": "035772_弹幕互动_回应夸奖弹幕",
+      "mfa_audio16": {
+        "sha256": "e7524b48c02e8151dcdf28cd26a258c9c61a266caf29d36ec94c28af1c2d8ba9",
+        "duration_s": 9.9706875,
+        "sample_rate": 16000,
+        "frames": 159531
+      },
+      "aligned_xmax": 9.970688,
+      "authoritative_audio": {
+        "sha256": "5df313e93e117bb8bead0fc120782a6f2a7081a86129a2abfd884336fe94d010",
+        "duration_s": 9.44,
+        "sample_rate": 48000,
+        "frames": 453120
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    },
+    {
+      "stem": "036632_弹幕互动_回应吐槽弹幕",
+      "mfa_audio16": {
+        "sha256": "514e528e049294571b89a7c67719c8af7e28f27712f4f25a96998b8dae6a1101",
+        "duration_s": 10.12,
+        "sample_rate": 16000,
+        "frames": 161920
+      },
+      "aligned_xmax": 10.12,
+      "authoritative_audio": {
+        "sha256": "bec1165c33166103f5846ea3d8d68f9985345256d7f06c50d90adef89d426e64",
+        "duration_s": 9.44,
+        "sample_rate": 48000,
+        "frames": 453120
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    },
+    {
+      "stem": "038598_弹幕互动_回答问题",
+      "mfa_audio16": {
+        "sha256": "98e5d72b3583b540f637bd6410bfe1a9f5176eb4fa24aac3db4e3c291dc728eb",
+        "duration_s": 11.773375,
+        "sample_rate": 16000,
+        "frames": 188374
+      },
+      "aligned_xmax": 11.773375,
+      "authoritative_audio": {
+        "sha256": "1cc32f6eb42bf41ea2122d76ccc25210bf4f9c4defc4f324d26b3a190dee0f33",
+        "duration_s": 10.88,
+        "sample_rate": 48000,
+        "frames": 522240
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    },
+    {
+      "stem": "038935_弹幕互动_回答问题",
+      "mfa_audio16": {
+        "sha256": "34ce606cce5b3a8c0168f4b86b26b3c22db45fa31824977519e8fc56e0e9f2b6",
+        "duration_s": 10.76,
+        "sample_rate": 16000,
+        "frames": 172160
+      },
+      "aligned_xmax": 10.76,
+      "authoritative_audio": {
+        "sha256": "bc98b1ac8b47fe556bd74213220514364da3f58e94bf7597e440c22d0f5ab135",
+        "duration_s": 10.4,
+        "sample_rate": 48000,
+        "frames": 499200
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    },
+    {
+      "stem": "039666_弹幕互动_回应要求",
+      "mfa_audio16": {
+        "sha256": "0d3c399df5fb1005f25d498a5f340b3e4a7d7a63aef2ee9462a020ad5181557a",
+        "duration_s": 8.8186875,
+        "sample_rate": 16000,
+        "frames": 141099
+      },
+      "aligned_xmax": 8.818687,
+      "authoritative_audio": {
+        "sha256": "2068cc0384ae7f760020ac6cce620ff0b739b5c7b12a5c5daf696f36bc3881e7",
+        "duration_s": 7.84,
+        "sample_rate": 48000,
+        "frames": 376320
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    },
+    {
+      "stem": "040689_弹幕互动_回应要求",
+      "mfa_audio16": {
+        "sha256": "efd12c21b04d92d68317cf9a985e09e4908bbc1fcc81bae730c3d2455276537d",
+        "duration_s": 11.805375,
+        "sample_rate": 16000,
+        "frames": 188886
+      },
+      "aligned_xmax": 11.805375,
+      "authoritative_audio": {
+        "sha256": "7286091345571c3bf1198b4d520573d7d22639bcf9bab7b5616f80837170fe52",
+        "duration_s": 11.36,
+        "sample_rate": 48000,
+        "frames": 545280
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    },
+    {
+      "stem": "050623_礼物互动_一般礼物反馈",
+      "mfa_audio16": {
+        "sha256": "004b390639903ed1a405c919290982d0f1903b68a8f3821a740810402218e3da",
+        "duration_s": 14.109375,
+        "sample_rate": 16000,
+        "frames": 225750
+      },
+      "aligned_xmax": 14.109375,
+      "authoritative_audio": {
+        "sha256": "da0485efcd2fc184b20524cd5b43957655afa36cbbe566286caff12de06fba90",
+        "duration_s": 13.6,
+        "sample_rate": 48000,
+        "frames": 652800
+      },
+      "expected": {
+        "mfa_alignment_axis_mismatch": false,
+        "tts_audio_axis_mismatch": true,
+        "candidate": false
+      }
+    }
+  ]
+}
+

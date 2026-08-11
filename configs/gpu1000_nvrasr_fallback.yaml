@@ -1,0 +1,64 @@
+# Template only. gpu1000_orchestrate.py prepare copies and resolves it into a
+# fresh run root; do not run the shared pipeline against this file directly.
+mode: nvrasr_fallback
+data_dir: /mnt/nvme3/mfa_audio_cache_ria
+workspace: /mnt/nvme3/mfa_runs/gpu1000_TEMPLATE/workspace
+output_dir: /mnt/nvme3/mfa_runs/gpu1000_TEMPLATE/configured_output_never_publish
+output_staging: false
+use_cache: false
+keep_16k_audio: true
+pad_silence:
+  target_edge_silence_sec: 0.5
+audio_axis:
+  mfa_axis_role: mfa_axis_audio
+  tts_authoritative_role: tts_authoritative_audio
+  reuse_ctc_requires_receipt: true
+  post_ctc_pad_silence: forbidden
+ctc_prealign:
+  enabled: true
+  python: /home/user/miniconda3/envs/asr/bin/python
+  model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
+  device: cuda:0
+  all_gpus: true
+  limit: 0
+  timeout: 14400
+  nvv_enabled: false
+  reference_nvv_enabled: true
+ctc_adjust:
+  enabled: false
+models_dir: /mnt/local_E/MFA_Pause/repo/models/mfa
+mfa:
+  num_jobs: 64
+  single_speaker: true
+  output_format: long_textgrid
+  clean: false
+  no_tokenization: true
+  skip_validate: true
+  fine_tune: false
+  beam: 20
+  retry_beam: 80
+  allow_partial: true
+  min_output_ratio: 0.54
+  timeout: 7200
+mfa_en:
+  enabled: true
+  num_jobs: 16
+  padding_ms: 50
+  min_segment_dur_ms: 150
+  max_gap_merge_s: 0.35
+  beam: 10
+  retry_beam: 40
+  fine_tune: false
+  acoustic_model: /mnt/local_E/MFA_Pause/pretrained_models/acoustic/english_us_arpa.zip
+  dictionary: dict/cmudict.dict
+  g2p_model: /mnt/local_E/MFA_Pause/pretrained_models/g2p/english_us_arpa.zip
+postprocess:
+  strict_ok: true
+  allow_filtered_integrity_failures: true
+  merge_silence: true
+  min_sil_merge_sec: 0.2
+  fix_short_word: false
+  detect_bgm: false
+  filter_suspicious: false
+  enable_text_correction: true
+  handle_unexpected_sil: false

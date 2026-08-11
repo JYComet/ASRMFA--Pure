@@ -77,6 +77,39 @@ def _case_phone_gap_inside_word_is_discontinuity() -> None:
     assert _collect_tier_discontinuities(tg, words) == ["pinyin_phones(1/5)"]
 
 
+def _case_punctuation_boundary_gaps_are_not_discontinuities() -> None:
+    # The real eight-item false positives were all word→punctuation or
+    # punctuation→word gaps.  Their boundary time belongs to punctuation,
+    # not to an uncovered content sequence.
+    words = Tier("words", 0.0, 1.0, [
+        Interval(0.00, 0.10, "ni3"), Interval(0.16, 0.22, "！"),
+        Interval(0.28, 0.38, "hao3"), Interval(0.44, 0.50, "，"),
+        Interval(0.56, 0.66, "ma5"),
+    ])
+    hanzi = Tier("hanzi", 0.0, 1.0, [
+        Interval(0.00, 0.10, "你"), Interval(0.16, 0.22, "！"),
+        Interval(0.28, 0.38, "好"), Interval(0.44, 0.50, "，"),
+        Interval(0.56, 0.66, "吗"),
+    ])
+    tg = TextGrid(0.0, 1.0, [hanzi, words])
+    assert _collect_tier_discontinuities(tg, words) == []
+
+
+def _case_systematic_content_gaps_remain_discontinuities() -> None:
+    words = Tier("words", 0.0, 1.0, [
+        Interval(0.00, 0.10, "ni3"), Interval(0.16, 0.26, "hao3"),
+        Interval(0.32, 0.42, "ma5"), Interval(0.48, 0.58, "wo3"),
+        Interval(0.64, 0.74, "men5"),
+    ])
+    hanzi = Tier("hanzi", 0.0, 1.0, [
+        Interval(0.00, 0.10, "你"), Interval(0.16, 0.26, "好"),
+        Interval(0.32, 0.42, "吗"), Interval(0.48, 0.58, "我"),
+        Interval(0.64, 0.74, "们"),
+    ])
+    tg = TextGrid(0.0, 1.0, [hanzi, words])
+    assert _collect_tier_discontinuities(tg, words) == ["hanzi(4/5)", "words(4/5)"]
+
+
 def _case_disabled_filter_keeps_diagnostic_only() -> None:
     report: dict = {}
     reasons: list[str] = []
@@ -89,6 +122,8 @@ def main() -> int:
     cases = [
         _case_phone_gap_across_pause_is_not_discontinuity,
         _case_phone_gap_inside_word_is_discontinuity,
+        _case_punctuation_boundary_gaps_are_not_discontinuities,
+        _case_systematic_content_gaps_remain_discontinuities,
         _case_disabled_filter_keeps_diagnostic_only,
     ]
     failures = 0
