@@ -23,9 +23,7 @@ from test_gpu1000_continuation import (
     test_composite_lineage_rejects_tampered_original_receipt,
     test_finalize_requires_single_strict_receipt_and_promotes_gate,
     test_stored_preflight_drift_blocks_continuation,
-        test_dual_strict_designation_prefers_bound_continuation,
-        test_singleton_batch_policy_is_narrow,
-        test_canonical_nonempty_bootstrap_builder,
+    test_dual_strict_designation_prefers_bound_continuation,
     test_singleton_batch_policy_is_narrow,
     test_canonical_nonempty_bootstrap_builder,
 )

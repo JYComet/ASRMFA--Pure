@@ -51,6 +51,71 @@ from pipeline_utils import (
 )
 
 
+def plan_streaming_resources(
+    *,
+    cpu_budget: int | None = None,
+    requested_gpu_workers: int | None = None,
+    requested_cpu_workers: int | None = None,
+    requested_mfa_jobs: int | None = None,
+    requested_mfa_en_jobs: int | None = None,
+    config_mfa_jobs: int = 0,
+    config_mfa_en_jobs: int = 0,
+    batch_size: int = 500,
+    batch_count: int | None = None,
+    gpu_queue_size: int = 0,
+    cpu_queue_size: int = 0,
+    pipelined: bool = False,
+) -> dict[str, int]:
+    """Return one bounded CPU/GPU allocation for every streaming mode.
+
+    ``run_pipeline.py`` can start a process pool for both MFA stages.  Keep
+    each pool within the host CPU budget even when several dataset/batch
+    workers run concurrently.  Explicit job requests are honoured only up to
+    that safe per-worker ceiling; configuration defaults follow the same cap.
+    The result intentionally contains only plain integers so launchers and
+    tests can use it without constructing argparse objects.
+    """
+    budget = max(1, int(cpu_budget or (os.cpu_count() or 1)))
+    requested_gpu = max(1, int(requested_gpu_workers or 1))
+    if batch_count is not None:
+        requested_gpu = min(requested_gpu, max(1, batch_count))
+
+    if requested_cpu_workers is None or requested_cpu_workers <= 0:
+        # Pipelined CPU work is intentionally less granular by default: an
+        # MFA worker is itself a process pool.  Ordinary mode has one CPU
+        # worker per dataset/batch worker.
+        requested_cpu = max(1, budget // 8) if pipelined else requested_gpu
+    else:
+        requested_cpu = int(requested_cpu_workers)
+    if batch_count is not None:
+        requested_cpu = min(requested_cpu, max(1, batch_count))
+    cpu_workers = max(1, min(requested_cpu, budget))
+    jobs_ceiling = max(1, budget // cpu_workers)
+
+    def _jobs(explicit: int | None, configured: int, default: int) -> int:
+        # ``explicit`` is not a license to oversubscribe the machine; it can
+        # only reduce the planner's safe ceiling.
+        requested = explicit if explicit is not None else configured
+        if requested is None or requested <= 0:
+            requested = default
+        return max(1, min(int(requested), jobs_ceiling))
+
+    mfa_jobs = _jobs(requested_mfa_jobs, config_mfa_jobs, budget)
+    mfa_en_jobs = _jobs(requested_mfa_en_jobs, config_mfa_en_jobs, max(1, budget // 16))
+    default_gpu_queue = max(2, 2 * requested_gpu)
+    default_cpu_queue = max(2, 2 * requested_gpu)
+    return {
+        "cpu_budget": budget,
+        "gpu_workers": requested_gpu,
+        "cpu_workers": cpu_workers,
+        "mfa_jobs_per_worker": mfa_jobs,
+        "mfa_en_jobs_per_worker": mfa_en_jobs,
+        "batch_size": max(1, int(batch_size)),
+        "gpu_queue_size": max(1, int(gpu_queue_size or default_gpu_queue)),
+        "cpu_queue_size": max(1, int(cpu_queue_size or default_cpu_queue)),
+    }
+
+
 def _index_wavs_for_stems(audio_dir: Path, stems: list[str]) -> dict[str, Path]:
     """Resolve explicit stems with one directory scan plus narrow fallbacks.
 
@@ -204,8 +269,8 @@ def _stage_one_batch(
     """Phase 1: NAS → NVMe. Copy WAV + CTC files for one batch.
 
     Returns:
-        (local_dir, elapsed_seconds, missing_audio_count).
-        Never raises — missing files are logged, not fatal.
+        (local_dir, elapsed_seconds, unavailable_input_count).
+        Callers must treat a non-zero count as a failed stage.
     """
     local_dir = local_base / f"batch_{batch_idx:04d}"
     local_audio = local_dir / "audio"
@@ -284,7 +349,7 @@ def _stage_one_batch(
             json.dumps(manifest, ensure_ascii=False))
 
     elapsed = time.time() - t0
-    return local_dir, elapsed, missing_audio
+    return local_dir, elapsed, missing_audio + failed_copies
 
 
 def _process_one_batch(
@@ -497,6 +562,8 @@ def run_single_batch(
     mode: str = "ctc_ready",
     text_index: dict[str, Path] | None = None,
     device: str = "",
+    mfa_num_jobs: int = 0,
+    mfa_en_num_jobs: int = 0,
 ) -> bool:
     """Process a single batch end-to-end (original streaming behavior).
 
@@ -505,11 +572,15 @@ def run_single_batch(
     use _stage_one_batch / _process_one_batch / _upload_one_batch directly.
     """
     t_start = time.time()
-    local_dir, prefetch_elapsed, _missing = _stage_one_batch(
+    local_dir, prefetch_elapsed, missing = _stage_one_batch(
         ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
         layout_map=layout_map, wav_index=wav_index,
         local_base=local_base, mode=mode, text_index=text_index,
     )
+    if missing:
+        print(f"  [BATCH {batch_idx:04d}] {ds['name']} STAGE FAIL "
+              f"({missing} missing audio files)")
+        return False
 
     ok = _process_one_batch(
         ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
@@ -519,6 +590,7 @@ def run_single_batch(
         batch_size=batch_size, python_path=python_path,
         mode=mode, device=device,
         restore_cache=True, persist_cache_on_failure=True,
+        mfa_num_jobs=mfa_num_jobs, mfa_en_num_jobs=mfa_en_num_jobs,
     )
     if not ok:
         return False
@@ -775,8 +847,10 @@ class StreamingPipeline:
         # Backpressure: prefetch N batches ahead to keep processing saturated
         # while bounding local NVMe usage; upload queue backpressure prevents
         # unbounded NVMe accumulation when NAS is slow.
-        self.prefetch_queue: queue.Queue[int] = queue.Queue(maxsize=prefetch_buffer)
-        self.upload_queue: queue.Queue[int] = queue.Queue(maxsize=upload_buffer)
+        self.prefetch_queue: queue.Queue[int] = queue.Queue(
+            maxsize=max(1, prefetch_buffer or 4))
+        self.upload_queue: queue.Queue[int] = queue.Queue(
+            maxsize=max(1, upload_buffer or 4))
 
         self.stats_lock = threading.Lock()
         self.stats: dict[str, int] = {
@@ -1144,6 +1218,8 @@ Examples:
     parser.add_argument("--mfa-jobs", type=int, default=None,
                         help="MFA num_jobs per worker (default: auto = min(4, cpu_count() // parallel)). "
                              "Set > 1 to utilize multi-core per batch. Requires pre-extracted model.")
+    parser.add_argument("--mfa-en-jobs", type=int, default=None,
+                        help="English MFA num_jobs per worker; capped by the same CPU budget.")
     parser.add_argument("--pipelined", action="store_true",
                         help="Enable pipelined GPU/CPU mode: NVASR and MFA run in parallel stages. "
                              "GPU workers process prealign, CPU workers process MFA alignment. "
@@ -1306,6 +1382,9 @@ Examples:
             prefetch_buffer=args.prefetch_buffer,
             upload_buffer=args.upload_buffer,
             staged=_staged,
+            mfa_num_jobs=(args.mfa_jobs if args.mfa_jobs is not None
+                          else cfg.get("mfa", {}).get("num_jobs", 0)),
+            mfa_en_num_jobs=cfg.get("mfa_en", {}).get("num_jobs", 0),
         )
         if not ok:
             sys.exit(1)
@@ -1328,6 +1407,7 @@ def run_single_dataset(
     upload_buffer: int = 4,
     staged: bool = True,
     mfa_num_jobs: int = 0,
+    mfa_en_num_jobs: int = 0,
     device: str = "",
     parallel_batches: int = 4,
 ) -> bool:
@@ -1408,6 +1488,16 @@ def run_single_dataset(
         layout_map=layout_map,
         wav_index=wav_index,
     )
+    resources = plan_streaming_resources(
+        requested_cpu_workers=parallel_batches,
+        requested_mfa_jobs=mfa_num_jobs if mfa_num_jobs > 0 else None,
+        config_mfa_en_jobs=mfa_en_num_jobs,
+        batch_size=batch_size,
+        batch_count=len(batch_mgr),
+    )
+    parallel_batches = resources["cpu_workers"]
+    mfa_num_jobs = resources["mfa_jobs_per_worker"]
+    mfa_en_num_jobs = resources["mfa_en_jobs_per_worker"]
 
     if not staged:
         # ── Streaming mode (original behavior) ──
@@ -1420,6 +1510,8 @@ def run_single_dataset(
             nas_output_root=nas_output_root,
             prefetch_buffer=prefetch_buffer,
             upload_buffer=upload_buffer,
+            mfa_num_jobs=mfa_num_jobs,
+            mfa_en_num_jobs=mfa_en_num_jobs,
         )
         return pipeline.run()
 
@@ -1447,7 +1539,11 @@ def run_single_dataset(
                 layout_map=layout_map, wav_index=wav_index,
                 local_base=local_work, mode="ctc_ready",
             )
-            staged_dirs[bi] = local_dir
+            if missing:
+                print(f"  [STAGE] FAIL batch {bi}: {missing} missing audio files")
+                stage_failures.add(bi)
+            else:
+                staged_dirs[bi] = local_dir
         except Exception as exc:
             print(f"  [STAGE] FAIL batch {bi}: {exc}")
             stage_failures.add(bi)
@@ -1475,6 +1571,8 @@ def run_single_dataset(
             mode="ctc_ready", device=device,
             restore_cache=False,
             persist_cache_on_failure=False,
+            mfa_num_jobs=mfa_num_jobs,
+            mfa_en_num_jobs=mfa_en_num_jobs,
         )
 
     n_proc = min(parallel_batches, len(staged_dirs))
@@ -1659,7 +1757,12 @@ def _execute_staged(
                     layout_map=layout_map, wav_index=wav_index,
                     local_base=local_base, mode=batch_mode, text_index=text_index,
                 )
-                staged_dirs[gidx] = local_dir
+                if missing:
+                    print(f"  [STAGE] FAIL {ds_name}/{batch_idx:04d}: "
+                          f"{missing} missing audio files")
+                    stage_failures.add(gidx)
+                else:
+                    staged_dirs[gidx] = local_dir
             except Exception as exc:
                 print(f"  [STAGE] FAIL {ds_name}/{batch_idx:04d}: {exc}")
                 import traceback as _tb
@@ -1961,27 +2064,27 @@ def run_batch(args) -> bool:
         print("ERROR: No usable local work drives!")
         sys.exit(1)
 
-    # MFA num_jobs per worker.
-    # Pre-extracted acoustic models (_ensure_mfa_model_extracted) avoid the
-    # TOCTOU race. BLAS threading is pinned to 1 per worker (get_mfa_env sets
-    # OMP/MKL/OPENBLAS/NUMEXPR_NUM_THREADS=1), so process-level parallelism
-    # scales near-linearly without oversubscription.
-    #
-    # Default: cpu_count // max(parallel, 1), capped by batch_size / 10
-    # (at least 10 stems per job to amortize Kaldi startup overhead).
-    # Use --mfa-jobs N to override (e.g. --mfa-jobs 1 for max safety).
+    # Plan once for ordinary and pipelined launch paths.  Each child pipeline
+    # receives a job count that cannot collectively exceed the CPU budget.
     import os as _os
     cpu_count = _os.cpu_count() or 32
     config_mfa_jobs = _cfg.get("mfa", {}).get("num_jobs", 0) if _cfg else 0
-    if config_mfa_jobs <= 0:
-        config_mfa_jobs = cpu_count  # default: use all cores
-    if args.mfa_jobs is None:
-        # Auto-scale to batch: at least 10 stems per job
-        _cap_by_batch = max(1, args.batch_size // 10)
-        _cap_by_parallel = max(1, cpu_count // max(parallel, 1))
-        _effective_mfa_jobs = max(1, min(config_mfa_jobs, _cap_by_parallel, _cap_by_batch))
-    else:
-        _effective_mfa_jobs = max(1, args.mfa_jobs)
+    config_mfa_en_jobs = _cfg.get("mfa_en", {}).get("num_jobs", 0) if _cfg else 0
+    _resource_plan = plan_streaming_resources(
+        cpu_budget=cpu_count,
+        requested_gpu_workers=args.gpus,
+        requested_cpu_workers=(
+            args.cpu_workers if args.pipelined else parallel),
+        requested_mfa_jobs=args.mfa_jobs,
+        requested_mfa_en_jobs=args.mfa_en_jobs,
+        config_mfa_jobs=config_mfa_jobs,
+        config_mfa_en_jobs=config_mfa_en_jobs,
+        batch_size=args.batch_size,
+        pipelined=args.pipelined,
+    )
+    if not args.pipelined:
+        parallel = _resource_plan["cpu_workers"]
+    _effective_mfa_jobs = _resource_plan["mfa_jobs_per_worker"]
     print(f"  MFA num_jobs/worker: {_effective_mfa_jobs}"
           f" (config={config_mfa_jobs}, parallel={parallel},"
           f" batch={args.batch_size}, CPUs={cpu_count})")
@@ -2000,13 +2103,9 @@ def run_batch(args) -> bool:
             print(f"     Use --mfa-jobs {_rec_jobs} for safe memory (~{_rec_jobs * parallel * 1.5:.0f} GB)")
     except ImportError:
         pass
-    # English MFA jobs — read from config directly (smaller job count)
-    _config_mfa_en_jobs = _cfg.get("mfa_en", {}).get("num_jobs", 0) if _cfg else 0
-    if _config_mfa_en_jobs <= 0:
-        _config_mfa_en_jobs = max(1, cpu_count // 16)  # default: fewer for English
-    _effective_mfa_en_jobs = _config_mfa_en_jobs
+    _effective_mfa_en_jobs = _resource_plan["mfa_en_jobs_per_worker"]
     print(f"  MFA EN num_jobs/worker: {_effective_mfa_en_jobs}"
-          f" (config={_config_mfa_en_jobs})")
+          f" (config={config_mfa_en_jobs})")
     # Update config for child processes
     if _cfg:
         _cfg.setdefault("mfa", {})["num_jobs"] = _effective_mfa_jobs
@@ -2353,6 +2452,8 @@ def run_batch(args) -> bool:
                         batch_size=args.batch_size, python_path=args.python,
                         mode=batch_mode, text_index=text_index,
                         device=device_str,
+                        mfa_num_jobs=getattr(args, '_effective_mfa_jobs', 0),
+                        mfa_en_num_jobs=getattr(args, '_effective_mfa_en_jobs', 0),
                     )
                 except Exception as _exc:
                     print(f"  [W{worker_id}] CRASH processing {batch_label}: {_exc}")
@@ -2500,20 +2601,33 @@ def _run_gpu_phase(
     local_audio.mkdir(parents=True, exist_ok=True)
     local_ctc.mkdir(parents=True, exist_ok=True)
     copy_tasks: list[tuple[Path, Path]] = []
+    missing_audio: list[str] = []
     for stem in batch_stems:
         src_wav = wav_index.get(stem) or find_wav(resolve_input_path(ds.get("audio_dir", "")), stem)
         if src_wav:
             copy_tasks.append((src_wav, local_audio / f"{stem}.wav"))
+        else:
+            missing_audio.append(stem)
         # Copy .txt if available (for reference text in NVASR)
         if text_index and stem in text_index:
             copy_tasks.append((text_index[stem], local_audio / f"{stem}.txt"))
 
+    if missing_audio:
+        print(f"  [GPU] Missing audio for {len(missing_audio)}/{len(batch_stems)} stems")
+        return False
     n_workers = min(8, max(1, len(copy_tasks) // 100))
+    failed_copies = 0
     with _cf.ThreadPoolExecutor(max_workers=n_workers) as pool:
         futures = [pool.submit(link_or_copy_file, s, d) for s, d in copy_tasks]
         for f in _cf.as_completed(futures):
-            try: f.result()
-            except Exception: pass
+            try:
+                if not f.result():
+                    failed_copies += 1
+            except Exception:
+                failed_copies += 1
+    if failed_copies:
+        print(f"  [GPU] {failed_copies}/{len(copy_tasks)} staging copies failed")
+        return False
 
     # ── Run NVASR prealign + normalize (GPU-intensive) ──
     cmd = [
@@ -2754,11 +2868,8 @@ def run_pipelined_batch(args) -> bool:
     # ── Config ──
     _cfg = getattr(args, '_config', {})
     pipeline_cfg = _cfg.get("pipelined", {}) if _cfg else {}
-    n_gpu_workers = args.gpus  # 1 GPU per GPU worker
-    n_cpu_workers = args.cpu_workers or pipeline_cfg.get("cpu_workers", 0)
-    if n_cpu_workers <= 0:
-        cpu_count = os.cpu_count() or 32
-        n_cpu_workers = max(2, cpu_count // 8)  # e.g. 48 on 384-core
+    n_gpu_workers = args.gpus  # 1 GPU per GPU worker; bounded after scanning.
+    requested_cpu_workers = args.cpu_workers or pipeline_cfg.get("cpu_workers", 0)
 
     # ── Resume ──
     ckpt_path = cache_path.with_name(cache_path.stem + ".checkpoint.json")
@@ -2843,15 +2954,52 @@ def run_pipelined_batch(args) -> bool:
         return
 
     total_batches = len(all_gpu_batches)
-    print(f"\n  Pipelined mode: {n_gpu_workers} GPU workers, {n_cpu_workers} CPU workers")
+    resource_plan = plan_streaming_resources(
+        cpu_budget=os.cpu_count() or 1,
+        requested_gpu_workers=n_gpu_workers,
+        requested_cpu_workers=requested_cpu_workers,
+        requested_mfa_jobs=getattr(args, "mfa_jobs", None),
+        config_mfa_jobs=getattr(args, "_effective_mfa_jobs", 0),
+        config_mfa_en_jobs=getattr(args, "_effective_mfa_en_jobs", 0),
+        requested_mfa_en_jobs=getattr(args, "mfa_en_jobs", None),
+        batch_size=args.batch_size,
+        batch_count=total_batches,
+        gpu_queue_size=getattr(args, "prefetch_buffer", 0),
+        cpu_queue_size=getattr(args, "upload_buffer", 0),
+        pipelined=True,
+    )
+    n_gpu_workers = resource_plan["gpu_workers"]
+    n_cpu_workers = resource_plan["cpu_workers"]
+    print(f"\n  Pipelined mode: {n_gpu_workers} GPU workers, {n_cpu_workers} CPU workers"
+          f" (CPU budget {resource_plan['cpu_budget']}; "
+          f"MFA jobs {resource_plan['mfa_jobs_per_worker']}/worker)")
     print(f"  Total batches: {total_batches}")
     print(f"{'#'*60}")
 
     # ── Queues ──
-    gpu_queue: _queue.Queue = _queue.Queue()
-    cpu_queue: _queue.Queue = _queue.Queue()
-    for item in all_gpu_batches:
-        gpu_queue.put(item)
+    # Both queues are bounded.  The feeder/consumer loops use short timeouts
+    # so an upstream failure cannot leave a producer blocked forever.
+    gpu_queue: _queue.Queue = _queue.Queue(maxsize=resource_plan["gpu_queue_size"])
+    cpu_queue: _queue.Queue = _queue.Queue(maxsize=resource_plan["cpu_queue_size"])
+    stop_event = threading.Event()
+    failure_event = threading.Event()
+
+    def put_with_stop(target: _queue.Queue, item: object) -> bool:
+        while not stop_event.is_set():
+            try:
+                target.put(item, timeout=0.25)
+                return True
+            except _queue.Full:
+                continue
+        return False
+
+    def get_with_stop(source: _queue.Queue):
+        while not stop_event.is_set():
+            try:
+                return source.get(timeout=0.25)
+            except _queue.Empty:
+                continue
+        return None
 
     # ── Tracking ──
     ok_count = 0
@@ -2874,11 +3022,12 @@ def run_pipelined_batch(args) -> bool:
         gpu_id = wid % n_gpu_workers
         device_str = f"cuda:{gpu_id}"
         while True:
-            try:
-                ds, batch_idx, batch_stems, layout_map, wav_index, text_index = \
-                    gpu_queue.get_nowait()
-            except _queue.Empty:
+            item = get_with_stop(gpu_queue)
+            if item is None:
                 break
+            if item is _GPU_SENTINEL:
+                break
+            ds, batch_idx, batch_stems, layout_map, wav_index, text_index = item
             ds_name = ds["name"]
             remaining = gpu_queue.qsize()
             print(f"\n  [GPU{device_str}] [{total_batches - remaining}/{total_batches}]"
@@ -2896,9 +3045,14 @@ def run_pipelined_batch(args) -> bool:
                 allow_force=getattr(args, '_allow_force', True),
             )
             if ok:
-                cpu_queue.put((ds, batch_idx, batch_stems, local_base))
-                print(f"  [GPU{device_str}] {ds_name}/{batch_idx:04d} → CPU queue")
+                if put_with_stop(cpu_queue, (ds, batch_idx, batch_stems, local_base)):
+                    print(f"  [GPU{device_str}] {ds_name}/{batch_idx:04d} → CPU queue")
+                else:
+                    failure_event.set()
+                    break
             else:
+                failure_event.set()
+                stop_event.set()
                 with ckpt_lock:
                     tracker = ds_tracker[ds_name]
                     tracker["fail"] += 1
@@ -2906,16 +3060,31 @@ def run_pipelined_batch(args) -> bool:
                         failed_set.add(ds_name)
                         _save_checkpoint(ckpt_path, completed_set, failed_set)
 
+    _GPU_SENTINEL = object()
     _CPU_SENTINEL = object()  # signals CPU worker to exit
+
+    def gpu_feeder() -> None:
+        try:
+            for item in all_gpu_batches:
+                if not put_with_stop(gpu_queue, item):
+                    return
+            for _ in range(n_gpu_workers):
+                if not put_with_stop(gpu_queue, _GPU_SENTINEL):
+                    return
+        except Exception as exc:
+            print(f"  [GPU QUEUE] feeder failure: {exc}")
+            failure_event.set()
+            stop_event.set()
 
     # ── CPU worker ──
     def cpu_worker(wid: int) -> tuple[int, list[str]]:
         w_ok = 0
         w_fails: list[str] = []
         while True:
-            item = cpu_queue.get()  # block until GPU produces or sentinel
+            item = get_with_stop(cpu_queue)
+            if item is None:
+                break
             if item is _CPU_SENTINEL:
-                cpu_queue.put(_CPU_SENTINEL)  # pass to next CPU worker
                 break
             ds, batch_idx, batch_stems, local_base = item
             ds_name = ds["name"]
@@ -2930,8 +3099,8 @@ def run_pipelined_batch(args) -> bool:
                 mfa_python=mfa_python, models_dir=models_dir,
                 nas_output=nas_output,
                 batch_size=args.batch_size, python_path=args.python,
-                mfa_num_jobs=getattr(args, '_effective_mfa_jobs', 0),
-                mfa_en_num_jobs=getattr(args, '_effective_mfa_en_jobs', 0),
+                mfa_num_jobs=resource_plan["mfa_jobs_per_worker"],
+                mfa_en_num_jobs=resource_plan["mfa_en_jobs_per_worker"],
                 allow_overwrite=getattr(args, '_allow_overwrite', True),
                 allow_force=getattr(args, '_allow_force', True),
             )
@@ -2952,11 +3121,17 @@ def run_pipelined_batch(args) -> bool:
                     status = "DONE" if tracker["fail"] == 0 else "FAIL"
                     print(f"  [CPU{wid}] {ds_name} — {status} "
                           f"({tracker['done']}/{tracker['total']} batches)")
+            if not ok:
+                failure_event.set()
+                stop_event.set()
+                break
         return w_ok, w_fails
 
     # ── Launch both pools ──
     with concurrent.futures.ThreadPoolExecutor(max_workers=n_gpu_workers) as gpu_pool, \
          concurrent.futures.ThreadPoolExecutor(max_workers=n_cpu_workers) as cpu_pool:
+        feeder = threading.Thread(target=gpu_feeder, name="pipelined-gpu-feeder", daemon=True)
+        feeder.start()
         gpu_futures = [gpu_pool.submit(gpu_worker, wid) for wid in range(n_gpu_workers)]
         cpu_futures = [cpu_pool.submit(cpu_worker, wid) for wid in range(n_cpu_workers)]
 
@@ -2965,16 +3140,33 @@ def run_pipelined_batch(args) -> bool:
             for fut in concurrent.futures.as_completed(gpu_futures):
                 fut.result()  # propagate exceptions
         finally:
-            # Always signal CPU workers — even if a GPU worker crashed.
-            # Without this, CPU workers block forever on cpu_queue.get().
-            cpu_queue.put(_CPU_SENTINEL)
+            # Wake CPU workers after GPU production is complete.  On success
+            # do not set stop_event: queued CPU work must drain before its
+            # sentinels.  On failure, timed queue operations let everybody
+            # exit even if a queue is full.
+            if failure_event.is_set():
+                stop_event.set()
+                for _ in range(n_cpu_workers):
+                    try:
+                        cpu_queue.put_nowait(_CPU_SENTINEL)
+                    except _queue.Full:
+                        break
+            else:
+                for _ in range(n_cpu_workers):
+                    while True:
+                        try:
+                            cpu_queue.put(_CPU_SENTINEL, timeout=0.25)
+                            break
+                        except _queue.Full:
+                            continue
+            feeder.join(timeout=5)
 
         for fut in concurrent.futures.as_completed(cpu_futures):
             w_ok, w_fails = fut.result()
             ok_count += w_ok
             fail_list.extend(w_fails)
 
-    all_ok = len(fail_list) == 0
+    all_ok = len(fail_list) == 0 and not failure_event.is_set()
     print(f"\n{'#'*60}")
     print(f"  PIPELINED BATCH COMPLETE: {ok_count}/{len(all_datasets)} OK"
           f"{' — ALL OK' if all_ok else ' — WITH FAILURES'}")

@@ -4318,12 +4318,31 @@ def step_pad_silence(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     pre_ctc = not bool(expected_stems) and ctx.get("mode") in ("nvrasr_fallback", "full")
     if pre_ctc:
         try:
-            entries = sorted(ctx["audio_dir"].iterdir(), key=lambda p: p.name)
-            expected_stems = tuple(sorted(
-                entry.stem for entry in entries
-                if entry.is_file() and not entry.is_symlink() and entry.suffix.lower() == ".wav"))
-            if not expected_stems or len(expected_stems) != len({p.name for p in entries if p.is_file() and p.suffix.lower() == ".wav"}):
-                print("  ERROR: pre-CTC physical WAV denominator is empty or duplicated")
+            # The fresh RIA cache is speaker-partitioned (one direct child per
+            # speaker), so a direct ``iterdir`` scan silently produced an
+            # empty denominator.  Freeze the physical source universe
+            # recursively, while still rejecting duplicate *stems* because
+            # every downstream CTC/MFA artifact is flat and stem-addressed.
+            entries = sorted(
+                (entry for entry in ctx["audio_dir"].rglob("*.wav")
+                 if entry.is_file() and not entry.is_symlink()),
+                key=lambda p: str(p),
+            )
+            by_stem: dict[str, list[Path]] = {}
+            for entry in entries:
+                by_stem.setdefault(entry.stem, []).append(entry)
+            duplicates = {stem: paths for stem, paths in by_stem.items()
+                          if len(paths) > 1}
+            expected_stems = tuple(sorted(by_stem))
+            if not expected_stems:
+                print("  ERROR: pre-CTC physical WAV denominator is empty")
+                return 1
+            if duplicates:
+                sample = "; ".join(
+                    f"{stem}: {', '.join(str(p) for p in paths[:3])}"
+                    for stem, paths in sorted(duplicates.items())[:5])
+                print("  ERROR: pre-CTC physical WAV denominator has duplicate stems")
+                print(f"    {sample}")
                 return 1
             manifest = ctx["workspace"] / "pre_ctc_stems.txt"
             manifest.write_text("\n".join(expected_stems) + "\n", encoding="utf-8")
@@ -4369,9 +4388,13 @@ def step_pad_silence(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         transform_dir = ctx["workspace"] / "audio_transform_receipts"
         transform_dir.mkdir(parents=True, exist_ok=True)
         for stem in sorted(expected_stems):
-            source_wav = ctx["audio_dir"] / f"{stem}.wav"
+            # Pre-CTC inputs may live below speaker subdirectories; resolve
+            # them with the same recursive lookup used by the padding worker.
+            source_wav = find_wav(ctx["audio_dir"], stem)
             padded_wav = padded_audio_dir / f"{stem}.wav"
             try:
+                if source_wav is None:
+                    raise FileNotFoundError(f"source WAV not found for {stem}")
                 transform = make_audio_transform_receipt(source_wav, padded_wav)
                 write_audio_transform_receipt(transform_dir / f"{stem}.json", transform)
             except (OSError, ValueError) as exc:
@@ -4581,7 +4604,7 @@ def validate_config(cfg: dict, mode: str) -> list[str]:
 
 STRICT_REPLAY_CANONICAL_SHA256 = "d88b9ac874283dbc67dc38003fb78d872b799597ce940175a8301f78aa2c5bcf"
 STRICT_REPLAY_CONFIG_PATH = PROJECT_ROOT / "configs" / "hecheng_ria_fresh.yaml"
-STRICT_REPLAY_CONFIG_SHA256 = "5d5ec4ca36460646f4cf9193641ab2fc1f5a4fa696633979304746b86b97e70b"
+STRICT_REPLAY_CONFIG_SHA256 = "78053e0455711ae943e8fabf2926014006f9f9449a96f8414c91b857a15ad553"
 STRICT_REPLAY_CANONICAL_SCHEMA = "mfa-quality-canonical-samples-v1"
 STRICT_REPLAY_SCHEMA = "strict-replay-import-v2.1"
 STRICT_REPLAY_CTC_SUFFIXES = (".TextGrid", ".lab", "_tokens.jsonl", "_punct.json",

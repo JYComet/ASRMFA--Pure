@@ -105,5 +105,6 @@ postprocess:
   fix_short_word: false
   detect_bgm: false
   filter_suspicious: false
+  enable_word_in_silence_filter: false
   enable_text_correction: true
   handle_unexpected_sil: false

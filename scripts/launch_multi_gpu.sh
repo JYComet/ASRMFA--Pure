@@ -3,8 +3,9 @@
 # Multi-GPU Pipeline Launcher
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# Distributes the MFA pipeline across all available GPUs, each running
-# independent streaming_pipeline.py processes with their own CUDA device.
+# Launches the batch streaming pipeline across all available GPUs.  Pipelined
+# GPU/CPU execution is the default; streaming_pipeline.py owns the bounded
+# resource plan.
 #
 # Usage:
 #   # Auto-detect GPUs, use batch cache from config:
@@ -39,10 +40,12 @@ CONFIG=""
 DATASET_LIMIT=0        # 0 = all
 BATCH_SIZE=""
 STREAMING=false
+PIPELINED=true
 LOCAL_WORK=""
 DRY_RUN=false
 RESUME=false
 MFA_JOBS=""            # MFA num_jobs per worker (empty = auto)
+MFA_EN_JOBS=""         # English MFA num_jobs per worker (empty = config/auto)
 PARALLEL_DATASETS=""   # streaming workers per GPU
 LOG_DIR=""
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -61,9 +64,12 @@ Options:
   --limit N             Limit datasets per GPU (0=all)
   --batch-size N        Stems per batch (streaming mode)
   --streaming           Use streaming_pipeline.py (NAS→local SSD→NAS)
+  --pipelined           Use pipelined GPU/CPU streaming mode (default)
+  --no-pipelined        Use ordinary streaming mode instead
   --local-work DIR      Local SSD path for streaming (can be comma-separated)
   --parallel N          Streaming workers per GPU (default: from config)
   --mfa-jobs N          MFA num_jobs per worker (default: auto)
+  --mfa-en-jobs N       English MFA num_jobs per worker (default: config/auto)
   --log-dir DIR         Log output directory (default: logs/multi_gpu_<ts>)
   --resume              Skip completed datasets (uses checkpoint)
   --dry-run             Print launch plan without executing
@@ -80,9 +86,12 @@ while [[ $# -gt 0 ]]; do
         --limit)       DATASET_LIMIT="$2"; shift 2 ;;
         --batch-size)  BATCH_SIZE="$2"; shift 2 ;;
         --streaming)   STREAMING=true; shift ;;
+        --pipelined)   PIPELINED=true; shift ;;
+        --no-pipelined) PIPELINED=false; shift ;;
         --local-work)  LOCAL_WORK="$2"; shift 2 ;;
         --parallel)    PARALLEL_DATASETS="$2"; shift 2 ;;
         --mfa-jobs)    MFA_JOBS="$2"; shift 2 ;;
+        --mfa-en-jobs) MFA_EN_JOBS="$2"; shift 2 ;;
         --log-dir)     LOG_DIR="$2"; shift 2 ;;
         --resume)      RESUME=true; shift ;;
         --dry-run)     DRY_RUN=true; shift ;;
@@ -104,7 +113,17 @@ if [[ -z "$NUM_GPUS" ]]; then
         NUM_GPUS=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "0")
     fi
     NUM_GPUS=${NUM_GPUS:-1}
-    if [[ "$NUM_GPUS" -lt 1 ]]; then NUM_GPUS=1; fi
+fi
+if [[ "$NUM_GPUS" -lt 1 ]]; then NUM_GPUS=1; fi
+
+# Respect an inherited visibility mask.  CUDA remaps visible devices to
+# 0..N-1, so launching more workers than visible entries would target
+# non-existent devices inside the child streaming process.
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" && "${CUDA_VISIBLE_DEVICES}" != "NoDevFiles" ]]; then
+    visible_count=$(awk -F',' '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")
+    if [[ "$visible_count" -gt 0 && "$NUM_GPUS" -gt "$visible_count" ]]; then
+        NUM_GPUS="$visible_count"
+    fi
 fi
 
 # ── Resolve paths ──────────────────────────────────────────────────────────
@@ -112,6 +131,28 @@ CONFIG_PATH="$CONFIG"
 [[ "$CONFIG_PATH" = /* ]] || CONFIG_PATH="$PROJECT_ROOT/$CONFIG"
 if [[ ! -f "$CONFIG_PATH" ]]; then
     echo -e "${RED}ERROR: Config not found: $CONFIG_PATH${NC}"
+    exit 1
+fi
+
+# This launcher only owns batch runs.  Strict ctc_ready configurations were
+# historically sent through shard launchers and must use their strict workflow
+# directly rather than this general-purpose multi-GPU wrapper.
+if ! python3 -c '
+import sys
+try:
+    import yaml
+    cfg = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+except Exception as exc:
+    print("ERROR: Cannot read batch config: {}".format(exc), file=sys.stderr)
+    raise SystemExit(1)
+strict = cfg.get("strict_ctc_ready", {})
+if cfg.get("mode") == "ctc_ready" or (isinstance(strict, dict) and strict.get("enabled")):
+    print("ERROR: strict ctc_ready configs are old shard targets; use the strict workflow directly.", file=sys.stderr)
+    raise SystemExit(1)
+if cfg.get("mode") != "batch_ctc_ready" or not isinstance(cfg.get("batch"), dict):
+    print("ERROR: --config must be a batch config (mode: batch_ctc_ready with batch: section).", file=sys.stderr)
+    raise SystemExit(1)
+' "$CONFIG_PATH"; then
     exit 1
 fi
 
@@ -213,6 +254,7 @@ launch_gpu() {
     fi
 
     [[ -n "$MFA_JOBS" ]] && cmd+=("--mfa-jobs" "$MFA_JOBS")
+    [[ -n "$MFA_EN_JOBS" ]] && cmd+=("--mfa-en-jobs" "$MFA_EN_JOBS")
     $RESUME || cmd+=("--no-resume")
 
     if $DRY_RUN; then
@@ -249,6 +291,10 @@ echo "  GPUs:         $NUM_GPUS"
 echo "  Datasets:     $n_total total, $REMAINING remaining"
 echo "  Per GPU:      ~$PER_GPU"
 echo "  Streaming:    $STREAMING"
+if $STREAMING; then
+    echo "  Pipelined:    $PIPELINED"
+fi
+echo "  CUDA visible: ${CUDA_VISIBLE_DEVICES:-<inherited/all>}"
 [[ -n "$LOCAL_WORK" ]] && echo "  Local work:   $LOCAL_WORK"
 echo "  Log dir:      $LOG_DIR"
 echo "  Resume:       $RESUME"
@@ -268,6 +314,8 @@ if $STREAMING; then
     [[ -n "$LOCAL_WORK" ]] && SINGLE_CMD+=("--local-work" "$LOCAL_WORK")
     [[ "$DATASET_LIMIT" -gt 0 ]] && SINGLE_CMD+=("--limit-datasets" "$DATASET_LIMIT")
     [[ -n "$MFA_JOBS" ]] && SINGLE_CMD+=("--mfa-jobs" "$MFA_JOBS")
+    [[ -n "$MFA_EN_JOBS" ]] && SINGLE_CMD+=("--mfa-en-jobs" "$MFA_EN_JOBS")
+    $PIPELINED && SINGLE_CMD+=("--pipelined")
     $RESUME || SINGLE_CMD+=("--no-resume")
 
     if $DRY_RUN; then
@@ -278,7 +326,6 @@ if $STREAMING; then
     else
         echo -e "${YELLOW}[MAIN] Launching streaming pipeline ($NUM_GPUS GPUs, ${PARALLEL_DATASETS:-$NUM_GPUS} workers)${NC}"
         echo -e "${YELLOW}[MAIN] Log: $LOG_DIR/main.log${NC}"
-        export CUDA_VISIBLE_DEVICES=""
         export MFA_ROOT_DIR="${MFA_ROOT_DIR:-$PROJECT_ROOT/models/mfa}"
         echo "PID: $$" > "$LOG_DIR/main.pid"
         echo "Started: $(date -Iseconds)" >> "$LOG_DIR/main.log"

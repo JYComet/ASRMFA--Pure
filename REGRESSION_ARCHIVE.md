@@ -138,10 +138,13 @@
 | 127 | 2026-08-07 | postprocess_textgrids.py, pipeline_utils.py | 权威标点/连字符英文投影与 phone 越界 |
 | 128 | 2026-08-07 | ctc_prealign.py, run_pipeline.py | CTC 全 GPU 合并隔离与输入副本安全 |
 | 129 | 2026-08-10 | audit_strict_ok.py, verify_strict_ok.py | strict manifest 未绑定 `pipeline-run-receipt-v2` |
+| 130 | 2026-08-12 | streaming_pipeline.py, launch_8gpu.py, launch_multi_gpu.sh | 批量 GPU/CPU 资源未统一规划，旧分片入口可能竞争 strict artifacts |
+| 131 | 2026-08-12 | run_pipeline.py, pad_silence_edges.py | 分 speaker 子目录的 pre-CTC WAV 被根目录扫描漏掉，54k 任务在 pad_silence 阶段误报空分母 |
+| 132 | 2026-08-12 | run_pipeline.py, ctc_prealign.py, pipeline_utils.py, postprocess_textgrids.py | 先前 MFA 对齐失败问题的统一根因、修复链路与验收索引 |
 
 ### 索引完整性与非 Case 章节
 
-截至 2026-08-10，Case 索引已覆盖 Case 1–129，每个编号各出现一次；Case 标题与正文
+截至 2026-08-12，Case 索引已覆盖 Case 1–132，每个编号各出现一次；Case 标题与正文
 均可按同一编号定位。除 Case 条目外，文档还包含以下纳入索引范围的专题章节：
 
 | 章节 | 内容 |
@@ -8567,3 +8570,215 @@ python scripts/verify_hecheng_english_ctc_ready_v4.py --help
 必须在复制/创建 target 之前调用 strict manifest verifier，并验证 v2 receipt 的
 source conservation、eligible membership 与 exclusion/filtered 分区。此文件未修改
 该公共发布函数，避免越权改变其接口。
+
+---
+
+## Case 130: 批量 GPU/CPU 资源统一规划与旧分片启动器 (bounded_batch_resources)
+
+**日期**: 2026-08-12
+**涉及文件**: `scripts/streaming_pipeline.py`, `scripts/launch_8gpu.py`,
+`scripts/launch_multi_gpu.sh`
+
+### 现象
+
+旧的 8-GPU 启动器会为同一 strict run 创建多个独立分片；这些分片没有共享的资源
+计划，也可能竞争同一批中间产物。批量流式路径此前也允许 dataset worker 与每个 MFA
+进程池的请求并发相乘，导致 CPU 过量订阅。无界的 phase 间队列还会在 NAS 较慢时持续
+占用本地 NVMe。
+
+### 修复
+
+- `plan_streaming_resources()` 在 ordinary 和 pipelined 路径计算同一 CPU/GPU 预算，
+  将 CPU worker、每个 MFA/MFA EN pool 的 jobs，以及实际 batch 数限制在安全上限内；
+- pipelined 模式使用有界 GPU→CPU 队列和 CPU/upload 队列，以反压限制本地积压；
+- `launch_8gpu.py` 改为只启动一个 `streaming_pipeline.py --pipelined` 命令，并拒绝
+  strict `ctc_ready` 配置；
+- `launch_multi_gpu.sh --streaming` 默认使用 `--pipelined`，并提供
+  `--no-pipelined` 选择普通批量路径。
+
+### 回归覆盖
+
+```bash
+python -m pytest tests/test_streaming_resources.py tests/test_multi_gpu_launchers.py
+```
+
+文档与批量示例配置公开 `streaming.num_gpus`、队列缓冲、`pipelined.cpu_workers` 和
+MFA jobs 请求值。它们仍是请求值；运行时资源规划器是最终的上限执行者。
+
+状态：已修复；严格生产运行仍必须使用其专用 strict workflow，而非通用批量启动器。
+
+---
+
+## Case 131: 分 speaker 音频目录导致 pre-CTC 分母误判为空 (recursive_pre_ctc_wav_denominator)
+
+**日期**: 2026-08-12
+**涉及文件**: `scripts/run_pipeline.py`, `scripts/pad_silence_edges.py`,
+`configs/hecheng_ria_fresh.yaml`
+
+### 现象
+
+在 GPU 已可见、NVMe 音频缓存可读的实际 54k 启动中，主管线在 `pad_silence` 阶段停止：
+
+```text
+ERROR: pre-CTC physical WAV denominator is empty or duplicated
+Stopping. Use --force to continue on errors.
+```
+
+输入目录实际布局为：
+
+```text
+/mnt/nvme3/mfa_audio_cache_ria/
+├── ria/     18000 WAV, 17999 TXT
+├── 花礼/    18000 WAV, 17999 TXT
+└── 雪狐桑/  18000 WAV, 18000 TXT
+```
+
+旧代码只对 `audio_dir.iterdir()` 做根目录平面扫描。由于根目录只有三个 speaker
+子目录，没有直接 WAV，因此冻结出的分母为空；即使绕过该错误，后续 transform receipt
+仍会用 `audio_dir / f"{stem}.wav"`，无法解析子目录内的源 WAV。
+
+### 根因
+
+pre-CTC 的 nvrasr/full 路径没有 CTC manifest 可复用，必须从物理 WAV 冻结 source
+denominator。实现错误地假设所有输入都是 flat layout，而当前 RIA 数据集采用
+speaker-partitioned layout。该错误发生在 GPU 推理之前，与 NVIDIA/CUDA 无关。
+
+### 修复
+
+- `step_pad_silence()` 改用递归 `rglob("*.wav")` 扫描所有 speaker 子目录；
+- 按 `Path.stem` 建立索引并拒绝重复 stem，避免后续 flat CTC/MFA namespace 发生碰撞；
+- 继续写入排序且唯一的 `pre_ctc_stems.txt`，保持分母冻结契约；
+- 生成 audio transform receipt 时使用 `find_wav()` 递归解析真实源路径，并对缺失源文件
+  fail-closed；
+- 没有使用 `--force` 绕过分母校验，也没有修改原始音频。
+
+### 实际验证
+
+只读检查结果：
+
+```text
+physical WAVs = 54000
+unique stems  = 54000
+duplicate     = 0
+ria/花礼/雪狐桑 = 18000/18000/18000 WAV
+```
+
+修复后的冻结逻辑在临时 workspace 中生成 54,000 条唯一 manifest；相关回归测试：
+
+```bash
+python -m compileall -q scripts/run_pipeline.py
+python -m pytest -q \
+  tests/test_streaming_resources.py \
+  tests/test_multi_gpu_launchers.py \
+  tests/test_gpu1000_postprocess_audit.py \
+  tests/test_ctc_all_gpu_merge_receipts.py \
+  tests/test_axis_contracts.py
+# 25 passed
+```
+
+### 运行要求
+
+修复只解决输入分母和路径解析问题；生产运行仍要求 NVIDIA 设备透传、
+`nvidia-smi -L` 可见 8 卡，以及 `/mnt/nvme3` 可写。该案例修复后应重新启动完整
+`nvrasr_fallback` 管线，不应从失败 run 目录强行续跑。
+
+状态：已修复；已通过 54k 输入布局验证，待 GPU 环境下重新执行主管线验收。
+
+---
+
+## Case 132: 先前 MFA 对齐失败问题的统一根因、修复链路与验收索引 (mfa_alignment_repair_index)
+
+**日期**: 2026-08-12
+**涉及文件**: `scripts/run_pipeline.py`, `scripts/ctc_prealign.py`,
+`scripts/pipeline_utils.py`, `scripts/pad_silence_edges.py`,
+`scripts/postprocess_textgrids.py`, `scripts/align_english_mfa.py`,
+`configs/hecheng_ria_fresh.yaml`
+
+本条不是新的单点 bug，而是把先前已经定位和修复的 MFA 失败原因集中登记，作为重新执行
+主管线前的验收清单。具体历史证据仍以所列 Case 正文为准。
+
+### 1. 音频轴与 CTC/MFA 时间轴冲突
+
+- Case 95：旧 `pad_silence_edges.py` 原地修改 CTC TextGrid/tokens/punct，重复运行会
+  累积平移，且尾部裁剪没有同步限制 CTC 末端，造成 MFA 输入轴与 CTC 锚点严重冲突；
+- Case 98/100：encoder 网格时长冒充 WAV 时长、blank-run pause frame 未正确移除，导致
+  锚点整体漂移；
+- Case 131：分 speaker 子目录被错误当作 flat 目录，pre-CTC 分母为空，任务在 MFA 前
+  就被错误阻断。
+
+修复链路：CTC 生成前冻结物理 WAV 分母；CTC 与 MFA 共用权威 WAV 轴；strict workflow
+禁止在 CTC 之后再 pad；每个音频变换写入 transform receipt；所有 TextGrid/tokens/
+punct 必须落在 WAV domain 内。当前 RIA 配置的 `audio_axis.post_ctc_pad_silence` 为
+`forbidden`。
+
+### 2. CTC transcript/参考文本不一致导致 MFA 词面错位
+
+- Case 61/62/68/69：ASR tokenizer 拆碎英文词或覆盖权威参考文本，导致 `.lab`、tokens、
+  TextGrid 与 MFA 词典不一致；
+- Case 81/82：RIA 归一化只修改部分 bundle，或 marker 使过期 bundle 绕过 normalize，
+  造成 MFA 接收到不同步的 lab/tokens/TextGrid；
+- Case 102：`--no-nvv` reference-only 路径仍可能让 ASR 内容污染 required sidecar。
+
+修复链路：原始 TXT/reference 是唯一词面权威；CTC 只提供时间锚点；`.lab`、
+`_tokens.jsonl`、TextGrid、`_ref.txt` 作为不可拆分 bundle 原子生成/校验；RIA 合并必须
+三方同步；normalize marker 只能优化，不能替代 bundle 内容校验；reference-only 模式
+禁止 ASR 文本覆盖 required sidecar。
+
+### 3. MFA 输出缺失、损坏或误报成功
+
+- Case 76/83/104：分片 MFA 只看退出码或字符串，Popen 异常/超时/损坏 TextGrid 可能
+  被当作成功；
+- Case 77/113/114/115：部分旧产物或已有 `.TextGrid` 触发短路，分母被静默缩小，未对齐
+  stem 未进入报告；
+- Case 73/84/89：`unknown`/`spn` 或空 English phones 被当成可用对齐结果，后处理可能
+  伪造通过。
+
+修复链路：启动前冻结 expected stem manifest；单进程和分片 MFA 统一使用严格 TextGrid
+ parser，检查 tier、interval、正时长和 WAV domain；捕获非零、超时、信号和 Popen
+ 异常并写结构化失败记录；aligned 分母必须与 frozen manifest 对账；MFA `unknown/spn`
+ 和无来源 English phone 进入 hard failure/filtered，不得伪造音素。
+
+### 4. MFA 边界、词典和后处理冲突
+
+- Case 16：`fine_tune` 默认开启造成边界漂移和对齐失败；
+- Case 32/33/43/49：英文词典缺项、英文词被中文词典检查或 phone 数不足，造成 MFA/
+  postprocess 误过滤；
+- Case 34–41、44–48、52–60、63–75：phone 重叠/间隙、CTC 跨标点、声母韵母压缩、
+  CJK/拼音错位和错误过滤条件把合法 MFA 结果判为失败，或把结构坏结果放行。
+
+修复链路：当前 RIA 配置显式设置 `fine_tune: false`、`beam: 20`、`retry_beam: 80`、
+`single_speaker: true`、`allow_partial: true`、`min_output_ratio: 0.54` 和
+`timeout: 7200`；后处理按 reference sequence、phone ownership、tier 连续性、
+MFA source provenance 分层检查；合法 canonical silence labels 不参与 lexical semantic
+比较；`filter_suspicious: false` 与 `enable_word_in_silence_filter: false` 均显式记录，
+避免旧默认值重新启用误过滤。
+
+### 5. 资源、缓存和并发造成的 MFA 不稳定
+
+- Case 90/125/128：混合缓存、旧 workspace、非版本化 output 或共享 staging 可能把其他
+  批次的 CTC/MFA 产物混入当前运行；
+- Case 105/130：父进程计算的 MFA jobs 未传递给子进程，或 GPU/CPU 并发相乘造成过量订阅；
+- Case 120–123：复制、处理或上传失败仍可能把失败 batch 送入下一阶段。
+
+修复链路：每次运行使用 run-specific workspace/output；CTC all-GPU 使用隔离 shard 和
+原子 merge；父进程把 effective `--mfa-jobs`/`--mfa-en-jobs` 传递给子进程；流式队列有界
+并对 copy/process/upload 失败 fail-closed；通用 `launch_8gpu.py` 不再拆分 strict run，
+strict `nvrasr_fallback` 由 `run_pipeline.py --ctc_prealign.all_gpus=true` 统一调度。
+
+### 当前验收状态
+
+已完成的代码/回归验证：
+
+```text
+targeted pytest suite: 25 passed
+continuation regressions: 24 PASS
+filtered-recovery regressions: 8 PASS
+54k input inventory: 54000 WAV / 54000 unique stems / 0 duplicate
+```
+
+尚未宣称完成的部分：GPU 环境下的 54k 全量 CTC→MFA→postprocess→strict-ok 仍需重新
+执行；当前只证明修复链路和过滤/分母契约，不把旧 run 的 aligned 或 filtered 结果当作
+新运行证据。
+
+状态：历史 MFA 问题已统一登记；对应代码修复和专项回归已通过，等待最新 GPU 主管线
+重新运行验收。

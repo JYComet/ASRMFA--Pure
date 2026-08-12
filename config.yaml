@@ -127,7 +127,12 @@
 
 # ── 流式批处理 (streaming_pipeline.py / launch_multi_gpu.sh) ─────────────
 # streaming:
-#   prefetch_buffer: 4      # max prefetched batches on local NVMe (higher=more disk)
-#   upload_buffer: 4        # max completed batches awaiting NAS upload (backpressure)
+#   num_gpus: 0             # 0 = auto-detect; CLI --gpus takes precedence
+#   prefetch_buffer: 4      # bounded GPU-side queue / local-NVMe prefetch capacity
+#   upload_buffer: 4        # bounded CPU/upload-side queue (backpressure)
 #   local_work: /ssd/mfa_work     # local SSD/NVMe work directory
 #   batch_size: 500                # stems per batch
+#   parallel: 1                    # ordinary (non-pipelined) batch parallelism
+#
+# pipelined:
+#   cpu_workers: 0           # 0 = auto (CPU budget // 8); planner caps MFA jobs/worker

@@ -49,6 +49,8 @@ chinese_mfa_pipeline/
 ├── scripts/
 │   ├── run_pipeline.py            # 主管线 (8 步编排)
 │   ├── streaming_pipeline.py      # 批量流式管线 (多数据集并行)
+│   ├── launch_8gpu.py             # 兼容启动器：单个批量流水线，不再分片
+│   ├── launch_multi_gpu.sh         # 批量多 GPU 启动器
 │   ├── pipeline_utils.py          # 共享工具 (路径翻译、文件发现、MFA 环境)
 │   ├── trim_silence_batch.py      # 静音裁剪 + 首尾补全 (step 1)
 │   ├── ctc_prealign.py            # NVASR CTC 强制对齐 → MFA 锚点 (step 3)
@@ -124,6 +126,52 @@ python scripts/run_pipeline.py --config configs/my_task.yaml --step postprocess
 # 覆盖已有输出
 python scripts/run_pipeline.py --config configs/my_task.yaml --overwrite
 ```
+
+## 批量 / 多 GPU 运行
+
+`mode: batch_ctc_ready` 配置（例如 `configs/batch_all.yaml`）先生成扫描缓存，再由
+`streaming_pipeline.py` 作为单个批量调度器运行。不要为同一个批次自行启动多个共享
+输出目录的分片进程。
+
+```bash
+# 1. 生成或刷新数据集扫描缓存（不开始正式处理）
+python scripts/run_pipeline.py --config configs/batch_all.yaml --scan-only
+
+# 2. 推荐入口：一个 GPU/CPU 分阶段流水线
+python scripts/streaming_pipeline.py --config configs/batch_all.yaml --pipelined
+```
+
+流水线在扫描完成后统一规划资源：GPU worker 与 CPU worker 会按实际 batch 数量收敛，
+两个队列受限于缓冲区；每个 MFA（含英语 MFA）进程池的 `num_jobs` 也会被限制在主机
+CPU 预算以内。配置或命令行中的较大数值是请求值，不会绕过该上限。
+
+常用资源控制如下：
+
+| 控制项 | 作用 |
+|------|------|
+| `streaming.num_gpus` / `--gpus N` | GPU worker 数；未指定或为 `0` 时自动检测。 |
+| `pipelined.cpu_workers` / `--cpu-workers N` | pipelined 模式的 CPU worker 数；`0` 为自动规划。 |
+| `mfa.num_jobs`、`mfa_en.num_jobs` / `--mfa-jobs N`、`--mfa-en-jobs N` | 每个 worker 的 MFA 请求值；资源规划器会按 CPU 预算截断。 |
+| `streaming.prefetch_buffer`、`streaming.upload_buffer` | 两个有界队列的容量；增大可提高吞吐，但需要更多本地 NVMe 空间。 |
+
+`scripts/launch_multi_gpu.sh` 可封装同一条批量流水线：`--streaming` 时默认启用
+`--pipelined`，而 `--no-pipelined` 会改走普通批量路径。
+
+```bash
+bash scripts/launch_multi_gpu.sh --config configs/batch_all.yaml --streaming --pipelined
+bash scripts/launch_multi_gpu.sh --config configs/batch_all.yaml --streaming --no-pipelined
+```
+
+`scripts/launch_8gpu.py` 保留为兼容入口，但只会启动一个 pipelined 批量流水线；它只
+接受 `mode: batch_ctc_ready` 配置，并会拒绝 strict `ctc_ready` 配置。可先用
+`--dry-run` 检查实际命令：
+
+```bash
+python scripts/launch_8gpu.py --config configs/batch_all.yaml --gpus 0,1,2,3 --dry-run
+```
+
+旧的独立脚本 `scripts/merge_ria_tokens.py`、`scripts/run_nvasr_batch.py` 和
+`scripts/run_nvasr_batch_v2.py` 已移除；批量运行请使用上述入口。
 
 ### 让 AI 帮你创建配置
 

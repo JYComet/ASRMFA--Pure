@@ -189,8 +189,8 @@ def test_reference_semantic_integrity_catches_english_position_swap(tmp_path):
     assert reasons == ["reference_semantic_sequence_mismatch"]
 
 
-def test_final_semantic_veto_uses_finalized_sp1_labels(tmp_path):
-    """A provisional `<sp2>` must not survive as a stale lexical veto.
+def test_final_semantic_veto_ignores_provisional_silence_labels(tmp_path):
+    """Canonical silence labels are excluded from semantic comparison.
 
     GPU1000 stem 000944 was semantically correct on disk, but its pre-write
     coverage check read `<sp2>` before finalization rewrote it to `<sp1>`.
@@ -204,8 +204,8 @@ def test_final_semantic_veto_uses_finalized_sp1_labels(tmp_path):
     ])
     before, before_reasons = post.assess_reference_coverage("你", words, hanzi,
                                                               reference_source="fixture")
-    assert before["exact_semantic_sequence"] is False
-    assert "reference_semantic_sequence_mismatch" in before_reasons
+    assert before["exact_semantic_sequence"] is True
+    assert "reference_semantic_sequence_mismatch" not in before_reasons
 
     grid = post.TextGrid(0.0, 1.0, [
         post.Tier("raw_text", 0.0, 1.0, [post.Interval(0.0, 1.0, "你")]),
