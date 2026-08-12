@@ -47,6 +47,7 @@ _NVV = re.compile(r"<([A-Za-z][A-Za-z-]*)>")
 _ENGLISH = re.compile(r"[A-Za-z]+")
 _PINYIN = re.compile(r"^[a-z]+[1-5]$")
 _SP1 = re.compile(r"<sp1>", re.I)
+_SILENCE = re.compile(r"<sp[0-3]>", re.I)
 _PUNCT_MAP = str.maketrans({",": "，", ".": "。", "?": "？", "!": "！", ";": "；", ":": "："})
 
 
@@ -292,8 +293,11 @@ def _axis_contract_reasons(args: argparse.Namespace,
 
 
 def _semantic_tokens(text: str) -> list[tuple[str, str]]:
-    """Return ordered CJK/NVV/punctuation/English tokens, excluding sp1."""
-    text = _SP1.sub("", text).translate(_PUNCT_MAP)
+    """Return ordered CJK/NVV/punctuation/English tokens, excluding silence."""
+    # Canonical silence labels are non-lexical alignment artifacts.  Strip
+    # all ``<spN>`` labels before semantic tokenization so punctuation-adjacent
+    # ``<sp2>`` cannot become a spurious English/other token sequence.
+    text = _SILENCE.sub("", text).translate(_PUNCT_MAP)
     result: list[tuple[str, str]] = []
     index = 0
     while index < len(text):
@@ -313,7 +317,7 @@ def _semantic_tokens(text: str) -> list[tuple[str, str]]:
         english = _ENGLISH.match(text, index)
         if english:
             word = english.group(0)
-            if not is_nvv_token(word) and word.lower() != "sp1":
+            if not is_nvv_token(word):
                 result.append(("english", word.lower()))
             index = english.end()
             continue
@@ -432,6 +436,21 @@ def _report_reasons(row: dict) -> list[str]:
     for key in ("hard_integrity_reasons", "filter_reasons", "warnings", "alignment_issues"):
         if row.get(key):
             reasons.append(f"report_positive:{key}")
+    sp3 = row.get("sp3")
+    if sp3:
+        benign_edge = False
+        output = Path(str(row.get("output", "")))
+        try:
+            tg = parse_textgrid(output)
+            words = next(tier for tier in tg.tiers if tier.name == "words")
+            details = sp3.get("details", []) if isinstance(sp3, dict) else []
+            sp3_indices = [int(item["index"]) for item in details
+                           if isinstance(item, dict) and isinstance(item.get("index"), int)]
+            benign_edge = bool(sp3_indices) and all(i in (0, len(words.intervals) - 1) for i in sp3_indices)
+        except (OSError, StopIteration, ValueError, IndexError):
+            benign_edge = False
+        if not benign_edge:
+            reasons.append("report_positive:sp3")
     # These fields are normal, independently rechecked transformations.  They
     # are not proof of correctness by themselves, but the auditor separately
     # verifies final tier geometry, reference sequence, phones and provenance.
@@ -443,6 +462,7 @@ def _report_reasons(row: dict) -> list[str]:
         "hard_integrity_reasons", "filter_reasons", "alignment_issues",
         "english_provenance", "silence_merges", "pp_deoverlap_fixed",
         "text_corrected", "pinyin_displacement", "text_order",
+        "sp3",
     }
     coverage = row.get("reference_coverage") or {}
     displacement = row.get("pinyin_displacement") or {}

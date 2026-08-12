@@ -18,6 +18,7 @@ Also generates tone_mapping.json — bidirectional IPA↔pinyin tone reference t
 
 import argparse
 import array
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
@@ -67,6 +68,7 @@ AXIS_EPS = 0.003
 _SEMANTIC_NVV = re.compile(r"<([A-Za-z][A-Za-z-]*)>")
 _SEMANTIC_ENGLISH = re.compile(r"[A-Za-z]+")
 _SEMANTIC_SP1 = re.compile(r"<sp1>", re.I)
+_SEMANTIC_SILENCE = re.compile(r"<sp[0-3]>", re.I)
 _SEMANTIC_PUNCT_MAP = str.maketrans({
     ",": "，", ".": "。", "?": "？", "!": "！", ";": "；", ":": "：",
 })
@@ -104,9 +106,14 @@ def _strict_semantic_tokens(text: str) -> list[tuple[str, str]]:
     intentional local copy.  In particular, tier labels are later joined by
     spaces: separate English labels ``all`` and ``in`` must remain separate,
     whereas real lexical corruption such as ``N`` becoming ``Noa`` remains a
-    mismatch.
+    mismatch.  Canonical ``<sp0>``–``<sp3>`` labels are non-lexical and are
+    removed before tokenization.
     """
-    text = _SEMANTIC_SP1.sub("", text).translate(_SEMANTIC_PUNCT_MAP)
+    # Silence labels are alignment artifacts, not lexical content.  Strip
+    # every canonical ``<spN>`` label before tokenizing; leaving ``<sp2>``
+    # behind would be parsed as English ``sp`` plus the digit ``2`` and cause
+    # a false semantic mismatch (notably for punctuation-adjacent labels).
+    text = _SEMANTIC_SILENCE.sub("", text).translate(_SEMANTIC_PUNCT_MAP)
     result: list[tuple[str, str]] = []
     index = 0
     while index < len(text):
@@ -124,7 +131,7 @@ def _strict_semantic_tokens(text: str) -> list[tuple[str, str]]:
         english = _SEMANTIC_ENGLISH.match(text, index)
         if english:
             word = english.group(0)
-            if not is_nvv_token(word) and word.lower() != "sp1":
+            if not is_nvv_token(word):
                 result.append(("english", word.lower()))
             index = english.end()
             continue
@@ -679,6 +686,30 @@ def silence_label(duration: float) -> str:
     return "<sp3>"
 
 
+# TextGrid timestamps are decimal seconds, but they arrive here as binary
+# floats after parsing.  QC boundaries such as 30 ms are policy ticks, not
+# approximate floating-point tolerances: 30.000 ms is valid while 29.999 ms
+# is not.  Convert through the decimal spelling emitted by the parser and
+# compare integer microsecond ticks so the boundary is deterministic.
+_TIME_TICK_HZ = 1_000_000
+
+
+def _duration_ticks(xmin: float, xmax: float) -> int:
+    """Return duration in integer microsecond ticks (truncating sub-ticks)."""
+    try:
+        raw = (Decimal(str(xmax)) - Decimal(str(xmin))) * _TIME_TICK_HZ
+        if not raw.is_finite():
+            return 0
+        return int(raw)
+    except (InvalidOperation, ValueError, TypeError, OverflowError):
+        return 0
+
+
+def _threshold_ticks(seconds: float) -> int:
+    """Convert a seconds threshold to integer microsecond ticks."""
+    return _duration_ticks(0.0, seconds)
+
+
 def tier_by_name(tg: TextGrid, name: str) -> Tier | None:
     for tier in tg.tiers:
         if tier.name.lower() == name.lower():
@@ -978,6 +1009,41 @@ def _build_pinyin_phones_1to1(phones_tier: Tier, ipa_to_pinyin: dict[str, str]) 
     return Tier("pinyin_phones", phones_tier.xmin, phones_tier.xmax, new_intervals)
 
 
+def _find_internal_pp_gaps(pp_tier: Tier | None, words_tier: Tier | None,
+                           threshold_s: float = 0.010) -> list[dict]:
+    """Return detailed pinyin-phone gaps that fall inside one content word."""
+    if pp_tier is None or words_tier is None:
+        return []
+
+    content_ranges = [
+        (iv.xmin, iv.xmax, iv.text.strip())
+        for iv in words_tier.intervals
+        if (iv.text.strip() and not is_silence(iv.text)
+            and not is_english_token(iv.text.strip()))
+    ]
+    threshold_ticks = _threshold_ticks(threshold_s)
+    gaps: list[dict] = []
+    for left, right in zip(pp_tier.intervals, pp_tier.intervals[1:]):
+        gap_ticks = _duration_ticks(left.xmax, right.xmin)
+        if gap_ticks <= threshold_ticks:
+            continue
+        owner = next((row for row in content_ranges
+                      if row[0] <= left.xmax + 0.001
+                      and right.xmin <= row[1] + 0.001), None)
+        if owner is None:
+            continue
+        gaps.append({
+            "start_s": round(left.xmax, 6),
+            "end_s": round(right.xmin, 6),
+            "duration_us": gap_ticks,
+            "duration_ms": round(gap_ticks / 1000.0, 3),
+            "left_phone": left.text.strip(),
+            "right_phone": right.text.strip(),
+            "word": owner[2],
+        })
+    return gaps
+
+
 def _count_internal_pp_gaps(pp_tier: Tier | None, words_tier: Tier | None,
                             threshold_s: float = 0.010) -> int:
     """Count pinyin-phone gaps that fall inside one content-word interval.
@@ -987,27 +1053,7 @@ def _count_internal_pp_gaps(pp_tier: Tier | None, words_tier: Tier | None,
     discontinuity.  Only an uncovered gap inside one non-silence word means
     the word's phone reconstruction lost coverage.
     """
-    if pp_tier is None or words_tier is None:
-        return 0
-
-    content_ranges = [
-        (iv.xmin, iv.xmax)
-        for iv in words_tier.intervals
-        if (iv.text.strip() and not is_silence(iv.text)
-            and not is_english_token(iv.text.strip()))
-    ]
-    gaps = 0
-    for left, right in zip(pp_tier.intervals, pp_tier.intervals[1:]):
-        gap_start, gap_end = left.xmax, right.xmin
-        if gap_end - gap_start <= threshold_s:
-            continue
-        if any(
-            word_start <= gap_start + 0.001
-            and gap_end <= word_end + 0.001
-            for word_start, word_end in content_ranges
-        ):
-            gaps += 1
-    return gaps
+    return len(_find_internal_pp_gaps(pp_tier, words_tier, threshold_s))
 
 
 def _collect_tier_discontinuities(textgrid: TextGrid,
@@ -1170,10 +1216,16 @@ def handle_unexpected_silences(textgrid: TextGrid, pinyin_text: str) -> list[str
 
     # Build gap_punct for same gaps
     gap_punct = [False] * n
+    _punctuation_chars = '，。…！？、；：,.!?;:～'
+    def _token_has_punctuation(token: str) -> bool:
+        cleaned = re.sub(r"<sp[0-3]>", "", token, flags=re.IGNORECASE)
+        return any(ch in _punctuation_chars for ch in cleaned)
+
     for k in range(1, n):
         lo = py_word_idx[k - 1] + 1
         hi = py_word_idx[k]
-        gap_punct[k] = any(is_punct(pinyin_tokens[i]) for i in range(lo, hi))
+        gap_punct[k] = any(is_punct(pinyin_tokens[i]) or _token_has_punctuation(pinyin_tokens[i])
+                            for i in range(lo, hi))
 
     filter_reasons = []
 
@@ -1433,7 +1485,8 @@ def _fix_overlapping_boundaries(words_tier) -> int:
         if cur.xmax is None or nxt.xmin is None:
             continue
         overlap = cur.xmax - nxt.xmin
-        if overlap <= 0.0005:         # sub-0.5 ms — float noise, skip
+        overlap_ticks = _duration_ticks(nxt.xmin, cur.xmax)
+        if overlap_ticks <= 500:      # sub-0.5 ms — float noise, skip
             continue
 
         cur_text = cur.text.strip() if cur.text else ""
@@ -1449,7 +1502,7 @@ def _fix_overlapping_boundaries(words_tier) -> int:
         # ── Two content words with mild overlap (incl. English/NVV adjacent) ──
         # Regr. Case 38: when one side is English/NVV (no MFA acoustic model),
         # clip that side to the content word's boundary.
-        if cur_is_content and nxt_is_content and overlap < 0.030:
+        if cur_is_content and nxt_is_content and overlap_ticks < 30_000:
             if cur_is_en_nvv and not nxt_is_en_nvv:
                 # English/NVV → content: clip English/NVV end
                 intervals[i] = Interval(cur.xmin, nxt.xmin, cur.text)
@@ -1549,6 +1602,7 @@ def _absorb_tiny_gaps(words_tier: Tier, max_gap_s: float = 0.030) -> Tier:
     intervals = list(words_tier.intervals)
     n = len(intervals)
     to_delete: set[int] = set()
+    max_gap_ticks = _threshold_ticks(max_gap_s)
 
     for i in range(n - 1):
         if i in to_delete:
@@ -1565,7 +1619,7 @@ def _absorb_tiny_gaps(words_tier: Tier, max_gap_s: float = 0.030) -> Tier:
             continue
         if is_silence(cur_text):
             # Silence gap between two content words — absorb if tiny
-            if cur.duration < max_gap_s:
+            if _duration_ticks(cur.xmin, cur.xmax) < max_gap_ticks:
                 # Absorb into the longer neighbouring word
                 prev_word = intervals[i - 1] if i > 0 else None
                 if (prev_word and not is_silence(prev_word.text)
@@ -1968,6 +2022,162 @@ def _reference_pinyin_text(reference_text: str, source_pinyin: str) -> str:
     return "<sp1> " + " ".join(rendered)
 
 
+def _repair_authority_punctuation_geometry(
+        words_tier: Tier, reference_text: str,
+        punct_entries: list[dict] | None = None) -> int:
+    """Repair punctuation timing only when an authority anchor owns silence.
+
+    CTC punctuation labels are lexical anchors, not permission to consume an
+    arbitrary neighbouring word.  A geometry repair is therefore allowed only
+    when the matching reference anchor overlaps an explicit silence interval in
+    ``words``.  The silence is folded into that punctuation interval; an
+    unexplained mid-word silence (with no colocated authority anchor) is left
+    untouched for the normal ``mid_sp`` QC path.
+    """
+    if not punct_entries:
+        return 0
+    allowed = '，。…！？、；：,.!?;:～'
+    current = list(words_tier.intervals)
+    punct_indices = [i for i, iv in enumerate(current)
+                     if iv.text.strip() in allowed]
+    if not punct_indices:
+        return 0
+
+    anchors_by_char: dict[str, list[tuple[float, float]]] = {}
+    for entry in punct_entries:
+        char = str(entry.get("word", "")).strip()
+        if char not in allowed:
+            continue
+        try:
+            start, end = float(entry["start_s"]), float(entry["end_s"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(start) and math.isfinite(end) and end > start:
+            anchors_by_char.setdefault(char, []).append((start, end))
+
+    used: dict[str, int] = {}
+    changed = 0
+    absorbed: set[int] = set()
+    owner_ranges: list[tuple[float, float]] = []
+    for punct_index in punct_indices:
+        punct = current[punct_index]
+        char = punct.text.strip()
+        occurrence = used.get(char, 0)
+        used[char] = occurrence + 1
+        anchors = anchors_by_char.get(char, [])
+        if occurrence >= len(anchors):
+            continue
+        anchor_start, anchor_end = anchors[occurrence]
+
+        # Establish the local lexical gap around this punctuation.  An anchor
+        # from a different repeated punctuation occurrence must not move this
+        # interval across a neighbouring word.
+        prev = next((current[i] for i in range(punct_index - 1, -1, -1)
+                     if current[i].text.strip() and not is_silence(current[i].text)
+                     and not is_punct(current[i].text.strip())), None)
+        nxt = next((current[i] for i in range(punct_index + 1, len(current))
+                    if current[i].text.strip() and not is_silence(current[i].text)
+                    and not is_punct(current[i].text.strip())), None)
+        gap_start = prev.xmax if prev is not None else words_tier.xmin
+        gap_end = nxt.xmin if nxt is not None else words_tier.xmax
+        if anchor_start < gap_start - 0.01 or anchor_end > gap_end + 0.01:
+            continue
+
+        local_silence = []
+        for index, iv in enumerate(current):
+            if index in absorbed or not is_silence(iv.text) or not iv.text.strip():
+                continue
+            if iv.xmax > anchor_start and iv.xmin < anchor_end:
+                local_silence.append((index, iv))
+        if not local_silence:
+            continue
+
+        owner_start = min(punct.xmin, anchor_start)
+        owner_end = max(punct.xmax, anchor_end)
+        owner_start = max(words_tier.xmin, gap_start, owner_start)
+        owner_end = min(words_tier.xmax, gap_end, owner_end)
+        if owner_end <= owner_start + 0.001:
+            continue
+        owner_ranges.append((owner_start, owner_end))
+        if abs(owner_start - punct.xmin) > 1e-9 or abs(owner_end - punct.xmax) > 1e-9:
+            current[punct_index] = Interval(owner_start, owner_end, punct.text)
+        # Removing a colocated silence is itself a geometry repair even when
+        # the punctuation interval already exactly spans the authority anchor.
+        # Without this marker the early return below leaves overlapping
+        # punctuation/silence intervals in place, triggering ``mid_sp`` and
+        # overlap diagnostics downstream.
+        changed += 1
+        for index, silence in local_silence:
+            absorbed.add(index)
+
+    if not changed:
+        return 0
+    rebuilt: list[Interval] = []
+    for index, iv in enumerate(current):
+        if index in absorbed:
+            pieces = [(iv.xmin, iv.xmax)]
+            for owner_start, owner_end in owner_ranges:
+                next_pieces = []
+                for piece_start, piece_end in pieces:
+                    if piece_end <= owner_start or piece_start >= owner_end:
+                        next_pieces.append((piece_start, piece_end))
+                        continue
+                    if piece_start < owner_start:
+                        next_pieces.append((piece_start, owner_start))
+                    if piece_end > owner_end:
+                        next_pieces.append((owner_end, piece_end))
+                pieces = next_pieces
+            for piece_start, piece_end in pieces:
+                if piece_end > piece_start + 0.001:
+                    rebuilt.append(Interval(piece_start, piece_end, iv.text))
+            continue
+        rebuilt.append(iv)
+    words_tier.intervals = sorted(rebuilt, key=lambda iv: (iv.xmin, iv.xmax, iv.text))
+    return changed
+
+
+def _repair_reference_authority_colocated_silence(
+        words_tier: Tier, reference_text: str) -> int:
+    """Remove only exact silence duplicated by restored reference punctuation.
+
+    A reference mark absent from ``_punct.json`` has no CTC timing anchor, so
+    :func:`_repair_authority_punctuation_geometry` deliberately cannot claim
+    the coincident pause.  Once the lexical reference reconciliation has
+    restored that mark, an exact (within one microsecond tick) punctuation /
+    explicit-silence duplicate is nevertheless unambiguous.  Do not use this
+    fallback for partial overlaps, non-authoritative punctuation, or a words
+    tier whose punctuation projection is not exactly the reference sequence.
+    """
+    allowed = '，。…！？、；：,.!?;:～'
+    reference_punct = [unit.strip() for unit in _extract_word_chars(reference_text)
+                       if is_punct(unit) and unit.strip() in allowed]
+    current = list(words_tier.intervals)
+    current_punct = [iv.text.strip() for iv in current
+                     if iv.text.strip() in allowed]
+    if not reference_punct or current_punct != reference_punct:
+        return 0
+
+    def _within_tick(left: float, right: float) -> bool:
+        try:
+            delta = (Decimal(str(left)) - Decimal(str(right))) * _TIME_TICK_HZ
+            return delta.is_finite() and abs(delta) <= 1
+        except (InvalidOperation, ValueError, TypeError, OverflowError):
+            return False
+
+    remove: set[int] = set()
+    silences = [(index, iv) for index, iv in enumerate(current)
+                if is_silence(iv.text) and iv.text.strip()]
+    for punct in (iv for iv in current if iv.text.strip() in allowed):
+        for index, silence in silences:
+            if (_within_tick(punct.xmin, silence.xmin)
+                    and _within_tick(punct.xmax, silence.xmax)):
+                remove.add(index)
+    if not remove:
+        return 0
+    words_tier.intervals = [iv for index, iv in enumerate(current) if index not in remove]
+    return len(remove)
+
+
 def _restore_reference_punctuation(words_tier: Tier, reference_text: str,
                                    punct_entries: list[dict] | None = None) -> int:
     """Make the words tier's punctuation sequence equal the authority.
@@ -1995,7 +2205,13 @@ def _restore_reference_punctuation(words_tier: Tier, reference_text: str,
                       if iv.text.strip() in '，。…！？、；：,.!?;:～']
     desired_puncts = [char for char, _ in ref_puncts]
     if current_puncts == desired_puncts:
-        return 0
+        # Even when the labels already match, an authoritative punctuation
+        # anchor may own an explicit silence interval.  Repair only that
+        # colocated geometry; unrelated unexplained silence remains untouched.
+        anchored = _repair_authority_punctuation_geometry(
+            words_tier, reference_text, punct_entries)
+        return anchored + _repair_reference_authority_colocated_silence(
+            words_tier, reference_text)
 
     lexical = [iv for iv in current
                if iv.text.strip() and not is_silence(iv.text)
@@ -2091,7 +2307,11 @@ def _restore_reference_punctuation(words_tier: Tier, reference_text: str,
     silences = [iv for iv in current if is_silence(iv.text) or not iv.text.strip()]
     words_tier.intervals = sorted(lexical + silences + [iv for _, iv in punctuation],
                                   key=lambda iv: (iv.xmin, iv.xmax, iv.text))
-    return len(punctuation)
+    geometry_fixed = _repair_authority_punctuation_geometry(
+        words_tier, reference_text, punct_entries)
+    reference_fixed = _repair_reference_authority_colocated_silence(
+        words_tier, reference_text)
+    return len(punctuation) + geometry_fixed + reference_fixed
 
 
 def _clip_pinyin_phones_to_words(pp_tier: Tier, words_tier: Tier) -> int:
@@ -3399,7 +3619,12 @@ def detect_issues(textgrid: TextGrid, args, wav_path: Path | None = None,
             (_prev_w and (is_english_token(_prev_w.text) or is_nvv_token(_prev_w.text)))
             or (_next_w and (is_english_token(_next_w.text) or is_nvv_token(_next_w.text)))
         )
+        _word_in_silence_enabled = getattr(args, "enable_word_in_silence_filter", None)
+        if (_word_in_silence_enabled is None
+                and args.filter_word_energy_ratio > 0):
+            _word_in_silence_enabled = True
         if (not _is_en_nvv and not is_punct(w.text) and not _near_en_nvv
+                and _word_in_silence_enabled is True
                 and args.filter_word_energy_ratio > 0 and noise_floor > 1e-8):
             w_energy = _word_rms(audio, sr, w.xmin, w.xmax) if (wav_path and wav_path.exists()) else 999
             if 0 < w_energy < noise_floor * args.filter_word_energy_ratio:
@@ -5321,9 +5546,12 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
                         if not isinstance(phone, dict):
                             continue
                         copied = dict(phone)
-                        ordinal = len(combined_phones)
-                        copied["ordinal"] = ordinal
-                        copied["mfa_phone_ordinal"] = ordinal
+                        # ``ordinal`` is local to the newly combined final word,
+                        # but ``mfa_phone_ordinal`` is immutable provenance in
+                        # the source segment.  Re-numbering both makes a later
+                        # grouped word collide with earlier phones in the same
+                        # segment (for example ``ria`` + ``Mil``/``ive``).
+                        copied["ordinal"] = len(combined_phones)
                         combined_phones.append(copied)
                 combined["phones"] = combined_phones
                 grouped_records.append(combined)
@@ -6404,6 +6632,19 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             final_words_tier = tier_by_name(new_tg, "words")
             raw_text = reference_text_original
             pinyin_text = pinyin_text_original
+        # Phase 5 spelling/punctuation authority can itself change interval
+        # geometry after the earlier D5 cleanup.  Re-apply the same narrow
+        # mechanical repair here so sub-30-ms overlaps introduced late do not
+        # survive solely because of operation ordering.  Larger overlaps keep
+        # flowing to the hard QC filter.
+        _late_overlaps_fixed = _fix_overlapping_boundaries(final_words_tier)
+        if _late_overlaps_fixed:
+            _sync_derived_tiers(
+                new_tg, ipa_to_pinyin, pinyin_dict,
+                raw_text=(reference_text_original if reference_text_authoritative else raw_text),
+                en_mfa_windows=en_mfa_windows,
+                report_warnings=report.get("warnings", []))
+            final_words_tier = tier_by_name(new_tg, "words")
         # 2. Rebuild hanzi from normalised words.
         hanzi_tier = _build_hanzi_tier(final_words_tier, raw_text,
                                         report.get("warnings", []))
@@ -6947,7 +7188,10 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             # pinyin leakage but legitimate silence interval labels embedded
             # in the raw_text tier to mark sentence-initial pauses.
             _raw_text = _re.sub(r'<sp\d+>', '', _iv.text)
-            _pinyin_hits.extend(_re.findall(r'\b(?!sp\d\b)[a-z]+[1-5]\b', _raw_text))
+            _pinyin_hits.extend(
+                token for token in _re.findall(r'\b(?!sp\d\b)[a-z]+[1-5]\b', _raw_text)
+                if is_pinyin_syllable(token)
+            )
     if _pinyin_hits:
         filter_reasons.append("pinyin_in_text")
         report["pinyin_in_text"] = sorted(set(_pinyin_hits))
@@ -7000,20 +7244,32 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # 只有中间 (非首非尾) 的长静音才是问题。
     if words_tier:
         n_ivs = len(words_tier.intervals)
+        _sp3_details: list[dict] = []
         for i, iv in enumerate(words_tier.intervals):
             if iv.text.strip() == "<sp3>":
+                _sp3_details.append({"index": i, "start_s": round(iv.xmin, 6),
+                                     "end_s": round(iv.xmax, 6),
+                                     "duration_us": _duration_ticks(iv.xmin, iv.xmax)})
                 if i == 0 or i == n_ivs - 1:
                     continue  # leading / trailing silence is normal
                 filter_reasons.append("sp3")
-        sp_in_mid = False
+        _mid_sp_details: list[dict] = []
         for i, iv in enumerate(words_tier.intervals):
             if i == 0 or i == n_ivs - 1:
                 continue  # leading / trailing silence is normal
             if is_silence(iv.text) and iv.text.strip():
-                sp_in_mid = True
-                break
-        if sp_in_mid:
+                _mid_sp_details.append({"index": i, "label": iv.text.strip(),
+                                        "start_s": round(iv.xmin, 6),
+                                        "end_s": round(iv.xmax, 6),
+                                        "duration_us": _duration_ticks(iv.xmin, iv.xmax),
+                                        "prev": words_tier.intervals[i - 1].text.strip(),
+                                        "next": words_tier.intervals[i + 1].text.strip()})
+        if _sp3_details:
+            report["sp3"] = {"count": len(_sp3_details), "details": _sp3_details[:10]}
+        if _mid_sp_details:
             filter_reasons.append("mid_sp")
+            report["mid_sp"] = {"count": len(_mid_sp_details),
+                                "details": _mid_sp_details[:10]}
 
     # suspicious_alignment (from phone-level QC in Phase 5)
     if align_issues:
@@ -7102,7 +7358,17 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                     if bgm_issues:
                         report["bgm_issues"] = bgm_issues
         # word_in_silence
-        if args.filter_suspicious and args.filter_word_energy_ratio > 0:
+        # ``strict_ok`` force-enables the surrounding QC pass, but must not
+        # resurrect the independently disabled word-in-silence detector.  The
+        # explicit switch is tri-state for backwards compatibility with
+        # callers that predate it: when absent, a positive ratio retains the
+        # historical behaviour; when present, only ``True`` enables it.
+        _word_in_silence_enabled = getattr(args, "enable_word_in_silence_filter", None)
+        if (_word_in_silence_enabled is None
+                and args.filter_word_energy_ratio > 0):
+            _word_in_silence_enabled = True
+        if (args.filter_suspicious and _word_in_silence_enabled is True
+                and args.filter_word_energy_ratio > 0):
             all_rms, _ = _frame_rms_vec(wav_audio, wav_sr, frame_ms=10.0)
             k = max(1, int(len(all_rms) * 0.15))
             nf = float(np.partition(all_rms, k)[k]) if len(all_rms) > 0 else 1e-6
@@ -7544,6 +7810,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # ── Case 27-B: overlapping_words — unresolved interval overlaps ──
     _overlap_count = 0
     _overlap_examples: list[str] = []
+    _overlap_details: list[dict] = []
     if words_tier is not None:
         for _i in range(len(words_tier.intervals) - 1):
             _ov = words_tier.intervals[_i].xmax - words_tier.intervals[_i + 1].xmin
@@ -7554,10 +7821,19 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                         f"{words_tier.intervals[_i].text.strip()}"
                         f"↔{words_tier.intervals[_i+1].text.strip()}"
                         f"({_ov*1000:.0f}ms)")
+                if len(_overlap_details) < 10:
+                    _left, _right = words_tier.intervals[_i], words_tier.intervals[_i + 1]
+                    _overlap_details.append({
+                        "left": _left.text.strip(), "right": _right.text.strip(),
+                        "start_s": round(_right.xmin, 6),
+                        "end_s": round(_left.xmax, 6),
+                        "duration_us": _duration_ticks(_right.xmin, _left.xmax),
+                    })
     if _overlap_count > 0:
         filter_reasons.append("overlapping_words")
         report["overlapping_words"] = {"count": _overlap_count,
-                                        "examples": _overlap_examples}
+                                        "examples": _overlap_examples,
+                                        "details": _overlap_details}
 
     # ── Case 28: inverted_interval — xmin > xmax ──
     _inverted_count = 0
@@ -7578,22 +7854,30 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # ── Case 29: short_word — content word < 30 ms (physically impossible) ──
     _short_count = 0
     _short_examples: list[str] = []
-    _SHORT_FLOOR = 0.030  # seconds
+    _short_details: list[dict] = []
+    _SHORT_FLOOR_TICKS = 30_000  # integer microseconds; strict < 30 ms
     if words_tier is not None:
         for _iv in words_tier.intervals:
             _text = _iv.text.strip()
             if (not _text or is_silence(_iv.text) or is_punct(_text)
                     or is_nvv_token(_text)):
                 continue
-            if _iv.xmax - _iv.xmin < _SHORT_FLOOR:
+            _duration_us = _duration_ticks(_iv.xmin, _iv.xmax)
+            if _duration_us < _SHORT_FLOOR_TICKS:
                 _short_count += 1
                 if len(_short_examples) < 8:
                     _short_examples.append(
-                        f"{_text}[{(_iv.xmax-_iv.xmin)*1000:.0f}ms]")
+                        f"{_text}[{_duration_us / 1000.0:.3f}ms]")
+                if len(_short_details) < 10:
+                    _short_details.append({"text": _text,
+                                           "start_s": round(_iv.xmin, 6),
+                                           "end_s": round(_iv.xmax, 6),
+                                           "duration_us": _duration_us})
     if _short_count > 0:
         filter_reasons.append("short_word")
         report["short_word"] = {"count": _short_count,
-                                 "examples": _short_examples}
+                                 "examples": _short_examples,
+                                 "details": _short_details}
 
 
     # ── Case 32: english_single_phone — English word (not NVV, not punct)
@@ -7708,12 +7992,14 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     #     natural pauses, punctuation, and English words whose phones live in
     #     the provenance-backed English alignment.
     _PP_GAP_THRESHOLD_S = 0.010
-    _pp_gap_count = _count_internal_pp_gaps(
+    _pp_gap_details = _find_internal_pp_gaps(
         pp_tier, words_tier, _PP_GAP_THRESHOLD_S)
+    _pp_gap_count = len(_pp_gap_details)
     if _pp_gap_count > 0:
         _record_filterable_qc(
             report, filter_reasons, args.filter_suspicious,
-            "pp_tier_gaps", {"count": _pp_gap_count}
+            "pp_tier_gaps", {"count": _pp_gap_count,
+                              "details": _pp_gap_details[:10]}
         )
 
     # ── Case 35: words_tier_gaps — direct gaps between content words.
@@ -7721,6 +8007,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     #     those are not alignment holes and must remain preserved.
     _wt_gap_count = 0
     _wt_gap_examples: list[str] = []
+    _wt_gap_details: list[dict] = []
     _WT_GAP_THRESHOLD_S = 0.020
     if words_tier is not None and len(words_tier.intervals) >= 2:
         for _i in range(len(words_tier.intervals) - 1):
@@ -7731,17 +8018,23 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             if (not _cl or not _nl or is_silence(_cl) or is_silence(_nl)
                     or is_punct(_cl) or is_punct(_nl)):
                 continue
-            _gap = round(_nxt.xmin - _cur.xmax, 4)
-            if _gap > _WT_GAP_THRESHOLD_S:
+            _gap_ticks = _duration_ticks(_cur.xmax, _nxt.xmin)
+            if _gap_ticks > _threshold_ticks(_WT_GAP_THRESHOLD_S):
                 _wt_gap_count += 1
                 if len(_wt_gap_examples) < 5:
                     _wt_gap_examples.append(
-                        f"{_cl!r}→{_nl!r}[{_gap*1000:.0f}ms]")
+                        f"{_cl!r}→{_nl!r}[{_gap_ticks / 1000.0:.3f}ms]")
+                if len(_wt_gap_details) < 10:
+                    _wt_gap_details.append({"left": _cl, "right": _nl,
+                                            "start_s": round(_cur.xmax, 6),
+                                            "end_s": round(_nxt.xmin, 6),
+                                            "duration_us": _gap_ticks})
     if _wt_gap_count > 0:
         _record_filterable_qc(
             report, filter_reasons, args.filter_suspicious,
             "words_tier_gaps", {"count": _wt_gap_count,
-                                 "examples": _wt_gap_examples}
+                                 "examples": _wt_gap_examples,
+                                 "details": _wt_gap_details}
         )
 
     # ── Case 36: tier_discontinuity — a tier has too many gaps
@@ -7774,6 +8067,32 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     )
     report["reference_coverage"] = _coverage
     report["hard_integrity_reasons"] = _coverage_reasons
+    if report.get("warnings"):
+        report["warning_evidence"] = {
+            "count": len(report["warnings"]),
+            "messages": list(report["warnings"][:20]),
+        }
+    if not _coverage.get("exact_semantic_sequence", True):
+        _semantic_ref = _strict_semantic_tokens(reference_text_original)
+        _semantic_obs = _strict_semantic_tokens(" ".join(
+            iv.text for iv in (tier_by_name(new_tg, "hanzi").intervals
+                               if tier_by_name(new_tg, "hanzi") else [])
+            if iv.text).strip())
+        _semantic_mismatches = []
+        for _si, (_expected, _actual) in enumerate(
+                zip(_semantic_ref, _semantic_obs)):
+            if _expected != _actual:
+                _semantic_mismatches.append({"index": _si,
+                                              "expected": _expected,
+                                              "actual": _actual})
+            if len(_semantic_mismatches) >= 10:
+                break
+        report["semantic_evidence"] = {
+            "reference_tokens": len(_semantic_ref),
+            "observed_tokens": len(_semantic_obs),
+            "mismatch_count_lower_bound": len(_semantic_mismatches),
+            "mismatches": _semantic_mismatches,
+        }
     filter_reasons.extend(_coverage_reasons)
 
     # strict-ok is intentionally stricter than the legacy best-effort mode:
@@ -7907,6 +8226,11 @@ def main() -> int:
                         help="Absolute minimum word duration (below = misaligned).")
     parser.add_argument("--filter-word-energy-ratio", type=float, default=2.0,
                         help="Flag word if energy < noise_floor * N.")
+    parser.add_argument("--enable-word-in-silence-filter",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help="Explicitly enable the word-in-silence detector. "
+                             "When omitted, a positive energy ratio preserves "
+                             "legacy behaviour.")
     parser.add_argument("--filter-min-phone-coverage", type=float, default=0.35)
     parser.add_argument("--filter-edge-gap-sec", type=float, default=0.25)
     parser.add_argument("--copy-errors", action="store_true")

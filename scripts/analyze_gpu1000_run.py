@@ -12,6 +12,207 @@ from typing import Any
 SCHEMA = "pipeline-run-receipt-v2"
 
 
+def _jsonl_rows(path: Path) -> list[dict[str, Any]]:
+    """Read a JSONL report, rejecting malformed rows instead of guessing."""
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        value = json.loads(line)
+        if not isinstance(value, dict):
+            raise ValueError(f"JSONL row is not an object: {path}")
+        rows.append(value)
+    return rows
+
+
+def build_filtered_root_cause_ledger(report_path: Path, output_path: Path | None = None,
+                                     *, expected_filtered: int | None = None) -> dict[str, Any]:
+    """Build a deterministic, non-exclusive ledger for filtered report rows.
+
+    One stem may contribute several instances (the sum is therefore greater
+    than the stem count).  Every instance carries the canonical report-row
+    hash, subtype, examples and a conservative disposition.  No output is
+    written by this function; callers may serialize the returned object.
+    """
+    rows = _jsonl_rows(report_path)
+    filtered = [row for row in rows if str(row.get("status", "")).startswith("filtered")]
+    if expected_filtered is not None and len(filtered) != expected_filtered:
+        raise ValueError(f"filtered row count {len(filtered)} != {expected_filtered}")
+    seen: set[str] = set(); instances: list[dict[str, Any]] = []
+    taxonomy: dict[str, int] = {}
+    trace_counts = {"semantic": 0, "mid_sp": 0, "displacement": 0, "warnings": 0}
+    for row in filtered:
+        stem = row.get("stem")
+        if not isinstance(stem, str) or not stem or stem in seen:
+            raise ValueError(f"filtered report stem missing or duplicated: {stem!r}")
+        seen.add(stem)
+        evidence_hash = hashlib.sha256(
+            json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        reasons = row.get("filter_reasons", [])
+        if not isinstance(reasons, list) or any(not isinstance(reason, str) or not reason for reason in reasons):
+            raise ValueError(f"invalid filter_reasons for {stem}")
+        # The report's reason list is the authoritative non-exclusive count.
+        for reason in reasons:
+            examples: list[str] = []
+            detail = row.get(reason)
+            if isinstance(detail, dict) and isinstance(detail.get("examples"), list):
+                examples = [str(value) for value in detail["examples"]]
+            elif reason == "warnings" and isinstance(row.get("warnings"), list):
+                examples = [str(value) for value in row["warnings"]]
+            disposition = "valid_rejection"
+            if reason in {"reference_semantic_sequence_mismatch", "cjk_mismatch", "cjk_token_count_mismatch"}:
+                disposition = "blocked"
+            instance = {"stem": stem, "subtype": reason, "examples": examples,
+                        "evidence_sha256": evidence_hash, "disposition": disposition}
+            instances.append(instance); taxonomy[reason] = taxonomy.get(reason, 0) + 1
+        # Trace semantic/mid-sp/displacement/warnings even where a future
+        # report forgot to include a corresponding filter reason.
+        coverage = row.get("reference_coverage", {})
+        displacement = row.get("pinyin_displacement", {})
+        traces = {
+            "semantic": coverage.get("exact_semantic_sequence") is False,
+            "mid_sp": "mid_sp" in row or "mid_sp" in reasons,
+            "displacement": ("pinyin_displacement" in reasons or
+                              (isinstance(displacement, dict) and
+                               (displacement.get("displacement_runs", 0) > 0 or
+                                displacement.get("mismatch_rate", 0) > 0))),
+            "warnings": bool(row.get("warnings")) or "warnings" in reasons,
+        }
+        for subtype, present in traces.items():
+            if present:
+                trace_counts[subtype] += 1
+    if output_path is not None:
+        output_stems = {p.stem for p in output_path.glob("*.TextGrid") if not p.is_symlink()}
+        if output_stems & seen:
+            raise ValueError("filtered/output stem overlap")
+    return {"schema": "filtered-root-cause-ledger-v1", "report": str(report_path.resolve()),
+            "filtered_stems": sorted(seen), "filtered_count": len(seen),
+            "instance_count": len(instances), "instances": instances,
+            "taxonomy_counts": dict(sorted(taxonomy.items())), "trace_counts": trace_counts}
+
+
+def _partition_sets(root: Path) -> tuple[set[str], set[str], dict[str, Any]]:
+    """Discover a run's output/filtered sets and selected manifest."""
+    root = root.resolve()
+    try: manifest = _read(root / "selected_manifest.json")
+    except (OSError, json.JSONDecodeError): manifest = {}
+    output = {p.stem for p in (root / "output").glob("*.TextGrid") if not p.is_symlink()}
+    filtered = {p.stem for p in (root / "filtered").glob("*.TextGrid") if not p.is_symlink()}
+    designated = None
+    try:
+        result = _read(root / "continuation_result.json")
+        designated = Path(str(result.get("strict_receipt_path", ""))) if result.get("status") == "PASS_WITH_CONTINUATION" else None
+    except (OSError, json.JSONDecodeError):
+        pass
+    continuation_present = designated is not None
+    if designated and designated.is_file():
+        resolved = designated.resolve(); strict_root = root / "workspace" / "strict_ok_runs"
+        if (not resolved.is_relative_to(strict_root) or resolved.parent.parent.name.startswith("continuation_") is False
+                or hashlib.sha256(resolved.read_bytes()).hexdigest() != result.get("strict_receipt_sha256")):
+            designated = None
+    if continuation_present and designated is None:
+        return set(), set(), manifest if isinstance(manifest, dict) else {}
+    if designated is not None:
+        output = {p.stem for p in designated.parent.glob("*.TextGrid") if not p.is_symlink()}
+        filtered = {p.stem for p in designated.parent.parent.joinpath("filtered").glob("*.TextGrid") if not p.is_symlink()}
+    if not output and not filtered:
+        receipts = sorted(root.glob("workspace/strict_ok_runs/*/output/.pipeline_run_receipt_v2.json"))
+        if len(receipts) == 1:
+            output = {p.stem for p in receipts[0].parent.glob("*.TextGrid") if not p.is_symlink()}
+            filtered = {p.stem for p in receipts[0].parent.parent.joinpath("filtered").glob("*.TextGrid") if not p.is_symlink()}
+    return output, filtered, manifest if isinstance(manifest, dict) else {}
+
+
+def _continuation_lineage(root: Path, errors: list[str]) -> dict[str, Any]:
+    """Validate a continuation receipt without treating it as a new upstream run."""
+    path = root / "continuation_result.json"
+    if not path.is_file():
+        return {"present": False, "status": "NONE"}
+    try:
+        receipt = _read(path)
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(f"continuation_receipt_unreadable:{exc}"); return {"present": True, "status": "BLOCKED"}
+    if not isinstance(receipt, dict) or receipt.get("schema") != "gpu1000-continuation-v1":
+        errors.append("continuation_receipt_schema_invalid"); return {"present": True, "status": "BLOCKED"}
+    if receipt.get("status") != "PASS_WITH_CONTINUATION": errors.append("continuation_status_not_pass")
+    original = Path(str(receipt.get("original_root", ""))).resolve()
+    original_receipt = original / "run_receipt.json"
+    original_hash = hashlib.sha256(original_receipt.read_bytes()).hexdigest() if original_receipt.is_file() else ""
+    if not original_receipt.is_file() or original_hash != receipt.get("original_run_receipt_sha256"):
+        errors.append("continuation_original_receipt_binding_invalid")
+    else:
+        try:
+            if _read(original_receipt).get("returncode") != 1:
+                errors.append("continuation_original_rc_not1")
+        except (OSError, json.JSONDecodeError):
+            errors.append("continuation_original_receipt_unreadable")
+    if receipt.get("scope_count") != 1 or not isinstance(receipt.get("scope"), dict): errors.append("continuation_scope_not_exact1")
+    if receipt.get("merged_count") != 1000: errors.append("continuation_merged_count_invalid")
+    axis = root / "workspace" / ".mfa_alignment_axis_receipt.json"
+    if not axis.is_file() or hashlib.sha256(axis.read_bytes()).hexdigest() != receipt.get("axis_receipt_sha256"):
+        errors.append("continuation_axis_binding_invalid")
+    source_receipt = root / "workspace" / ".continuation_source_receipt.json"
+    source_hash = hashlib.sha256(source_receipt.read_bytes()).hexdigest() if source_receipt.is_file() else ""
+    if not source_receipt.is_file() or source_hash != receipt.get("source_receipt_sha256"):
+        errors.append("continuation_source_binding_invalid")
+    designated = receipt.get("strict_receipt_path")
+    strict = [Path(designated)] if isinstance(designated, str) and Path(designated).is_file() else []
+    if not strict:
+        strict = sorted(root.glob("workspace/strict_ok_runs/*/output/.pipeline_run_receipt_v2.json"))
+    if receipt.get("status") == "PASS_WITH_CONTINUATION":
+        if len(strict) != 1 or hashlib.sha256(strict[0].read_bytes()).hexdigest() != receipt.get("strict_receipt_sha256"):
+            errors.append("continuation_strict_binding_invalid")
+    return {"present": True, "status": "PASS_WITH_CONTINUATION" if not any(e.startswith("continuation_") for e in errors) else "BLOCKED",
+            "receipt": receipt}
+
+
+def compare_acceptance_runs(parent_root: Path, future_root: Path) -> dict[str, Any]:
+    """Fail-closed comparison of accepted-776 baseline against a future run."""
+    errors: list[str] = []
+    old_output, old_filtered, old_manifest = _partition_sets(parent_root)
+    new_output, new_filtered, new_manifest = _partition_sets(future_root)
+    if len(old_output) != 776:
+        errors.append(f"parent_accepted_count:{len(old_output)}")
+    if old_output & old_filtered or new_output & new_filtered:
+        errors.append("partition_overlap")
+    missing = old_output - new_output
+    if missing:
+        errors.append(f"old_accepted_missing:{len(missing)}")
+    newly_filtered = new_filtered - old_filtered
+    if newly_filtered:
+        errors.append(f"new_filtered:{len(newly_filtered)}")
+    old_samples = old_manifest.get("samples", [])
+    new_samples = new_manifest.get("samples", [])
+    old_identity = [{key: row.get(key) for key in ("speaker", "stem", "source_relative_wav", "source_relative_txt", "wav_sha256", "txt_sha256")}
+                    for row in old_samples if isinstance(row, dict)]
+    new_identity = [{key: row.get(key) for key in ("speaker", "stem", "source_relative_wav", "source_relative_txt", "wav_sha256", "txt_sha256")}
+                    for row in new_samples if isinstance(row, dict)]
+    if not old_identity or not new_identity or _digest(old_identity) != _digest(new_identity):
+        errors.append("source_identity_drift")
+    if new_manifest.get("count") != 1000 or new_manifest.get("run_label") != "full1000":
+        errors.append("future_not_exact1000")
+    selected = {row.get("stem") for row in new_samples if isinstance(row, dict) and isinstance(row.get("stem"), str)}
+    plan = _plan_rows(future_root.resolve(), selected, 1000, errors)
+    if len(plan) != 8 or any(len(row.get("stems", [])) != 125 for row in plan):
+        errors.append("future_shards_not_exact_125")
+    # Semantic integrity is hard: a future report with a hard semantic flag
+    # cannot be accepted even if the set partition happens to conserve.
+    for report_path in sorted(future_root.resolve().rglob("*.jsonl")):
+        try: rows = _jsonl_rows(report_path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        for row in rows:
+            coverage = row.get("reference_coverage", {})
+            if row.get("hard_integrity_reasons") or (isinstance(coverage, dict) and coverage.get("exact_semantic_sequence") is False):
+                errors.append(f"hard_semantic_drift:{row.get('stem', '?')}")
+    return {"schema": "gpu1000-acceptance-comparison-v1", "ok": not errors,
+            "errors": sorted(set(errors)), "parent_accepted": len(old_output),
+            "future_output": len(new_output), "future_filtered": len(new_filtered),
+            "old_accepted_missing": sorted(missing), "new_filtered": sorted(newly_filtered),
+            "future_selected": len(selected), "future_shard_counts": [len(row.get("stems", [])) for row in plan]}
+
+
 def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
                                      separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -19,6 +220,52 @@ def _digest(value: Any) -> str:
 
 def _read(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def audit_filtered_recovery_logic(
+    output_dir: Path, filtered_dir: Path, report_path: Path,
+    frozen_stems: list[str], accepted_stems: list[str],
+    *, expected_count: int | None = None,
+) -> dict[str, Any]:
+    """Independent audit for a quarantined all-filtered recovery replay."""
+    errors: list[str] = []
+    frozen, accepted = set(frozen_stems), set(accepted_stems)
+    if expected_count is None:
+        expected_count = len(frozen)
+    if len(frozen) != expected_count or len(frozen_stems) != len(frozen):
+        errors.append("frozen_set_count_or_duplicate")
+    if frozen & accepted:
+        errors.append("parent_accepted_intersection")
+    try:
+        rows = [json.loads(line) for line in report_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except (OSError, json.JSONDecodeError) as exc:
+        rows, errors = [], [f"report_unreadable:{exc}"]
+    by_stem: dict[str, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("stem"), str):
+            errors.append("report_row_malformed"); continue
+        stem = row["stem"]
+        if stem in by_stem: errors.append(f"report_duplicate:{stem}")
+        by_stem[stem] = row
+    if len(rows) != expected_count: errors.append(f"report_count:{len(rows)}")
+    if set(by_stem) != frozen: errors.append("report_frozen_set_mismatch")
+    output = {p.stem for p in output_dir.glob("*.TextGrid") if not p.is_symlink()}
+    filtered = {p.stem for p in filtered_dir.glob("*.TextGrid") if not p.is_symlink()}
+    if output & filtered: errors.append("output_filtered_overlap")
+    if output | filtered != frozen: errors.append("output_filtered_frozen_union_mismatch")
+    if output & accepted or filtered & accepted: errors.append("final_parent_accepted_intersection")
+    taxonomy = {"ok": [], "filtered": []}
+    for stem, row in by_stem.items():
+        status = row.get("status")
+        if status == "ok": taxonomy["ok"].append(stem)
+        elif isinstance(status, str) and status.startswith("filtered"): taxonomy["filtered"].append(stem)
+        else: errors.append(f"taxonomy_status_invalid:{stem}")
+    if set(taxonomy["ok"]) != output: errors.append("report_output_taxonomy_mismatch")
+    if set(taxonomy["filtered"]) != filtered: errors.append("report_filtered_taxonomy_mismatch")
+    return {"ok": not errors, "errors": sorted(set(errors)),
+            "source": expected_count, "eligible": expected_count, "exclusions": 0,
+            "output": len(output), "filtered": len(filtered),
+            "taxonomy": {key: len(value) for key, value in taxonomy.items()}}
 
 
 def _write_new(path: Path, content: str) -> None:
@@ -125,7 +372,21 @@ def _ctc_shards(root: Path, workspace: Path, universe: set[str], count: int, err
 
 
 def _strict_output(workspace: Path, universe: set[str], count: int, errors: list[str]) -> tuple[set[str], set[str], list[Any]]:
-    candidates = sorted(workspace.glob("strict_ok_runs/*/output/.pipeline_run_receipt_v2.json"))
+    designated = None
+    try:
+        result = _read(workspace.parent / "continuation_result.json")
+        if result.get("status") == "PASS_WITH_CONTINUATION": designated = Path(str(result.get("strict_receipt_path", "")))
+    except (OSError, json.JSONDecodeError): pass
+    continuation_present = designated is not None
+    if designated and designated.is_file():
+        resolved = designated.resolve(); strict_root = workspace / "strict_ok_runs"
+        if (not resolved.is_relative_to(strict_root) or not resolved.parent.parent.name.startswith("continuation_")
+                or hashlib.sha256(resolved.read_bytes()).hexdigest() != result.get("strict_receipt_sha256")):
+            errors.append("continuation_designated_strict_binding_invalid"); designated = None
+    if continuation_present and designated is None:
+        errors.append("continuation_designated_strict_binding_invalid")
+        return set(), set(), []
+    candidates = [designated] if designated and designated.is_file() else sorted(workspace.glob("strict_ok_runs/*/output/.pipeline_run_receipt_v2.json"))
     if len(candidates) != 1:
         errors.append("strict_output_receipt_not_exactly_one"); return set(), set(), []
     receipt_path = candidates[0]; output_dir = receipt_path.parent; filtered_dir = output_dir.parent / "filtered"
@@ -238,6 +499,7 @@ def _telemetry(root: Path, workspace: Path, plan: list[dict[str, Any]], count: i
 
 def analyze(root: Path) -> dict[str, Any]:
     root = root.resolve(); errors: list[str] = []
+    continuation = _continuation_lineage(root, errors)
     try: manifest = _read(root / "selected_manifest.json")
     except (OSError, json.JSONDecodeError) as exc: raise RuntimeError(f"missing selection manifest: {exc}")
     samples = manifest.get("samples", []); selected = [row.get("stem") for row in samples if isinstance(row, dict)]
@@ -251,7 +513,8 @@ def analyze(root: Path) -> dict[str, Any]:
                 for row in samples if isinstance(row, dict)]
     if _digest(identity) != manifest.get("selection_digest"): errors.append("selection_digest_mismatch")
     run = _read(root / "run_receipt.json") if (root / "run_receipt.json").is_file() else {}
-    if not isinstance(run, dict) or run.get("returncode") != 0: errors.append("pipeline_returncode_nonzero_or_missing")
+    if (not isinstance(run, dict) or run.get("returncode") != 0) and continuation.get("status") != "PASS_WITH_CONTINUATION":
+        errors.append("pipeline_returncode_nonzero_or_missing")
     workspace = root / "workspace"
     shards = _ctc_shards(root, workspace, universe, count if isinstance(count, int) else 0, errors)
     output, filtered, reasons = _strict_output(workspace, universe, count if isinstance(count, int) else 0, errors)
@@ -260,7 +523,8 @@ def analyze(root: Path) -> dict[str, Any]:
             "errors": sorted(set(errors)), "selected_count": len(universe), "run_label": manifest.get("run_label"),
             "shard_counts": {str(row["gpu"]): len(row["stems"]) for row in shards},
             "output_count": len(output), "filtered_count": len(filtered), "global_reasons": reasons,
-            "gpu_activity_samples": activity, "gpu_activity_evidence": activity_source, "publication": "forbidden"}
+            "gpu_activity_samples": activity, "gpu_activity_evidence": activity_source, "publication": "forbidden",
+            "continuation": continuation}
 
 
 def analyze_command(args: argparse.Namespace) -> int:

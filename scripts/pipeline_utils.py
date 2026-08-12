@@ -1051,9 +1051,59 @@ def is_english_token(token: str) -> bool:
     return True
 
 
+def _load_pinyin_syllable_bases() -> frozenset[str]:
+    """Return the finite Mandarin syllable inventory used by this pipeline.
+
+    A tone-number suffix alone is not sufficient to identify pinyin: ordinary
+    English words such as ``target1`` and ``target2`` satisfy the old regular
+    expression and were consequently treated as CJK units.  The authoritative
+    ``fullpinyin_enword.dict`` already contains every supported syllable, so we
+    derive a compact base inventory once at import time.  Keep a small fallback
+    for installed/packaged deployments where the repository dictionary is not
+    present; the fallback includes the common one-syllable forms used by the
+    normalization helpers and, importantly, ``jin``.
+    """
+    bases: set[str] = set()
+    dictionary = PROJECT_ROOT / "dict" / "fullpinyin_enword.dict"
+    try:
+        for line in dictionary.read_text(encoding="utf-8").splitlines():
+            first = line.split(maxsplit=1)[0].strip().lower() if line.strip() else ""
+            match = _re.fullmatch(r"([a-z]+)[1-5]", first)
+            if match:
+                bases.add(match.group(1))
+    except (OSError, UnicodeError):
+        # Minimal fallback for wheels/isolated test environments.  The full
+        # dictionary is preferred whenever available.
+        bases.update({
+            "a", "ai", "an", "ang", "ao", "ba", "bei", "bian", "biao",
+            "cai", "ci", "da", "de", "di", "dong", "er", "fa", "fei",
+            "ga", "ge", "gu", "hai", "han", "he", "hua", "hui", "jia",
+            "jin", "jing", "jiu", "kai", "kan", "ke", "la", "lai", "li",
+            "lian", "lin", "ling", "ma", "mei", "mi", "ming", "na", "ni",
+            "nin", "nong", "ou", "pa", "qi", "qian", "qing", "qu", "ran",
+            "re", "ren", "ri", "rong", "ru", "rui", "san", "se", "shan",
+            "shang", "shi", "shu", "si", "ta", "tan", "te", "ti", "ting",
+            "tu", "wa", "wan", "wei", "wen", "wo", "wu", "xi", "xia", "xian",
+            "xiang", "xiao", "xin", "xing", "xiong", "xu", "ya", "yan", "yang",
+            "ye", "yi", "yin", "ying", "you", "yu", "yuan", "yue", "yun", "za",
+            "zai", "zan", "zhan", "zhang", "zhao", "zhe", "zhen", "zheng", "zhi",
+            "zhong", "zhou", "zhu", "zhuang", "zi", "zou", "zu", "zuo",
+        })
+    return frozenset(bases)
+
+
+_PINYIN_SYLLABLE_BASES = _load_pinyin_syllable_bases()
+
+
 def is_pinyin_syllable(token: str) -> bool:
-    """True for Chinese pinyin syllable with tone digit (e.g. jin1, ya4)."""
-    return bool(_re.match(r'^[a-z]+[1-5]$', token))
+    """True only for a supported Mandarin pinyin syllable with tone digit.
+
+    Requiring membership in the finite syllable inventory prevents English
+    alpha+digit words (``target1``/``target2``) from being misclassified while
+    preserving genuine forms such as ``jin1``.
+    """
+    match = _re.fullmatch(r"([a-z]+)([1-5])", token.strip().lower())
+    return bool(match and match.group(1) in _PINYIN_SYLLABLE_BASES)
 
 
 def is_word_like(s: str) -> bool:

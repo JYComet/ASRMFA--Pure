@@ -2034,6 +2034,8 @@ def _run_mfa_sharded(
                 "return_code": _return_codes.get(_si),
                 "log": str(_log_path),
                 "expected_count": len(_expected),
+                "expected": sorted(_expected),
+                "produced": [],
                 "produced_count": 0,
                 "missing": sorted(_expected),
                 "extra": [],
@@ -2073,6 +2075,8 @@ def _run_mfa_sharded(
             "return_code": _return_codes.get(_si),
             "log": str(_log_path),
             "expected_count": len(_expected),
+            "expected": sorted(_expected),
+            "produced": sorted(_produced),
             "produced_count": len(_produced),
             "missing": _missing,
             "extra": _extra,
@@ -2081,6 +2085,85 @@ def _run_mfa_sharded(
         })
 
     _manifest_path = _log_dir / "mfa_output_manifest.json"
+    _reconciliations = [reconcile_mfa_outputs(row.get("expected", []), row.get("produced", []),
+                                               return_code=(row.get("return_code") if isinstance(row.get("return_code"), int) else 1),
+                                               invalid_stems=row.get("invalid", []))
+                        for row in _manifest_rows]
+    _retry_missing = sorted({stem for rec in _reconciliations
+                             if rec.get("retry_missing") for stem in rec.get("missing", [])})
+    if _retry_missing:
+        _retry_invocation = 0
+        def _execute_retained_missing(_missing, *, _beam=beam, _retry_beam=retry_beam):
+            """Retry only retained missing shard inputs with resolved MFA context."""
+            nonlocal _retry_invocation
+            _retry_invocation += 1
+            _root = _shard_root / f"retry_missing_{_retry_invocation:02d}"
+            _root.mkdir(parents=True, exist_ok=False)
+            _corpus, _audio, _out = _root / "corpus", _root / "audio", _root / "output"
+            _corpus.mkdir(); _audio.mkdir(); _out.mkdir()
+            for _stem in _missing:
+                _src_shard = next((_sd for (_i, _p, _sd, _lh, _lp, _ex, _st) in _procs if _stem in _ex), None)
+                if _src_shard is None: continue
+                for _suffix in (".lab", ".txt"):
+                    _src = _src_shard / "corpus" / f"{_stem}{_suffix}"
+                    if _src.is_file(): shutil.copy2(_src, _corpus / _src.name)
+                _src = _src_shard / "audio" / f"{_stem}.wav"
+                if _src.is_file(): shutil.copy2(_src, _audio / _src.name)
+            _cmd = [str(mfa_python), "-m", "montreal_forced_aligner.command_line.mfa", "align",
+                    str(_corpus), str(dict_path), acoustic_model, str(_out), "--audio_directory", str(_audio),
+                    "--temporary_directory", str(_root / "temp"), "--output_format", output_format,
+                    "--num_jobs", str(_jobs_per_shard), "--overwrite", "--no_textgrid_cleanup", "--single_speaker",
+                    "--no_tokenization", "--beam", str(_beam), "--retry_beam", str(_retry_beam),
+                    "--boost_silence", str(boost_silence)]
+            _proc = subprocess.run(_cmd, cwd=str(PROJECT_ROOT), env=get_mfa_env(mfa_python, models_dir),
+                                   capture_output=True, text=True)
+            (_root / "retry.stdout.log").write_text(_proc.stdout or "", encoding="utf-8")
+            (_root / "retry.stderr.log").write_text(_proc.stderr or "", encoding="utf-8")
+            _produced = [] ; _invalid = []
+            for _tg in _out.glob("*.TextGrid"):
+                if validate_strict_mfa_textgrid(_tg): _invalid.append(_tg.stem)
+                else: _produced.append(_tg.stem)
+            return {"return_code": _proc.returncode, "produced": _produced,
+                    "invalid": _invalid, "exception": _proc.stderr[-500:],
+                    "output_dir": str(_out)}
+        _initial_attempt = {"return_code": 0, "produced": sorted(set().union(*(_usable_by_shard.values() or [set()]))),
+                            "invalid": [], "exception": "rc0_incomplete"}
+        _retry_state = run_mfa_retry_coordinator(
+            sorted(set().union(*[set(row.get("expected", [])) for row in _manifest_rows])),
+            _initial_attempt,
+            _execute_retained_missing,
+            # The eligible singleton is derived only after the cumulative
+            # batch retry.  The executor is therefore supplied unconditionally
+            # but can be reached solely after the coordinator's explicit
+            # nonzero NoAlignmentsError isolation gate.
+            rescue_executor=(lambda stem: _execute_retained_missing([stem], _beam=200, _retry_beam=800)))
+        _manifest_path.write_text(_json.dumps({"schema": "mfa-output-manifest-v2", "run_id": _run_id,
+            "expected_total": _n, "shards": _manifest_rows}, ensure_ascii=False, indent=2), encoding="utf-8")
+        _retry_plan = _log_dir / "mfa_missing_retry_plan.json"
+        _retry_plan.write_text(_json.dumps({"schema": MFA_RETRY_SCHEMA,
+            "stems": _retry_missing, "reason": "rc0_incomplete_before_partial_admission",
+            "workspaces_retained": True, "reconciliation": _reconciliations,
+            "coordinator": _retry_state}, ensure_ascii=False, indent=2), encoding="utf-8")
+        if _retry_state.get("merge_allowed"):
+            # Each attempt is retained independently; merge every successful
+            # attempt's valid grids so a singleton isolation/rescue cannot
+            # discard the batch's individually recovered stems.
+            _retry_outputs = [Path(_attempt["output_dir"])
+                              for _attempt in _retry_state.get("attempts", [])[1:]
+                              if _attempt.get("output_dir")]
+            for _retry_out in _retry_outputs:
+                for _tg in _retry_out.glob("*.TextGrid"):
+                    _target_shard = next((_sd for (_i, _p, _sd, _lh, _lp, _ex, _st) in _procs if _tg.stem in _ex), None)
+                    if _target_shard is not None and not validate_strict_mfa_textgrid(_tg):
+                        shutil.copy2(_tg, _target_shard / "output" / _tg.name)
+                        _usable_by_shard[next(_i for (_i, _p, _sd, _lh, _lp, _ex, _st) in _procs if _sd == _target_shard)].add(_tg.stem)
+            _all_missing = [s for s in _all_missing if s not in _retry_state["history"][-1].get("produced", [])]
+            _failed = [si for si, usable in _usable_by_shard.items()
+                       if usable != set(_shard_stems[si])]
+            print(f"  MFA retry coordinator recovered exact missing set; continuing strict merge")
+        else:
+            print(f"  MFA rc=0 incomplete; retained shard workspaces and wrote retry plan: {_retry_plan}")
+            return 1
     _manifest_path.write_text(_json.dumps({
         "schema": 1,
         "run_id": _run_id,
@@ -2603,6 +2686,17 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         pp_args += ["--bgm-max-threshold", str(pc.get("bgm_max_threshold", 0.05))]
     else:
         pp_args.append("--no-detect-bgm")
+    # word_in_silence has an explicit tri-state CLI because strict QC treats
+    # an omitted value as enabled for legacy invocations.  Always serialize
+    # the configured boolean, even when the broader suspicious-filter bundle
+    # is disabled; otherwise ``filter_suspicious: false`` accidentally
+    # resurrects this detector in the child process.
+    if pc.get("enable_word_in_silence_filter", False):
+        pp_args.append("--enable-word-in-silence-filter")
+        pp_args += ["--filter-word-energy-ratio", str(pc.get("filter_word_energy_ratio", 2.0))]
+    else:
+        pp_args.append("--no-enable-word-in-silence-filter")
+        pp_args += ["--filter-word-energy-ratio", "0"]
     # Quality filters
     if pc.get("filter_suspicious", True):
         if pc.get("filter_short_phone", True):
@@ -2612,10 +2706,6 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         pp_args += ["--filter-long-word-sec", str(pc.get("filter_long_word_sec", 1.0))]
         pp_args += ["--filter-min-word-sec", str(pc.get("filter_min_word_sec", 0.15))]
         pp_args += ["--filter-min-word-dur-sec", str(pc.get("filter_min_word_dur_sec", 0.02))]
-        if pc.get("enable_word_in_silence_filter", False):
-            pp_args += ["--filter-word-energy-ratio", str(pc.get("filter_word_energy_ratio", 2.0))]
-        else:
-            pp_args += ["--filter-word-energy-ratio", "0"]
         pp_args += ["--filter-min-phone-coverage", str(pc.get("filter_min_phone_coverage", 0.35))]
         pp_args += ["--filter-edge-gap-sec", str(pc.get("filter_edge_gap_sec", 0.25))]
         pp_args += ["--filter-flank-silence-sec", str(pc.get("filter_flank_silence_sec", 0.4))]
@@ -4415,7 +4505,7 @@ def validate_config(cfg: dict, mode: str) -> list[str]:
     if pc.get("all_gpus") and pc.get("enabled") is False:
         errors.append("ctc_prealign.all_gpus=true but ctc_prealign.enabled=false")
     if (pc.get("enabled", True) and pc.get("all_gpus")
-            and mode not in ("full", "ctc_ready", "nvrasr_fallback", "strict_replay")):
+            and mode not in ("full", "ctc_ready", "nvrasr_fallback", "strict_replay", "filtered_recovery")):
         errors.append(
             f"ctc_prealign.all_gpus=true requires full or nvrasr_fallback mode,"
             f" got {mode!r}"
@@ -4502,6 +4592,1155 @@ STRICT_REPLAY_CATEGORIES = (
     "english_provenance_rejected",
 )
 STRICT_REPLAY_RANGES = ("000000-017999", "018000-035999", "036000-053999")
+
+# ---------------------------------------------------------------------------
+# Filtered recovery (provenance-quarantined, non-publishing)
+# ---------------------------------------------------------------------------
+
+FILTERED_RECOVERY_SCHEMA = "filtered-recovery-import-v1"
+MFA_RETRY_SCHEMA = "mfa-retry-evidence-v1"
+MFA_RESCUE_SCHEMA = "mfa-rescue-evidence-v1"
+
+
+def reconcile_mfa_outputs(expected_stems, produced_stems, *, return_code: int,
+                          invalid_stems=()) -> dict:
+    """Reconcile an MFA attempt before any partial merge or cleanup."""
+    expected = set(_filtered_recovery_sorted_unique(list(expected_stems), "MFA expected"))
+    produced = set(_filtered_recovery_sorted_unique(list(produced_stems), "MFA produced"))
+    invalid = set(_filtered_recovery_sorted_unique(list(invalid_stems), "MFA invalid"))
+    return {"return_code": return_code, "expected": sorted(expected),
+            "produced": sorted(produced), "missing": sorted(expected - produced),
+            "extra": sorted(produced - expected), "invalid": sorted(invalid),
+            "complete": return_code == 0 and produced == expected and not invalid,
+            "retry_missing": return_code == 0 and bool(expected - produced) and not (produced - expected)}
+
+
+def mfa_retry_state_machine(expected_stems, attempts, *, rescue_stem=None) -> dict:
+    """Fail-closed retry policy with explicit batch/isolation/rescue phases.
+
+    ``produced`` in an executor result is that attempt's individual output;
+    ``produced_individual`` is accepted as an explicit alias when callers
+    have already annotated it.  Reconciliation always uses the cumulative
+    union, while retaining each attempt in ``history`` for auditability.
+    """
+    expected = set(_filtered_recovery_sorted_unique(list(expected_stems), "MFA expected"))
+    state = "initial"; rescue_used = False; history = []; cumulative: set[str] = set()
+    for index, attempt in enumerate(attempts):
+        individual = set(_filtered_recovery_sorted_unique(
+            list(attempt.get("produced_individual", attempt.get("produced", []))),
+            f"MFA produced attempt {index}"))
+        cumulative.update(individual)
+        result = reconcile_mfa_outputs(expected, sorted(cumulative),
+                                       return_code=int(attempt.get("return_code", 1)),
+                                       invalid_stems=attempt.get("invalid", []))
+        result["attempt_index"] = index
+        result["produced_individual"] = sorted(individual)
+        result["produced"] = sorted(cumulative)
+        history.append(result)
+        if result["complete"]:
+            state = "complete"; break
+        clean_missing = (not result["extra"] and not result["invalid"]
+                         and bool(result["missing"]))
+        if index == 0 and result["retry_missing"]:
+            state = "unchanged_retry"; continue
+        # A batch retry that leaves exactly one cumulative gap must be
+        # followed by an unchanged 20/80 singleton isolation attempt.
+        if index == 1 and clean_missing and len(result["missing"]) == 1:
+            state = "singleton_isolation"; continue
+        # Only a nonzero, explicit NoAlignmentsError from that isolation
+        # attempt can authorize the single 200/800 rescue.
+        if (index == 2 and rescue_stem and clean_missing
+                and result["missing"] == [rescue_stem]
+                and int(attempt.get("return_code", 1)) != 0
+                and "NoAlignmentsError" in str(attempt.get("exception", ""))):
+            rescue_used = True; state = "singleton_rescue"; continue
+        state = "permanent_failure"; break
+    return {"state": state, "rescue_used": rescue_used, "history": history,
+            "merge_allowed": state == "complete"}
+
+
+def run_mfa_retry_coordinator(expected_stems, initial_attempt: dict, retry_executor,
+                              *, rescue_stem=None, rescue_executor=None) -> dict:
+    """Execute batch retry, singleton isolation, then one guarded rescue."""
+    expected = set(_filtered_recovery_sorted_unique(list(expected_stems), "MFA expected"))
+    attempts = [dict(initial_attempt)]
+    effective_rescue_stem = rescue_stem
+    initial_rec = reconcile_mfa_outputs(
+        expected, initial_attempt.get("produced_individual", initial_attempt.get("produced", [])),
+        return_code=int(initial_attempt.get("return_code", 1)),
+        invalid_stems=initial_attempt.get("invalid", []))
+    if initial_rec["retry_missing"]:
+        batch_missing = initial_rec["missing"]
+        batch = dict(retry_executor(batch_missing))
+        batch["produced_individual"] = sorted(set(batch.get("produced", [])))
+        attempts.append(batch)
+        # Evaluate the cumulative batch result before deciding whether the
+        # unchanged 20/80 singleton isolation is warranted.
+        batch_state = mfa_retry_state_machine(expected, attempts, rescue_stem=rescue_stem)
+        batch_history = batch_state["history"][-1]
+        if (batch_state["state"] == "singleton_isolation"
+                and len(batch_history["missing"]) == 1):
+            # In production the initial missing set can be large, so the
+            # singleton eligible for rescue is only knowable after the batch
+            # union.  A caller-supplied stem remains a strict binding check.
+            effective_rescue_stem = (batch_history["missing"][0]
+                                     if rescue_stem is None else rescue_stem)
+            isolation = dict(retry_executor(batch_history["missing"]))
+            isolation["produced_individual"] = sorted(set(isolation.get("produced", [])))
+            attempts.append(isolation)
+            isolation_state = mfa_retry_state_machine(expected, attempts,
+                                                      rescue_stem=effective_rescue_stem)
+            isolation_history = isolation_state["history"][-1]
+            explicit_noalign = (
+                isolation_history["missing"] == [effective_rescue_stem]
+                and not isolation_history["extra"] and not isolation_history["invalid"]
+                and int(isolation.get("return_code", 1)) != 0
+                and "NoAlignmentsError" in str(isolation.get("exception", "")))
+            if explicit_noalign and rescue_executor and effective_rescue_stem:
+                rescue = dict(rescue_executor(effective_rescue_stem))
+                rescue["produced_individual"] = sorted(set(rescue.get("produced", [])))
+                attempts.append(rescue)
+    state = mfa_retry_state_machine(expected, attempts, rescue_stem=effective_rescue_stem)
+    state["attempts"] = attempts
+    return state
+
+
+def _filtered_recovery_sorted_unique(stems, label: str) -> list[str]:
+    """Normalize a recovery stem sequence and reject duplicates/path escapes."""
+    if not isinstance(stems, (list, tuple, set, frozenset)):
+        raise ValueError(f"filtered recovery {label} must be a stem sequence")
+    values = [str(stem) for stem in stems]
+    if any(not stem or Path(stem).name != stem for stem in values):
+        raise ValueError(f"filtered recovery {label} contains malformed stem")
+    if len(values) != len(set(values)):
+        raise ValueError(f"filtered recovery {label} contains duplicate stems")
+    return sorted(values)
+
+
+def validate_filtered_recovery_partition(
+    frozen_stems, accepted_stems, recovered_stems, still_filtered_stems,
+    *, expected_count: int | None = None,
+) -> dict:
+    """Validate the independent final recovery accounting for any frozen set.
+
+    The parent accepted set is deliberately supplied separately and can never
+    be copied into recovery.  Recovery rows must form a disjoint union of the
+    frozen parent-filtered set, with no omissions, extras, or duplicate rows.
+    """
+    frozen = set(_filtered_recovery_sorted_unique(frozen_stems, "frozen"))
+    accepted = set(_filtered_recovery_sorted_unique(accepted_stems, "accepted"))
+    recovered = set(_filtered_recovery_sorted_unique(recovered_stems, "recovered"))
+    filtered = set(_filtered_recovery_sorted_unique(still_filtered_stems, "still_filtered"))
+    if expected_count is None:
+        expected_count = len(frozen)
+    if not isinstance(expected_count, int) or expected_count < 1:
+        raise ValueError("filtered recovery expected_count must be a positive integer")
+    if len(frozen) != expected_count:
+        raise ValueError(f"filtered recovery frozen set must contain exactly {expected_count} stems")
+    if frozen & accepted:
+        raise ValueError("filtered recovery frozen/parent accepted intersection is non-empty")
+    if recovered & filtered:
+        raise ValueError("filtered recovery recovered/still-filtered overlap")
+    if recovered | filtered != frozen:
+        missing = sorted(frozen - (recovered | filtered))
+        extra = sorted((recovered | filtered) - frozen)
+        raise ValueError(f"filtered recovery union mismatch: missing={missing[:5]} extra={extra[:5]}")
+    return {
+        "source": expected_count,
+        "eligible": expected_count,
+        "exclusions": 0,
+        "output": len(recovered),
+        "filtered": len(filtered),
+        "recovered_stems": sorted(recovered),
+        "still_filtered_stems": sorted(filtered),
+        "parent_accepted_intersection": 0,
+    }
+
+
+def validate_filtered_recovery_rows(report_rows, frozen_stems, accepted_stems) -> dict:
+    """Validate exactly one final taxonomy/report row per frozen stem."""
+    frozen = _filtered_recovery_sorted_unique(frozen_stems, "frozen")
+    if not isinstance(report_rows, list) or len(report_rows) != len(frozen):
+        raise ValueError(f"filtered recovery final report must contain exactly {len(frozen)} rows")
+    by_stem: dict[str, dict] = {}
+    for row in report_rows:
+        if not isinstance(row, dict) or not isinstance(row.get("stem"), str):
+            raise ValueError("filtered recovery final report row malformed")
+        stem = row["stem"]
+        if stem in by_stem:
+            raise ValueError("filtered recovery final report contains duplicate stem")
+        by_stem[stem] = row
+    recovered = [stem for stem, row in by_stem.items() if row.get("status") == "ok"]
+    still_filtered = [stem for stem, row in by_stem.items()
+                      if isinstance(row.get("status"), str)
+                      and row["status"].startswith("filtered")]
+    if len(recovered) + len(still_filtered) != len(frozen):
+        raise ValueError("filtered recovery final report has invalid taxonomy statuses")
+    return validate_filtered_recovery_partition(
+        frozen_stems, accepted_stems, recovered, still_filtered)
+
+
+def validate_filtered_recovery_manifest(
+    manifest: dict, frozen_stems, accepted_stems, *,
+    parent_hashes: dict[str, str] | None = None,
+    observed_parent_hashes: dict[str, str] | None = None,
+    expected_mismatch: dict[str, str] | None = None,
+) -> dict:
+    """Fail-closed validation for a subset/full frozen retry manifest."""
+    if not isinstance(manifest, dict) or manifest.get("schema") != FILTERED_RECOVERY_SCHEMA:
+        raise ValueError("filtered recovery manifest schema mismatch")
+    frozen = set(_filtered_recovery_sorted_unique(frozen_stems, "frozen"))
+    accepted = set(_filtered_recovery_sorted_unique(accepted_stems, "accepted"))
+    selected = _filtered_recovery_sorted_unique(manifest.get("stems", []), "selected")
+    if not selected:
+        raise ValueError("filtered recovery manifest selected stems are empty")
+    if set(selected) - frozen:
+        raise ValueError("filtered recovery manifest contains stem outside frozen set")
+    if set(selected) & accepted:
+        raise ValueError("filtered recovery manifest contains parent accepted stem")
+    if manifest.get("source") != len(selected) or manifest.get("eligible") != len(selected):
+        raise ValueError("filtered recovery manifest source/eligible must equal selected count")
+    if manifest.get("exclusions", 0) != 0:
+        raise ValueError("filtered recovery manifest exclusions must be zero")
+    mismatch = _validate_filtered_recovery_mismatch(manifest.get("declared_vs_actual_inner_receipt"))
+    if expected_mismatch is not None and mismatch != expected_mismatch:
+        raise ValueError("filtered recovery declared/actual mismatch does not match evidence receipt")
+    if parent_hashes is not None:
+        if observed_parent_hashes != parent_hashes:
+            raise ValueError("filtered recovery parent artifact hash changed")
+    return {"stems": selected, "count": len(selected), "frozen_count": len(frozen),
+            "declared_vs_actual_inner_receipt": mismatch}
+
+
+def import_filtered_recovery_assets(
+    assets: dict[str, Path], destination: Path, *, allowlist: set[str],
+    destination_names: dict[str, str] | None = None,
+) -> list[dict]:
+    """Copy allowlisted frozen assets into a fresh recovery namespace.
+
+    Symlink and hardlink aliases are rejected before and after copying; each
+    row records source/destination hashes, inode and link-count evidence.
+    """
+    destination = Path(destination)
+    if destination.exists() or destination.is_symlink():
+        raise ValueError(f"filtered recovery destination must be fresh: {destination}")
+    destination.mkdir(parents=True)
+    rows: list[dict] = []
+    for label, source in sorted(assets.items()):
+        if label not in allowlist:
+            raise ValueError(f"filtered recovery asset is not allowlisted: {label}")
+        source = Path(source)
+        if not source.is_file() or source.is_symlink():
+            raise ValueError(f"filtered recovery source is not an ordinary file: {source}")
+        dst_name = (destination_names.get(label, source.name)
+                    if destination_names else source.name)
+        if Path(dst_name).name != dst_name:
+            # Category-prefixed relative names are permitted but must remain
+            # beneath the fresh import root.
+            if Path(dst_name).is_absolute() or ".." in Path(dst_name).parts:
+                raise ValueError(f"filtered recovery destination name escapes namespace: {label}")
+        dst = destination / dst_name
+        if dst.exists() or dst.is_symlink():
+            raise ValueError(f"filtered recovery destination collision: {dst}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src_stat = source.stat()
+        if src_stat.st_nlink != 1:
+            raise ValueError(f"filtered recovery source has hardlink aliases: {label}")
+        src_hash = _sha256_file(source)
+        shutil.copy2(source, dst)
+        dst_stat = dst.stat()
+        if _sha256_file(dst) != src_hash:
+            raise ValueError(f"filtered recovery copy hash mismatch: {label}")
+        if os.path.samestat(src_stat, dst_stat) or dst.is_symlink() or dst_stat.st_nlink != 1:
+            raise ValueError(f"filtered recovery copy inode/link alias: {label}")
+        dst_hash = _sha256_file(dst)
+        rows.append({"label": label, "source": str(source.resolve()), "destination": str(dst.resolve()),
+                     "sha256": src_hash, "source_sha256": src_hash,
+                     "destination_sha256": dst_hash, "source_inode": src_stat.st_ino,
+                     "destination_inode": dst_stat.st_ino, "source_nlink": src_stat.st_nlink,
+                     "destination_nlink": dst_stat.st_nlink, "size": src_stat.st_size})
+    return rows
+
+
+def make_filtered_recovery_receipt(
+    partition: dict, imports: list[dict], parent_hashes: dict[str, str],
+    parent_hashes_after: dict[str, str] | None = None, *, strict_id: str | None = None,
+    declared_vs_actual_inner_receipt: dict[str, str] | None = None,
+) -> dict:
+    """Build durable, explicitly non-sealing recovery evidence."""
+    after = dict(parent_hashes if parent_hashes_after is None else parent_hashes_after)
+    if declared_vs_actual_inner_receipt is None:
+        raise ValueError("filtered recovery receipt requires explicit inner-receipt evidence")
+    return {"schema": FILTERED_RECOVERY_SCHEMA, "scope": "filtered_recovery",
+            "publishing": False, "reseal_parent": False,
+            "evidence_mode": "quarantined_independent_reconstruction",
+            "parent_certification_status": "invalid_receipt_binding",
+            "partition": partition, "imports": imports,
+            "parent_artifact_sha256": dict(sorted(parent_hashes.items())),
+            "parent_artifact_sha256_before": dict(sorted(parent_hashes.items())),
+            "parent_artifact_sha256_after": dict(sorted(after.items())),
+            "parent_hashes_unchanged": parent_hashes == after,
+            "strict_id": strict_id,
+            "declared_vs_actual_inner_receipt": dict(declared_vs_actual_inner_receipt)}
+
+
+def _filtered_recovery_root(path: Path, label: str) -> Path:
+    raw = Path(os.path.abspath(path))
+    if not raw.is_dir() or raw.is_symlink():
+        raise ValueError(f"{label} must be an ordinary directory: {raw}")
+    cursor = Path(raw.anchor)
+    for part in raw.parts[1:]:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ValueError(f"{label} has symlink ancestor: {cursor}")
+    return raw.resolve(strict=True)
+
+
+def _mfa_retry_regular_copy(source: Path, target: Path) -> dict:
+    source = Path(source)
+    if source.is_symlink() or not source.is_file() or source.stat().st_nlink != 1:
+        raise ValueError(f"MFA retry source is not an ordinary file: {source}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() or target.is_symlink():
+        raise ValueError(f"MFA retry destination collision: {target}")
+    shutil.copy2(source, target)
+    return {"source": str(source.resolve()), "destination": str(target.resolve()),
+            "sha256": _sha256_file(source), "destination_sha256": _sha256_file(target),
+            "size": source.stat().st_size}
+
+
+def prepare_mfa_retry_packet(parent_root: Path, retry_root: Path, stems: list[str], *,
+                             frozen_stems: list[str], accepted_stems: list[str],
+                             execute: bool = False, mfa_python: Path | None = None,
+                             model_path: Path | None = None, dictionary_path: Path | None = None) -> dict:
+    """Create/run an exact-missing MFA retry in a fresh quarantine packet."""
+    parent = _filtered_recovery_root(parent_root, "MFA retry parent")
+    retry_root = _strict_replay_path_new(Path(retry_root), "MFA retry workspace")
+    stems = _filtered_recovery_sorted_unique(stems, "MFA retry stems")
+    frozen = set(_filtered_recovery_sorted_unique(frozen_stems, "frozen"))
+    accepted = set(_filtered_recovery_sorted_unique(accepted_stems, "accepted"))
+    if not set(stems) <= frozen or set(stems) & accepted:
+        raise ValueError("MFA retry stems must be a frozen subset and exclude parent accepted stems")
+    ws = parent / "workspace"
+    axis_path = ws / ".mfa_alignment_axis_receipt.json"
+    post_path = next(iter(ws.glob("strict_ok_runs/*/output/postprocess_report.jsonl")), None)
+    manifest_path = next(iter(ws.glob("mfa_logs/*/mfa_output_manifest.json")), None)
+    strict_path = next(iter(ws.glob("strict_ok_runs/*/output/strict_ok_manifest.json")), None)
+    for path, label in ((axis_path, "MFA axis receipt"), (post_path, "postprocess report"),
+                        (manifest_path, "MFA output manifest"), (strict_path, "strict manifest")):
+        if path is None or path.is_symlink() or not path.is_file():
+            raise ValueError(f"MFA retry {label} missing")
+    axis = json.loads(axis_path.read_text(encoding="utf-8"))
+    axis_missing = {r.get("stem") for r in axis.get("alignments", [])
+                    if isinstance(r, dict) and r.get("status") == "missing_mfa_alignment"}
+    post_missing = {r.get("stem") for r in (json.loads(line) for line in post_path.read_text(encoding="utf-8").splitlines() if line.strip())
+                    if isinstance(r, dict) and "missing_mfa_alignment" in str(r.get("filter_reasons", []))}
+    mfa_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_missing = {stem for row in mfa_payload.get("shards", []) for stem in row.get("missing", [])}
+    evidence_missing = axis_missing & post_missing & manifest_missing
+    if not (axis_missing == post_missing == manifest_missing) or not set(stems) <= evidence_missing:
+        raise ValueError("MFA retry exact-missing evidence disagreement")
+    strict_payload = json.loads(strict_path.read_text(encoding="utf-8"))
+    strict_ok = {row.get("stem") for row in strict_payload.get("ok", []) if isinstance(row, dict)}
+    if strict_ok & set(stems):
+        raise ValueError("MFA retry exact set intersects accepted strict output")
+    retry_root.mkdir(parents=True)
+    corpus = retry_root / "corpus"; audio = retry_root / "audio"; output = retry_root / "aligned"
+    copied = []
+    for stem in stems:
+        for suffix in (".lab", ".txt"):
+            source = ws / "ctc_pretg" / f"{stem}{suffix}"
+            if source.is_file(): copied.append({"stem": stem, "role": f"anchor{suffix}", **_mfa_retry_regular_copy(source, corpus / source.name)})
+        wav = ws / "audio_16k" / f"{stem}.wav"
+        copied.append({"stem": stem, "role": "mfa_axis_audio", **_mfa_retry_regular_copy(wav, audio / wav.name)})
+    model = Path(model_path or "/home/user/Documents/MFA/pretrained_models/acoustic/mandarin_mfa.zip")
+    dictionary = Path(dictionary_path or PROJECT_ROOT / "dict" / "mfa_ipa.dict")
+    mfa_bin = Path(mfa_python or "/home/user/miniconda3/envs/mfa-dev/bin/mfa")
+    mfa_bin_dir = mfa_bin.parent
+    mfa_python = mfa_bin_dir / "python"
+    fstcompile = mfa_bin_dir / "fstcompile"
+    if not mfa_bin.is_file() or not os.access(mfa_bin, os.X_OK) or not mfa_python.is_file():
+        raise ValueError(f"MFA executable unavailable: {mfa_bin}")
+    if not fstcompile.is_file() or not os.access(fstcompile, os.X_OK):
+        raise ValueError(f"MFA dependency unavailable: {fstcompile}")
+    numba_cache = retry_root / "numba_cache"
+    numba_cache.mkdir(parents=True, exist_ok=True)
+    preflight_env = os.environ.copy()
+    preflight_env["PATH"] = str(mfa_bin_dir) + os.pathsep + preflight_env.get("PATH", "")
+    preflight_env["NUMBA_CACHE_DIR"] = str(numba_cache)
+    preflight = subprocess.run(
+        [str(mfa_python), "-c", "import librosa; assert librosa.note_to_midi('C4') == 60"],
+        cwd=str(PROJECT_ROOT), text=True, capture_output=True, env=preflight_env)
+    if preflight.returncode != 0:
+        raise ValueError(f"MFA librosa preflight failed: {preflight.stderr[-500:]}")
+    command = [str(mfa_bin), "align", str(corpus), str(dictionary), str(model), str(output),
+               "--audio_directory", str(audio), "--num_jobs", "12", "--single_speaker",
+               "--no_tokenization", "--beam", "20", "--retry_beam", "80",
+               "--boost_silence", "1.0", "--no_fine_tune", "--no_clean",
+               "--output_format", "long_textgrid"]
+    receipt = {"schema": MFA_RETRY_SCHEMA, "scope": "exact_missing_mfa_retry",
+               "parent_root": str(parent), "stems": stems,
+               "evidence_missing_stems": sorted(evidence_missing),
+               "frozen_count": len(frozen), "accepted_intersection": 0,
+               "evidence": {"axis": str(axis_path), "postprocess": str(post_path),
+                            "mfa_manifest": str(manifest_path), "strict_manifest": str(strict_path),
+                            "hashes": {str(p): _sha256_file(p) for p in (axis_path, post_path, manifest_path, strict_path)}},
+               "inputs": copied, "command": command, "cwd": str(PROJECT_ROOT),
+               "model": {"path": str(model), "sha256": _sha256_file(model)},
+               "dictionary": {"path": str(dictionary), "sha256": _sha256_file(dictionary)},
+               "mfa_executable": {"path": str(mfa_bin), "sha256": _sha256_file(mfa_bin)},
+               "mfa_dependency": {"name": "fstcompile", "path": str(fstcompile), "sha256": _sha256_file(fstcompile)},
+               "preflight": {"librosa_note_to_midi": "C4=60", "python": str(mfa_python),
+                             "return_code": preflight.returncode, "stdout": preflight.stdout[-200:],
+                             "stderr": preflight.stderr[-200:]},
+               "options": {"num_jobs": 12, "single_speaker": True, "no_tokenization": True,
+                           "beam": 20, "retry_beam": 80, "boost_silence": 1.0,
+                           "fine_tune": False, "clean": False, "output_format": "long_textgrid"},
+               "environment": {"PATH_prefix": str(mfa_bin_dir),
+                               "MFA_ROOT_DIR": str(retry_root / "mfa_root"),
+                               "NUMBA_CACHE_DIR": str(numba_cache),
+                               "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
+                               "OPENBLAS_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1"},
+               "execution": {"attempted": False}}
+    if execute:
+        output.mkdir(parents=True, exist_ok=True)
+        started = time.time()
+        retry_env = os.environ.copy()
+        retry_env["PATH"] = str(mfa_bin_dir) + os.pathsep + retry_env.get("PATH", "")
+        mfa_root_dir = retry_root / "mfa_root"
+        mfa_root_dir.mkdir(parents=True, exist_ok=True)
+        retry_env["MFA_ROOT_DIR"] = str(mfa_root_dir)
+        retry_env["NUMBA_CACHE_DIR"] = str(numba_cache)
+        proc = subprocess.run(command, cwd=str(PROJECT_ROOT), text=True, capture_output=True, env=retry_env)
+        (retry_root / "mfa.stdout.log").write_text(proc.stdout or "", encoding="utf-8")
+        (retry_root / "mfa.stderr.log").write_text(proc.stderr or "", encoding="utf-8")
+        produced = sorted(p.stem for p in output.glob("*.TextGrid") if p.is_file() and not p.is_symlink())
+        produced_set = set(produced)
+        per_stem = []
+        for stem in stems:
+            artifact = output / f"{stem}.TextGrid"
+            per_stem.append({"stem": stem, "produced": stem in produced_set,
+                             "sha256": _sha256_file(artifact) if artifact.is_file() else None,
+                             "oov": [], "invalid": bool(artifact.is_symlink()),
+                             "return_code": proc.returncode, "started": started, "finished": time.time()})
+        receipt["execution"] = {"attempted": True, "return_code": proc.returncode,
+                                 "started": started, "finished": time.time(),
+                                 "produced": produced, "missing": sorted(set(stems) - set(produced)),
+                                 "extra": sorted(set(produced) - set(stems)),
+                                 "invalid": [row["stem"] for row in per_stem if row["invalid"]],
+                                 "per_stem": per_stem,
+                                 "stdout": str(retry_root / "mfa.stdout.log"),
+                                 "stderr": str(retry_root / "mfa.stderr.log"),
+                                 "path_prefix": str(mfa_bin_dir),
+                                 "mfa_root_dir": str(mfa_root_dir)}
+    receipt_path = retry_root / "mfa_retry_receipt.json"
+    receipt_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return receipt
+
+
+def run_mfa_singleton_rescue(parent_root: Path, rescue_root: Path, stem: str,
+                             *, frozen_stems: list[str], accepted_stems: list[str],
+                             prior_receipt_path: Path) -> dict:
+    """Run the one authorized NoAlignmentsError singleton rescue (200/800)."""
+    prior_receipt_path = Path(prior_receipt_path)
+    if not prior_receipt_path.is_file() or prior_receipt_path.is_symlink():
+        raise ValueError("MFA rescue prior receipt missing")
+    prior = json.loads(prior_receipt_path.read_text(encoding="utf-8"))
+    prior_exec = prior.get("execution", {})
+    prior_stems = prior.get("stems", [])
+    if prior_stems != [stem] or prior_exec.get("return_code") != 1 or prior_exec.get("produced"):
+        raise ValueError("MFA rescue prior receipt is not the unchanged isolated failure")
+    prior_log = Path(str(prior_exec.get("stderr", "")))
+    if not prior_log.is_file() or "NoAlignmentsError" not in prior_log.read_text(encoding="utf-8"):
+        raise ValueError("MFA rescue prior failure is not NoAlignmentsError")
+    rescue_root = Path(rescue_root)
+    packet = prepare_mfa_retry_packet(parent_root, rescue_root, [stem],
+                                      frozen_stems=frozen_stems,
+                                      accepted_stems=accepted_stems, execute=False)
+    command = list(packet["command"])
+    command[command.index("20")] = "200"
+    command[command.index("80")] = "800"
+    # Guard the singleton policy against accidental generic/batch widening.
+    if packet["stems"] != [stem] or command.count("200") != 1 or command.count("800") != 1:
+        raise ValueError("MFA rescue policy widening guard failed")
+    output = rescue_root / "aligned"
+    started = time.time()
+    mfa_bin_dir = Path(command[0]).parent
+    env = os.environ.copy()
+    env["PATH"] = str(mfa_bin_dir) + os.pathsep + env.get("PATH", "")
+    env["MFA_ROOT_DIR"] = str(rescue_root / "mfa_root")
+    env["NUMBA_CACHE_DIR"] = str(rescue_root / "numba_cache")
+    (rescue_root / "mfa_root").mkdir(parents=True, exist_ok=True)
+    (rescue_root / "numba_cache").mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(command, cwd=str(PROJECT_ROOT), text=True, capture_output=True, env=env)
+    (rescue_root / "mfa.stdout.log").write_text(proc.stdout or "", encoding="utf-8")
+    (rescue_root / "mfa.stderr.log").write_text(proc.stderr or "", encoding="utf-8")
+    produced = sorted(p.stem for p in output.glob("*.TextGrid") if p.is_file() and not p.is_symlink())
+    receipt = {"schema": MFA_RESCUE_SCHEMA, "stem": stem,
+               "policy": {"attempts": 1, "beam": 200, "retry_beam": 800,
+                           "reason": "NoAlignmentsError at unchanged beam20/retry80"},
+               "prior_receipt": {"path": str(prior_receipt_path.resolve()),
+                                 "sha256": _sha256_file(prior_receipt_path),
+                                 "stderr_sha256": _sha256_file(prior_log)},
+               "command": command, "cwd": str(PROJECT_ROOT),
+               "environment": {"PATH_prefix": str(mfa_bin_dir),
+                               "MFA_ROOT_DIR": str(rescue_root / "mfa_root"),
+                               "NUMBA_CACHE_DIR": str(rescue_root / "numba_cache")},
+               "model": packet["model"], "dictionary": packet["dictionary"],
+               "mfa_executable": packet["mfa_executable"],
+               "execution": {"attempted": True, "attempts": 1,
+                             "return_code": proc.returncode, "started": started,
+                             "finished": time.time(), "produced": produced,
+                             "missing": sorted({stem} - set(produced)), "extra": sorted(set(produced) - {stem}),
+                             "stdout": str(rescue_root / "mfa.stdout.log"),
+                             "stderr": str(rescue_root / "mfa.stderr.log"),
+                             "textgrid_sha256": _sha256_file(output / f"{stem}.TextGrid") if (output / f"{stem}.TextGrid").is_file() else None}}
+    path = rescue_root / "mfa_rescue_receipt.json"
+    path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return receipt
+
+
+def _filtered_recovery_stem_digest(stems) -> str:
+    """Digest the canonical sorted frozen partition, independent of count."""
+    payload = json.dumps(_filtered_recovery_sorted_unique(stems, "frozen"),
+                         ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _validate_filtered_recovery_mismatch(mismatch) -> dict[str, str]:
+    if not isinstance(mismatch, dict) or set(mismatch) != {"declared_sha256", "actual_sha256"}:
+        raise ValueError("filtered recovery declared/actual mismatch must contain two SHA-256 digests")
+    for key, value in mismatch.items():
+        if not isinstance(value, str) or len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+            raise ValueError(f"filtered recovery mismatch {key} is not a lowercase SHA-256 digest (known value/evidence digest required)")
+    if mismatch["declared_sha256"] == mismatch["actual_sha256"]:
+        raise ValueError("filtered recovery declared/actual mismatch must be non-equal")
+    return {"declared_sha256": mismatch["declared_sha256"],
+            "actual_sha256": mismatch["actual_sha256"]}
+
+
+def _read_filtered_recovery_evidence(path: Path, frozen, plan: dict) -> dict:
+    """Load explicit evidence binding for a recovery plan.
+
+    The evidence receipt is intentionally external to the plan so a stale
+    historical digest cannot silently become an approved production value.
+    """
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"filtered recovery evidence receipt missing: {path}")
+    evidence = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(evidence, dict) or evidence.get("schema") != "filtered-recovery-evidence-v1":
+        raise ValueError("filtered recovery evidence receipt schema mismatch")
+    digest = evidence.get("frozen_stems_sha256")
+    if digest != _filtered_recovery_stem_digest(frozen):
+        raise ValueError("filtered recovery frozen partition digest does not match evidence")
+    evidence_hashes = evidence.get("parent_artifact_sha256")
+    plan_hashes = plan.get("parent_artifact_sha256")
+    if not isinstance(evidence_hashes, dict) or evidence_hashes != plan_hashes:
+        raise ValueError("filtered recovery parent artifact hashes do not match evidence")
+    mismatch = _validate_filtered_recovery_mismatch(evidence.get("declared_vs_actual_inner_receipt"))
+    if plan.get("declared_vs_actual_inner_receipt") != mismatch:
+        raise ValueError("filtered recovery inner-receipt mismatch does not match evidence")
+    return evidence
+
+
+def _validate_filtered_recovery_english_ledger_scope(source_ledgers, frozen, accepted) -> set[str]:
+    """Validate the sealed English ledger universe before frozen-only import.
+
+    A producer manifest may be either an earlier frozen-only manifest or the
+    parent-global manifest.  The latter is safe only because its exact bytes
+    are already bound by the filtered-recovery evidence receipt.  No partial
+    or expanded ledger universe is accepted.
+    """
+    if not isinstance(source_ledgers, list):
+        raise ValueError("filtered recovery English source manifest ledgers missing")
+    ledger_stems: list[str] = []
+    for row in source_ledgers:
+        if not isinstance(row, dict) or not isinstance(row.get("stem"), str) or not row["stem"]:
+            raise ValueError("filtered recovery English source ledger stem invalid")
+        ledger_stems.append(row["stem"])
+    source_stems = set(ledger_stems)
+    if len(source_stems) != len(ledger_stems):
+        raise ValueError("filtered recovery English source manifest contains duplicate ledger stems")
+    frozen_stems = set(frozen)
+    accepted_stems = set(accepted)
+    if source_stems not in (frozen_stems, frozen_stems | accepted_stems):
+        raise ValueError("filtered recovery English source ledger universe is not sealed frozen/full partition")
+    return source_stems
+
+
+def run_filtered_recovery(args, cfg: dict, config_path: Path | None = None) -> int:
+    """Validate a frozen recovery plan in a fresh quarantine namespace.
+
+    This entry point intentionally performs no MFA/CTC execution.  It imports
+    only explicitly supplied allowlisted evidence and writes a non-publishing
+    receipt.  ``--validate-only`` revalidates an existing import receipt
+    without touching the parent or copying files.
+    """
+    try:
+        parent = _filtered_recovery_root(Path(args.filtered_recovery_parent_root), "filtered recovery parent")
+        workspace = Path(args.workspace) if args.workspace else parent / "workspace" / "filtered_recovery"
+        output = Path(args.output_dir) if args.output_dir else workspace / "output"
+        if getattr(args, "filtered_recovery_validate_only", False):
+            receipt_arg = getattr(args, "filtered_recovery_import_receipt", None)
+            if not receipt_arg:
+                raise ValueError("filtered_recovery --validate-only requires --filtered-recovery-import-receipt")
+            receipt_path = Path(receipt_arg)
+            if receipt_path.is_symlink() or not receipt_path.is_file():
+                raise ValueError(f"filtered recovery import receipt missing: {receipt_path}")
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if receipt.get("schema") != FILTERED_RECOVERY_SCHEMA or receipt.get("publishing") is not False or receipt.get("reseal_parent") is not False:
+                raise ValueError("filtered recovery import receipt is not quarantined")
+            partition = receipt.get("partition")
+            if not isinstance(partition, dict):
+                raise ValueError("filtered recovery import receipt partition missing")
+            frozen_path = Path(args.filtered_recovery_frozen_manifest) if args.filtered_recovery_frozen_manifest else parent / "frozen_filtered.json"
+            accepted_path = Path(args.filtered_recovery_accepted_manifest) if args.filtered_recovery_accepted_manifest else parent / "strict_ok_manifest.json"
+            for candidate, label in ((frozen_path, "frozen manifest"), (accepted_path, "accepted manifest")):
+                if not candidate.is_file() or candidate.is_symlink():
+                    raise ValueError(f"filtered recovery {label} missing: {candidate}")
+            frozen_payload = json.loads(frozen_path.read_text(encoding="utf-8"))
+            accepted_payload = json.loads(accepted_path.read_text(encoding="utf-8"))
+            frozen = frozen_payload.get("stems", frozen_payload.get("filtered", {}).get("stems", []))
+            accepted = accepted_payload.get("ok", accepted_payload.get("output", {}).get("stems", []))
+            if isinstance(accepted, list) and accepted and isinstance(accepted[0], dict):
+                accepted = [row.get("stem") for row in accepted]
+            if isinstance(frozen, list) and frozen and isinstance(frozen[0], dict):
+                frozen = [row.get("stem") for row in frozen]
+            mismatch = receipt.get("declared_vs_actual_inner_receipt")
+            if not getattr(args, "filtered_recovery_evidence_receipt", None):
+                raise ValueError("filtered recovery --validate-only requires --filtered-recovery-evidence-receipt")
+            validate_filtered_recovery_partition(frozen, accepted,
+                                                 partition.get("recovered_stems", []),
+                                                 partition.get("still_filtered_stems", []))
+            if receipt.get("parent_hashes_unchanged") is not True:
+                raise ValueError("filtered recovery parent hashes are not unchanged")
+            _read_filtered_recovery_evidence(Path(args.filtered_recovery_evidence_receipt), frozen, receipt)
+            for name, expected in receipt.get("parent_artifact_sha256", {}).items():
+                path = (parent / name).resolve(strict=True)
+                try:
+                    path.relative_to(parent)
+                except ValueError as exc:
+                    raise ValueError(f"filtered recovery parent artifact escapes parent: {name}") from exc
+                if path.is_symlink() or not path.is_file() or _sha256_file(path) != expected:
+                    raise ValueError(f"filtered recovery parent artifact changed: {name}")
+            print(f"filtered_recovery validate-only OK: {receipt_path}")
+            return 0
+        if workspace.exists() or output.exists():
+            raise ValueError("filtered recovery workspace/output must be fresh non-existing paths")
+        frozen_path = Path(args.filtered_recovery_frozen_manifest) if args.filtered_recovery_frozen_manifest else parent / "frozen_filtered.json"
+        accepted_path = Path(args.filtered_recovery_accepted_manifest) if args.filtered_recovery_accepted_manifest else parent / "strict_ok_manifest.json"
+        plan_path = Path(args.filtered_recovery_manifest) if args.filtered_recovery_manifest else parent / "filtered_recovery_manifest.json"
+        evidence_path = getattr(args, "filtered_recovery_evidence_receipt", None)
+        if not evidence_path:
+            raise ValueError("filtered_recovery requires explicit --filtered-recovery-evidence-receipt")
+        for candidate, label in ((frozen_path, "frozen manifest"), (accepted_path, "accepted manifest"), (plan_path, "recovery manifest")):
+            if not candidate.is_file() or candidate.is_symlink():
+                raise ValueError(f"filtered recovery {label} missing: {candidate}")
+        frozen_payload = json.loads(frozen_path.read_text(encoding="utf-8"))
+        accepted_payload = json.loads(accepted_path.read_text(encoding="utf-8"))
+        plan_payload = json.loads(plan_path.read_text(encoding="utf-8"))
+        frozen = frozen_payload.get("stems", frozen_payload.get("filtered", {}).get("stems", []))
+        accepted = accepted_payload.get("ok", accepted_payload.get("output", {}).get("stems", []))
+        if isinstance(accepted, list) and accepted and isinstance(accepted[0], dict):
+            accepted = [row.get("stem") for row in accepted]
+        if isinstance(frozen, list) and frozen and isinstance(frozen[0], dict):
+            frozen = [row.get("stem") for row in frozen]
+        evidence = _read_filtered_recovery_evidence(Path(evidence_path), frozen, plan_payload)
+        validated = validate_filtered_recovery_manifest(
+            plan_payload, frozen, accepted,
+            expected_mismatch=evidence["declared_vs_actual_inner_receipt"])
+        # Hash every parent evidence file named by the plan before any import.
+        parent_hashes = plan_payload.get("parent_artifact_sha256", {})
+        if not isinstance(parent_hashes, dict):
+            raise ValueError("filtered recovery parent_artifact_sha256 must be an object")
+        observed = {}
+        for name in sorted(parent_hashes):
+            raw_path = parent / name
+            try:
+                path = raw_path.resolve(strict=True)
+                path.relative_to(parent)
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"filtered recovery parent artifact escapes parent: {name}") from exc
+            if not path.is_file() or raw_path.is_symlink():
+                raise ValueError(f"filtered recovery parent artifact missing: {name}")
+            observed[name] = _sha256_file(path)
+        if observed != parent_hashes:
+            raise ValueError("filtered recovery parent artifact hash changed")
+        # Import only the frozen stems' replay inputs.  Accepted-parent stems
+        # are never enumerated or copied.  These four axes are the minimum
+        # authoritative inputs consumed by a filtered replay.
+        strict_output = Path(accepted_payload.get("output_dir", ""))
+        if not strict_output.is_absolute():
+            strict_output = parent / strict_output
+        try:
+            strict_output = strict_output.resolve(strict=True)
+            strict_output.relative_to(parent)
+        except (OSError, ValueError) as exc:
+            raise ValueError("filtered recovery strict output escapes parent root") from exc
+        filtered_root = strict_output.parent / "filtered"
+        aligned_root = Path(args.filtered_recovery_aligned_root) if getattr(args, "filtered_recovery_aligned_root", None) else parent / "workspace" / "aligned"
+        aligned_root = _filtered_recovery_root(aligned_root, "filtered recovery aligned root")
+        ctc_root = parent / "workspace" / "ctc_pretg"
+        en_root = parent / "workspace" / "en_phones"
+        ctc_override_root = None
+        en_override_root = None
+        en_aligned_override_root = None
+        if getattr(args, "filtered_recovery_ctc_root", None):
+            ctc_override_root = _filtered_recovery_root(
+                Path(args.filtered_recovery_ctc_root),
+                "filtered recovery CTC override root")
+        if getattr(args, "filtered_recovery_english_root", None):
+            en_override_root = _filtered_recovery_root(
+                Path(args.filtered_recovery_english_root),
+                "filtered recovery English override root")
+        if getattr(args, "filtered_recovery_english_aligned_root", None):
+            en_aligned_override_root = _filtered_recovery_root(
+                Path(args.filtered_recovery_english_aligned_root),
+                "filtered recovery English aligned override root")
+        input_root = parent / "input"
+        mfa_audio_root = parent / "workspace" / "audio_16k"
+        tts_audio_root = parent / "workspace" / "padded_audio"
+        rejected_rows = accepted_payload.get("rejected", {})
+        missing_mfa = {stem for stem, reasons in rejected_rows.items()
+                       if "missing_mfa_alignment" in str(reasons)} if isinstance(rejected_rows, dict) else set()
+        if not missing_mfa:
+            axis_path = parent / "workspace" / ".mfa_alignment_axis_receipt.json"
+            try:
+                axis_rows = json.loads(axis_path.read_text(encoding="utf-8")).get("alignments", [])
+                missing_mfa = {row.get("stem") for row in axis_rows
+                               if isinstance(row, dict) and row.get("status") == "missing_mfa_alignment"}
+            except (OSError, TypeError, json.JSONDecodeError):
+                pass
+        assets: dict[str, Path] = {}
+        destination_names: dict[str, str] = {}
+        for stem in frozen:
+            required = {
+                f"filtered_textgrid:{stem}": filtered_root / f"{stem}.TextGrid",
+                f"audio:{stem}": input_root / f"{stem}.wav",
+                f"reference:{stem}": input_root / f"{stem}.txt",
+            }
+            mfa_audio = mfa_audio_root / f"{stem}.wav"
+            tts_audio = tts_audio_root / f"{stem}.wav"
+            if not mfa_audio.is_file() or mfa_audio.is_symlink():
+                raise ValueError(f"filtered recovery MFA-axis audio missing: {mfa_audio}")
+            if not tts_audio.is_file() or tts_audio.is_symlink():
+                raise ValueError(f"filtered recovery TTS-authoritative audio missing: {tts_audio}")
+            required[f"mfa_audio:{stem}"] = mfa_audio
+            required[f"tts_audio:{stem}"] = tts_audio
+            transform_candidates = sorted((parent / "workspace" / "audio_transform_receipts").glob(f"{stem}.*.json"))
+            if transform_candidates:
+                required[f"audio_transform:{stem}"] = transform_candidates[0]
+            for suffix in (".txt", "_ref.txt", ".lab", ".TextGrid", "_tokens.jsonl", "_punct.json", "_text_cn.txt", "_text_raw.txt"):
+                ctc = ctc_root / f"{stem}{suffix}"
+                if ctc_override_root is not None:
+                    override = ctc_override_root / f"{stem}{suffix}"
+                    if override.is_file() and not override.is_symlink():
+                        ctc = override
+                if ctc.is_file() and not ctc.is_symlink():
+                    required[f"ctc_authority:{stem}:{suffix}"] = ctc
+            aligned = aligned_root / f"{stem}.TextGrid"
+            if aligned.is_file() and not aligned.is_symlink():
+                required[f"mfa_aligned_textgrid:{stem}"] = aligned
+            elif stem not in missing_mfa:
+                raise ValueError(f"filtered recovery MFA aligned asset missing: {aligned}")
+            en_phone = en_root / f"{stem}_en_phones.json"
+            if en_override_root is not None:
+                override = en_override_root / f"{stem}_en_phones.json"
+                if override.is_file() and not override.is_symlink():
+                    en_phone = override
+            if en_phone.is_file() and not en_phone.is_symlink():
+                required[f"english_phones:{stem}"] = en_phone
+            if en_aligned_override_root is not None:
+                for segment_grid in sorted(en_aligned_override_root.glob(f"{stem}_seg*.TextGrid")):
+                    if segment_grid.is_file() and not segment_grid.is_symlink():
+                        required[f"english_aligned_segment:{stem}:{segment_grid.name}"] = segment_grid
+            for label, source in required.items():
+                if not source.is_file() or source.is_symlink():
+                    raise ValueError(f"filtered recovery required asset missing: {source}")
+                assets[label] = source
+                category = label.split(":", 1)[0]
+                destination_names[label] = f"{category}/{source.name}"
+        en_manifest = en_root / "en_alignment_manifest.json"
+        if en_override_root is not None:
+            override_manifest = en_override_root / "en_alignment_manifest.json"
+            if override_manifest.is_file() and not override_manifest.is_symlink():
+                en_manifest = override_manifest
+        if en_manifest.is_file() and not en_manifest.is_symlink():
+            assets["english_manifest_source"] = en_manifest
+            destination_names["english_manifest_source"] = "english_phones/en_alignment_manifest.source.json"
+        import_root = workspace / "imports"
+        imports = import_filtered_recovery_assets(
+            assets, import_root, allowlist=set(assets),
+            destination_names=destination_names)
+        # Localize the fresh English producer manifest and its ledger/grid
+        # references into the quarantine namespace.  The source manifest is
+        # retained verbatim as ``*.source.json``; the canonical manifest is a
+        # frozen-stem subset whose every path/hash resolves to an imported
+        # regular file (never a historical absolute path).
+        localized_en_manifest = None
+        localized_en_ledgers = {}
+        source_en_manifest_path = import_root / "english_phones" / "en_alignment_manifest.source.json"
+        if source_en_manifest_path.is_file():
+            source_en_manifest = json.loads(source_en_manifest_path.read_text(encoding="utf-8"))
+            if (source_en_manifest.get("schema") != "strict-en-mfa-v1"
+                    or source_en_manifest.get("strict_provenance") is not True
+                    or source_en_manifest.get("status") not in {"success", "no_english"}):
+                raise ValueError("filtered recovery English source manifest is not strict-en-mfa-v1")
+            source_ledgers = source_en_manifest.get("stem_ledgers")
+            _validate_filtered_recovery_english_ledger_scope(source_ledgers, frozen, accepted)
+            expected_ids = [item for item in source_en_manifest.get("expected_segments", [])
+                            if isinstance(item, str) and item.rsplit(":s", 1)[0] in frozen]
+            produced_ids = [item for item in source_en_manifest.get("produced_segments", [])
+                            if isinstance(item, str) and item.rsplit(":s", 1)[0] in frozen]
+            rejected_ids = [item for item in source_en_manifest.get("rejected_segments", [])
+                            if isinstance(item, dict) and isinstance(item.get("id"), str)
+                            and item["id"].rsplit(":s", 1)[0] in frozen]
+            localized_rows = []
+            localized_grid_refs = []
+            english_words = verified_words = rejected_words = 0
+            for source_row in source_ledgers:
+                if not isinstance(source_row, dict) or source_row.get("stem") not in frozen:
+                    continue
+                stem = source_row["stem"]
+                imported_ledger = import_root / "english_phones" / Path(source_row["path"]).name
+                if not imported_ledger.is_file() or imported_ledger.is_symlink():
+                    raise ValueError(f"filtered recovery English ledger import missing: {stem}")
+                ledger_payload = json.loads(imported_ledger.read_text(encoding="utf-8"))
+                if ledger_payload.get("schema") != "strict-en-mfa-v1" or ledger_payload.get("stem") != stem:
+                    raise ValueError(f"filtered recovery English ledger invalid: {stem}")
+                for segment in ledger_payload.get("segments", []):
+                    if not isinstance(segment, dict):
+                        raise ValueError(f"filtered recovery English segment invalid: {stem}")
+                    words = segment.get("words", [])
+                    if isinstance(words, list):
+                        english_words += len(words)
+                        verified_words += sum(1 for word in words if isinstance(word, dict) and word.get("status") == "verified")
+                        rejected_words += sum(1 for word in words if isinstance(word, dict) and word.get("status") != "verified")
+                    source_grid = segment.get("mfa_textgrid")
+                    if segment.get("status") == "verified":
+                        if not isinstance(source_grid, dict) or not isinstance(source_grid.get("path"), str):
+                            raise ValueError(f"filtered recovery English source grid missing: {stem}")
+                        grid_name = Path(source_grid["path"]).name
+                        imported_grid = import_root / "english_aligned_segment" / grid_name
+                        if not imported_grid.is_file() or imported_grid.is_symlink():
+                            raise ValueError(f"filtered recovery English aligned grid import missing: {grid_name}")
+                        segment["mfa_textgrid"] = {"path": str(imported_grid.resolve()),
+                                                     "sha256": _sha256_file(imported_grid)}
+                        localized_grid_refs.append({"path": str(imported_grid.resolve()),
+                                                    "sha256": _sha256_file(imported_grid),
+                                                    "segment_id": segment.get("segment_id")})
+                # Rewrite the imported ledger itself so downstream provenance
+                # validation never follows the producer's temporary paths.
+                _strict_replay_replace_json(imported_ledger, ledger_payload)
+                ledger_hash = _sha256_file(imported_ledger)
+                localized_en_ledgers[stem] = {"path": str(imported_ledger.resolve()), "sha256": ledger_hash}
+                localized_rows.append({"stem": stem, "path": str(imported_ledger.resolve()), "sha256": ledger_hash})
+            localized_en_manifest = json.loads(json.dumps(source_en_manifest))
+            localized_en_manifest.update({
+                "expected_segments": sorted(set(expected_ids)),
+                "produced_segments": sorted(set(produced_ids)),
+                "rejected_segments": sorted(rejected_ids, key=lambda item: item.get("id", "")),
+                "stem_ledgers": sorted(localized_rows, key=lambda item: item["stem"]),
+                "counts": {"english_stems": len(localized_rows),
+                            "english_segments": len(set(expected_ids)),
+                            "english_words": english_words,
+                            "verified_words": verified_words,
+                            "rejected_words": rejected_words},
+                "localized_scope": "filtered_recovery_frozen_only",
+                "source_manifest": {"path": str(source_en_manifest_path.resolve()),
+                                    "sha256": _sha256_file(source_en_manifest_path)},
+                "paths_rewritten": True,
+                "segment_grids": sorted(localized_grid_refs, key=lambda item: item.get("segment_id", "")),
+            })
+            localized_en_manifest_path = import_root / "english_phones" / "en_alignment_manifest.json"
+            _strict_replay_write_once_json(localized_en_manifest_path, localized_en_manifest)
+            imports.append({"label": "english_localized_manifest", "source": str(source_en_manifest_path.resolve()),
+                            "destination": str(localized_en_manifest_path.resolve()),
+                            "sha256": _sha256_file(source_en_manifest_path),
+                            "destination_sha256": _sha256_file(localized_en_manifest_path),
+                            "localized": True, "scope": "frozen_only"})
+        # Bind a localized CTC v2 receipt to the frozen import namespace.  The
+        # parent receipt is read-only evidence; this receipt rewrites every
+        # per-stem path/hash to the copied CTC/audio assets and records any
+        # fresh frozen-only producer override without admitting accepted stems.
+        parent_ctc_receipt_path = ctc_root / ".ctc_run_receipt.json"
+        if not parent_ctc_receipt_path.is_file() or parent_ctc_receipt_path.is_symlink():
+            raise ValueError("filtered recovery parent CTC v2 receipt missing")
+        parent_ctc_receipt = json.loads(parent_ctc_receipt_path.read_text(encoding="utf-8"))
+        if parent_ctc_receipt.get("schema") != CTC_RUN_RECEIPT_SCHEMA:
+            raise ValueError("filtered recovery parent CTC receipt is not v2")
+        override_ctc_receipt = None
+        override_ctc_receipt_path = (ctc_override_root / ".ctc_run_receipt.json"
+                                     if ctc_override_root is not None else None)
+        if override_ctc_receipt_path is not None and override_ctc_receipt_path.is_file():
+            override_ctc_receipt = json.loads(override_ctc_receipt_path.read_text(encoding="utf-8"))
+            if override_ctc_receipt.get("schema") != CTC_RUN_RECEIPT_SCHEMA:
+                raise ValueError("filtered recovery CTC override receipt is not v2")
+        parent_ctc_rows = {row.get("stem"): row for row in parent_ctc_receipt.get("audio_bindings", [])
+                           if isinstance(row, dict)}
+        override_ctc_rows = {row.get("stem"): row for row in (override_ctc_receipt or {}).get("audio_bindings", [])
+                             if isinstance(row, dict)}
+        localized_bindings = []
+        for stem in sorted(frozen):
+            source_row = dict(override_ctc_rows.get(stem) or parent_ctc_rows.get(stem) or {})
+            audio_path = import_root / "mfa_audio" / f"{stem}.wav"
+            lab_path = import_root / "ctc_authority" / f"{stem}.lab"
+            textgrid_path = import_root / "ctc_authority" / f"{stem}.TextGrid"
+            token_path = import_root / "ctc_authority" / f"{stem}_tokens.jsonl"
+            punct_path = import_root / "ctc_authority" / f"{stem}_punct.json"
+            reference_path = import_root / "ctc_authority" / f"{stem}_ref.txt"
+            for required_path, label in ((audio_path, "MFA audio"), (lab_path, "CTC lab"),
+                                          (textgrid_path, "CTC TextGrid"), (token_path, "CTC tokens"),
+                                          (punct_path, "CTC punctuation"), (reference_path, "CTC reference")):
+                if not required_path.is_file() or required_path.is_symlink():
+                    raise ValueError(f"filtered recovery localized CTC {label} missing: {required_path}")
+            audio_meta = _axis_audio_metadata(audio_path)
+            tg_xmin, tg_xmax = _textgrid_global_bounds(textgrid_path)
+            token_rows = []
+            for line in token_path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    token_rows.append(json.loads(line))
+            token_bounds = [float(row[key]) for row in token_rows
+                            for key in ("start_s", "end_s")
+                            if isinstance(row.get(key), (int, float)) and math.isfinite(float(row[key]))]
+            source_row.update({
+                "stem": stem, "path": str(audio_path.resolve()),
+                "sha256": audio_meta["sha256"], "duration_s": audio_meta["duration_s"],
+                "sample_rate": audio_meta["sample_rate"], "frames": audio_meta["frames"],
+                "channels": audio_meta["channels"], "sample_width": audio_meta["sample_width"],
+                "ctc_bounds": {"xmin": min(token_bounds) if token_bounds else tg_xmin,
+                               "xmax": max(token_bounds) if token_bounds else tg_xmax},
+                "token_min_s": min(token_bounds) if token_bounds else None,
+                "token_max_s": max(token_bounds) if token_bounds else None,
+                "tokens_path": str(token_path.resolve()), "tokens_sha256": _sha256_file(token_path),
+                "lab_sha256": _sha256_file(lab_path), "lab_sha256_path": str(lab_path.resolve()),
+                "punct_sha256": _sha256_file(punct_path), "punct_sha256_path": str(punct_path.resolve()),
+                "reference_sha256": _sha256_file(reference_path),
+                "reference_sha256_path": str(reference_path.resolve()),
+                "textgrid_path": str(textgrid_path.resolve()), "textgrid_sha256": _sha256_file(textgrid_path),
+                "textgrid_xmin": tg_xmin, "textgrid_xmax": tg_xmax,
+            })
+            localized_bindings.append(source_row)
+        localized_ctc_receipt = dict(parent_ctc_receipt)
+        localized_ctc_receipt.update({
+            "input_stems": sorted(frozen), "output_stems": sorted(frozen),
+            "input_stems_digest": stable_json_digest(sorted(frozen)),
+            "output_stems_digest": stable_json_digest(sorted(frozen)),
+            "audio_bindings": sorted(localized_bindings, key=lambda row: row.get("stem", "")),
+            "localized_scope": "filtered_recovery_frozen_only",
+            "parent_receipt": {"path": str(parent_ctc_receipt_path.resolve()),
+                               "sha256": _sha256_file(parent_ctc_receipt_path)},
+            "override_receipt": ({"path": str(override_ctc_receipt_path.resolve()),
+                                  "sha256": _sha256_file(override_ctc_receipt_path),
+                                  "stems": sorted(override_ctc_rows)}
+                                 if override_ctc_receipt_path is not None and override_ctc_receipt_path.is_file()
+                                 else None),
+        })
+        ctc_receipt_errors = validate_ctc_run_receipt_v2(
+            localized_ctc_receipt, expected_stems=sorted(frozen),
+            audio_root=import_root / "mfa_audio")
+        if ctc_receipt_errors:
+            raise ValueError("localized CTC v2 receipt invalid: " + "; ".join(ctc_receipt_errors[:8]))
+        localized_ctc_path = import_root / "ctc_authority" / ".ctc_run_receipt.json"
+        _strict_replay_write_once_json(localized_ctc_path, localized_ctc_receipt)
+        imports.append({"label": "ctc_localized_receipt", "source": str(parent_ctc_receipt_path.resolve()),
+                        "destination": str(localized_ctc_path.resolve()),
+                        "sha256": _sha256_file(parent_ctc_receipt_path),
+                        "destination_sha256": _sha256_file(localized_ctc_path),
+                        "localized": True, "scope": "frozen_only"})
+        # Materialize a stem-restricted axis contract in quarantine so the
+        # committed entry point can run the filtered-only postprocess without
+        # consulting accepted-parent assets.
+        import_rows = {row["label"]: row for row in imports}
+        parent_input_axis = json.loads((ctc_root / ".mfa_input_axis_receipt.json").read_text(encoding="utf-8"))
+        parent_alignment_axis = json.loads((parent / "workspace" / ".mfa_alignment_axis_receipt.json").read_text(encoding="utf-8"))
+        input_rows = []
+        replay_transform_dir = import_root / "axis" / "audio_transform_receipts"
+        replay_transform_dir.mkdir(parents=True, exist_ok=True)
+        for stem in sorted(frozen):
+            source_row = next((row for row in parent_input_axis.get("audio", []) if row.get("stem") == stem), None)
+            if not isinstance(source_row, dict):
+                raise ValueError(f"filtered recovery input axis row missing: {stem}")
+            row = dict(source_row)
+            row["path"] = str((import_root / "mfa_audio" / f"{stem}.wav").resolve())
+            transform = import_rows.get(f"audio_transform:{stem}")
+            if transform:
+                transform_payload = json.loads(Path(transform["destination"]).read_text(encoding="utf-8"))
+                transform_payload["input"]["path"] = str((import_root / "tts_audio" / f"{stem}.wav").resolve())
+                transform_payload["output"]["path"] = str((import_root / "mfa_audio" / f"{stem}.wav").resolve())
+                replay_transform = replay_transform_dir / Path(transform["destination"]).name
+                _strict_replay_write_once_json(replay_transform, transform_payload)
+                row["transform_receipt"] = str(replay_transform.resolve())
+            input_rows.append(row)
+        input_axis = make_mfa_input_axis_receipt(sorted(frozen), input_rows,
+                                                  axis_root=import_root / "mfa_audio")
+        input_axis["tts_authoritative_audio_root"] = str((import_root / "tts_audio").resolve())
+        input_axis["transform_receipts"] = [row["transform_receipt"] for row in input_rows if row.get("transform_receipt")]
+        aligned_rows, missing_rows = [], []
+        for stem in sorted(frozen):
+            source_row = next((row for row in parent_alignment_axis.get("alignments", []) if row.get("stem") == stem), None)
+            aligned_path = import_root / "mfa_aligned_textgrid" / f"{stem}.TextGrid"
+            if not aligned_path.is_file():
+                missing_rows.append(stem)
+                continue
+            row = dict(source_row or {})
+            audio_row = next(item for item in input_rows if item.get("stem") == stem)
+            from postprocess_textgrids import parse_textgrid as _parse_recovery_textgrid
+            recovery_grid = _parse_recovery_textgrid(aligned_path)
+            row.update({"stem": stem, "status": "aligned", "path": str(aligned_path.resolve()),
+                        "sha256": _sha256_file(aligned_path),
+                        "audio_sha256": audio_row.get("sha256"),
+                        "audio_duration_s": audio_row.get("duration_s"),
+                        "xmax": recovery_grid.xmax})
+            aligned_rows.append(row)
+        alignment_axis = make_mfa_alignment_axis_receipt_v2(
+            input_axis, aligned_rows, missing_rows,
+            alignment_root=import_root / "mfa_aligned_textgrid")
+        axis_dir = import_root / "axis"
+        _strict_replay_write_once_json(axis_dir / ".mfa_input_axis_receipt.json", input_axis)
+        _strict_replay_write_once_json(axis_dir / ".mfa_alignment_axis_receipt.json", alignment_axis)
+        # Replay only the frozen namespace through postprocess.  Failures stay
+        # in filtered/ and are never promoted or resealed into the parent.
+        replay_filtered = workspace / "filtered"
+        postprocess_report = output / "postprocess_report.jsonl"
+        postprocess_cmd = [sys.executable, str(SCRIPTS_DIR / "postprocess_textgrids.py"),
+            "--txt-dir", str(import_root / "ctc_authority"),
+            "--textgrid-dir", str(import_root / "mfa_aligned_textgrid"),
+            "--output-dir", str(output), "--filtered-dir", str(replay_filtered),
+            "--wav-dir", str(import_root / "mfa_audio"),
+            "--raw-text-dir", str(import_root / "reference"),
+            "--original-txt-dir", str(import_root / "reference"),
+            "--pinyin-dict", str(PROJECT_ROOT / "dict" / "fullpinyin_enword.dict"),
+            "--ipa-dict", str(PROJECT_ROOT / "dict" / "mfa_ipa.dict"),
+            "--en-phones-dir", str(import_root / "english_phones"),
+            "--no-fix-short-word", "--no-detect-bgm", "--no-filter-suspicious",
+            "--strict-ok", "--allow-filtered-integrity-failures",
+            "--no-handle-unexpected-sil", "--no-enable-word-in-silence-filter",
+            "--filter-word-energy-ratio", "0", "--mfa-input-axis-receipt",
+            str(axis_dir / ".mfa_input_axis_receipt.json"), "--mfa-alignment-axis-receipt",
+            str(axis_dir / ".mfa_alignment_axis_receipt.json"), "--mfa-axis-audio-root",
+            str(import_root / "mfa_audio"), "--tts-authoritative-audio-root",
+            str(import_root / "tts_audio")]
+        proc = subprocess.run(postprocess_cmd, cwd=str(PROJECT_ROOT), text=True,
+                              capture_output=True)
+        if proc.returncode != 0:
+            raise ValueError(f"filtered recovery postprocess failed (rc={proc.returncode}): {proc.stderr[-500:]}")
+        if not postprocess_report.is_file():
+            raise ValueError("filtered recovery postprocess report missing")
+        report_rows = [json.loads(line) for line in postprocess_report.read_text(encoding="utf-8").splitlines() if line.strip()]
+        present = {row.get("stem") for row in report_rows}
+        for stem in sorted(set(frozen) - present):
+            report_rows.append({"stem": stem, "status": "filtered_missing_mfa_alignment",
+                                "filter_reasons": ["missing_mfa_alignment"], "warnings": []})
+        report_rows.sort(key=lambda row: row.get("stem", ""))
+        final_report = workspace / "filtered_recovery_final_report.jsonl"
+        final_report.write_text("".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in report_rows), encoding="utf-8")
+        # Preserve exact frozen-set filesystem accounting for missing MFA rows
+        # with copied filtered placeholders; they remain quarantined.
+        for stem in sorted(set(frozen) - present):
+            placeholder = import_root / "filtered_textgrid" / f"{stem}.TextGrid"
+            target = replay_filtered / f"{stem}.TextGrid"
+            if placeholder.is_file() and not target.exists():
+                shutil.copy2(placeholder, target)
+        recovered = [row["stem"] for row in report_rows if row.get("status") == "ok"]
+        still_filtered = [row["stem"] for row in report_rows if row.get("status", "").startswith("filtered")]
+        final_partition = validate_filtered_recovery_partition(frozen, accepted, recovered, still_filtered)
+        taxonomy_path = workspace / "filtered_recovery_taxonomy.jsonl"
+        taxonomy_path.write_text("".join(json.dumps({"stem": row["stem"], "final_status": row.get("status"),
+            "partition": "output" if row["stem"] in recovered else "filtered",
+            "final_report_sha256": _sha256_file(final_report)}, ensure_ascii=False, sort_keys=True) + "\n" for row in report_rows), encoding="utf-8")
+        from analyze_gpu1000_run import audit_filtered_recovery_logic
+        independent_audit_path = workspace / "filtered_recovery_independent_audit.json"
+        independent_audit = audit_filtered_recovery_logic(
+            output, replay_filtered, final_report, sorted(frozen), sorted(accepted))
+        _strict_replay_write_once_json(independent_audit_path, independent_audit)
+        if not independent_audit.get("ok"):
+            raise ValueError(f"filtered recovery independent audit failed: {independent_audit.get('errors')}")
+        accounting = make_pipeline_accounting_receipt(sorted(frozen), sorted(frozen), [], sorted(recovered), sorted(still_filtered), mode="filtered_recovery", route=["filtered_only_postprocess"], paths={"report": str(final_report), "filtered": str(replay_filtered)}, extra={"quarantine": True})
+        accounting_path = workspace / "filtered_recovery_pipeline_accounting_receipt.json"
+        write_pipeline_accounting_receipt(accounting_path, accounting)
+        english_ledger = output / "filtered_recovery_english_evidence.json"
+        english_evidence_dir = output / "english_provenance"
+        english_evidence_dir.mkdir(parents=True, exist_ok=True)
+        localized_manifest_ref = ({"path": str((import_root / "english_phones" / "en_alignment_manifest.json").resolve()),
+                                   "sha256": _sha256_file(import_root / "english_phones" / "en_alignment_manifest.json")}
+                                  if localized_en_manifest is not None else None)
+        english_evidence_rows = []
+        for stem in sorted(recovered):
+            ledger_ref = localized_en_ledgers.get(stem)
+            if not ledger_ref:
+                continue
+            source_ledger = Path(ledger_ref["path"])
+            copied_ledger = english_evidence_dir / source_ledger.name
+            if copied_ledger.exists() or copied_ledger.is_symlink():
+                raise ValueError(f"filtered recovery English evidence collision: {copied_ledger}")
+            shutil.copy2(source_ledger, copied_ledger)
+            if _sha256_file(copied_ledger) != ledger_ref["sha256"]:
+                raise ValueError(f"filtered recovery English evidence ledger hash mismatch: {stem}")
+            source_grids = []
+            try:
+                ledger_payload = json.loads(source_ledger.read_text(encoding="utf-8"))
+                for segment in ledger_payload.get("segments", []):
+                    source = segment.get("mfa_textgrid") if isinstance(segment, dict) else None
+                    if not isinstance(source, dict) or not isinstance(source.get("path"), str):
+                        continue
+                    grid = Path(source["path"])
+                    if not grid.is_file() or grid.is_symlink():
+                        raise ValueError(f"filtered recovery English evidence grid missing: {grid}")
+                    copied_grid = english_evidence_dir / grid.name
+                    if not copied_grid.exists() and not copied_grid.is_symlink():
+                        shutil.copy2(grid, copied_grid)
+                    if _sha256_file(copied_grid) != source.get("sha256"):
+                        raise ValueError(f"filtered recovery English evidence grid hash mismatch: {grid.name}")
+                    source_grids.append({"path": str(copied_grid.relative_to(output)),
+                                         "sha256": _sha256_file(copied_grid),
+                                         "segment_id": segment.get("segment_id")})
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(f"filtered recovery English evidence staging failed: {stem}: {exc}") from exc
+            english_evidence_rows.append({"stem": stem,
+                                          "ledger": {"path": str(copied_ledger.relative_to(output)),
+                                                      "sha256": _sha256_file(copied_ledger)},
+                                          "source_textgrids": source_grids})
+        _strict_replay_write_once_json(english_ledger, {
+            "schema": "strict-en-mfa-v1", "source": "localized_filtered_recovery",
+            "localized_manifest": localized_manifest_ref,
+            "stems": english_evidence_rows,
+        })
+        ok_entries = []
+        for stem in sorted(recovered):
+            tg = output / f"{stem}.TextGrid"
+            ref = import_root / "reference" / f"{stem}.txt"
+            entry = {"stem": stem, "textgrid_sha256": _sha256_file(tg),
+                     "reference": {"path": str(ref), "sha256": _sha256_file(ref)}}
+            evidence_row = next((row for row in english_evidence_rows if row["stem"] == stem), None)
+            if evidence_row is not None:
+                entry["english_provenance"] = {"schema": "strict-en-mfa-v1",
+                    "ledger": evidence_row["ledger"],
+                    "source_textgrids": evidence_row["source_textgrids"],
+                    "localized_manifest": localized_manifest_ref}
+            ok_entries.append(entry)
+        strict_manifest = {"policy_version": "strict-ok-v3.2", "english_provenance_policy": {"schema": "strict-en-mfa-v1", "required": True, "evidence_root": str(output)}, "output_dir": str(output), "filtered_dir": str(replay_filtered), "expected_stems": sorted(frozen), "ok": ok_entries, "rejected": {stem: ["filtered"] for stem in sorted(still_filtered)}, "safe_empty": False, "safe_empty_applied": False, "global_reasons": [], "pipeline_accounting_receipt": {"schema": accounting["schema"], "path": str(accounting_path), "sha256": _sha256_file(accounting_path)}}
+        _strict_replay_write_once_json(workspace / "filtered_recovery_strict_manifest.json", strict_manifest)
+        observed_after = {name: _sha256_file((parent / name).resolve(strict=True)) for name in sorted(parent_hashes)}
+        if observed_after != observed:
+            raise ValueError("filtered recovery parent artifact changed after validation")
+        partition = validate_filtered_recovery_partition(frozen, accepted, [], frozen)
+        receipt = make_filtered_recovery_receipt(
+            final_partition, imports, observed, observed_after,
+            strict_id=args.filtered_recovery_strict_id,
+            declared_vs_actual_inner_receipt=evidence["declared_vs_actual_inner_receipt"])
+        receipt["manifest"] = validated
+        receipt["execution"] = {"attempted": True, "mode": "filtered_only_postprocess", "return_code": 0,
+                                 "report": str(final_report), "taxonomy": str(taxonomy_path),
+                                 "strict_manifest": str(workspace / "filtered_recovery_strict_manifest.json"),
+                                 "accounting_receipt": str(accounting_path)}
+        receipt_path = workspace / "filtered_recovery_import_receipt.json"
+        _strict_replay_write_once_json(receipt_path, receipt)
+        print(f"filtered_recovery replayed {len(validated['stems'])} frozen stems in quarantine: {receipt_path}")
+        return 0
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"ERROR: filtered_recovery: {exc}")
+        return 1
 
 
 def _strict_replay_path_new(path: Path, label: str) -> Path:
@@ -5515,7 +6754,7 @@ def main() -> int:
     parser.add_argument("--validate", action="store_true",
                         help="Validate output structure after each step (uses output_spec in config).")
     parser.add_argument("--mode", type=str, default=None,
-                        choices=["full", "ctc_ready", "batch_ctc_ready", "nvrasr_fallback", "strict_replay"],
+                        choices=["full", "ctc_ready", "batch_ctc_ready", "nvrasr_fallback", "strict_replay", "filtered_recovery", "mfa_retry", "mfa_rescue"],
                         help="Pipeline mode (default: from config, or 'full').")
     parser.add_argument("--strict-replay-manifest", type=str, default=None,
                         help="Canonical 96-slot manifest for strict_replay.")
@@ -5531,6 +6770,48 @@ def main() -> int:
                         help="Explicit MFA-axis audio root for strict_replay (distinct from TTS authority).")
     parser.add_argument("--strict-replay-pilot", action="store_true",
                         help="Select the frozen 24-slot strict_replay pilot subset.")
+    parser.add_argument("--filtered-recovery-parent-root", type=str, default=None,
+                        help="Read-only sealed parent root for filtered_recovery.")
+    parser.add_argument("--filtered-recovery-strict-id", type=str, default=None,
+                        help="Opaque sealed-parent strict run identifier for evidence binding.")
+    parser.add_argument("--filtered-recovery-frozen-manifest", type=str, default=None,
+                        help="Frozen rejected stem manifest (read-only; denominator is derived from contents).")
+    parser.add_argument("--filtered-recovery-accepted-manifest", type=str, default=None,
+                        help="Sealed parent accepted-776 manifest (read-only).")
+    parser.add_argument("--filtered-recovery-manifest", type=str, default=None,
+                        help="Digest-bound subset/full filtered recovery manifest.")
+    parser.add_argument("--filtered-recovery-evidence-receipt", type=str, default=None,
+                        help="Explicit filtered-recovery evidence receipt binding the frozen partition, parent digests, and inner-receipt mismatch.")
+    parser.add_argument("--filtered-recovery-import-receipt", type=str, default=None,
+                        help="Existing filtered-recovery import receipt for --filtered-recovery-validate-only.")
+    parser.add_argument("--filtered-recovery-validate-only", action="store_true",
+                        help="Validate an existing quarantined filtered-recovery import receipt without copying or replaying.")
+    parser.add_argument("--filtered-recovery-aligned-root", type=str, default=None,
+                        help="Optional fresh staged aligned-TextGrid root for frozen-only replay; never writes parent.")
+    parser.add_argument("--filtered-recovery-ctc-root", type=str, default=None,
+                        help="Optional fresh frozen-only CTC producer root; per-stem assets override parent CTC inputs.")
+    parser.add_argument("--filtered-recovery-english-root", type=str, default=None,
+                        help="Optional fresh frozen-only English strict-ledger root; per-stem ledgers override parent inputs.")
+    parser.add_argument("--filtered-recovery-english-aligned-root", type=str, default=None,
+                        help="Optional fresh English MFA aligned segment-TextGrid root for provenance staging.")
+    parser.add_argument("--mfa-retry-parent-root", type=str, default=None,
+                        help="Read-only parent root for exact-missing MFA retry packet.")
+    parser.add_argument("--mfa-retry-stems-file", type=str, default=None,
+                        help="Exact frozen stem list for MFA retry.")
+    parser.add_argument("--mfa-retry-frozen-manifest", type=str, default=None)
+    parser.add_argument("--mfa-retry-accepted-manifest", type=str, default=None)
+    parser.add_argument("--mfa-retry-workspace", type=str, default=None)
+    parser.add_argument("--mfa-retry-execute", action="store_true",
+                        help="Execute the approved exact-missing MFA command in fresh quarantine workspace.")
+    parser.add_argument("--mfa-retry-mfa", type=str, default=None,
+                        help="Explicit MFA executable for manual retry packet (otherwise environment default).")
+    parser.add_argument("--mfa-retry-model", type=str, default=None,
+                        help="Explicit acoustic model for manual retry packet.")
+    parser.add_argument("--mfa-retry-dict", type=str, default=None,
+                        help="Explicit pronunciation dictionary for manual retry packet.")
+    parser.add_argument("--mfa-rescue-prior-receipt", type=str, default=None)
+    parser.add_argument("--mfa-rescue-stem", type=str, default=None)
+    parser.add_argument("--mfa-rescue-workspace", type=str, default=None)
     parser.add_argument("--ctc-ready", type=str, default=None, metavar="CTC_DIR",
                         help="Enable ctc_ready mode: path to pre-existing NVASR CTC output.")
     parser.add_argument("--ctc-ready-stems-file", type=str, default=None, metavar="FILE",
@@ -5592,7 +6873,7 @@ def main() -> int:
         cfg.setdefault("ctc_ready", {})["ctc_dir"] = args.ctc_ready
         print(f"ctc_ready mode: CTC dir = {args.ctc_ready}")
 
-    if mode not in ("full", "ctc_ready", "batch_ctc_ready", "nvrasr_fallback", "strict_replay"):
+    if mode not in ("full", "ctc_ready", "batch_ctc_ready", "nvrasr_fallback", "strict_replay", "filtered_recovery", "mfa_retry", "mfa_rescue"):
         print(f"ERROR: Unknown mode: {mode}")
         sys.exit(1)
     print(f"Pipeline mode: {mode}")
@@ -5614,6 +6895,59 @@ def main() -> int:
     # dedicated import routine above.
     if mode == "strict_replay":
         return run_strict_replay(args, cfg, config_path)
+    if mode == "filtered_recovery":
+        if not args.filtered_recovery_parent_root:
+            print("ERROR: filtered_recovery requires --filtered-recovery-parent-root")
+            return 1
+        return run_filtered_recovery(args, cfg, config_path)
+    if mode == "mfa_retry":
+        if not args.mfa_retry_parent_root or not args.mfa_retry_stems_file or not args.mfa_retry_workspace:
+            print("ERROR: mfa_retry requires --mfa-retry-parent-root, --mfa-retry-stems-file, --mfa-retry-workspace")
+            return 1
+        try:
+            parent = Path(args.mfa_retry_parent_root)
+            stems = [line.strip() for line in Path(args.mfa_retry_stems_file).read_text(encoding="utf-8").splitlines() if line.strip()]
+            frozen_path = Path(args.mfa_retry_frozen_manifest) if args.mfa_retry_frozen_manifest else parent / "frozen_filtered.json"
+            accepted_path = Path(args.mfa_retry_accepted_manifest) if args.mfa_retry_accepted_manifest else parent / "strict_ok_manifest.json"
+            frozen_payload = json.loads(frozen_path.read_text(encoding="utf-8"))
+            accepted_payload = json.loads(accepted_path.read_text(encoding="utf-8"))
+            frozen = frozen_payload.get("stems", frozen_payload.get("filtered", {}).get("stems", []))
+            accepted = accepted_payload.get("ok", accepted_payload.get("output", {}).get("stems", []))
+            if accepted and isinstance(accepted[0], dict):
+                accepted = [row.get("stem") for row in accepted]
+            prepare_mfa_retry_packet(
+                parent, Path(args.mfa_retry_workspace), stems,
+                frozen_stems=frozen, accepted_stems=accepted,
+                execute=args.mfa_retry_execute,
+                mfa_python=Path(args.mfa_retry_mfa) if args.mfa_retry_mfa else None,
+                model_path=Path(args.mfa_retry_model) if args.mfa_retry_model else None,
+                dictionary_path=Path(args.mfa_retry_dict) if args.mfa_retry_dict else None)
+            print(f"mfa_retry packet ready: {args.mfa_retry_workspace}/mfa_retry_receipt.json")
+            return 0
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"ERROR: mfa_retry: {exc}")
+            return 1
+    if mode == "mfa_rescue":
+        if not args.mfa_retry_parent_root or not args.mfa_rescue_stem or not args.mfa_rescue_workspace or not args.mfa_rescue_prior_receipt:
+            print("ERROR: mfa_rescue requires parent, stem, workspace, and prior receipt")
+            return 1
+        try:
+            parent = Path(args.mfa_retry_parent_root)
+            frozen_path = Path(args.mfa_retry_frozen_manifest) if args.mfa_retry_frozen_manifest else parent / "frozen_filtered.json"
+            accepted_path = Path(args.mfa_retry_accepted_manifest) if args.mfa_retry_accepted_manifest else parent / "strict_ok_manifest.json"
+            frozen_payload = json.loads(frozen_path.read_text(encoding="utf-8"))
+            accepted_payload = json.loads(accepted_path.read_text(encoding="utf-8"))
+            frozen = frozen_payload.get("stems", frozen_payload.get("filtered", {}).get("stems", []))
+            accepted = accepted_payload.get("ok", accepted_payload.get("output", {}).get("stems", []))
+            if accepted and isinstance(accepted[0], dict): accepted = [row.get("stem") for row in accepted]
+            receipt = run_mfa_singleton_rescue(parent, Path(args.mfa_rescue_workspace), args.mfa_rescue_stem,
+                                               frozen_stems=frozen, accepted_stems=accepted,
+                                               prior_receipt_path=Path(args.mfa_rescue_prior_receipt))
+            print(f"mfa_rescue complete: {args.mfa_rescue_workspace}/mfa_rescue_receipt.json")
+            return 0
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"ERROR: mfa_rescue: {exc}")
+            return 1
 
     # Evidence mode is fail-closed before model probing, directory creation,
     # cache discovery, or execution of any pipeline step.  The returned path
