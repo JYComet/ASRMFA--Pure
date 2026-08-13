@@ -1,0 +1,96 @@
+# 纱依 + 花礼：无参考文本全管线（NVASR/CTC → MFA → 英文 MFA → 后处理）
+# 本次运行使用已存在的 NVMe 音频缓存，避免 84,788 个 WAV 在全流程中反复从 NAS 读取。
+# 输入没有同名 .txt，必须使用 nvrasr_fallback 从音频生成转录和 CTC 结果。
+
+mode: nvrasr_fallback
+
+# 原始数据标识；批处理实际通过 streaming.batch_cache 使用 NVMe 缓存。
+data_dir: //RS3621/Research_TTS/Data/Raw/shayi_huali_wav
+
+# 独立的版本化输出目录，避免覆盖既有 shayi_huali_new 结果。
+output_dir: //RS3621/Research_TTS/Data/Raw/shayi_huali_mfa_20260813
+output_staging: true
+keep_16k_audio: true
+
+# 音频已完成静音补全，本次不重复执行 pad_silence。
+pad_silence:
+  enabled: false
+
+streaming:
+  batch_cache: cache/shayi_huali_full_20260813.cache.json
+  batch_size: 500
+  parallel: 8
+  num_gpus: 8
+  local_work:
+    - /mnt/nvme0/mfa_work_shayi_huali_20260813_retry34
+    - /mnt/nvme1/mfa_work_shayi_huali_20260813_retry34
+    - /mnt/nvme3/mfa_work_shayi_huali_20260813_retry34
+    - /mnt/nvme4/mfa_work_shayi_huali_20260813_retry34
+
+# 384 核机器：让 8 张 GPU 持续做 NVASR，同时让 CPU MFA 池满载。
+pipelined:
+  cpu_workers: 48
+  # 本任务每批由 GPU 新生成 CTC，禁止从旧 NAS 输出目录恢复 adj 缓存。
+  restore_ctc_cache: false
+
+ctc_prealign:
+  enabled: true
+  python: /home/user/miniconda3/envs/asr/bin/python
+  model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
+  device: cuda:0
+  limit: 0
+  timeout: 7200
+  nvv_enabled: true
+  allow_missing_reference: true
+
+ctc_adjust:
+  enabled: true
+  limit: 0
+
+# CPU 阶段读取 GPU 生成的 CTC bundle；本任务没有参考 TXT，使用 ASR-only
+# bundle 继续进入 MFA，而不是按 ctc_ready 的默认参考文本门禁排除。
+ctc_ready:
+  allow_missing_reference: true
+
+mfa:
+  num_jobs: 8
+  single_speaker: true
+  output_format: long_textgrid
+  clean: false
+  fine_tune: false
+  skip_validate: true
+  beam: 20
+  retry_beam: 80
+  # 少数异常/极长片段可能无法导出 TextGrid；保留缺失清单，允许批次继续。
+  allow_partial: true
+  # A small, explicitly recorded MFA-missing subset is expected for noisy
+  # no-reference ASR batches; postprocess places those stems in filtered/.
+  min_output_ratio: 0.90
+
+mfa_en:
+  enabled: true
+  # No reference TXT is available; do not reject an entire batch when
+  # English G2P cannot cover ASR-invented/ambiguous tokens.
+  strict_provenance: false
+  num_jobs: 4
+  beam: 10
+  retry_beam: 40
+  fine_tune: false
+
+postprocess:
+  # 本任务无权威参考 TXT；独立 strict-ok 审计要求参考文本，故不执行该终审。
+  strict_ok: false
+  merge_silence: true
+  min_sil_merge_sec: 0.2
+  fix_short_word: true
+  short_word_max_sec: 0.25
+  flank_silence_sec: 0.4
+  detect_bgm: true
+  filter_suspicious: true
+  filter_min_phone_coverage: 0.35
+  enable_text_correction: true
+  handle_unexpected_sil: true
+  workers: 0
+  # 无参考文本时，ASR 与 MFA 的词序/语义偏差由 postprocess 隔离到
+  # filtered/；保留完整报告，不因已隔离样本阻断整批发布。
+  allow_filtered_integrity_failures: true

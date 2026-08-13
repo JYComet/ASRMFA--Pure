@@ -180,6 +180,25 @@ def _reference_inventory(wav_files: list[Path], data_dir: Path,
     return [by_stem[s] for s in sorted(eligible)], eligible, exclusions
 
 
+def _source_inventory(wav_files: list[Path], data_dir: Path,
+                      txt_index: dict[str, Path],
+                      allow_missing_reference: bool = False) -> tuple[list[Path], dict[str, str], dict[str, str]]:
+    """Build either a reference-authoritative or free-ASR inventory."""
+    if not allow_missing_reference:
+        return _reference_inventory(wav_files, data_dir, txt_index)
+    by_stem: dict[str, Path] = {}
+    for wav in wav_files:
+        if wav.stem in by_stem:
+            raise ValueError(f"duplicate WAV stem in frozen source universe: {wav.stem}")
+        by_stem[wav.stem] = wav
+    optional_refs: dict[str, str] = {}
+    for stem in sorted(by_stem):
+        ref = find_ref_text(stem, data_dir, txt_index)
+        if ref and not has_japanese(ref):
+            optional_refs[stem] = clean_unsupported_punct(ref)
+    return [by_stem[stem] for stem in sorted(by_stem)], optional_refs, {}
+
+
 def load_mfa_word_set(dict_path: Path | None) -> set[str] | None:
     """加载 MFA 词典词条集合 (若提供)."""
     if not dict_path or not dict_path.exists():
@@ -373,7 +392,12 @@ def make_patched_inference(ref_texts: dict[str, str],
             asr_final = asr_text.lstrip('…')
             asr_clean = re.sub(r'<\|[^|]+\|>', '', asr_final).strip()
 
-            stem = Path(key[i]).stem
+            # FunASR may return the filename stem without its final suffix.
+            # Preserve an exact key match first because valid filenames can
+            # themselves contain ".wav" (e.g. source.wav.tmp_clip0001.wav).
+            _raw_key_stem = str(key[i])
+            stem = (_raw_key_stem if _raw_key_stem in ref_texts
+                    else Path(_raw_key_stem).stem)
             if stem in ref_texts:
                 # 使用参考文本 (ground truth) → 更准确的 CJK 字符级强制对齐
                 align_text = ref_texts[stem].strip()
@@ -1253,6 +1277,8 @@ def main():
                         help=f"NVV blank-frame bias (default: {NVV_BIAS_DEFAULT}).")
     parser.add_argument("--no-nvv", action="store_true",
                         help="禁用 NVV 标签检测, 仅用 CTC 锚点给参考文本做时间戳.")
+    parser.add_argument("--allow-missing-reference", action="store_true",
+                        help="无参考文本全管线：所有 WAV 进入 NVASR，自由 ASR 文本作为 MFA 语料.")
     parser.add_argument("--no-dict-update", action="store_true",
                         help="Do not append discovered English tokens to --dict-path.")
     args = parser.parse_args()
@@ -1316,8 +1342,9 @@ def main():
             _source_wavs = sorted(audio_dir.rglob("*.wav"))
             _txt_index = _build_txt_index(args.data_dir)
             try:
-                all_wavs, _all_ref_texts, _all_exclusions = _reference_inventory(
-                    _source_wavs, args.data_dir, _txt_index)
+                all_wavs, _all_ref_texts, _all_exclusions = _source_inventory(
+                    _source_wavs, args.data_dir, _txt_index,
+                    args.allow_missing_reference)
             except ValueError as _exc:
                 print(f"ERROR: {_exc}", file=sys.stderr)
                 return 2
@@ -1675,7 +1702,27 @@ def main():
                     encoding="utf-8",
                 )
                 # ── Parent run receipt (Case 99 / R5) ──────────────────
+                # The CTC receipt describes the eligible/processed audio
+                # axis, not the frozen source universe.  The latter may
+                # include reference-less exclusions and is recorded in the
+                # pipeline accounting receipt below.  Binding the receipt to
+                # _all_stems would make ctc_ready reject a valid partial
+                # reference run because its audio_bindings cannot match the
+                # eligible CTC output set.
                 _all_stems = sorted({p.stem for p in _source_wavs})
+                _output_stems_v2 = sorted(p.stem for p in _merge_output_dir.glob("*.lab"))
+                from pipeline_utils import _axis_audio_metadata, _textgrid_global_bounds
+                _audio_bindings_v2 = []
+                for _stem in _output_stems_v2:
+                    _wav = audio_dir / f"{_stem}.wav"
+                    _xmin, _xmax = _textgrid_global_bounds(
+                        _merge_output_dir / f"{_stem}.TextGrid")
+                    _audio_bindings_v2.append({
+                        "stem": _stem,
+                        "path": str(_wav.resolve()),
+                        **_axis_audio_metadata(_wav),
+                        "ctc_bounds": {"xmin": _xmin, "xmax": _xmax},
+                    })
                 write_ctc_run_receipt(
                     _merge_output_dir,
                     actual_argv=sys.argv,
@@ -1685,11 +1732,11 @@ def main():
                     model_file_manifest=_model_file_manifest,
                     dict_path=Path(args.dict_path) if args.dict_path else Path(""),
                     dict_digest=_dict_digest,
-                    input_stems=_all_stems,
-                    output_stems=_all_stems,
+                    input_stems=_output_stems_v2,
+                    output_stems=_output_stems_v2,
+                    audio_bindings=_audio_bindings_v2,
                 )
                 _eligible_stems = sorted(p.stem for p in all_wavs)
-                _output_stems_v2 = sorted(p.stem for p in _merge_output_dir.glob("*.lab"))
                 _filtered_stems_v2 = sorted(set(_eligible_stems) - set(_output_stems_v2))
                 _shard_rows = [
                     {"shard_id": f"gpu{_gpu_id}", "stems": sorted(
@@ -1707,7 +1754,8 @@ def main():
                     route=["ctc_prealign", "all_gpus"],
                     paths={"output": str(args.output_dir), "filtered": str(args.output_dir)},
                     shards=_shard_rows,
-                    extra={"source_frozen": True, "reference_only": True,
+                    extra={"source_frozen": True,
+                           "reference_only": not args.allow_missing_reference,
                            "selected_stems_manifest_sha256": _selected_manifest_digests},
                 )
                 write_pipeline_accounting_receipt(_merge_output_dir, _accounting)
@@ -1740,8 +1788,9 @@ def main():
     print(f"扫描到 {len(source_wav_files)} 个 WAV 文件")
     txt_index = _build_txt_index(args.data_dir)
     try:
-        wav_files, ref_texts, source_exclusions = _reference_inventory(
-            source_wav_files, args.data_dir, txt_index)
+        wav_files, ref_texts, source_exclusions = _source_inventory(
+            source_wav_files, args.data_dir, txt_index,
+            args.allow_missing_reference)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -1861,7 +1910,14 @@ def main():
         # one file's CTC anchors under another audio after a reordered or
         # partially failed batch.
         result_key = str(r.get("key", ""))
-        result_stem = Path(result_key).stem if result_key else ""
+        # Prefer the exact returned key: Path(...).stem would incorrectly
+        # strip an embedded ".wav" from names such as
+        # source.wav.tmp_clip0001.wav when FunASR returns the stem
+        # source.wav.tmp_clip0001.
+        result_stem = ""
+        if result_key:
+            result_stem = (result_key if result_key in input_stems
+                           else Path(result_key).stem)
         if not result_stem or result_stem not in input_stems:
             print(f"  FAIL result[{i}]: invalid/unmatched key {result_key!r}")
             fail += 1
@@ -2395,7 +2451,7 @@ def main():
             # v2 source-denominator receipt: the source universe was frozen
             # before filtering, and skipped eligible stems are explicit
             # filtered evidence rather than silent loss.
-            _eligible_all = sorted(ref_texts)
+            _eligible_all = sorted(stems) if args.allow_missing_reference else sorted(ref_texts)
             _output_v2 = sorted(_all_output_stems)
             _filtered_v2 = sorted(set(_eligible_all) - set(_output_v2))
             _accounting = make_pipeline_accounting_receipt(
@@ -2408,7 +2464,8 @@ def main():
                 route=["ctc_prealign"],
                 paths={"output": str(args.output_dir), "filtered": str(args.output_dir)},
                 shards=[{"shard_id": "single", "stems": _eligible_all}],
-                extra={"source_frozen": True, "reference_only": True,
+                extra={"source_frozen": True,
+                       "reference_only": not args.allow_missing_reference,
                        "processed_stems": sorted(Path(p).stem for p in paths)},
             )
             write_pipeline_accounting_receipt(args.output_dir, _accounting)

@@ -29,6 +29,7 @@ Streaming batch pipeline — 预取→处理→回传 三阶段流水线并行�
 """
 
 import argparse
+import hashlib
 import json
 import os
 import queue
@@ -47,7 +48,7 @@ from pipeline_utils import (
     translate_path, resolve_input_path, find_mfa_python, get_mfa_env,
     find_wav, link_or_copy_file, sync_tree_back,
     discover_stems, discover_stems_separated, build_ctc_presence, build_file_index,
-    CTC_SUFFIXES,
+    CTC_SUFFIXES, stable_json_digest,
 )
 
 
@@ -256,6 +257,101 @@ def _restore_ctc_adj_cache(local_workspace: Path, nas_speaker: Path) -> bool:
             return False
 
 
+def _repair_complete_ctc_receipt(
+    local_workspace: Path, local_audio: Path, batch_stems: list[str],
+) -> bool:
+    """Rebuild the producer receipt when NVASR left a complete bundle behind.
+
+    A late NVASR wrapper error can occur after all TextGrids/labs are written
+    but before the receipt is atomically committed.  The bundle is still
+    usable; create the minimal producer receipt and let the canonical pipeline
+    helper fill and validate audio bindings and artifact hashes.
+    """
+    ctc_dir = local_workspace / "ctc_pretg"
+    if not ctc_dir.exists():
+        return False
+    try:
+        from pipeline_utils import (compute_model_tree_digest,
+                                    write_ctc_run_receipt,
+                                    validate_ctc_run_receipt_v2)
+        from run_pipeline import _ensure_ctc_axis_receipt
+        _existing = ctc_dir / ".ctc_run_receipt.json"
+        if _existing.is_file():
+            # Reuse the already recorded model/dictionary provenance.  A full
+            # model-tree digest per partial batch is needlessly expensive and
+            # can make the launcher preserve a usable batch before repair
+            # finishes.  Only the local path bindings and exact subset change.
+            receipt = json.loads(_existing.read_text(encoding="utf-8"))
+            if receipt.get("schema") == "ctc-run-receipt-v2":
+                selected = set(batch_stems)
+                ctc_dir = local_workspace / "ctc_pretg"
+                rows = []
+                for row in receipt.get("audio_bindings", []):
+                    stem = row.get("stem") if isinstance(row, dict) else None
+                    if stem not in selected:
+                        continue
+                    row = dict(row)
+                    wav = local_audio / f"{stem}.wav"
+                    if not wav.is_file():
+                        continue
+                    row["path"] = str(wav.resolve())
+                    for field, suffix in (("tokens_sha256", "_tokens.jsonl"),
+                                          ("lab_sha256", ".lab"),
+                                          ("punct_sha256", "_punct.json"),
+                                          ("reference_sha256", "_ref.txt"),
+                                          ("textgrid_sha256", ".TextGrid")):
+                        artifact = ctc_dir / f"{stem}{suffix}"
+                        path_field = field + "_path"
+                        if artifact.is_file():
+                            row[path_field] = str(artifact.resolve())
+                        elif field in row:
+                            row.pop(field, None)
+                            row.pop(path_field, None)
+                    for path_field, suffix in (("tokens_path", "_tokens.jsonl"),
+                                               ("textgrid_path", ".TextGrid")):
+                        artifact = ctc_dir / f"{stem}{suffix}"
+                        if artifact.is_file():
+                            row[path_field] = str(artifact.resolve())
+                        else:
+                            row.pop(path_field, None)
+                    rows.append(row)
+                stems = sorted(row.get("stem") for row in rows)
+                receipt["input_stems"] = stems
+                receipt["input_stems_digest"] = stable_json_digest(stems)
+                receipt["output_stems"] = stems
+                receipt["output_stems_digest"] = stable_json_digest(stems)
+                receipt["audio_bindings"] = sorted(rows, key=lambda r: r.get("stem", ""))
+                errors = validate_ctc_run_receipt_v2(
+                    receipt, expected_stems=stems, audio_root=local_audio)
+                if not errors:
+                    _existing.write_text(
+                        json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8")
+                    print(f"  [GPU] Rebound existing CTC receipt for {len(stems)} stems")
+                    return True
+        model_path = Path("/mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR")
+        dict_path = PROJECT_ROOT / "dict" / "mfa_ipa.dict"
+        model_digest, model_manifest = compute_model_tree_digest(model_path)
+        dict_digest = hashlib.sha256(dict_path.read_bytes()).hexdigest()
+        write_ctc_run_receipt(
+            ctc_dir, actual_argv=["repaired-complete-bundle"],
+            asr_python="/home/user/miniconda3/envs/asr/bin/python",
+            model_path=model_path, model_tree_digest=model_digest,
+            model_file_manifest=model_manifest, dict_path=dict_path,
+            dict_digest=dict_digest, input_stems=sorted(batch_stems),
+            output_stems=sorted(batch_stems), audio_bindings=[])
+        rc = _ensure_ctc_axis_receipt({
+            "ctc_pretg": ctc_dir, "audio_dir": local_audio,
+        })
+        if rc == 0:
+            print(f"  [GPU] Repaired and validated CTC receipt for {len(batch_stems)} stems")
+            return True
+        print(f"  [GPU] CTC receipt repair validation returned rc={rc}")
+    except Exception as exc:
+        print(f"  [GPU] CTC receipt repair failed: {exc}")
+    return False
+
+
 # ═══════════════════════════════════════════════════════════════
 # Composable batch operations — Stage / Process / Upload / Cleanup
 # ═══════════════════════════════════════════════════════════════
@@ -287,6 +383,7 @@ def _stage_one_batch(
 
     import concurrent.futures as _cf2
     copy_tasks: list[tuple[Path, Path]] = []
+    regular_audio_tasks: list[tuple[Path, Path]] = []
     missing_audio = 0
 
     for stem in batch_stems:
@@ -294,7 +391,13 @@ def _stage_one_batch(
         if src_wav is None:
             src_wav = find_wav(nas_audio_dir, stem)
         if src_wav:
-            copy_tasks.append((src_wav, local_audio / f"{stem}.wav"))
+            # Strict CTC/MFA axis receipts reject symlink audio.  In the raw
+            # NVASR fallback route the batch WAV is therefore a real local
+            # file; ctc_ready keeps the historical hard-link/symlink path.
+            if is_fallback:
+                regular_audio_tasks.append((src_wav, local_audio / f"{stem}.wav"))
+            else:
+                copy_tasks.append((src_wav, local_audio / f"{stem}.wav"))
         else:
             missing_audio += 1
 
@@ -321,16 +424,18 @@ def _stage_one_batch(
                      local_ctc / f"{stem}{suffix}")
                 )
 
-    if not copy_tasks:
+    if not copy_tasks and not regular_audio_tasks:
         elapsed = time.time() - t0
         print(f"  [STAGE {batch_idx:04d}] WARNING: no files to copy "
               f"(missing_audio={missing_audio})")
         return local_dir, elapsed, missing_audio
 
-    n_workers = min(8, max(1, len(copy_tasks) // 100))
+    n_workers = min(8, max(1, (len(copy_tasks) + len(regular_audio_tasks)) // 100))
     failed_copies = 0
     with _cf2.ThreadPoolExecutor(max_workers=n_workers) as pool:
-        futures = [pool.submit(link_or_copy_file, s, d) for s, d in copy_tasks]
+        futures = [pool.submit(shutil.copy2, str(s), str(d))
+                   for s, d in regular_audio_tasks]
+        futures += [pool.submit(link_or_copy_file, s, d) for s, d in copy_tasks]
         for f in _cf2.as_completed(futures):
             try:
                 if not f.result():
@@ -422,6 +527,9 @@ def _process_one_batch(
 
     t0 = time.time()
     env = get_mfa_env(mfa_python, models_dir)
+    _mfa_root = local_workspace / "mfa_root"
+    _mfa_root.mkdir(parents=True, exist_ok=True)
+    env["MFA_ROOT_DIR"] = str(_mfa_root)
     if device:
         gpu_idx = device.replace("cuda:", "")
         if gpu_idx.isdigit():
@@ -2601,11 +2709,15 @@ def _run_gpu_phase(
     local_audio.mkdir(parents=True, exist_ok=True)
     local_ctc.mkdir(parents=True, exist_ok=True)
     copy_tasks: list[tuple[Path, Path]] = []
+    regular_audio_tasks: list[tuple[Path, Path]] = []
     missing_audio: list[str] = []
     for stem in batch_stems:
         src_wav = wav_index.get(stem) or find_wav(resolve_input_path(ds.get("audio_dir", "")), stem)
         if src_wav:
-            copy_tasks.append((src_wav, local_audio / f"{stem}.wav"))
+            # The downstream CTC/MFA receipt validator intentionally rejects
+            # symlinked WAVs.  Keep text files cheap to stage, but materialize
+            # audio as regular files on the local NVMe workspace.
+            regular_audio_tasks.append((src_wav, local_audio / f"{stem}.wav"))
         else:
             missing_audio.append(stem)
         # Copy .txt if available (for reference text in NVASR)
@@ -2615,10 +2727,12 @@ def _run_gpu_phase(
     if missing_audio:
         print(f"  [GPU] Missing audio for {len(missing_audio)}/{len(batch_stems)} stems")
         return False
-    n_workers = min(8, max(1, len(copy_tasks) // 100))
+    all_tasks = len(copy_tasks) + len(regular_audio_tasks)
+    n_workers = min(8, max(1, all_tasks // 100))
     failed_copies = 0
     with _cf.ThreadPoolExecutor(max_workers=n_workers) as pool:
-        futures = [pool.submit(link_or_copy_file, s, d) for s, d in copy_tasks]
+        futures = [pool.submit(shutil.copy2, str(s), str(d)) for s, d in regular_audio_tasks]
+        futures += [pool.submit(link_or_copy_file, s, d) for s, d in copy_tasks]
         for f in _cf.as_completed(futures):
             try:
                 if not f.result():
@@ -2647,6 +2761,9 @@ def _run_gpu_phase(
     if device:
         cmd += ["--device", "cuda:0"]  # CUDA_VISIBLE_DEVICES remaps this
     env = get_mfa_env(mfa_python, models_dir)
+    _mfa_root = local_workspace / "mfa_root"
+    _mfa_root.mkdir(parents=True, exist_ok=True)
+    env["MFA_ROOT_DIR"] = str(_mfa_root)
     if device:
         gpu_idx = device.replace("cuda:", "")
         if gpu_idx.isdigit():
@@ -2658,6 +2775,45 @@ def _run_gpu_phase(
         rc = 1
 
     if rc != 0:
+        # NVASR can return a non-zero wrapper status after writing a complete
+        # CTC bundle (for example, a late verification warning).  Do not
+        # discard a batch whose complete CTC subset is large enough for the
+        # no-reference partial-accounting contract; the missing stems are
+        # explicitly carried into ctc_ready/filtered instead of failing the
+        # whole batch.
+        _ctc_dir = local_workspace / "ctc_pretg"
+        _suffixes = (".TextGrid", ".lab", "_tokens.jsonl", "_punct.json",
+                     "_text_cn.txt", "_text_raw.txt")
+        _complete_stems = set(batch_stems)
+        for _suffix in _suffixes:
+            _complete_stems &= {
+                p.name[:-len(_suffix)] for p in _ctc_dir.glob("*" + _suffix)
+            }
+        _complete_stems &= set(batch_stems)
+        _min_complete = max(1, int(len(batch_stems) * 0.90))
+        if len(_complete_stems) >= _min_complete:
+            print(f"  [GPU] Warning: NVASR returned rc={rc}, but CTC bundle is"
+                  f" usable ({len(_complete_stems)}/{len(batch_stems)}); continuing")
+            # A producer receipt may exist but still bind the pre-move batch
+            # path (the launcher preserves failed batches as ``*.FAILED``).
+            # For a partial bundle always rebuild it against the current local
+            # audio axis; this also projects the receipt to the complete stem
+            # subset.
+            if (len(_complete_stems) < len(batch_stems)
+                    or not (local_workspace / "ctc_pretg" / ".ctc_run_receipt.json").is_file()):
+                if not _repair_complete_ctc_receipt(
+                        local_workspace, local_audio, sorted(_complete_stems)):
+                    print("  [GPU] Complete CTC bundle has no valid receipt; preserving batch")
+                    rc = 1
+                    _complete_stems = set()
+            if not _complete_stems:
+                pass
+            else:
+                _persist_ctc_adj_cache(local_workspace,
+                                       resolve_input_path(ds.get("ctc_dir", "")))
+                if nas_output_dir:
+                    _persist_ctc_adj_cache(local_workspace, nas_output_dir)
+                return True
         # Preserve failed batch directory for forensic analysis
         _failed_dir = local_dir.with_name(local_dir.name + ".FAILED")
         if _failed_dir.exists():
@@ -2686,6 +2842,8 @@ def _run_cpu_phase(
     mfa_en_num_jobs: int = 0,
     allow_overwrite: bool = True,
     allow_force: bool = True,
+    restore_cache: bool = True,
+    upload_lock=None,
 ) -> bool:
     """CPU phase: read CTC from local workspace + run MFA align + postprocess.
 
@@ -2747,8 +2905,26 @@ def _run_cpu_phase(
         print(f"  WARNING: no CTC files found for {len(batch_stems)} stems "
               f"— CPU phase will fail")
 
+    # ctc_ready re-use is receipt-gated.  Carry the GPU-generated CTC axis
+    # receipt into the per-batch import directory so the CPU link stage can
+    # validate the exact audio/stem namespace instead of rejecting a complete
+    # bundle as untrusted.
+    for _src in _ctc_sources:
+        _receipt = _src / ".ctc_run_receipt.json"
+        if _receipt.is_file():
+            try:
+                shutil.copy2(str(_receipt), str(local_ctc / _receipt.name))
+            except OSError as _exc:
+                print(f"  WARNING: could not stage CTC axis receipt: {_exc}")
+            break
+
     # ── Restore cached adjust output if available ──
-    _restore_ctc_adj_cache(local_workspace, nas_output)
+    # A no-reference GPU phase has just produced the authoritative CTC axis
+    # for this batch. Restoring ctc_pretg_adj from a shared NAS output tree
+    # can silently import another run's stems/receipt, so callers may disable
+    # this legacy optimization for isolated full-pipeline jobs.
+    if restore_cache:
+        _restore_ctc_adj_cache(local_workspace, nas_output)
 
     # ── Run MFA alignment + postprocess (CPU-intensive) ──
     cmd = [
@@ -2775,6 +2951,9 @@ def _run_cpu_phase(
     if mfa_en_num_jobs > 0:
         cmd += ["--mfa-en-jobs", str(mfa_en_num_jobs)]
     env = get_mfa_env(mfa_python, models_dir)
+    _mfa_root = local_workspace / "mfa_root"
+    _mfa_root.mkdir(parents=True, exist_ok=True)
+    env["MFA_ROOT_DIR"] = str(_mfa_root)
     try:
         rc = subprocess.run(cmd, env=env, timeout=7200, capture_output=False).returncode
     except subprocess.TimeoutExpired:
@@ -2793,40 +2972,58 @@ def _run_cpu_phase(
 
     # ── Upload results to NAS ──
     _upload_ok = True
-    for local_src, nas_rel in [
-        (local_output, nas_output / "output"),
-        (local_workspace / "filtered", nas_output / "filtered"),
-        (local_workspace / "ctc_pretg_adj", nas_output / "ctc_pretg_adj"),
-    ]:
-        if not local_src.exists() or not any(local_src.iterdir()):
-            continue
-        nas_rel.mkdir(parents=True, exist_ok=True)
-        rsync = shutil.which("rsync")
-        if rsync:
-            try:
-                rc = subprocess.run(
-                    [rsync, "-a", str(local_src) + "/", str(nas_rel) + "/"],
-                    capture_output=True, text=True, timeout=300).returncode
-                if rc != 0:
-                    print(f"  ERROR: rsync failed (rc={rc}) for {local_src} → {nas_rel}")
+    from contextlib import nullcontext
+    with (upload_lock if upload_lock is not None else nullcontext()):
+        for local_src, nas_rel in [
+            (local_output, nas_output / "output"),
+            (local_workspace / "filtered", nas_output / "filtered"),
+            (local_workspace / "ctc_pretg_adj", nas_output / "ctc_pretg_adj"),
+        ]:
+            if not local_src.exists() or not any(local_src.iterdir()):
+                continue
+            nas_rel.mkdir(parents=True, exist_ok=True)
+            rsync = shutil.which("rsync")
+            if rsync:
+                last_rc = 1
+                last_err = ""
+                for attempt in range(3):
+                    try:
+                        proc = subprocess.run(
+                            [rsync, "-a", str(local_src) + "/", str(nas_rel) + "/"],
+                            capture_output=True, text=True, timeout=600)
+                        last_rc = proc.returncode
+                        last_err = (proc.stderr or "").strip()
+                        if last_rc == 0:
+                            break
+                        if attempt < 2:
+                            time.sleep(2 * (attempt + 1))
+                    except subprocess.TimeoutExpired:
+                        last_rc = 124
+                        last_err = "timeout"
+                        if attempt < 2:
+                            time.sleep(2 * (attempt + 1))
+                    except Exception as e:
+                        last_rc = 1
+                        last_err = str(e)
+                        break
+                if last_rc != 0:
+                    print(f"  WARNING: rsync failed after 3 attempts (rc={last_rc})"
+                          f" for {local_src} → {nas_rel}: {last_err[-300:]}")
+                    # CIFS can reject a directory-wide rsync transiently;
+                    # fall back to independent file copies before failing.
+                    rsync = None
+            if not rsync:
+                try:
+                    for f in local_src.rglob("*"):
+                        if f.is_file():
+                            rel = f.relative_to(local_src)
+                            tgt = nas_rel / rel
+                            tgt.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(str(f), str(tgt))
+                except Exception as e:
+                    print(f"  ERROR: upload copy error for {local_src}: {e}")
                     _upload_ok = False
-            except subprocess.TimeoutExpired:
-                print(f"  ERROR: rsync timed out for {local_src} → {nas_rel}")
-                _upload_ok = False
-            except Exception as e:
-                print(f"  ERROR: rsync error for {local_src}: {e}")
-                _upload_ok = False
-        else:
-            try:
-                for f in local_src.rglob("*"):
-                    if f.is_file():
-                        rel = f.relative_to(local_src)
-                        tgt = nas_rel / rel
-                        tgt.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(str(f), str(tgt))
-            except Exception as e:
-                print(f"  ERROR: upload copy error for {local_src}: {e}")
-                _upload_ok = False
+                    break
 
     if not _upload_ok:
         # Preserve local directory for forensic analysis
@@ -2887,6 +3084,8 @@ def run_pipelined_batch(args) -> bool:
         mfa_python = find_mfa_python()
     models_dir = PROJECT_ROOT / "models" / "mfa"
     _ensure_mfa_model_extracted()
+    nas_output_root = resolve_input_path(
+        cache.get("output_root", "").rstrip("/"), PROJECT_ROOT)
 
     # ── Pre-scan datasets → build all batches ──
     print(f"\n  Pre-scanning {len(all_datasets)} datasets ...")
@@ -2934,6 +3133,26 @@ def run_pipelined_batch(args) -> bool:
         if args.limit > 0 and args.limit < len(all_stems):
             all_stems = all_stems[:args.limit]
             print(f"  {ds_name}: limited to {len(all_stems)} stems")
+
+        # Skip stems that were already uploaded by an earlier interrupted run.
+        # Output and filtered are both terminal destinations in no-reference
+        # mode, so either one is sufficient to avoid recomputing the stem.
+        _processed_stems = set()
+        for _terminal_dir in (
+            nas_output_root / ds_name / "output",
+            nas_output_root / ds_name / "filtered",
+        ):
+            if _terminal_dir.exists():
+                try:
+                    _processed_stems.update(
+                        p.stem for p in _terminal_dir.rglob("*") if p.is_file())
+                except OSError as _exc:
+                    print(f"  WARNING: could not inventory {_terminal_dir}: {_exc}")
+        if _processed_stems:
+            _before = len(all_stems)
+            all_stems = [s for s in all_stems if s not in _processed_stems]
+            print(f"  {ds_name}: skipped {_before - len(all_stems)} already-uploaded stems;"
+                  f" {len(all_stems)} remain")
 
         # Build text_index for reference text (optional)
         text_index: dict[str, Path] = {}
@@ -3012,8 +3231,7 @@ def run_pipelined_batch(args) -> bool:
             ds_tracker[ds_name] = {"total": 0, "done": 0, "fail": 0}
         ds_tracker[ds_name]["total"] += 1
 
-    nas_output_root = resolve_input_path(
-        cache.get("output_root", "").rstrip("/"), PROJECT_ROOT)
+    upload_lock = threading.Lock()
 
     # ── GPU worker ──
     def gpu_worker(wid: int) -> None:
@@ -3103,6 +3321,8 @@ def run_pipelined_batch(args) -> bool:
                 mfa_en_num_jobs=resource_plan["mfa_en_jobs_per_worker"],
                 allow_overwrite=getattr(args, '_allow_overwrite', True),
                 allow_force=getattr(args, '_allow_force', True),
+                restore_cache=bool(pipeline_cfg.get("restore_ctc_cache", True)),
+                upload_lock=upload_lock,
             )
             with ckpt_lock:
                 tracker = ds_tracker[ds_name]

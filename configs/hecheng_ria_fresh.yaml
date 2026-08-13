@@ -9,15 +9,15 @@
 #       --config configs/hecheng_ria_fresh.yaml \
 #       --python /home/user/miniconda3/envs/mfa-dev/bin/python
 
-mode: nvrasr_fallback
+mode: ctc_ready
 
 # ── 路径配置 ──────────────────────────────────────────────────
 
 # 输入: 父目录, 管线自动发现子目录 (ria/花礼/雪狐桑) 下的 WAV + .txt
-data_dir: /mnt/nvme3/mfa_audio_cache_ria
+data_dir: /mnt/nvme3/mfa_workspace_54k_fresh/padded_audio
 
 # 新工作目录 (避免旧 0805 的 cn2an 污染)
-workspace: /mnt/nvme3/mfa_workspace_54k_fresh
+workspace: /mnt/nvme3/mfa_workspace_54k_mfa_20260812
 
 # 最终输出
 output_dir: /mnt/Raw/54k_fresh
@@ -33,7 +33,14 @@ temp_dir: temp
 
 # ── 静音补全 ──────────────────────────────────────────────────
 pad_silence:
+  enabled: false
   target_edge_silence_sec: 0.5
+
+# CTC was already generated against the frozen padded_audio axis.  Keep the
+# completed CTC tree immutable and import it into the fresh MFA workspace.
+ctc_ready:
+  ctc_dir: /mnt/nvme3/mfa_workspace_54k_fresh/ctc_pretg
+  require_all: true
 
 # Single MFA timeline contract.  The CTC v2 receipt binds the producer's input
 # audio; a per-stem identity resample receipt connects it to the actual MFA

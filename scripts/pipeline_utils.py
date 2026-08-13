@@ -144,7 +144,10 @@ def get_mfa_env(mfa_python: Path, models_dir: Path,
     (MFA's ``--num_jobs``) gives near-linear scaling.
     """
     env = os.environ.copy()
-    env["MFA_ROOT_DIR"] = str(models_dir)
+    # Allow each batch/shard process to provide an isolated MFA root.  MFA
+    # writes command_history.yaml below this directory; forcing every
+    # concurrent batch to share models/mfa corrupts that YAML during retries.
+    env.setdefault("MFA_ROOT_DIR", str(models_dir))
     # Pin BLAS threads per worker — critical for multi-core scaling
     for ev in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
                "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
@@ -1197,6 +1200,37 @@ def load_ctc_token_entries(tokens_path: Path) -> list[dict]:
     if not entries:
         raise ValueError(f"No CTC tokens in {tokens_path}")
     return entries
+
+
+def repair_degenerate_ctc_token_intervals(tokens_path: Path) -> int:
+    """Repair zero-duration NVASR tokens before strict bundle validation."""
+    lines = tokens_path.read_text(encoding="utf-8-sig").splitlines()
+    entries = [json.loads(line) for line in lines if line.strip()]
+    changed = 0
+    for index, entry in enumerate(entries):
+        start = float(entry.get("start_s", 0.0))
+        end = float(entry.get("end_s", 0.0))
+        if end > start:
+            continue
+        next_start = None
+        for later in entries[index + 1:]:
+            candidate = float(later.get("start_s", start))
+            if candidate > start:
+                next_start = candidate
+                break
+        end = min(next_start, start + 0.001) if next_start is not None else start + 0.001
+        if end <= start:
+            end = start + 0.001
+        entry["start_s"] = round(start, 3)
+        entry["end_s"] = round(end, 3)
+        entry["start_ms"] = round(start * 1000, 3)
+        entry["end_ms"] = round(end * 1000, 3)
+        changed += 1
+    if changed:
+        tokens_path.write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in entries),
+            encoding="utf-8")
+    return changed
 
 
 def read_ctc_textgrid_words(textgrid_path: Path) -> list[str]:

@@ -5322,6 +5322,64 @@ def load_en_phones(stem: str, en_phones_dir: Path | None) -> list[dict] | None:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not data:
             return None
+        # New English MFA runs persist a strict-en-mfa-v1 ledger object,
+        # while the legacy injection path consumes a flat list.  Normalize
+        # the ledger here so disabling the independent strict-ok audit (which
+        # is required for no-reference ASR jobs) does not disable English
+        # phone injection or iterate over dictionary keys as entries.
+        if isinstance(data, dict) and data.get("schema") == "strict-en-mfa-v1":
+            normalized: list[dict] = []
+            for segment in data.get("segments", []):
+                if not isinstance(segment, dict):
+                    continue
+                words = segment.get("words", [])
+                if not isinstance(words, list):
+                    continue
+                valid_words = [word for word in words
+                               if isinstance(word, dict)
+                               and isinstance(word.get("start"), (int, float))
+                               and isinstance(word.get("mfa_word"), dict)
+                               and isinstance(word["mfa_word"].get("start"), (int, float))]
+                if not valid_words:
+                    continue
+                offset = float(valid_words[0]["start"]) - float(
+                    valid_words[0]["mfa_word"]["start"])
+                for word in words:
+                    if not isinstance(word, dict):
+                        continue
+                    text = str(word.get("ctc_text", "")).strip()
+                    mfa_word = word.get("mfa_word")
+                    if (not text or not isinstance(mfa_word, dict)
+                            or not isinstance(word.get("start"), (int, float))
+                            or not isinstance(word.get("end"), (int, float))):
+                        continue
+                    en_start = offset + float(mfa_word.get("start", 0.0))
+                    en_end = offset + float(mfa_word.get("end", 0.0))
+                    phones = []
+                    for phone in word.get("phones", []):
+                        if not isinstance(phone, dict):
+                            continue
+                        label = str(phone.get("label", phone.get("phone", ""))).strip()
+                        if not label:
+                            continue
+                        phones.append({
+                            "phone": label,
+                            "start": offset + float(phone.get("start", 0.0)),
+                            "end": offset + float(phone.get("end", 0.0)),
+                        })
+                    normalized.append({
+                        "seg_idx": segment.get("segment_ordinal", 0),
+                        "offset": offset,
+                        "word_text": text,
+                        "word_start": float(word["start"]),
+                        "word_end": float(word["end"]),
+                        "en_word_start": en_start,
+                        "en_word_end": en_end,
+                        "phones": phones,
+                    })
+            return normalized or None
+        if not isinstance(data, list):
+            return None
         return data
     except Exception:
         return None

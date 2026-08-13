@@ -49,7 +49,8 @@ from pipeline_utils import (
     build_ctc_presence, build_file_index, build_flat_file_names,
     count_files_fast, find_wav,
     is_punct, is_word_like, is_english_token,
-    load_ctc_token_entries, normalize_reference_numerals,
+    load_ctc_token_entries, repair_degenerate_ctc_token_intervals,
+    normalize_reference_numerals,
     read_ctc_textgrid_words, rebuild_lab_from_tokens,
     validate_ctc_transcript_bundle,
     validate_strict_mfa_textgrid,
@@ -893,6 +894,8 @@ def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         prealign_args += ["--nvv-bias", str(pc["nvv_bias"])]
     if not pc.get("nvv_enabled", True):
         prealign_args.append("--no-nvv")
+    if pc.get("allow_missing_reference", False):
+        prealign_args.append("--allow-missing-reference")
     if pc.get("limit", 0) > 0:
         prealign_args += ["--limit", str(pc["limit"])]
     if pc.get("offset", 0) > 0:
@@ -1497,6 +1500,7 @@ def step_normalize_text(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     pinyin tone suffixes (for example rui4 -> rui四), so a lab is only
     recovered from its validated tokens JSONL sequence.
     """
+    import re
     if _skip_if_ctc_normalized(ctx):
         return 0
     try:
@@ -1527,20 +1531,50 @@ def step_normalize_text(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
 
     # tokens + CTC words must agree before tokens are allowed to repair a lab.
     for tokens_path in sorted(ctc_dir.glob("*_tokens.jsonl")):
+        repaired = repair_degenerate_ctc_token_intervals(tokens_path)
+        if repaired:
+            print(f"  Repaired {repaired} degenerate CTC token interval(s): {tokens_path.name}")
         stem = tokens_path.name[:-len("_tokens.jsonl")]
         lab_path = ctc_dir / f"{stem}.lab"
         textgrid_path = ctc_dir / f"{stem}.TextGrid"
         try:
-            token_words = [
-                entry["word"].strip()
-                for entry in load_ctc_token_entries(tokens_path)
-            ]
+            token_entries = load_ctc_token_entries(tokens_path)
+            token_words = [entry["word"].strip() for entry in token_entries]
             tg_words = read_ctc_textgrid_words(textgrid_path)
             if token_words != tg_words:
-                raise ValueError(
-                    f"TextGrid/tokens mismatch ({len(tg_words)} != "
-                    f"{len(token_words)})"
-                )
+                # NVASR's RIA normalizer can merge rui3+ya5 into one ``ria``
+                # token before this validation step, while the producer's
+                # TextGrid still contains the two original intervals.  This
+                # is the same deterministic rewrite performed by
+                # normalize_ria; apply it here so the bundle reaches that
+                # step instead of being rejected prematurely.
+                expanded_matches = True
+                _ti = 0
+                for _word in token_words:
+                    if _word == "ria":
+                        if _ti < len(tg_words) and tg_words[_ti] == "ria":
+                            _ti += 1
+                        elif (_ti + 1 < len(tg_words)
+                              and re.fullmatch(r"rui[0-5]", tg_words[_ti])
+                              and re.fullmatch(r"(?:ya|a)[0-5]", tg_words[_ti + 1])):
+                            _ti += 2
+                        else:
+                            expanded_matches = False
+                            break
+                    else:
+                        if _ti >= len(tg_words) or tg_words[_ti] != _word:
+                            expanded_matches = False
+                            break
+                        _ti += 1
+                if expanded_matches and _ti == len(tg_words):
+                    from normalize_english_tokens import rewrite_ctc_textgrid_words
+                    rewrite_ctc_textgrid_words(textgrid_path, token_entries)
+                    tg_words = read_ctc_textgrid_words(textgrid_path)
+                if token_words != tg_words:
+                    raise ValueError(
+                        f"TextGrid/tokens mismatch ({len(tg_words)} != "
+                        f"{len(token_words)})"
+                    )
             current_words = (
                 lab_path.read_text(encoding="utf-8-sig").strip().split()
                 if lab_path.exists() else []
@@ -1758,10 +1792,18 @@ def _validate_mfa_shard_axis_links(stems: list[str], link_tasks: list[tuple[Path
                                    mfa_axis_receipt: dict) -> list[str]:
     """Validate every shard WAV symlink against the frozen MFA axis."""
     axis_rows = {row.get("stem"): row for row in mfa_axis_receipt.get("audio", [])}
+    # ``link_tasks`` contains three artifacts per stem (lab, WAV, anchor).
+    # Filtering the full task list once per stem is O(N²) at 54k scale and
+    # can prevent MFA from ever launching.  Build the WAV destination index
+    # once, then validate each frozen stem in O(1).
+    wav_links: dict[str, list[Path]] = {}
+    for src, dst in link_tasks:
+        if src.suffix == ".wav":
+            wav_links.setdefault(src.name, []).append(dst)
     errors: list[str] = []
     for stem in stems:
         row = axis_rows.get(stem)
-        links = [dst for src, dst in link_tasks if src.name == f"{stem}.wav"]
+        links = wav_links.get(f"{stem}.wav", [])
         if not isinstance(row, dict) or len(links) != 1:
             errors.append(f"MFA shard audio-axis binding missing: {stem}")
             continue
@@ -1959,9 +2001,13 @@ def _run_mfa_sharded(
         _log_handle = _log_path.open("w", encoding="utf-8")
         # ── OSError capture (Case 83 / R7) ─────────────────────────
         try:
+            _mfa_env = get_mfa_env(mfa_python, models_dir)
+            _mfa_root = _sd / "mfa_root"
+            _mfa_root.mkdir(parents=True, exist_ok=True)
+            _mfa_env["MFA_ROOT_DIR"] = str(_mfa_root)
             _proc = subprocess.Popen(
                 _cmd,
-                env=get_mfa_env(mfa_python, models_dir),
+                env=_mfa_env,
                 stdout=_log_handle,
                 stderr=subprocess.STDOUT,
             )
@@ -2115,7 +2161,11 @@ def _run_mfa_sharded(
                     "--num_jobs", str(_jobs_per_shard), "--overwrite", "--no_textgrid_cleanup", "--single_speaker",
                     "--no_tokenization", "--beam", str(_beam), "--retry_beam", str(_retry_beam),
                     "--boost_silence", str(boost_silence)]
-            _proc = subprocess.run(_cmd, cwd=str(PROJECT_ROOT), env=get_mfa_env(mfa_python, models_dir),
+            _retry_env = get_mfa_env(mfa_python, models_dir)
+            _retry_mfa_root = _root / "mfa_root"
+            _retry_mfa_root.mkdir(parents=True, exist_ok=True)
+            _retry_env["MFA_ROOT_DIR"] = str(_retry_mfa_root)
+            _proc = subprocess.run(_cmd, cwd=str(PROJECT_ROOT), env=_retry_env,
                                    capture_output=True, text=True)
             (_root / "retry.stdout.log").write_text(_proc.stdout or "", encoding="utf-8")
             (_root / "retry.stderr.log").write_text(_proc.stderr or "", encoding="utf-8")
@@ -2162,8 +2212,41 @@ def _run_mfa_sharded(
                        if usable != set(_shard_stems[si])]
             print(f"  MFA retry coordinator recovered exact missing set; continuing strict merge")
         else:
-            print(f"  MFA rc=0 incomplete; retained shard workspaces and wrote retry plan: {_retry_plan}")
-            return 1
+            # A clean retry may still leave a small, explicit missing set.
+            # If partial output is enabled and the configured ratio is met,
+            # admit the recovered grids and carry the remainder as the
+            # declared MFA-missing ledger.  Do not fabricate TextGrids for
+            # stems that MFA could not align.
+            _last_retry = _retry_state.get("history", [])[-1] if _retry_state.get("history") else {}
+            _last_missing = set(_last_retry.get("missing", []))
+            _last_extra = set(_last_retry.get("extra", []))
+            _last_invalid = set(_last_retry.get("invalid", []))
+            _last_produced = set(_last_retry.get("produced", []))
+            _last_ratio = len(_last_produced) / len(stems) if stems else 0.0
+            if (allow_partial and _last_missing and not _last_extra
+                    and not _last_invalid and _last_ratio >= min_output_ratio):
+                for _attempt in _retry_state.get("attempts", [])[1:]:
+                    _retry_out = Path(_attempt.get("output_dir", ""))
+                    if not _retry_out.is_dir():
+                        continue
+                    for _tg in _retry_out.glob("*.TextGrid"):
+                        _target_shard = next(
+                            (_sd for (_i, _p, _sd, _lh, _lp, _ex, _st) in _procs
+                             if _tg.stem in _ex), None)
+                        if _target_shard is not None and not validate_strict_mfa_textgrid(_tg):
+                            shutil.copy2(_tg, _target_shard / "output" / _tg.name)
+                            _target_i = next(
+                                _i for (_i, _p, _sd, _lh, _lp, _ex, _st) in _procs
+                                if _sd == _target_shard)
+                            _usable_by_shard[_target_i].add(_tg.stem)
+                _all_missing = sorted(_last_missing)
+                _failed = [si for si, usable in _usable_by_shard.items()
+                           if usable != set(_shard_stems[si])]
+                print(f"  MFA retry recovered {_last_ratio:.2%}; continuing partial merge"
+                      f" with {len(_all_missing)} declared missing stems")
+            else:
+                print(f"  MFA rc=0 incomplete; retained shard workspaces and wrote retry plan: {_retry_plan}")
+                return 1
     _manifest_path.write_text(_json.dumps({
         "schema": 1,
         "run_id": _run_id,
@@ -2569,6 +2652,47 @@ def _refresh_postprocess_accounting(ctx: dict, output_stems: set[str],
         return 0
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         print(f"  ERROR: postprocess formal accounting refresh failed: {exc}")
+        return 1
+
+
+def _refresh_strict_manifest_accounting_binding(output_dir: Path) -> int:
+    """Rebind strict-ok evidence after the audit isolates late rejects.
+
+    The audit may move a candidate from output/ to filtered/ after reading the
+    pre-audit accounting receipt.  The final runner receipt is then refreshed
+    with the post-audit partition, so the manifest's receipt hash and derived
+    counts must be updated atomically before publication.
+    """
+    manifest_path = output_dir / "strict_ok_manifest.json"
+    receipt_path = output_dir / ".pipeline_run_receipt_v2.json"
+    try:
+        if not manifest_path.is_file() or not receipt_path.is_file():
+            raise ValueError("strict-ok manifest or accounting receipt missing")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        receipt = read_pipeline_accounting_receipt(receipt_path)
+        receipt_errors = validate_pipeline_accounting_receipt(receipt)
+        if receipt_errors:
+            raise ValueError("accounting receipt invalid: " + "; ".join(receipt_errors))
+        expected = set(manifest.get("expected_stems", []))
+        output = set(receipt["output"]["stems"])
+        filtered = set(receipt["filtered"]["stems"])
+        if (expected != set(receipt["eligible"]["stems"])
+                or output != {entry["stem"] for entry in manifest.get("ok", [])}
+                or filtered != set(manifest.get("rejected", {}))):
+            raise ValueError("strict manifest and final accounting sets disagree")
+        manifest["pipeline_accounting_receipt"] = {
+            "path": str(receipt_path.resolve()),
+            "sha256": _sha256_file(receipt_path),
+            "schema": PIPELINE_ACCOUNTING_SCHEMA,
+        }
+        manifest["pipeline_accounting"] = receipt.get("derived", {})
+        tmp = manifest_path.with_name(f".{manifest_path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        os.replace(tmp, manifest_path)
+        return 0
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"  ERROR: strict-ok accounting binding refresh failed: {exc}")
         return 1
 
 
@@ -3830,12 +3954,32 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
             if receipt.get("schema") != CTC_RUN_RECEIPT_SCHEMA:
                 raise ValueError("reuse CTC legacy receipt is not trusted")
             stems = sorted(ctx.get("accounting_eligible_stems", receipt.get("input_stems", [])))
+            # NVASR can leave a producer receipt for the requested batch even
+            # when one stem has no complete six-file CTC bundle.  ``link`` has
+            # already frozen the complete eligible subset, so project the
+            # receipt onto that subset before validating it.  The omitted
+            # source stem remains an explicit accounting exclusion instead of
+            # poisoning the entire batch.
+            stem_set = set(stems)
+            receipt["input_stems"] = stems
+            receipt["input_stems_digest"] = stable_json_digest(stems)
+            receipt["output_stems"] = sorted(
+                stem for stem in receipt.get("output_stems", [])
+                if stem in stem_set)
+            receipt["output_stems_digest"] = stable_json_digest(
+                receipt["output_stems"])
+            receipt["audio_bindings"] = sorted(
+                (row for row in receipt.get("audio_bindings", [])
+                 if isinstance(row, dict) and row.get("stem") in stem_set),
+                key=lambda row: row.get("stem", ""))
             errors = validate_ctc_run_receipt_v2(receipt, expected_stems=stems,
                                                  audio_root=Path(ctx["audio_dir"]))
             if errors:
                 raise ValueError("; ".join(errors))
             target_receipt.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_receipt, target_receipt)
+            target_receipt.write_text(
+                json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8")
             ctx["ctc_axis_receipt"] = receipt
             return 0
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -4128,16 +4272,20 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         if len(incomplete_ctc) > 5:
             print(f"    ... and {len(incomplete_ctc) - 5} more")
 
-    # CTC-ready runs are reference-authoritative: a WAV without TXT (including
-    # a bundled *_ref.txt) is an explicit missing_reference exclusion, never an
-    # ASR fallback.  Keep only stems with a complete CTC bundle and authority.
+    # CTC-ready runs are reference-authoritative by default.  The pipelined
+    # NVASR fallback route can explicitly opt into ASR-only bundles, which
+    # carry no TXT/_ref.txt but do have a complete CTC artifact set.
+    _allow_missing_reference = bool(cr.get("allow_missing_reference", False))
     _authoritative_valid: list[str] = []
     _source_exclusions: dict[str, str] = {}
     for _stem in _source_stems:
         _txt = text_index.get(_stem)
         _bundled = (_ctc_base_cache.get(_stem, ctc_dir_src) / f"{_stem}_ref.txt")
         if _txt is None and not _bundled.is_file():
-            _source_exclusions[_stem] = "missing_reference"
+            if _allow_missing_reference and _stem in valid:
+                _authoritative_valid.append(_stem)
+            else:
+                _source_exclusions[_stem] = "missing_reference"
         elif _stem in valid:
             _authoritative_valid.append(_stem)
         else:
@@ -4348,6 +4496,14 @@ def step_pad_silence(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
             manifest.write_text("\n".join(expected_stems) + "\n", encoding="utf-8")
             ctx["expected_stems"] = expected_stems
             ctx["pre_ctc_stems_file"] = manifest
+            # Keep the recursive inventory for the receipt pass below.  Calling
+            # find_wav() once per stem would recursively rescan the entire
+            # speaker-partitioned cache for every item (O(N^2)); on a 54k run
+            # that can appear hung and is easy to interrupt after padding has
+            # already completed.
+            ctx["pre_ctc_audio_index"] = {
+                stem: paths[0] for stem, paths in by_stem.items()
+            }
         except OSError as exc:
             print(f"  ERROR: unable to freeze pre-CTC WAV denominator: {exc}")
             return 1
@@ -4387,10 +4543,16 @@ def step_pad_silence(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     if rc == 0:
         transform_dir = ctx["workspace"] / "audio_transform_receipts"
         transform_dir.mkdir(parents=True, exist_ok=True)
+        source_index = ctx.get("pre_ctc_audio_index")
+        if not isinstance(source_index, dict):
+            source_index = build_file_index(ctx["audio_dir"], ".wav")
+        if len(source_index) < len(expected_stems):
+            print("  ERROR: source WAV index is incomplete before receipt generation")
+            return 1
         for stem in sorted(expected_stems):
             # Pre-CTC inputs may live below speaker subdirectories; resolve
-            # them with the same recursive lookup used by the padding worker.
-            source_wav = find_wav(ctx["audio_dir"], stem)
+            # them from the single recursive inventory created above.
+            source_wav = source_index.get(stem)
             padded_wav = padded_audio_dir / f"{stem}.wav"
             try:
                 if source_wav is None:
@@ -7290,7 +7452,12 @@ def main() -> int:
             print("  Strict run publication disabled (--no-output-staging or config)")
     elif _output_staging and output_dir:
         _nas_output_dir = output_dir
-        output_dir = workspace / "output_staging" / f"{_run_id}_{os.getpid()}"
+        _stage_root = workspace / "output_staging" / f"{_run_id}_{os.getpid()}"
+        output_dir = _stage_root
+        # Non-strict staging still needs an isolated filtered partition.  Keep
+        # it beside the workspace so the streaming uploader can transfer it
+        # together with the published output directory.
+        filtered_dir = workspace / "filtered"
         print(f"  Run-specific output staging: {output_dir}")
         print(f"  Versioned publish target: {_nas_output_dir}")
     else:
@@ -7526,11 +7693,13 @@ def main() -> int:
             print(f"  Kept 16kHz audio: {mfa_audio}")
 
     # Save scan cache for future --use-cache runs (single-dataset mode).
-    # Skip when running as a subprocess of streaming_pipeline (config mode
-    # is batch_ctc_ready but --mode ctc_ready was passed on command line).
+    # Skip when running as a subprocess of streaming_pipeline.  Child runs
+    # receive an explicit --workspace; writing their single-batch scan cache
+    # here would overwrite the parent's multi-dataset batch cache.
     _config_mode = cfg.get("mode", "")
     if (not _strict_ready and mode in ("ctc_ready", "full") and not failed
-            and _config_mode != "batch_ctc_ready"):
+            and _config_mode != "batch_ctc_ready"
+            and not getattr(args, "workspace", None)):
         import json as _json
         manifest_path = workspace / cfg.get("ctc_pretg", "ctc_pretg") / "ctc_ready_manifest.json"
         n_stems = 0
@@ -7583,6 +7752,14 @@ def main() -> int:
         print(f"  ERROR: failed to write v2 pipeline accounting receipt: {exc}")
         failed.append("receipt_accounting")
 
+    # strict_ok can isolate additional candidates after it reads the
+    # pre-audit receipt.  Rebind the audited manifest to the final receipt
+    # before the publication guard checks both partition sets and its hash.
+    if (not failed and "strict_ok" in run_list
+            and (output_dir / "strict_ok_manifest.json").is_file()):
+        if _refresh_strict_manifest_accounting_binding(output_dir) != 0:
+            failed.append("strict_manifest_accounting_refresh")
+
     # ── Clean up temp NVMe cache ──
     if _nvme_cache_dir and _nvme_is_temp:
         _cleanup_nvme_cache(_nvme_cache_dir, _nvme_is_temp)
@@ -7591,7 +7768,8 @@ def main() -> int:
     _final_output = output_dir
     _should_publish = (
         _nas_output_dir is not None
-        and "strict_ok" in run_list
+        and ("strict_ok" in run_list or _output_staging)
+        and not args.stop_after
         and output_dir.exists()
     )
     if _should_publish and failed:
@@ -7601,7 +7779,26 @@ def main() -> int:
         from pipeline_utils import publish_output_versioned, write_publish_manifest
         manifest_path = write_publish_manifest(output_dir)
         print(f"  Publish manifest: {manifest_path}")
-        if publish_output_versioned(output_dir, _nas_output_dir):
+        if "strict_ok" in run_list:
+            _published = publish_output_versioned(output_dir, _nas_output_dir)
+        else:
+            # In pipelined no-reference mode the CLI output target is the
+            # batch-local handoff directory, not a versioned NAS root.  The
+            # latter is uploaded by streaming_pipeline after this subprocess
+            # returns, so use an ordinary local copy here instead of the
+            # versioned-publish safety gate.
+            import shutil as _publish_shutil
+            _target = Path(_nas_output_dir)
+            if (_target.exists() and any(_target.iterdir())
+                    and not args.overwrite):
+                print(f"  Refusing non-empty local publish target: {_target}")
+                _published = False
+            else:
+                _target.mkdir(parents=True, exist_ok=True)
+                _publish_shutil.copytree(output_dir, _target,
+                                         dirs_exist_ok=True)
+                _published = True
+        if _published:
             print(f"  Published and verified: {_nas_output_dir}")
             _final_output = _nas_output_dir
         else:

@@ -369,6 +369,12 @@ def process_one(stem: str, ctc_dir: Path, audio_dir: Path,
         if src.exists():
             shutil.copy2(src, out_dir / f"{stem}{suffix}")
 
+    # Preserve the producer receipt alongside adjusted anchors for MFA axis
+    # validation of the same CTC/audio namespace.
+    receipt = ctc_dir / ".ctc_run_receipt.json"
+    if receipt.is_file():
+        shutil.copy2(receipt, out_dir / receipt.name)
+
     stats["stem"] = stem
     return stats
 
