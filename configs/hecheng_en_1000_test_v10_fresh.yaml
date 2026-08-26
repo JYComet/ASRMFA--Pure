@@ -1,0 +1,69 @@
+# Fresh v10 full-route validation for the fixed v7/v9 1000-stem selection.
+mode: nvrasr_fallback
+reference_mode: authority
+require_fresh_workspace: true
+
+data_dir: /mnt/Raw/新版合成英文数据
+workspace: /mnt/nvme3/mfa_workspace_1000test_fresh_20260824_v10
+output_dir: /mnt/Raw/0805test_v10
+output_staging: true
+keep_16k_audio: true
+temp_dir: /tmp/mfa_temp_v10
+models_dir: /mnt/local_E/MFA_Pause/repo/models/mfa
+
+pad_silence:
+  enabled: true
+  target_edge_silence_sec: 0.5
+
+ctc_prealign:
+  enabled: true
+  python: /home/user/miniconda3/envs/asr/bin/python
+  model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
+  device: cuda:0
+  limit: 0
+  selection_manifest: configs/hecheng_en_1000_test_v10_selection_manifest.json
+  selection_stems_sha256: e22f9d2ea067ef7e9bfa3abbe6fe36d594e8197a10eaddc02536c025be91357b
+  timeout: 14400
+  nvv_enabled: false
+  reference_nvv_enabled: true
+
+ctc_adjust:
+  enabled: true
+
+mfa:
+  num_jobs: 64
+  single_speaker: true
+  output_format: long_textgrid
+  clean: false
+  no_tokenization: true
+  skip_validate: true
+  fine_tune: false
+  beam: 20
+  retry_beam: 80
+  allow_partial: true
+  min_output_ratio: 0.99
+  timeout: 7200
+
+mfa_en:
+  enabled: true
+  strict_provenance: true
+  num_jobs: 16
+  padding_ms: 50
+  min_segment_dur_ms: 200
+  max_gap_merge_s: 0.35
+  beam: 10
+  retry_beam: 40
+  fine_tune: false
+  acoustic_model: /mnt/local_E/MFA_Pause/pretrained_models/acoustic/english_us_arpa.zip
+  dictionary: dict/cmudict.dict
+  g2p_model: /mnt/local_E/MFA_Pause/pretrained_models/g2p/english_us_arpa.zip
+
+postprocess:
+  strict_ok: true
+  merge_silence: true
+  min_sil_merge_sec: 0.2
+  fix_short_word: false
+  detect_bgm: false
+  filter_suspicious: false
+  enable_text_correction: true
+  handle_unexpected_sil: false

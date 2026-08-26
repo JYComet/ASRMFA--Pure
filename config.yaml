@@ -81,7 +81,7 @@
 #   num_jobs: 4             # parallel MFA jobs for English segments
 #   normalize_workers: 0    # parallel workers for English token normalisation (0=auto)
 #   corpus_workers: 0       # parallel workers for English corpus building (0=auto)
-#   padding_ms: 50          # audio padding around English segments
+#   padding_ms: 75          # audio padding around English segments
 #   min_segment_dur_ms: 200 # skip segments shorter than this (use G2P split)
 #   max_gap_merge_s: 0.35   # max gap between consecutive English words to merge
 #   beam: 10                # MFA Viterbi beam width

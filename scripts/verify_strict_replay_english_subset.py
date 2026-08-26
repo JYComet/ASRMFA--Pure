@@ -44,6 +44,9 @@ ALIGNMENT_SUBSET_V2_SCHEMA = "strict-replay-english-alignment-subset-v2"
 ALIGNMENT_SUBSET_V21_SCHEMA = "strict-replay-english-alignment-subset-v2.1"
 PRODUCER_REVISION = "strict-replay-english-producer-v4.2.1"
 FINAL_EVIDENCE_SCHEMA = "strict-replay-final-evidence-v1"
+STRICT_ENGLISH_SCHEMA = "strict-en-mfa-v2"
+HISTORICAL_STRICT_ENGLISH_SCHEMA = "strict-en-mfa-v1"
+CANONICAL_ENGLISH_UNITS_SCHEMA = "canonical-english-units-v1"
 HISTORICAL_SCHEMAS = {"strict-en-mfa-v1", "strict-replay-english-subset-v1"}
 
 
@@ -156,6 +159,61 @@ def _load_subset(receipt: dict, errors: list[str]) -> dict | None:
         errors.append("historical-v1-as-v2 or unknown English subset schema")
         return None
     return subset
+
+
+def _v2_english_ledger_errors(payload: object, label: str, *,
+                              stem: str | None = None,
+                              require_segments: bool = False) -> list[str]:
+    """Return contract failures for current English ledger evidence.
+
+    The direct verifier must not treat a v1 ledger wrapped in a v2 import as
+    fresh evidence.  Segment/word bindings are checked when a real ledger
+    payload is available; metadata-only direct fixtures can still exercise
+    the import boundary without manufacturing MFA output.
+    """
+    errors: list[str] = []
+    if not isinstance(payload, dict):
+        return [f"{label} is not an object"]
+    if payload.get("schema") != STRICT_ENGLISH_SCHEMA:
+        errors.append(f"{label} schema is not {STRICT_ENGLISH_SCHEMA}")
+    if payload.get("canonical_units") != CANONICAL_ENGLISH_UNITS_SCHEMA:
+        errors.append(f"{label} canonical unit binding missing")
+    if stem is not None and payload.get("stem") not in (None, stem):
+        errors.append(f"{label} stem mismatch")
+    segments = payload.get("segments")
+    if segments is None and not require_segments:
+        return errors
+    if not isinstance(segments, list):
+        errors.append(f"{label} segments missing")
+        return errors
+    for index, segment in enumerate(segments):
+        if (not isinstance(segment, dict)
+                or segment.get("canonical_units") != CANONICAL_ENGLISH_UNITS_SCHEMA):
+            errors.append(f"{label} segment {index} canonical unit binding missing")
+            continue
+        words = segment.get("words")
+        if not isinstance(words, list):
+            errors.append(f"{label} segment {index} words missing")
+            continue
+        for word_index, word in enumerate(words):
+            if (not isinstance(word, dict)
+                    or word.get("canonical_binding") != CANONICAL_ENGLISH_UNITS_SCHEMA):
+                errors.append(f"{label} word {index}:{word_index} canonical unit binding missing")
+    return errors
+
+
+def _v2_english_manifest_errors(payload: object, label: str) -> list[str]:
+    """Return contract failures for the current English parent manifest."""
+    errors: list[str] = []
+    if not isinstance(payload, dict):
+        return [f"{label} is not an object"]
+    if payload.get("schema") != STRICT_ENGLISH_SCHEMA:
+        errors.append(f"{label} schema is not {STRICT_ENGLISH_SCHEMA}")
+    if payload.get("canonical_units") != CANONICAL_ENGLISH_UNITS_SCHEMA:
+        errors.append(f"{label} canonical unit binding missing")
+    if payload.get("strict_provenance") is not True:
+        errors.append(f"{label} strict provenance missing")
+    return errors
 
 
 def _within(root: Path, candidate: Path) -> bool:
@@ -271,7 +329,7 @@ def _verify_english_import_v21(path: Path, *, replay_path: Path | None = None) -
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return [f"v2.1 English import unreadable:{exc}"]
-    exact = {"schema", "scope", "run_id", "timestamp_utc", "canonical_manifest_path", "canonical_manifest_sha256",
+    exact = {"schema", "scope", "english_schema", "canonical_units", "run_id", "timestamp_utc", "canonical_manifest_path", "canonical_manifest_sha256",
              "replay_import_manifest_path", "replay_import_manifest_sha256", "selection_slot_records", "selection_slot_count", "selection_slot_digest",
              "source_stems", "source_count", "source_digest", "exclusion_records", "exclusion_count", "exclusion_digest", "excluded_stems", "excluded_count", "excluded_digest",
              "eligible_stems", "eligible_count", "eligible_digest", "english_required_stems", "english_required_count", "english_required_digest",
@@ -281,6 +339,10 @@ def _verify_english_import_v21(path: Path, *, replay_path: Path | None = None) -
         return ["v2.1 English import exact field set mismatch"]
     if payload["schema"] != ENGLISH_IMPORT_V21_SCHEMA or payload["scope"] != "strict_replay":
         errors.append("v2.1 schema/scope mismatch")
+    if payload["english_schema"] != STRICT_ENGLISH_SCHEMA:
+        errors.append("v2.1 English provenance schema mismatch")
+    if payload["canonical_units"] != CANONICAL_ENGLISH_UNITS_SCHEMA:
+        errors.append("v2.1 canonical English units binding missing")
     if any(key.startswith("selected_") and not key.startswith("selection_slot_") for key in payload):
         errors.append("selected legacy field present")
     if any(key in payload for key in ("dictionary_sha256", "dictionary_path")):
@@ -373,13 +435,29 @@ def _verify_english_import_v21(path: Path, *, replay_path: Path | None = None) -
         errors.append("subset/parent path hash invalid")
     try:
         subset = json.loads(subset_path.read_text(encoding="utf-8")); parent_payload = json.loads(parent_path.read_text(encoding="utf-8"))
-        if subset.get("schema") != ALIGNMENT_SUBSET_V21_SCHEMA or parent_payload.get("schema") != "strict-en-mfa-v1": errors.append("subset/parent schema mismatch")
+        if subset.get("schema") != ALIGNMENT_SUBSET_V21_SCHEMA:
+            errors.append("subset/parent schema mismatch")
+        errors.extend(_v2_english_manifest_errors(parent_payload, "parent English manifest"))
         pg = subset.get("parent_global_manifest", {})
         if pg.get("authoritative_source", {}).get("path") == pg.get("workspace_copy", {}).get("path"): errors.append("parent roles swapped")
     except (OSError, ValueError, json.JSONDecodeError): errors.append("subset/parent JSON unreadable")
     records = payload["records"]
     if [r.get("stem") for r in records if isinstance(r, dict)] != payload["english_entries_stems"] or len(records) != 18:
         errors.append("records membership/order mismatch")
+    for record in records:
+        if not isinstance(record, dict):
+            errors.append("v2.1 record malformed")
+            continue
+        stem = record.get("stem")
+        if record.get("status") != "english_required":
+            errors.append(f"v2.1 record status invalid:{stem}")
+        if record.get("schema") != STRICT_ENGLISH_SCHEMA:
+            errors.append(f"v2.1 record schema invalid:{stem}")
+        if record.get("canonical_units") != CANONICAL_ENGLISH_UNITS_SCHEMA:
+            errors.append(f"v2.1 record canonical unit binding missing:{stem}")
+        ledger = record.get("ledger")
+        errors.extend(_v2_english_ledger_errors(
+            ledger, f"v2.1 ledger metadata:{stem}", stem=stem))
     return sorted(set(errors))
 
 
@@ -390,7 +468,7 @@ def _verify_english_import_v2(path: Path, *, replay_path: Path | None = None) ->
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return [f"v2 English import unreadable:{exc}"]
     exact = {
-        "schema", "scope", "run_id", "timestamp_utc", "canonical_manifest_path", "canonical_manifest_sha256",
+        "schema", "scope", "english_schema", "canonical_units", "run_id", "timestamp_utc", "canonical_manifest_path", "canonical_manifest_sha256",
         "replay_import_manifest_path", "replay_import_manifest_sha256", "selection_slot_records", "selection_slot_count", "selection_slot_digest",
         "source_stems", "source_count", "source_digest", "exclusion_records", "exclusion_stems", "exclusion_count", "exclusion_digest",
         "eligible_stems", "eligible_count", "eligible_digest", "english_required_stems", "english_required_count", "english_required_digest",
@@ -405,6 +483,10 @@ def _verify_english_import_v2(path: Path, *, replay_path: Path | None = None) ->
         if not isinstance(payload, dict): return errors
     if payload.get("schema") != ENGLISH_IMPORT_V2_SCHEMA or payload.get("scope") != "strict_replay":
         errors.append("v2 English import schema/scope mismatch")
+    if payload.get("english_schema") != STRICT_ENGLISH_SCHEMA:
+        errors.append("v2 English provenance schema mismatch")
+    if payload.get("canonical_units") != CANONICAL_ENGLISH_UNITS_SCHEMA:
+        errors.append("v2 canonical English units binding missing")
     if payload.get("producer_revision") != PRODUCER_REVISION:
         errors.append("v2 producer revision mismatch")
     if any(key.startswith("selected_") and key not in {"selection_slot_records", "selection_slot_count", "selection_slot_digest"} for key in payload):
@@ -491,8 +573,9 @@ def _verify_english_import_v2(path: Path, *, replay_path: Path | None = None) ->
         errors.append("parent English manifest path/hash invalid")
     try:
         subset = json.loads(subset_path.read_text(encoding="utf-8")); parent = json.loads(parent_path.read_text(encoding="utf-8"))
-        if subset.get("schema") != ALIGNMENT_SUBSET_V2_SCHEMA or parent.get("schema") != "strict-en-mfa-v1":
+        if subset.get("schema") != ALIGNMENT_SUBSET_V2_SCHEMA:
             errors.append("parent/subset schema mismatch")
+        errors.extend(_v2_english_manifest_errors(parent, "parent English manifest"))
         if (subset.get("parent_manifest_path") != str(parent_path)
                 or subset.get("parent_manifest_sha256") != payload.get("parent_english_manifest_sha256")
                 or subset.get("parent_manifest_copy_sha256") != payload.get("parent_english_manifest_sha256")):
@@ -509,10 +592,22 @@ def _verify_english_import_v2(path: Path, *, replay_path: Path | None = None) ->
         if not isinstance(record, dict) or record.get("stem") not in set(required or []) or record.get("status") != "english_required":
             errors.append("v2 record non-English/missing/excluded")
             continue
+        stem = record.get("stem")
+        if record.get("schema") != STRICT_ENGLISH_SCHEMA:
+            errors.append(f"v2 record schema invalid:{stem}")
+        if record.get("canonical_units") != CANONICAL_ENGLISH_UNITS_SCHEMA:
+            errors.append(f"v2 record canonical unit binding missing:{stem}")
         workspace = _absolute_role(rpaths.get("workspace"), "workspace", errors) if isinstance(rpaths, dict) else None
         ledger = record.get("ledger")
+        if not isinstance(ledger, dict):
+            errors.append(f"v2 ledger metadata missing:{stem}")
+            continue
+        if ledger.get("schema") != STRICT_ENGLISH_SCHEMA:
+            errors.append(f"v2 ledger schema invalid:{stem}")
+        if ledger.get("canonical_units") != CANONICAL_ENGLISH_UNITS_SCHEMA:
+            errors.append(f"v2 ledger canonical unit binding missing:{stem}")
         try:
-            if workspace is None or not isinstance(ledger, dict) or Path(ledger["path"]).is_absolute() or ".." in Path(ledger["path"]).parts:
+            if workspace is None or Path(ledger["path"]).is_absolute() or ".." in Path(ledger["path"]).parts:
                 raise ValueError("ledger path role")
             ledger_path = workspace / ledger["path"]
             if ledger_path.is_symlink() or not ledger_path.is_file() or not _within(workspace, ledger_path) or _sha256(ledger_path) != ledger.get("sha256"):
@@ -527,6 +622,10 @@ def _verify_english_import_v2(path: Path, *, replay_path: Path | None = None) ->
                 source_path = workspace / rel
                 if source_path.is_symlink() or not source_path.is_file() or not _within(workspace, source_path) or _sha256(source_path) != source.get("sha256"):
                     raise ValueError("source TextGrid hash/path")
+            ledger_payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+            errors.extend(_v2_english_ledger_errors(
+                ledger_payload, f"v2 ledger payload:{stem}",
+                stem=stem, require_segments=True))
         except (KeyError, TypeError, ValueError, OSError) as exc:
             errors.append(f"v2 record evidence invalid:{record.get('stem')}:{exc}")
     return sorted(set(errors))
@@ -1141,8 +1240,13 @@ def verify(receipt_path: Path, output_dir: Path | None = None) -> list[str]:
         if stem not in selected_stems:
             errors.append(f"English ledger stem outside canonical subset:{stem}")
         schema = record.get("schema")
-        if schema in HISTORICAL_SCHEMAS:
-            errors.append(f"historical-v1 ledger used as current-v2:{stem}")
+        if schema != STRICT_ENGLISH_SCHEMA:
+            if schema == HISTORICAL_STRICT_ENGLISH_SCHEMA:
+                errors.append(f"historical-v1 ledger used as current-v2:{stem}")
+            else:
+                errors.append(f"current-v2 ledger schema invalid:{stem}")
+        if record.get("canonical_units") != CANONICAL_ENGLISH_UNITS_SCHEMA:
+            errors.append(f"current-v2 ledger canonical unit binding missing:{stem}")
         source = record.get("path", record.get("source"))
         try:
             ledger_path = _ordinary_file(source, roots)
@@ -1150,10 +1254,9 @@ def verify(receipt_path: Path, output_dir: Path | None = None) -> list[str]:
             if not isinstance(declared, str) or _sha256(ledger_path) != declared:
                 errors.append(f"English ledger hash mismatch:{stem}")
             ledger_payload = json.loads(ledger_path.read_text(encoding="utf-8"))
-            if ledger_payload.get("schema") in HISTORICAL_SCHEMAS:
-                errors.append(f"historical-v1 ledger payload:{stem}")
-            if ledger_payload.get("stem") not in (None, stem):
-                errors.append(f"English ledger stem payload mismatch:{stem}")
+            errors.extend(_v2_english_ledger_errors(
+                ledger_payload, f"English ledger payload:{stem}",
+                stem=stem, require_segments=True))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             errors.append(f"English ledger missing/unreadable:{stem}")
     # A current-v2 English subset may contain only the selected stems that

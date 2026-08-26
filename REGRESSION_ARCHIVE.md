@@ -141,10 +141,69 @@
 | 130 | 2026-08-12 | streaming_pipeline.py, launch_8gpu.py, launch_multi_gpu.sh | 批量 GPU/CPU 资源未统一规划，旧分片入口可能竞争 strict artifacts |
 | 131 | 2026-08-12 | run_pipeline.py, pad_silence_edges.py | 分 speaker 子目录的 pre-CTC WAV 被根目录扫描漏掉，54k 任务在 pad_silence 阶段误报空分母 |
 | 132 | 2026-08-12 | run_pipeline.py, ctc_prealign.py, pipeline_utils.py, postprocess_textgrids.py | 先前 MFA 对齐失败问题的统一根因、修复链路与验收索引 |
+| 133 | 2026-08-14 | postprocess_textgrids.py, audit_strict_ok.py | RIA-262 filtered evidence-constrained recovery (mfa_unknown/short geometry/overlap) |
+| 134 | 2026-08-14 | scripts/run_pipeline.py, tests/test_filtered_recovery_package.py | filtered recovery audio-axis transform receipt localization |
+| 135 | 2026-08-14 | scripts/streaming_pipeline.py | no-reference fix03 threshold and conservation acceptance |
+| 136 | 2026-08-15 | scripts/run_pipeline.py, scripts/ctc_prealign.py, scripts/postprocess_textgrids.py, scripts/audit_strict_ok.py | reference/无参考模式显式隔离 |
+| 137 | 2026-08-18 | scripts/run_pipeline.py, tests/test_run_pipeline_normalize_ria.py | normalize_ria partial bundle evidence |
+| 138 | 2026-08-18 | scripts/streaming_pipeline.py, tests/test_streaming_resources.py | GPU staging transient NAS copy retries |
+| 139 | 2026-08-18 | scripts/run_pipeline.py, scripts/filtered_recovery_package.py, scripts/streaming_pipeline.py, scripts/recover_ctc_labs.py, tests/fixtures/strict_replay_english/ | 012871 K-Pop canonical English v2 consumer contract |
+| 140 | 2026-08-18 | scripts/postprocess_textgrids.py, scripts/audit_strict_ok.py, tests/test_boundary_punctuation_display_regressions.py, tests/test_postprocess_recovery_geometry.py | publication/display boundary ownership reconciliation |
+| 141 | 2026-08-18 | scripts/postprocess_textgrids.py, scripts/audit_strict_ok.py, scripts/verify_strict_ok.py, tests/test_postprocess_recovery_geometry.py, tests/test_align_english_mfa_canonical_units.py | SOS run-local pronunciation consumer and APP negative canary |
+| 142 | 2026-08-18 | scripts/pipeline_utils.py, scripts/run_pipeline.py, scripts/streaming_pipeline.py, scripts/ctc_prealign.py | path/checkpoint/publication fail-closed boundaries |
+| 143 | 2026-08-18 | configs/hecheng_ria_ok100_authority.selection.json, configs/hecheng_ria_ok100_authority.yaml, scripts/audit_authority_ok100.py, tests/test_authority_publication_contract.py | authority ok 100-stem selection and fresh publication audit |
+| 144 | 2026-08-18 | scripts/run_pipeline.py, tests/test_run_pipeline_subset_denominator.py | ctc_ready explicit subset denominator propagation |
+| 145 | 2026-08-18 | scripts/run_pipeline.py, configs/hecheng_ria_ok100_authority.yaml, tests/test_run_pipeline_subset_denominator.py | fresh-only subset workspace and stale fast-path rejection |
+| 146 | 2026-08-18 | scripts/english_units.py, scripts/align_english_mfa.py, scripts/postprocess_textgrids.py, tests/test_english_units.py, tests/test_align_english_mfa_canonical_units.py, tests/test_hyphenated_postprocess_provenance.py | authority alpha+digit English units |
+| 147 | 2026-08-18 | /mnt/nvme3/mfa_workspace_54k_ok100_authority_validation_v9 | authority ok100 v9 end-to-end validation and fail-closed outcome |
+| 148 | 2026-08-19 | scripts/postprocess_textgrids.py, tests/test_authority_publication_contract.py, tests/test_postprocess_geometry.py, tests/test_boundary_punctuation_display_regressions.py | authority publication evidence envelope, phone lineage, and transactional punctuation |
+| 149 | 2026-08-19 | /mnt/nvme3/mfa_workspace_54k_ok100_authority_validation_v11 | v11 real 100-stem verification after authority-owner repair |
+| 150 | 2026-08-19 | scripts/postprocess_textgrids.py, tests/test_authority_publication_contract.py, tests/test_boundary_punctuation_display_regressions.py | owner-aware phone repair, explicit internal-sp policy, and punctuation-loss tolerance |
+| 151 | 2026-08-19 | /mnt/nvme3/mfa_workspace_54k_ok100_authority_validation_v12 | v12 rerun after end-to-end punctuation compatibility fix |
+| 152 | 2026-08-20 | scripts/postprocess_textgrids.py, tests/test_postprocess_geometry.py | CTC 主锚点最终屏障、相邻边界补偿与双向标点静音归属 |
+| 153 | 2026-08-20 | scripts/audit_strict_ok.py, scripts/audit_authority_ok100.py, README.md | raw/work/processed lineage audit and frozen publication geometry |
+| 154 | 2026-08-20 | scripts/postprocess_textgrids.py, scripts/audit_authority_ok100.py, tests/test_authority_publication_contract.py | processed boundary outside raw CTC span must not be a publication veto |
+| 155 | 2026-08-20 | scripts/postprocess_textgrids.py, tests/test_postprocess_geometry.py | 宽 CTC 标点 anchor 应吸收局部长静音但不得吞掉后续词 |
+| 156 | 2026-08-20 | scripts/postprocess_textgrids.py, tests/test_postprocess_geometry.py | 已存在的标点被延长词边界覆盖后必须恢复 |
+| 157 | 2026-08-20 | scripts/postprocess_textgrids.py, tests/test_authority_publication_contract.py | 标点缺失不得被重复字符贪心匹配误报为错位 |
+| 158 | 2026-08-20 | scripts/postprocess_textgrids.py, tests/test_postprocess_geometry.py, tests/test_authority_publication_contract.py, tests/test_boundary_punctuation_display_regressions.py | 部分标点投影必须增量恢复且保持幂等 |
+| 159 | 2026-08-21 | scripts/postprocess_textgrids.py, tests/test_postprocess_geometry.py, tests/test_ctc_artifact_versions.py | 最终视觉静音 owner 必须由能量决定且只能提交一次 |
+| 160 | 2026-08-21 | scripts/postprocess_textgrids.py, tests/test_postprocess_geometry.py, README.md | `<sp1>` 必须遵循最终 visual words 双向 energy owner 语义 |
+| 161 | 2026-08-21 | scripts/postprocess_textgrids.py, tests/test_postprocess_geometry.py, README.md | 内部 `<sp1>` 强制 owner 与末标点尾静音归属 |
+| 162 | 2026-08-21 | scripts/english_units.py, scripts/align_english_mfa.py, scripts/postprocess_textgrids.py, scripts/audit_strict_ok.py, scripts/audit_authority_ok100.py, 相关 English/authority/postprocess tests | authority English compound split cascades into reference and derived tiers |
+| 163 | 2026-08-21 | scripts/postprocess_textgrids.py, tests/test_postprocess_word_energy.py, README.md | 静音合并后的词能量稀释与证据归属 |
+| 164 | 2026-08-21 | scripts/pipeline_utils.py, scripts/postprocess_textgrids.py, tests/test_pipeline_utils_audio.py, tests/test_hyphenated_postprocess_provenance.py, README.md | authority reference Arabic numerals leak into English projection |
+| 165 | 2026-08-21 | scripts/run_pipeline.py, tests/test_run_pipeline_subset_denominator.py, README.md | `ctc_prealign.limit` 未冻结 pre-CTC pad/MFA 分母 |
+| 166 | 2026-08-21 | scripts/english_units.py, scripts/postprocess_textgrids.py, scripts/audit_strict_ok.py, tests/test_hyphenated_postprocess_provenance.py | authority 占位符数字的 hanzi/semantic projection 被花括号阻断 |
+| 167 | 2026-08-21 | configs/hecheng_en_1000_test.yaml | 参考文本模式 1000 条 fresh replay 最终验证 |
+| 168 | 2026-08-21 | CTC_RAW_MANIFEST, CTC_WORK_RECEIPT, output/_provenance/english | 手工重跑 strict-ok 时的生命周期/证据目录污染 |
+| 169 | 2026-08-24 | scripts/postprocess_textgrids.py, scripts/audit_strict_ok.py, tests/test_postprocess_recovery_geometry.py, tests/test_authority_publication_contract.py | CTC/MFA 首个英文词 `<unk>` 的 ordinal recovery 与 publication contract 脱节 |
+| 170 | 2026-08-24 | scripts/ctc_prealign.py, scripts/adjust_ctc_boundaries.py, scripts/align_english_mfa.py, scripts/pipeline_utils.py | 英文单帧 CTC 锚点被错误发布为最终词边界 |
+| 171 | 2026-08-24 | scripts/run_pipeline.py, scripts/ctc_processed_geometry.py, scripts/ctc_prealign.py, scripts/adjust_ctc_boundaries.py, scripts/postprocess_textgrids.py, scripts/audit_strict_ok.py, tests/test_audit_sp3.py | 1000 条复跑耗时过长、严格审计误判最终层级 |
+| 172 | 2026-08-24 | scripts/ctc_processed_geometry.py, scripts/adjust_ctc_boundaries.py, scripts/postprocess_textgrids.py, scripts/pipeline_utils.py, scripts/align_english_mfa.py, scripts/run_pipeline.py | Wave 4 geometry/publication/artifact/freshness contract 收口与 v10 运行暴露的缓存回归 |
+| 173 | 2026-08-25 | scripts/run_pipeline.py, tests/test_run_pipeline_subset_denominator.py | corrected CTC work root cold-resume receipt owner isolation |
+| 174 | 2026-08-25 | scripts/run_pipeline.py, tests/test_run_pipeline_subset_denominator.py | frozen pre-CTC selection scoped resume fingerprint |
+| 175 | 2026-08-25 | scripts/english_units.py, scripts/postprocess_textgrids.py, scripts/audit_strict_ok.py, 相关 English provenance/recovery tests | strict English noncontiguous source span requires marked processed-token binding |
+| 176 | 2026-08-25 | scripts/ctc_processed_geometry.py, tests/test_ctc_english_units.py, tests/test_align_english_mfa_canonical_units.py | acoustically validate declared long-pause boundaries after canonical English |
+| 177 | 2026-08-25 | scripts/run_pipeline.py, scripts/align_english_mfa.py, tests/test_ctc_artifact_versions.py, tests/test_run_pipeline_subset_denominator.py, tests/test_align_english_mfa_canonical_units.py | isolated English replay, authoritative resume axis, and bounded singleton MFA retry |
+| 178 | 2026-08-25 | scripts/postprocess_textgrids.py, tests/test_postprocess_geometry.py, tests/test_align_english_mfa_canonical_units.py, README.md | final internal silence label normalization after owner commit and before geometry freeze |
+| 179 | 2026-08-25 | scripts/streaming_pipeline.py, tests/test_streaming_publication_contract.py, configs/laria_v5_no_reference_8gpu_20260825.yaml | pipelined multi-batch publication plus frozen-source validation and single-worker GPU launch safety |
+| 180 | 2026-08-25 | scripts/postprocess_textgrids.py, 相关 geometry/no-reference tests | no-reference NVV、内部静音和最终 geometry 的批量假阳性 |
+| 181 | 2026-08-25 | scripts/streaming_pipeline.py, tests/test_streaming_publication_contract.py | GPU fallback producer 被 CPU consumer 错换成 ctc_ready mode |
+| 182 | 2026-08-25 | scripts/streaming_pipeline.py, configs/laria_v5_no_reference_strict_8gpu_20260825.yaml, tests/test_streaming_publication_contract.py | batch evidence orphan recovery、发布诊断和 config/cache 输出身份漂移 |
+| 183 | 2026-08-25 | scripts/postprocess_textgrids.py, scripts/run_pipeline.py, scripts/audit_strict_ok.py, scripts/streaming_pipeline.py, English/axis/publication tests | no-reference strict English provenance 与 authority strict-ok 错误耦合 |
+| 184 | 2026-08-26 | scripts/postprocess_textgrids.py, tests/test_laria_bgm_ctc_gap.py | no-reference BGM 候选必须由精确 CTC gap 支持 |
+| 185 | 2026-08-26 | scripts/streaming_pipeline.py, tests/test_streaming_publication_contract.py | staged/普通八卡批次成功不得绕过 dataset 聚合与 COMPLETE receipt |
+| 186 | 2026-08-26 | scripts/postprocess_textgrids.py, tests/test_laria_fallback_mapping.py | no-reference unknown recovery 的 exact ordered single-consumption projection 与 ordinal-safe NVV restoration |
+| 187 | 2026-08-26 | scripts/align_english_mfa.py, config.yaml, tests/test_align_english_mfa_canonical_units.py | English 精确 150ms clip 的 sample-domain eligibility 与 75ms context |
+| 188 | 2026-08-26 | scripts/run_pipeline.py, tests/test_laria_mfa_retry_contract.py, tests/test_single_process_mfa_partition.py | single-process MFA missing retry 必须保留精确 CTC anchor |
+| 189 | 2026-08-26 | scripts/postprocess_textgrids.py, tests/test_laria_fallback_mapping.py | fallback English unknown 仅由 exact correspondence 加 strict English ledger 赎回 |
+| 190 | 2026-08-26 | scripts/streaming_pipeline.py, tests/test_streaming_publication_contract.py | staged dataset finalize 的单一 owner，禁止 staged/streaming 双重提交 |
+| 191 | 2026-08-26 | configs/laria_v5_no_reference_strict_8gpu_20260826_v12.yaml, production receipts | LAria v12 八卡无参考生产验收：1055 条守恒、English/NVV provenance 与真实 BGM 过滤 |
 
 ### 索引完整性与非 Case 章节
 
-截至 2026-08-12，Case 索引已覆盖 Case 1–132，每个编号各出现一次；Case 标题与正文
+截至 2026-08-26，Case 索引已覆盖 Case 1–191，每个编号各出现一次；Case 标题与正文
 均可按同一编号定位。除 Case 条目外，文档还包含以下纳入索引范围的专题章节：
 
 | 章节 | 内容 |
@@ -8782,3 +8841,2172 @@ filtered-recovery regressions: 8 PASS
 
 状态：历史 MFA 问题已统一登记；对应代码修复和专项回归已通过，等待最新 GPU 主管线
 重新运行验收。
+
+---
+
+## Case 133: RIA-262 filtered evidence-constrained recovery (mfa_unknown/short geometry/overlap)
+
+**日期**: 2026-08-14
+**涉及文件**: `scripts/postprocess_textgrids.py`, `scripts/audit_strict_ok.py`,
+`tests/test_postprocess_recovery_geometry.py`
+
+本条只记录 `/mnt/nvme3/mfa_workspace_ria_xinzeng_20260813_hyphenfix/strict_ok_runs/20260813T144340Z_1364496`
+的 filtered 候选证据规则；不改变 ledger/config/run schema，也不把 filtered 文件直接视为发布结果。
+
+### Unknown source：只允许 initial-Mira proof
+
+`<unk>` 只有在以下字段全部由磁盘证据绑定时才可被标记为 redeemed：source words
+中恰好一个 unknown、lexical ordinal 为 0、左右紧邻 `<eps>`；CTC ordinal 0 是
+`Mira` 且与 source interval 有实际重叠；reference semantic ordinal 与最终 English
+owner 都是 `Mira`；CTC token、reference ordinal、final semantic sequence、English
+ledger word/sha256 和 verified provenance 均写入
+`mfa-unknown-recovery-proof-v1`。多个 unknown、非首 unknown、CTC 重排、缺失或 hash
+不一致 ledger、source/CTC 矛盾均保持 hard failure。strict audit 会重新读取 source、CTC、
+reference 和 ledger 验证 proof；report marker 本身没有豁免权。
+
+### Short word / tier gap：双证据且不降低阈值
+
+修复仅接受 source MFA 与 CTC 都支持的局部词序，并要求每个 source/CTC word duration
+均为至少 30 ms。局部边界必须只有一个单调解；CTC boundary 是首选，若权威标点使其
+低于 30 ms，只允许使用确定的 30 ms floor clamp，不使用全局 tolerance 或 blanket
+midpoint。verified English phones 不移动，CTC anchors、NVV/tone、`<sp1>`、punctuation
+保持权威。无法得到唯一解的 short/gap 继续进入 filtered。
+
+530–800 ms 的低能量 source-epsilon internal `mid_sp` 不属于该 repair lane，继续保留并
+过滤。
+
+### Overlap candidate decision table
+
+| stem | source/CTC order | decision |
+|---|---|---|
+| `000240` | agree | repair one local boundary |
+| `000314` | agree | repair one local boundary |
+| `001776` | agree | repair one local boundary with explicit floor guard |
+| `001802` | agree | repair one local boundary |
+| `000407` | conflict/reordered local ownership | retain filtered |
+
+Overlap repair只读取上述四个 allowlisted stem；其他 stem 不使用 midpoint 或全局 overlap
+修复。回归覆盖 multiple/non-first unknown、missing/mismatched ledger、reordered CTC、
+source/CTC `<30 ms`、true internal `mid_sp` 和 `000407` source/CTC conflict。
+
+**状态**：代码和 focused regression 已完成；需在新的隔离 strict run 中重新生成 report，
+再由 strict audit 验证 proof 后才能统计 recovery 数量或发布结果。
+
+## Case 134: filtered recovery audio-axis transform receipt localization
+
+**日期**: 2026-08-14
+**涉及文件**: `scripts/run_pipeline.py`, `tests/test_filtered_recovery_package.py`
+
+第一次 RIA-262 隔离回放将全部 259 个 artifact-only stem 标记为
+`tts_audio_axis_mismatch`。原因不是音频损坏，而是 recovery package 没有导入父级
+MFA input-axis 行引用的 resample transform receipt，回放时无法证明
+`padded_audio`（原始采样率）到 `audio_16k`（MFA 轴）的合法关系。
+
+修复要求父级 input-axis 行、父级 padded/MFA 音频、transform receipt 的路径、hash、
+采样率、帧数和时长全部一致；只把 receipt 的 input/output 路径局部化到新的 quarantine，
+不重新生成或伪造 receipt。缺失、越界、符号链接、hash/metadata/path 不匹配均
+fail-closed。正常全量、参考文本和无参考文本模式不改变。
+
+### 隔离回放结果
+
+新的 quarantine：`/tmp/recovery_ria262_20260814_v2`
+
+| 项目 | 结果 |
+|---|---:|
+| frozen | 262 |
+| artifact-only replay | 259 |
+| MFA-axis retry | 0（3 条缺少 producer evidence） |
+| recovered | 15 |
+| still filtered | 247 |
+| independent strict audit | 15 ok / 247 rejected |
+| parent hashes | unchanged |
+| published | false |
+
+15 条恢复结果全部通过独立 strict audit；其余 247 条仍按
+`mfa_unknown_source`、`pp_tier_gaps`、`mid_sp`、`short_word`、
+`words_tier_gaps`、`overlapping_words` 或 `missing_mfa_alignment` 保留过滤，
+没有通过降低阈值或关闭完整性检查来赎回。
+
+**验证**：相关回归 `57 passed`，`compileall`、`git diff --check`、recovery
+`validate-only` 均通过；没有写入父级 workspace、NAS 或已发布结果。
+
+## Case 135: no-reference fix03 threshold and conservation acceptance
+
+**日期**: 2026-08-14
+**运行目录**: `/mnt/nvme3/mfa_runs/shayi_huali_noref1000_20260814_fix03`
+**冻结 manifest SHA256**: `28005987adf4e788bc2504d5857ae8622d850b559ac1b2443fa1513c9142caa5`
+
+修复前历史 baseline 为 `39/1000`，历史 counterfactual threshold 为 `516`。fix03 使用
+以下精确命令执行 fresh no-reference run：
+
+```text
+/home/user/miniconda3/envs/asr/bin/python scripts/streaming_pipeline.py --config /mnt/nvme3/mfa_runs/shayi_huali_noref1000_20260814_fix03/resolved_config.yaml --batch-cache /mnt/nvme3/mfa_runs/shayi_huali_noref1000_20260814_fix03/batch_1000.cache.json --pipelined --gpus 8 --cpu-workers 48 --batch-size 500 --parallel-datasets 2 --limit 1000 --no-resume
+```
+
+### Fix03 结果
+
+| dataset | result |
+|---|---:|
+| 纱依 | 294/500 |
+| 花礼 | 252/500 |
+| total | 546/1000 = 54.6% |
+
+全部阈值通过：total `546 >= 516`、纱依 `294 >= 282`、花礼 `252 >= 234`。
+fix01/fix02 为只读且保持不变；fix02 在 boundary fix 前为 `283/226 = 509`。
+
+### Conservation and output evidence
+
+- `output ∩ filtered = 0`；reports `1000/1000` closed。
+- 未发现 `reference_semantic_sequence_mismatch`、`cjk_token_count_mismatch` 或
+  `reference_cjk_count_mismatch`；`text_order.in_order=false` 为 `0`。
+- `546` 个 outputs 均包含 `raw_text`、`pinyin`、`pinyin_phones`、`hanzi`、`words`
+  和 `<sp1>`。
+
+### Root cause and fix boundary
+
+根因链为 no-reference fallback authority-contract gap，加上 cross-word boundary 的
+internal-gap ownership defect。fix03 收紧 fallback contracts，并要求 same-word gap
+detection 的两个端点都严格位于同一个 content word 内。Reference mode 仍由 paired
+tests 和既有 reference authority tests 覆盖。
+
+## Case 136: reference/无参考模式显式隔离
+
+**日期**：2026-08-15
+**涉及文件**：`scripts/run_pipeline.py`, `scripts/ctc_prealign.py`,
+`scripts/postprocess_textgrids.py`, `scripts/audit_strict_ok.py`
+**状态**：已修复，已完成 focused regression；未启动新的生产全量任务。
+
+### 根因
+
+`nvrasr_fallback` 是管线阶段名，不等于文本权威模式。旧逻辑在每个 stem 上自动
+查找 `.txt`，因此无参考任务中若混入旧 `.txt`，CTC、后处理和 strict audit 可能分别
+把同一批次的一部分当成 authority，另一部分当成 ASR fallback。无参考后处理的
+`text_order` 检查还可能读取 `original_txt_dir`，把权威文本约束带入 ASR-only 输出。
+
+### 修复
+
+- 新增顶层 `reference_mode: authority|fallback|auto`，并由 `run_pipeline.py` 解析后
+  同时传给 CTC、postprocess 和 strict audit；旧配置无该字段时保留 `auto` 兼容路径。
+- `authority`：缺少参考文本直接失败，不允许静默退回 ASR。
+- `fallback`：CTC inventory、postprocess reference lookup 和 strict audit 均忽略
+  incidental/stale reference TXT，只使用 ASR 或 `.lab` fallback evidence。
+- all-GPU CTC 子进程继承同一策略；accounting receipt 记录 `reference_mode`。
+- fallback 的 `text_corrected`/`text_order` 只在已有安全 fallback lexical evidence、
+  零位移且共同结构完整时通过；authority 的严格语义/数量约束不放宽。
+- 已明确标注 `shayi_huali` 为 `fallback`，RIA/合成参考文本配置为 `authority`。
+
+### 验证
+
+`tests/test_no_reference_mode_compat.py` 与相关回归集合计 `113 passed`；
+`verify_reference_authority.py`、`verify_strict_ok.py`、`compileall` 和
+`git diff --check` 均通过。覆盖了 incidental reference、authority 缺失参考、
+CTC fallback inventory、strict report 绑定、all-mode boundary 以及旧 `auto` 兼容。
+
+## Case 137: normalize_ria partial bundle evidence
+
+**日期**：2026-08-18
+**涉及文件**：`scripts/run_pipeline.py`, `tests/test_run_pipeline_normalize_ria.py`
+
+`normalize_ria` 遇到单个 CTC bundle 的真实 token 错误（例如零时长 interval）时，
+在 `mfa.allow_partial=true` 下将 `(stem, reason)` 写入
+`ctx["ctc_normalize_ria_failures"]` 并返回 0，使后续 postprocess/filtering 能够隔离
+该 stem；`allow_partial=false` 仍返回 1。RIA 合并算法和正常 bundle 转换不变。
+
+## Case 138: GPU staging transient NAS copy retries
+
+**日期**：2026-08-18
+**涉及文件**：`scripts/streaming_pipeline.py`, `tests/test_streaming_resources.py`
+
+GPU 预取阶段的 regular audio `copy2` 与文本 `link_or_copy_file` 现在各自使用 3 次
+有限重试，等待时间递增（0.05s、0.10s）；最终失败仍 fail-closed，并记录 stem、源路径、
+目标路径和异常。失败汇总分母改为音频与文本的总任务数，避免出现 `N/0` 诊断。CTC、MFA
+和过滤逻辑不变。
+
+## Case 139: 012871 K-Pop canonical English v2 consumer contract
+
+**日期**：2026-08-18
+**涉及文件**：`scripts/run_pipeline.py`, `scripts/filtered_recovery_package.py`,
+`scripts/streaming_pipeline.py`, `scripts/recover_ctc_labs.py`,
+`tests/fixtures/strict_replay_english/`
+
+012871 的回归边界固定为：参考文本中的 `K-Pop` 只生成一个 canonical English
+unit；CTC/MFA consumer 只接受一个 MFA word；该词的 English evidence 只允许对应
+一个 `strict-en-mfa-v2` ledger record，并由最终 TextGrid 的 `K-Pop` owner 持有。
+连字符不能被拆成 `K`/`Pop` 两个 owner，也不能以 pinyin 或词典猜测替代 MFA
+evidence。
+
+当前成功链必须同时有 `strict-en-mfa-v2` 和
+`canonical-english-units-v1` binding；缺失或篡改 canonical contract、manifest、
+ledger hash、replay/recovery path 都 fail closed。`strict-en-mfa-v1` 产物保持历史/不
+兼容，不原地迁移；English pronunciation dictionary 必须是本次 run-local 文件并由
+SHA-256 绑定，不能回读旧生产目录词典。无参考路径不适用 English provenance 时仍
+保持兼容，但一旦出现 English lexical output 就重新进入上述 v2 门槛。
+
+## Case 140: publication/display boundary ownership reconciliation
+
+**日期**：2026-08-18
+**涉及文件**：`scripts/postprocess_textgrids.py`, `scripts/audit_strict_ok.py`,
+`tests/test_boundary_punctuation_display_regressions.py`,
+`tests/test_postprocess_recovery_geometry.py`
+
+这是 W2 历史问题的 W3 publication/display 收口。`52697` 的 CTC-only 末尾句号覆盖
+了显式 tail silence；reference punctuation removal 不能因此丢掉 axis-closing
+`<sp1>`，也不能把 `huan1` 延伸到 `1.0`。`16735` 的 `，` 和 `！` 只能拥有各自
+相邻 lexical owner 之间的 local gap，`bei4`/`xu4` 保持原结束边界，`！` 后的 edge
+remainder 保持 canonical silence。`16806` 的 520ms substantive interior pause
+保持 `<sp2>`，并因 strict interior SP 进入 filtered，而不是被伪装成 lexical owner。
+
+生产路径现在在 punctuation/reference reconciliation 与 derived-tier sync 处统一
+补齐 axis、按 `AXIS_EPS` 处理 axis residual；30 ms 只是候选上限，只有 source/CTC
+lexical ownership 证明相邻 span contiguous/overlapping、且没有 source silence 或
+reference punctuation owner 时才吸收 mechanical frame residual。证据缺失则保留 gap，
+规范 `silence_label(duration)`，并由
+words 派生 hanzi 的同边界/同静音标签。独立 audit 另外拒绝 coverage hole、overlap、
+words/hanzi count/boundary 或 silence/punctuation/English label split，并验证已有
+phone 均落入恰好一个 owner。当前后处理不会仅按小于 30 ms 吸收 direct lexical gap；
+无证据的 10/20 ms gap 与 30.000 ms 及以上的 interior silence 一样保留并 filter。
+Case 20/22/25
+是历史末尾标点/重叠修复证据；Case 35/39
+是历史 words gap/MFA frame residual 证据；Case 58/66 是历史 mixed-decision 与
+derived-tier desync 证据；Case 127 是历史 K-Pop/reference projection 证据；139 是
+历史 canonical English consumer 证据。它们不是本次 synthetic fixture 的替代品：
+本条使用 52697/16735/16806 synthetic geometry tests 验证当前 publication contract。
+
+## Case 141: SOS run-local pronunciation consumer and APP negative canary
+
+**日期**：2026-08-18
+**涉及文件**：`scripts/postprocess_textgrids.py`, `scripts/audit_strict_ok.py`,
+`scripts/verify_strict_ok.py`, `tests/test_postprocess_recovery_geometry.py`,
+`tests/test_align_english_mfa_canonical_units.py`
+
+W1 producer 已写入 `sos-exact-override-v1`。W3 consumer 现在独立绑定
+`policy_id`、`expected_pronunciation == actual_source_sequence ==
+(EH2,S,OW2,EH1,S)`、record/ledger dictionary provenance 与 run-local dictionary
+SHA-256，并检查 source/ledger phone ordinals；旧、缺失、重排、tampered SOS 均
+fail-closed。APP 的 exact `(AE1,P)` 作为 negative canary，伪造第二个 `P` 不能通过。
+普通 K-Pop canonical-v2 owner/phone contract 保持不变。
+
+Case 20/22/25/35/39/58/66/127/139 在本条只作为 historical forensic evidence
+分类，不重新解释为当前生产结果；Case 140/141 的新增检查是 synthetic/focused
+tests。当前没有重新运行任何 MFA/GPU/NVASR 或 production pipeline，也没有把历史运行
+目录当作本次发布证据。
+
+## Case 142: path/checkpoint/publication fail-closed boundaries
+
+**日期**：2026-08-18
+**涉及文件**：`scripts/pipeline_utils.py`, `scripts/run_pipeline.py`,
+`scripts/streaming_pipeline.py`, `scripts/ctc_prealign.py`
+
+输入路径现在先做词法分类再映射或执行文件系统探测：POSIX、相对路径、反斜杠相对
+路径、Windows 盘符和两种 UNC 形式不再在 Linux 上发生隐式 workspace 解析；未映射
+UNC/盘符以及 `.git`/仓库根 workspace fail-closed。Streaming 损坏 checkpoint 不再
+静默清空为“未完成”，上传 staging 在写完成状态前逐文件验证 size/SHA-256。all-GPU
+合并锁使用原子创建，子进程保留外层 `CUDA_VISIBLE_DEVICES` 的物理 token；已有
+模式、postprocess 五阶段和 reference authority 语义不变。
+
+本次 correction 将 checkpoint 升级为 `streaming-checkpoint-v2`：规范化 dataset/batch
+identity、input manifest digest、resolved config digest 和可用 model identity 均在写入
+与 resume 时比较；旧 schema、输入重排以外的输入变化、配置/模型变化均给出 recovery
+required，而不是清空进度。无剩余 dataset 的 batch entrypoint 现在返回成功状态；CLI
+仍映射为 `0/1`。Focused coverage 位于
+`tests/test_streaming_checkpoint_contract.py`。
+
+all-GPU merge 的 dictionary update 现在先写入并验证 sibling candidate，再以旧 output
+与旧 dictionary 的 recoverable backup 执行提交；output/dictionary publish 故障会
+quarantine 新候选并恢复旧 pair，避免 live output 与共享 dictionary 分离。Focused
+fault-injection coverage 位于 `tests/test_ctc_dictionary_transaction.py`，覆盖成功
+提交及两类 publish failure。
+
+## Case 143: authority `ok` 100-stem selection and fresh publication audit
+
+**日期**：2026-08-18
+**涉及文件**：`configs/hecheng_ria_ok100_authority.selection.json`,
+`configs/hecheng_ria_ok100_authority.yaml`, `scripts/audit_authority_ok100.py`,
+`tests/test_authority_publication_contract.py`
+
+旧的 canary 选择曾取历史 bundle 的 lexicographic first 100，不能证明 reference
+含有独立英文单词 `ok`。当前选择先在只读历史 `_ref.txt` 中用大小写不敏感的 ASCII
+边界 `(?<![A-Za-z])ok(?![A-Za-z])` 筛选，再在 2,385 个完整候选中按固定 seed
+`authority-ok100-20260818-v1` 的 SHA-256 顺序选 100；seed、排序、候选数、manifest
+摘要和完整 artifact 模式都写入清单。配置中的 100 个 stems 与清单逐项一致。
+CTC receipt 的 source audio binding 是 `/mnt/nvme3/mfa_workspace_54k_fresh/padded_audio`；
+配置和 audit 必须使用该 root，不能把历史 `audio_16k` 当作同一音频轴。
+
+`audit_authority_ok100.py` 对每条输入 reference 再做一次 exact token 检查；缺少
+`ok`、缺少 audio/CTC/reference 文件或 MFA/English/CTC/publication ownership 证据时
+形成结构化 reason，并禁止进入 published verdict。它同时要求 output/filtered 对固定
+100 条完全守恒且不存在“发布但证据不一致”。该 selection 与历史目录是 forensic
+证据；必须在新隔离 workspace 产生 fresh output/filtered 后才能作为当前验证，未启动
+54k 全量或生产 MFA/GPU/NVASR。
+
+## Case 144: ctc_ready explicit subset denominator propagation
+
+**日期**：2026-08-18
+**涉及文件**：`scripts/run_pipeline.py`,
+`tests/test_run_pipeline_subset_denominator.py`
+
+显式 `ctc_ready.stems` 或 `stem_range` 现在在 link 后冻结为 `ctx.expected_stems`、
+`accounting_eligible_stems` 和 source-audio mapping。resample 不再从完整 `data_dir`
+的 `scandir`/`rglob` 回退读取 54k WAV，而是逐个构造冻结 stem 的 source path；receipt、
+MFA transform/axis、MFA、postprocess 和 strict-ok 继续消费同一分母。输出 `audio_16k`
+仍执行 exact 100-stem namespace 校验，额外或缺失文件都会 fail-closed。普通未筛选
+路径保留原有 full namespace contract；回归测试覆盖 full source + explicit subset、
+receipt stem 集合、额外 source stem、旧 54k `mfa_audio`/link manifest 污染以及
+未冻结分母时拒绝 resample fallback。ok100 authority 配置现固定使用全新的
+`/mnt/nvme3/mfa_workspace_54k_ok100_authority_validation_v9` workspace/output 根，
+旧 v2/v3/v4 或历史 workspace 不会被 fast-path 复用。
+
+## Case 145: fresh-only subset workspace and stale fast-path rejection
+
+**日期**：2026-08-18
+**涉及文件**：`scripts/run_pipeline.py`,
+`configs/hecheng_ria_ok100_authority.yaml`,
+`tests/test_run_pipeline_subset_denominator.py`
+
+ok100 配置切换到 `_v9` 隔离 workspace，并声明 `require_fresh_workspace: true`；
+显式 subset 运行若目标 workspace 已存在即 fail-closed。link fast-path 会比较已有
+manifest 与显式 selector，并拒绝额外 CTC stems；即使 `--overwrite` 也不会把旧 54k
+CTC namespace 当作可复用输入。resample 在 `ctc_ready_subset` 没有冻结
+`expected_stems` 时拒绝全目录 fallback，并对已有 `audio_16k` 执行 exact subset
+namespace 检查，额外 WAV 进入失败而非发布。
+
+## Case 146: authority alpha+digit English units
+
+**日期**：2026-08-18
+**涉及文件**：`scripts/english_units.py`, `scripts/align_english_mfa.py`,
+`scripts/postprocess_textgrids.py`, `tests/test_english_units.py`,
+`tests/test_align_english_mfa_canonical_units.py`,
+`tests/test_hyphenated_postprocess_provenance.py`
+
+权威文本中的 `target1`/`target2` 是两个独立 surface unit，分别绑定不同的
+`en-uXXXX` ordinal，但使用字典可查的 alpha 基础 token `target` 对齐。CTC 的
+`target` + `1` 只有在有序、连续且数字为最后片段时才合并；`jin1`/`rui4` 等有限
+拼音 tone token 不进入 English 单位。后处理仅在同一 reference unit 的相邻 lexical
+owners 上合并，silence、标点、pinyin 或不完整证据均保持分裂并 fail-closed。当前条目
+由 synthetic/focused tests 验证，不代表历史或生产 MFA 重跑结果。
+
+## Case 148: authority publication evidence envelope, phone lineage, and transactional punctuation
+
+**日期**：2026-08-19
+**涉及文件**：`scripts/postprocess_textgrids.py`,
+`tests/test_authority_publication_contract.py`, `tests/test_postprocess_geometry.py`,
+`tests/test_boundary_punctuation_display_regressions.py`
+
+v9 forensic run
+`/mnt/nvme3/mfa_workspace_54k_ok100_authority_validation_v9/strict_ok_runs/20260818T115348Z_2255295`
+报告了 CTC boundary 92、phones owner 99、strict interior SP 86、punctuation ownership 84；
+006035 的代表链为 comma `1.17-1.29`、`!` `2.135-2.61`、首个 period
+`5.54-6.395`、末 period `7.53-7.6347`，其中 `7.13-7.53` 保持为未解释的
+`<sp1>`。
+
+当前修复以 source MFA words、CTC lexical tokens 和（适用时）strict English span 的
+有序 ordinal envelope 作为 publication 证据；不再要求 final word 完全包含在单个 CTC
+interval 内。原始 MFA phones 在边界修改前绑定到唯一 source owner，并按 owner lineage
+affine 重建；cross-owner phone 保持 ambiguous veto，不使用 strongest-overlap 归属。
+权威标点按 reference lexical boundary、字符和 occurrence 原子匹配，只能裁剪相邻 lexical
+owners；无 finite local anchor 时不合成 gap timing，未覆盖 silence 保持 canonical SP。
+本条由 synthetic/current focused tests 验证，历史 v9 目录只作为 forensic evidence，
+没有宣称生产 MFA/GPU/NVASR 重跑。
+
+## Case 147: authority ok100 v9 end-to-end validation and fail-closed outcome
+
+**日期**：2026-08-18
+**运行目录**：/mnt/nvme3/mfa_workspace_54k_ok100_authority_validation_v9
+**run**：strict_ok_runs/20260818T115348Z_2255295
+**独立审计**：authority_ok100_audit.json
+
+使用 Case 143 冻结的100条样本、2,385个候选、固定 seed 和
+reference_mode: authority 完整执行 link → normalize → resample → Chinese MFA →
+English MFA → postprocess → strict-ok。显式 subset 分母在所有阶段保持100；CTC
+receipt 的历史哈希、子集 receipt 的100条输入/输出集合、音频根
+/mnt/nvme3/mfa_workspace_54k_fresh/padded_audio 及逐条音频 SHA 均通过审计。
+
+结果为 **0 published / 100 filtered / 0 missing**，output/filtered 完全守恒，独立
+authority audit 返回 ok=true。这不是把失败改成成功：100条中仍有 CTC lexical span
+越出源证据（92）、phones owner 不唯一（99）、strict interior sp（86）、参考标点
+ownership 不一致（84）等真实证据冲突，全部被隔离；没有任何不确定边界进入发布目录。
+另有1条 Chinese MFA 缺失对齐，按 partial accounting 单独进入 filtered；英文 partial
+manifest 的2个过短 segment 被计入拒绝分母，未污染其他 stem。
+
+本次修复的逻辑闭环包括：
+
+- strict English manifest 允许有完整分区和理由的 partial，但受影响 stem 仍逐条
+  fail-closed；无关 stem 可继续验证。
+- K-Pop、OK、APP、SOS 和 alpha+digit surface（target1/target2）均绑定 canonical
+  unit；数字后缀只有在权威文本、连续 CTC ordinal、完整时间覆盖共同证明时才合并，
+  有限拼音词（如 jin1/rui4）不会误判成英文。
+- 小 sp0 只有被连续 CTC lexical span 覆盖时才可吸收；长停顿、标点、无证据间隙
+  继续过滤。words/hanzi/phones/pinyin_phones 的 owner、顺序、覆盖和标点归属均是
+  独立发布门禁。
+- audit 不再错误地把100条子集 receipt 与历史54k receipt做字节级比较，而是分别
+  校验历史 provenance 和当前 subset lineage。
+
+验证：Case 146 新增聚焦测试46项通过；authority audit 通过守恒/证据审计。MFA
+进程仍打印仓库中既有损坏 models/mfa/command_history.yaml 的退出回调 warning，
+不影响 MFA 对齐结果，本次未修改该无关历史文件。
+
+## Case 149: v11 real 100-stem verification after authority-owner repair
+
+**日期**：2026-08-19
+**运行目录**：`/mnt/nvme3/mfa_workspace_54k_ok100_authority_validation_v11`
+**run**：`strict_ok_runs/20260819T064733Z_2526841`
+**独立审计**：`authority_ok100_audit.json`
+
+在 Case 148 的 evidence-envelope、phone-lineage 和 transactional punctuation 修复后，
+使用同一冻结的 100 条 authority 样本重新执行 link → resample → Chinese MFA → English
+MFA → postprocess → strict-ok。配置在运行后恢复为 v9 canary 配置；v11 是独立新目录，
+未覆盖历史产物。
+
+生产后处理契约的目标告警变化为：
+
+| reason | v9 基线 | v11 实跑 | 解释 |
+|---|---:|---:|---|
+| `ctc_lexical_boundary_outside_evidence` | 92 | 71 | 其余是 source MFA 与最终词无正交重叠的真实证据冲突，继续 fail-closed |
+| `phones_owner_mismatch` | 99 | 79 | 006035 已消除；其余无法由 source phone lineage 唯一重建 |
+| `strict_interior_sp` | 86 | 99 | 未被 authority 标点锚点覆盖的真实 pause 全部保留并过滤，不能吸收成词/标点 |
+| `reference_punctuation_ownership_mismatch` | 84 | 23 | authority anchor 可跨旧 MFA 边界裁剪相邻词；无局部证据的标点仍拒绝合成 |
+
+006035 的真实最终 words 几何验证为：
+
+- `，` 恢复为 `1.17–1.29`；
+- 首个 `。` 恢复为 `5.54–6.395`；
+- 末 `。` 保持 `7.53–7.6347`；
+- `7.13–7.53` 未被末标点锚点覆盖，仍为内部 `<sp1>` 并触发过滤；
+- `OK`、`shang4` 等相邻 owner 的 phone 不再产生 owner mismatch。
+
+v11 结果为 **0 published / 100 filtered / 0 missing**。独立审计返回
+`ok=true`，100 条守恒、CTC receipt/audio lineage 正确、无 published evidence mismatch。
+这证明修复改变了真实 owner/punctuation 几何并降低了级联告警；剩余告警表示无法从
+source MFA、CTC、参考标点和 phone lineage 同时证明的样本，不能通过放宽阈值或强行发布解决。
+
+## Case 150: owner-aware phone repair, explicit internal-sp policy, and punctuation-loss tolerance
+
+**日期**：2026-08-19
+**涉及文件**：`scripts/postprocess_textgrids.py`,
+`tests/test_authority_publication_contract.py`,
+`tests/test_boundary_punctuation_display_regressions.py`
+
+本次复核确认内部 `<sp>` 合并逻辑没有整体删除，但旧的通用吸收代码中存在硬编码跳过：
+`is_target = False` 和 `if True: continue` 使该分支永远不执行。该分支不能直接恢复为
+无条件合并，否则会把真实停顿吞进前一个词并造成词边界漂移。现在的明确契约是：
+
+- `<sp0>` 是无语义的微小残差，可以按现有 owner 逻辑合并；
+- 有标点证据的停顿只能由相邻、已接受的标点 owner 吸收；
+- 没有标点 owner 的内部 `<sp1>`–`<sp3>` 保留为显式 interval，并触发
+  `unexpected_silence`/`strict_interior_sp`，不再延长任意词；
+- 首尾静音仍可保留，不因其本身触发内部停顿过滤。
+
+phone 不再把跨词 phone 直接判成无 owner 或按 midpoint 强行切分。新 pass 会记录所有候选
+词及重叠时长；只有非静音 phone 在一个词内达到至少 55% 且比次优 owner 多至少 10% 时，
+才裁剪到该词边界。平局、弱多数、silence phone 或没有候选 owner 均保持原 interval，
+进入 publication contract 的 ambiguous veto，并在报告中保存 `candidate_owners`。
+
+权威标点过滤改为“reference 序列的子序列”规则：标点消失只记录为
+`missing_allowed`，不再单独过滤；标点顺序错误、标点异常增加、标签替换，或标点落在
+错误 lexical boundary，才触发 `reference_punctuation_ownership_mismatch`。因此“丢失”和
+“错位/增加”不再混为同一类。
+
+同一兼容规则已同步到 `assess_reference_coverage` 和独立 `audit_strict_ok`：后置语义门禁
+不会再次把“标点消失”升级成 `reference_semantic_sequence_mismatch`；词/字/NVV 的缺失、
+替换或顺序变化仍然拒绝。
+
+验证：新增 owner/punctuation/internal-sp 回归用例，聚焦测试 **43 passed**，全量测试
+**312 passed**。这次修改是逻辑约束和证据判定的修复，不是放宽数值阈值。
+
+## Case 151: v12 rerun after end-to-end punctuation compatibility fix
+
+**日期**：2026-08-19
+**复测目录**：`/mnt/nvme3/mfa_workspace_54k_ok100_authority_validation_v12`
+**输入证据**：v11 冻结的 100 条 authority 样本、MFA aligned、CTC bundle、English MFA
+provenance；本次只重跑 postprocess，没有重跑 MFA。
+
+首次 v12 复测发现 owner pass 的调用顺序错误，99 条均报未初始化变量；修正后重新执行。
+随后又发现前置 punctuation projection 虽允许标点消失，`assess_reference_coverage` 和独立
+`audit_strict_ok` 仍使用全语义序列相等，导致后置门禁再次拒绝丢失标点；已同步改为只允许
+跳过 reference punctuation，词、字、NVV、英文顺序变化仍拒绝。
+
+最终复测结果：99 条有 MFA 对齐的样本全部进入 `filtered/`，0 条进入 `output/`；第
+`047714_弹幕互动_回应恶意攻击` 条仍是原有 `missing_mfa_alignment`，没有被伪造输出。
+核心统计如下：
+
+| reason | v12 | 说明 |
+|---|---:|---|
+| `strict_interior_sp` / `mid_sp` | 99 | 内部真实停顿全部保留并过滤 |
+| `phones_owner_mismatch` | 78 | 545 个明确 owner 的 phone 已修复，其余为平局/静音/无 owner |
+| `ctc_lexical_boundary_outside_evidence` | 71 | 仍无法由 source+CTC 双证据证明 |
+| `reference_punctuation_ownership_mismatch` | 0 | 标点消失不再触发；本批无标点增加或错位 |
+| `reference_semantic_sequence_mismatch` | 5 | 均为英文/词序等真实语义错乱，不是单纯标点消失 |
+
+验证：聚焦测试 **65 passed**，全量测试 **313 passed**，编译和 `git diff --check` 通过。
+
+## Case 152: CTC 主锚点最终屏障、相邻边界补偿与双向标点静音归属
+
+**日期**：2026-08-20
+**涉及文件**：`scripts/postprocess_textgrids.py`、
+`tests/test_postprocess_geometry.py`
+**复测报告**：`/tmp/mfa_ctc_primary_v20/output/postprocess_report.jsonl`
+
+本次深入审查确认，问题不在“CTC 结果整体不可靠”，而在后处理链存在多处二次写入：
+`_snap_to_ctc` 的单词决策被相邻 overlap clamp、energy refine、punctuation restore、
+late overlap repair 或 derived-tier sync 重新改写；最后 publication contract 又用原始
+MFA span 复核，导致已经落在 CTC span 内的词仍被报告为越界。典型表现是前词沿用 MFA
+末端后，当前词的 CTC 起点被推迟，`fan4` 被压缩成 10ms；以及 `OK/app/SOS` 的后续
+phone/word owner 发生漂移。
+
+修复后的不可覆盖契约如下：
+
+- CTC lexical token 是跨词 word-level anchor。MFA 只参与“近距离时是否保留 speech
+  evidence”的选择，并作为被接受词内 phone 的比例/affine 时间来源；MFA 偏移过大时，
+  使用 CTC span，不再因 MFA 无 overlap 而失败。
+- 相邻词冲突不再把 `current.start` 粗暴推到旧的 `previous.end`。有序 CTC spans 保留
+  CTC gap；重叠 CTC spans 在两 anchor 的 midpoint 分界；必要时同时修正上下两个词，
+  并更新 `resolved_span` 和 `boundary_source`。最终 geometry barrier 会恢复最后一次
+  已接受的 CTC/MFA 决策，后续阶段不能覆盖它。
+- 所有新建/重建 words tier 复制 authority metadata；publication contract 在 metadata
+  丢失时仍可由“无 MFA overlap + 有 CTC overlap”推断 CTC ownership，避免 tier 替换造成
+  的假阴性/假过滤。
+- phone lineage 改为 verified/partial 两级：真实 lexical phone 跨源词界仍然拒绝，
+  不按最大 overlap 猜 owner；歧义 silence phone 只保留落在最终 silence/标点 owner 的
+  片段，穿过 lexical word 的部分不写回，避免旧 phone 几何造成成批 owner mismatch。
+- 标点相邻的 `<spN>` 双向归属：`punct—sp` 和 `sp—punct` 都合并到标点；严格位于两个
+  lexical owner 之间的 sp 不合并，继续触发 `strict_interior_sp`。该规则在最终参考文本
+  restore 后只执行一次，避免“后面再次恢复标点”重新制造 stale sp，也避免完整 sync
+  重新打开 CTC/MFA 仲裁。
+- “标点消失”仍不触发 publication veto；标点顺序、归属边界或异常增加才过滤。真实
+  `ctc_lexical_sequence_mismatch`、无 CTC 覆盖、lexical phone 无唯一 owner、word-in-
+  silence 和 strict interior sp 继续 fail-closed，不能用数值阈值伪修复。
+
+使用 v11 同一批 99 条 MFA/CTC/reference 输入，在 reference-authority 模式下重跑后处理，
+没有重跑 MFA：
+
+| reason | v12 原统计 | 修复后 v20 | 处理 |
+|---|---:|---:|---|
+| `ctc_lexical_boundary_outside_evidence` | 71 | 2 | 仅保留 CTC 对该词也无覆盖的真实错配 |
+| `phones_owner_mismatch` | 78/81（历史口径） | 10 | 只保留无法证明唯一 lexical owner 的 phone |
+| `strict_interior_sp` | 99 | 32 | 标点相邻 sp 已归标点，词间真实 pause 仍过滤 |
+| `mid_sp` | 99 | 32 | 同上，不再把标点两侧 pause 当作孤立 owner |
+| `short_word` | 2/11（不同修复阶段） | 6 | 保留真实 CTC/MFA 无法证明的极短词 |
+
+最终为 **20 published / 79 filtered / 0 missing**；20 条 published 的
+`publication_contract.reasons` 全为空。过滤不是失败掩盖，而是把剩余真实证据冲突隔离：
+`unexpected_silence` 75、`word_in_silence` 14、CTC sequence mismatch 7、英文 provenance
+rejected 7、phone owner mismatch 10 等。所有 output/filtered 样本均可按 report 逐条追溯。
+
+验证：新增/更新回归测试 **40 passed**，全量测试 **317 passed**。本条修复的是决策来源、
+生命周期和最终发布契约，未通过修改固定时长或放宽过滤阈值制造通过结果。
+
+## Case 153: raw/work/processed lineage audit and frozen publication geometry
+
+**日期**：2026-08-20
+**涉及文件**：`scripts/audit_strict_ok.py`、`scripts/audit_authority_ok100.py`、
+`README.md`
+
+本次审计复核的根因是：生产链已经把 CTC 分成 immutable `ctc_pretg`、mutable
+`ctc_pretg_adj` 和最终 processed words，但独立 audit 仍主要检查目录中的当前文件和
+report status，未重新证明三段之间的 identity/digest/物理副本关系；同时，report 中的
+processed geometry/operation ledger 与最终 TextGrid 的 words interval 没有形成独立的
+published-span binding。这样一来，raw 文件被替换、work receipt 脱链、raw/work 共享
+inode，或旧 `resolved_span` 被误当成最终 publication authority 时，可能只留下表面上
+“status=ok”的自报信息。
+
+修复边界只在两个 audit 和文档层：
+
+- 一旦发现任一 raw manifest/work receipt marker，strict 和 authority audit 都要求
+  raw manifest identity、逐文件 SHA-256、producer receipt、work receipt lineage、
+  raw/work 不共享 inode、work transform ledger，以及 work receipt 的 raw path/digest/
+  identity 全部成立；任意 raw digest/identity mismatch 都对候选集 fail-closed。没有
+  marker 的历史单目录 synthetic fixture 保留兼容读取。
+- audit 重新读取最终 TextGrid，校验 report 的 `ctc_lifecycle`、
+  `processed_geometry_digest`、`processed_geometry.frozen`、operation ledger，并把
+  lexical proof 的 `word_span`/`published_span` 与最终 words geometry 逐项比较。只要
+  proof 退回旧 `resolved_span`，或 digest/freeze/ledger 不一致，就不能发布。
+- README 明确 `ctc_pretg=immutable raw`、`ctc_pretg_adj=mutable processed/work`、
+  `words=processed frozen geometry`，并记录 raw → work → processed 的 fail-closed
+  边界；旧 authority、MFA lineage、strict publication 和 output/filtered conservation
+  检查继续保留。
+
+验证：audit scripts `compileall`、`git diff --check` 及安全 focused audit/fixture checks
+通过；本条没有修改生产脚本或测试，也没有把历史 filtered 结果转成 published。
+
+## Case 154: processed boundary outside raw CTC span must not be a publication veto
+
+**日期**：2026-08-20
+**涉及文件**：`scripts/postprocess_textgrids.py`、`scripts/audit_authority_ok100.py`、
+`tests/test_authority_publication_contract.py`
+
+原先 publication contract 将最终 processed word 的边界强制限制在 raw CTC/MFA
+evidence envelope 内，并以 `ctc_lexical_boundary_outside_evidence` 过滤。该约束与
+当前生命周期设计冲突：CTC 只提供 lexical identity/order 和初始锚点，最终边界允许经过
+MFA 音素比例、能量、标点和 silence compensation 调整，不能再被 raw span 反向覆盖。
+
+修复后：
+
+- raw CTC/MFA span 仍检查存在、数值有效、词序和标点重叠；
+- processed word 可以位于 raw CTC/MFA span 外部；
+- span overlap、evidence envelope containment 和 source overlap 不再触发过滤；
+- CTC sequence mismatch、evidence missing、phone owner 冲突、标点归属冲突、内部 sp
+  等独立问题继续过滤；
+- `ctc_lexical_boundary_outside_evidence` 仅保留为历史报告兼容名，不再由新 publication
+  contract 产生。
+
+验证：authority publication tests 和全量 pytest 均通过。
+
+## Case 155: 宽 CTC 标点 anchor 应吸收局部长静音但不得吞掉后续词
+
+**日期**：2026-08-20
+**涉及文件**：`scripts/postprocess_textgrids.py`、`tests/test_postprocess_geometry.py`
+
+此前 `_restore_reference_punctuation()` 要求 CTC 标点 anchor 完全落在当前两个
+lexical owner 的 envelope 内。实际 CTC 标点的持续区间可以明显长于旧 MFA gap，例如
+`002226` 的 `。` anchor 为 `7.215–9.427`，其间包含当前句末长静音以及后续句子的
+lexical 区间。旧逻辑因 anchor 越过后续词而直接拒绝，导致参考文本中的标点没有进入
+最终 words tier，`<sp2>` 继续作为内部静音被过滤。
+
+修复后的 owner 规则是：
+
+- 宽 anchor 本身是合法 CTC evidence，不因超过旧 MFA gap 而拒绝；
+- 最终 publication owner 按参考文本中该标点两侧的相邻 lexical word 局部投影；
+- anchor 覆盖的当前局部 gap 全部归标点，包含长 `<spN>`；
+- anchor 如果越过右侧 lexical word，标点在右词起点处截断，后续词及其 phone 不被吞掉；
+- anchor 如果完全位于某个立即 lexical owner 内：有参考文本确认时按该参考边界裁剪 owner
+  并恢复标点；没有可靠参考归属、或实际落在非相邻 owner 内时仍拒绝，避免远处 anchor
+  在错误位置合成标点；
+- 末尾标点保留真实 anchor end，不再无条件延伸到 TextGrid 轴末端。
+
+新增回归覆盖宽 anchor、局部静音吸收、后续 lexical word 保留；相关 focused tests
+为 **46 passed**。
+
+使用 v11 同一批 99 条 MFA/CTC/reference 输入重新执行 postprocess（未重跑 MFA），
+`mid_sp`/`strict_interior_sp` 从原先 34 条降为 **19 条**。原先 17 个参考文本明确在
+两个 lexical owner 之间有标点的长静音中，**17 个全部**不再残留为内部 sp；剩余 19 个
+均属于参考边界没有可归属标点的内部停顿，继续由 strict QC 隔离。该复测的其他过滤项
+仍独立保留，未通过放宽总过滤门槛制造通过结果。
+
+## Case 156: 已存在的标点被延长词边界覆盖后必须恢复
+
+**日期**：2026-08-20
+**涉及文件**：`scripts/postprocess_textgrids.py`、`tests/test_postprocess_geometry.py`
+
+复现模式：参考文本为 `你，好`，CTC 标点 anchor 为 `， [0.40, 0.50]`，但 MFA/CTC
+边界补偿先把前词 `ni3` 延长到 `[0.00, 0.60]`。旧 `_inject_punctuation()` 在发现
+“词区间完整包含标点 anchor”时直接删除标点；随后 `_restore_reference_punctuation()`
+又要求 anchor 必须跨过旧词边界，因此也拒绝恢复，形成“原始有标点、最终被词顶掉”的
+双重丢失。
+
+修复规则：
+
+- 有参考文本确认且有局部静音证据的 CTC 标点优先于被延长的相邻词；不再在
+  word-contains-punct 分支删除标点，而是只把支撑 anchor 的静音替换为标点；
+- 恢复阶段允许 anchor 落在当前参考边界两侧的任一立即 lexical owner 内，但只有 anchor
+  与显式静音相交时才裁剪 owner；没有静音时保留原词和全部音素，不凭空补标点；
+- 仍拒绝越过非相邻词的远端 anchor；无参考文本的 CTC-only 标点仍不自动注入；
+- 标点恢复后由后续 derived-tier 重建同步 `words`、`hanzi`、`pinyin_phones`，避免
+  只修改显示文本而留下旧边界。
+
+新增回归覆盖：标点落在前词内部、标点落在后词内部，以及恢复阶段原标点已被删除的
+情况。相关 focused tests 为 **62 passed**。
+
+## Case 157: 标点缺失不得被重复字符贪心匹配误报为错位
+
+**日期**：2026-08-20
+**涉及文件**：`scripts/postprocess_textgrids.py`、
+`tests/test_authority_publication_contract.py`
+
+问题表现：publication contract 虽然已经规定“标点消失不触发过滤”，但旧投影逻辑
+从 reference 侧逐个寻找“后面第一个同字符标点”。当参考序列中有重复标点、而前面的
+标点被 CTC/MFA/静音处理吞掉时，后面仍保留的标点会被匹配到前一个同字符位置。例如：
+
+```text
+reference: ！ ， 。 。
+observed:  ！     。
+```
+
+旧逻辑会把 observed 的 `。` 绑定到第一个 `。`，同时制造错误的 boundary mismatch，
+甚至把本来合法的后一个 `。`列为 extra。这样“标点少了”被错误升级成了“标点错位/增加”。
+
+修复规则：
+
+- reference punctuation 与 observed punctuation 使用保持顺序的动态匹配；
+- 同字符重复出现时优先选择实际 lexical boundary 相同的 reference occurrence；
+- 未出现在 observed 中的 reference 标点只写入 `missing_allowed`，不触发
+  `reference_punctuation_ownership_mismatch`；
+- observed 标点无法由任意后续 reference occurrence 解释时才记为 `extra`；
+- observed 标点已能匹配但 lexical boundary 不同，或顺序无法保持时才记为
+  `boundary_errors` 并过滤；
+- 末尾标点的兼容恢复也必须先确认 CTC anchor 与显式尾部静音相交；没有静音时不再从
+  最后一个 voiced word 硬裁时长，避免音素减少或凭空增加标点；
+- `punctuation_local_owner_mismatch` 仍独立检查实际存在的标点是否跨越错误的 lexical
+  owner，因此不会因“标点缺失”触发。
+
+复测：使用 v11 同一批 100 条候选、同一批 MFA/CTC/reference 输入，仅重新执行
+postprocess。99 条有 MFA 结果中 **5 条通过、94 条过滤**，另 **1 条**因
+`missing_mfa_alignment` 无法处理。`reference_punctuation_ownership_mismatch` 从修复前
+的 **36 条降为 5 条**；剩余 5 条均有明确的 `boundary_errors`，没有 `missing_allowed`
+单独触发过滤。末尾无显式静音的强制裁剪路径也已关闭。专项回归 **52 passed**，全量测试
+**332 passed**。
+
+## Case 158: 部分标点投影必须增量恢复且保持幂等
+
+**日期**：2026-08-20
+**涉及文件**：`scripts/postprocess_textgrids.py`、
+`tests/test_postprocess_geometry.py`、`tests/test_authority_publication_contract.py`、
+`tests/test_boundary_punctuation_display_regressions.py`
+
+复现模式：reference 含多个标点，但当前 words projection 只保留其中一部分；旧
+`_restore_reference_punctuation()` 重建 lexical+silence+punctuation 列表，会删除已经
+正确存在的 occurrence，后续 canonicalization 又可能把局部静音重新 materialize 为
+`<spN>`。重复字符时，贪心匹配还会把后一个标点绑定到前一个 reference boundary。
+
+修复规则：
+
+- 以当前 words interval 列表为事务输入，保留所有已观察标点；只为 ordered missing
+  occurrence 增加局部标点，不删除 extra/wrong-boundary/non-local evidence；
+- CTC anchor 只能支持其参考边界内唯一显式局部静音；无 anchor 时仅允许把唯一精确
+  local gap 转成标点；没有显式 silence 时不裁剪 voiced lexical audio；
+- 真正无标点的 lexical pause、edge/tail silence、以及仅存在于 phones tier 的内部 hole
+  继续保留并交由严格过滤；
+- authority final commit 另行合并严格 lexical–`<sp0>`–lexical 的无 owner mechanical
+  gap，并同步 source `phones` 与 derived `pinyin_phones`；`<sp1>/<sp2>`、punctuation-
+  owned gap、edge silence、phone-hole/ambiguous overlap 均不处理；
+- `process_one` 只保留一次最终 authority commit，之后只从 frozen words 重建 derived
+  tiers；authority 路径不再运行 swallowed-punctuation 或 fixed-duration terminal carve。
+
+验证：focused geometry/publication/display/recovery tests **71 passed**；重复调用
+ resolver 的 words geometry digest 保持不变。全量测试 **341 passed**。
+
+使用 v11 同一批 100 条候选、同一 MFA/CTC 输入，在 fresh `/tmp` 目录按 v23 authority
+flags 复测：99 条有 MFA 结果中 **29 条通过、70 条过滤**，另 **1 条**因 MFA 缺失无法
+处理。最终 `mid_sp`/`strict_interior_sp` 从修复前的 **91/91 条**降为 **34/34 条**，
+内部静音区间从 216 个降为 38 个；剩余区间为 19 个 `<sp0>`、14 个 `<sp1>`、5 个
+`<sp2>`。其中 `<sp0>` 是配置关闭短静音合并后遗留的机械短间隔，长 `<sp1>/<sp2>`
+仍需按“有权威标点则归标点、无标点则保留并过滤”的规则继续区分，不能统一放宽门禁。
+
+对照实验开启旧的 `handle_unexpected_sil` 后，`<sp0>` 确实被合并，但长静音又产生
+`unexpected_silence`，通过数降至 3；因此简单切换开关不是最终方案，必须在 authority
+最终 owner commit 中单独处理 `<sp0>` 与 punctuation-owned `<spN>`。
+
+Correction verification：新增 synthetic regressions 验证 final owner commit 合并纯
+mechanical `<sp0>` 并同步 phones/pinyin_phones，同时保留 `<sp1>/<sp2>` 与标点拥有的
+gap；resolver 二次调用保持无变化。使用同一 v11 100-candidate authority 输入、fresh
+`/tmp/mfa-sp-owner-v25.SSUY8h` 和 v24 flags（含 `--reference-mode authority`、
+`--no-handle-unexpected-sil`）复测：99 条有 MFA 结果中 **32 条 ok、67 条 filtered**，
+另 **1 条 missing**。本次 final owner commit 记录 15 次 `<sp0>` merge；全部输出及
+filtered TextGrid 中剩余内部 `<sp0>/<sp1>/<sp2>` 为 **4/116/25**，长暂停仍按
+`mid_sp`/`strict_interior_sp` 过滤。aggregated filter reasons：
+`phones_owner_mismatch=45`、`word_in_silence=23`、`mid_sp=22`、
+`strict_interior_sp=22`、`english_provenance_rejected=7`、
+`ctc_lexical_sequence_mismatch=7`、`tier_desync=5`、
+`words_hanzi_bounds_mismatch=5`、`reference_semantic_sequence_mismatch=5`、
+`short_word=1`。
+
+Root 复核使用相同 authority flags 和新 fresh 目录
+`/tmp/mfa_sp_owner_root_v25.WAPOCR`，得到 **33 ok / 66 filtered / 1 missing**；
+与上一轮独立 v25 运行相差 1 条边界样本，但 `strict_interior_sp` 的标签分布一致：
+`<sp0>=4`、`<sp1>=14`、`<sp2>=5`。4 个残余 `<sp0>` 均未满足唯一 source silence/
+phone owner 条件，分别伴随 phone owner、word-in-silence 或 CTC/英文语义冲突，未被
+强行吞并。
+
+## Case 159: 最终视觉静音 owner 必须由能量决定且只能提交一次
+
+**日期**：2026-08-21
+**涉及文件**：`scripts/postprocess_textgrids.py`、`tests/test_postprocess_geometry.py`、
+`tests/test_ctc_artifact_versions.py`
+
+旧流程在 Phase 1、`handle_unexpected_silences()`、derived sync、energy refine 和
+authority commit 中重复消费同一段短静音；无论音频更接近哪一侧，authority pass 还会
+固定并入前词。这样 raw CTC span、最终 visual words、source phones 与 derived tiers
+可能互相指向不同边界，且二次运行会继续改变几何。
+
+修复后：
+
+- punctuation restore/adjacent absorption 完成后复制不可变 visual words snapshot，并
+  用 snapshot digest 作为 gap 坐标与 lexical owner；raw CTC/MFA span 不再反推最终 words；
+- 只有 lexical–`<sp0>`–lexical、非 edge、无 punctuation/reference/CTC owner、无
+  NVV、无 phone-hole/ambiguous lineage、音频完整覆盖且总时长严格小于
+  `min(merge_max_sil_sec, 0.2)` 的 gap 才进入 resolver；
+- 以 5ms RMS、`max(3*noise_floor, 0.001)`、连续三帧 active、左右 excess-energy mass、
+  50ms context ratio 和 55%/10% margin 共同决定 `merged_left` 或 `merged_right`；
+  50/50、54/46、低能量、全零、缺音频和所有结构性 owner 均 preserve；
+- 所有决策进入 `report["silence_merges"]`，实际 words mutation 只记录
+  `energy_short_sp_merge`；一次性重建 words 后由 freeze/lineage rebuild 同步 phones、
+  hanzi、pinyin_phones，保持 strict English/publication audit 与 raw/work CTC lifecycle；
+- `handle_unexpected_silences()` 变为诊断-only，`_absorb_tiny_gaps()` 只处理 AXIS_EPS
+  序列化残差，旧 fixed-left authority pass 停用，resolver 二次运行幂等。
+
+验证：geometry、authority publication、boundary display、CTC artifact focused tests
+共 **77 passed**；新增覆盖左右能量 owner、模糊/缺失音频、sp1/2/3、edge、punctuation、
+NVV、长暂停、raw CTC span 优先级、freeze/derived owner sync 与幂等性。
+
+Fresh authority 复测：使用 v11 冻结的同一批 100 条输入，仅重跑 postprocess，输出目录为
+`/tmp/mfa-visual-energy-Z6Ap3h`。99 条有 MFA 对齐，1 条 MFA 缺失；output/filtered
+分别为 **51/48**，文件守恒。最终 resolver 实际执行 **9 次合并**（`merged_left=5`、
+`merged_right=4`），其余 164 个静音决策保留。过滤原因计数为：
+`mid_sp=36`、`strict_interior_sp=36`、`word_in_silence=16`、
+`ctc_lexical_sequence_mismatch=7`、`english_provenance_rejected=7`、
+`tier_desync=5`、`words_hanzi_bounds_mismatch=5`、
+`reference_semantic_sequence_mismatch=5`、`short_word=1`。没有新增过滤类别；
+所有合并均记录左右词、能量质量、胜者份额、margin 和 visual digest。该结果证明
+静音不再固定并入前词，但长静音、标点 owner、phone hole 和证据冲突仍保持过滤。
+
+## Case 160: `<sp1>` 必须遵循最终 visual words 双向 energy owner 语义
+
+**日期**：2026-08-21
+**涉及文件**：`scripts/postprocess_textgrids.py`、`tests/test_postprocess_geometry.py`、
+`README.md`
+
+### 根因
+
+Case 159 的最终 resolver 已经从 immutable visual words snapshot 做一次 energy-owner
+提交，但候选入口仍只接受 `<sp0>`，并把配置上限硬截断为 `0.2s`。因此完整的
+`[0.2s, 0.5s)` `<sp1>` 即使配置意图允许，也会被标签门禁保留；与此同时，直接按
+标签放宽会绕过 pause duration、owner evidence 和音频能量保护。
+
+### 修复语义
+
+- 保持 `silence_label` 不变：`<sp0>` `<0.2s`、`<sp1>` `[0.2s, 0.5s)`、`<sp2>`
+  `[0.5s, 1.5s)`、`<sp3>` `>=1.5s`；候选 label 必须是 pure canonical label，且
+  与 gap 总时长的 `silence_label()` 一致。
+- `effective_max_sil_sec = min(configured_max_sil_sec, 0.5)`，并采用严格
+  `duration < effective_max_sil_sec`。默认 `0.2` 不改变历史行为；配置 `0.3` 只
+  允许 `[0.2s, 0.3s)`，配置 `0.5` 允许 `<0.5s` 的 `<sp1>`，恰好 `0.5s` 保留。
+- `<sp1>` 只复用 Case 159 已有的双向 5ms RMS、`3*noise floor` active floor、
+  连续三帧、左右 excess mass、55% winner share、10% margin 和 context ratio；
+  不因标签本身合并，也不恢复 fixed-left 或二次 geometry mutation。
+- lexical/non-edge/single-run label、punctuation/reference punctuation owner、NVV、
+  phone lineage hole/ambiguous、音频覆盖、低能量、平局和单帧失败均 fail-closed，
+  并在 `silence_merges` 报告中记录 label、duration、configured/effective max、
+  expected label、decision 与 reason。lexical CTC token overlap 不作为独立 veto，
+  继续交给既有 phone lineage 与双向能量 owner gate；CTC punctuation overlap 仍保留。
+
+### Case 160 correction boundary
+
+上述可配置 `<sp1>` admission 描述是 Case 160 当时的普通 energy-owner policy；对
+“有效内部 lexical–`<sp1>`–lexical”场景，后续 Case 161 的
+`forced_internal_sp1` policy supersedes max/开关/phone/audio preserve 结果。可靠双向
+能量仍决定左右方向；没有可靠方向时才使用 `forced_left_fallback`。Case 160 中既有
+sp0、punctuation/reference/CTC punctuation、NVV、edge、sp2/sp3 保护和 audit 历史事实
+保持不变。
+
+### 验证
+
+新增 geometry regressions 覆盖 `<sp1>` 左右 owner、默认/`0.3`/`0.5` 上限与
+`0.2`/`0.499999`/`0.5` 边界，低/零/模糊/单帧能量，punctuation/CTC/NVV/edge、
+phone hole/ambiguous、mixed label、duration mismatch、lexical CTC overlap、
+CTC punctuation negative、`<sp2>/<sp3>` 保护，以及
+幂等和 freeze/derived sync。geometry 单测为 `49 passed`；指定 focused 套件为
+`84 passed`；全量 `python -m pytest -p no:cacheprovider -q` 为 `353 passed`；
+`python -m compileall -q scripts tests` 与 `git diff --check` 均通过。未执行真实
+生产批量复测。
+
+随后使用同一 v11 authority 100 条输入、显式 `--merge-max-sil-sec 0.5` 做 fresh
+postprocess，输出为 `/tmp/mfa-sp1-energy-6cwagB`：99 条有 MFA 对齐，output/filtered
+为 **51/48**，另 1 条 MFA 缺失。共记录 173 个静音决策，其中 `<sp1>` 为 94 个；本批
+没有 `<sp1>` 被合并，原因是 79 个为 edge silence、6 个 phone hole、8 个没有连续
+active 能量、1 个能量平局。`<sp2>/<sp3>` 仍全部保留。已有 `<sp0>` 继续按左右能量
+合并 9 次（左 5、右 4）。该结果说明 `<sp1>` 已进入与 `<sp0>` 相同的 resolver，但
+真实样本没有足够证据时不会被强行吞并；过滤原因类别和其他 authority 门禁没有新增。
+
+为使用户原先运行的配置实际启用该策略，`configs/hecheng_ria_fresh.yaml` 和
+`configs/hecheng_ria_ok100_authority.yaml` 的 `min_sil_merge_sec` 已设为 `0.5`；其他
+配置保持原值，不做批量改写。
+
+## Case 161: 内部 `<sp1>` 强制 owner 与末标点尾静音归属
+
+**日期**：2026-08-21
+**涉及文件**：`scripts/postprocess_textgrids.py`、`tests/test_postprocess_geometry.py`、
+`README.md`
+
+### 根因
+
+Case 160 的 resolver 对 `<sp1>` 复用了普通 max、`merge_silence`、phone lineage 和
+音频能量 preserve gate；因此有效内部 `<sp1>` 在默认配置、低/零/缺音频、phone hole
+或 rejected lineage 时仍残留。另一方面，最终已有标点后的显式尾部静音会被视为 edge
+silence，导致 16735 的最后 `！` 没有成为尾部静音 owner；缺失标点的 52697/006035
+则必须继续保留尾静音，不能通过 CTC/reference-only anchor 合成 owner。
+
+### 修复语义
+
+- 在唯一 immutable visual words snapshot/commit 中识别末标点尾部：只有 snapshot 中
+  已存在的最后非静音 owner 是 punctuation，且其后直到 `words_tier.xmax` 只有连续
+  pure silence interval，才执行 `terminal_punctuation_tail_absorption`，扩展标点并
+  删除尾部静音；不读取 reference/CTC-only anchor 来合成标点。operation 与完整
+  decision 写入 report/geometry ledger。
+- 对纯、时长一致、内部、直接夹在两个普通 lexical owner 之间的 `<sp1>`，即使
+  `merge_silence=false`、max 不足、phone hole、rejected/ambiguous lineage、缺音频、
+  全零、低能量或平局，也从 words geometry 删除并合并到一侧。可靠双向能量沿用
+  `merged_left/right`；无可靠方向确定性 `merged_left`，并记录
+  `policy=forced_internal_sp1`、`direction_source` 和原始 phone/energy reason。
+- 首部静音、最后 lexical/NVV、缺失标点、CTC-only punctuation、内部 punctuation owner、
+  NVV、edge、`<sp2>/<sp3>` 不属于强制候选；publication audit、missing_allowed、
+  extra/wrong-order punctuation 和 phone lineage ambiguity gate 不被合并动作放宽。
+- words 仍只在该 resolver 的单次 commit 中变更；phones、hanzi、pinyin_phones 继续
+  由 freeze/lineage rebuild 派生，resolver 二次调用保持幂等。
+
+### 验证
+
+新增覆盖内部 sp1 默认/关闭 merge/不同 max、能量左右方向、低能量/全零/缺音频/平局、
+phone hole/rejected lineage fallback-left、首部静音、16735 尾标点、52697/006035
+缺失末标点、CTC-only 末标点、NVV、sp2/sp3、punctuation negative、tier sync 与幂等。
+ geometry tests 为 `51 passed`，指定 focused 套件为 `86 passed`，全量 pytest 为
+`355 passed`；compileall 与 `git diff --check` 均通过。真实 100 条 fresh replay
+未在本次修复包中执行，未修改任何配置文件。
+
+## Case 162: authority English compound split cascades into reference and derived tiers
+
+**日期**：2026-08-21
+**涉及文件**：`scripts/english_units.py`、`scripts/align_english_mfa.py`、
+`scripts/postprocess_textgrids.py`、`scripts/audit_strict_ok.py`、
+`scripts/audit_authority_ok100.py`、相关 English/authority/postprocess tests
+
+### 根因
+
+000240、010755、028083、039628、037818 的 `target1`/`target2` 被真实 CTC
+`tokens.jsonl` 拆成 `t/ar/ge/t/1` 等 fragment；生产 tokens 没有 fixture 中的
+`source_ctc_ordinal`，旧 postprocess 因此跳过 reconciliation。strict authority 又只
+改名单个 interval，随后 `_build_hanzi_tier` 把参考文本拆成 CJK/alpha 两条队列，导致
+`target1`、独立的“和”与 `target2` 级联错位。020943/053657 的 120ms English anchor
+还在 padding 前被 `min_segment_dur_ms=150` 拒绝。
+
+### 修复与保护
+
+- `english_units.project_authority_semantics()` 成为 postprocess/strict/ok100 的共同
+  ordered projection；surface、unit_id、alignment_token 分离，`target1` 与 `target2`
+  不会因共享 dictionary key 合并，pinyin/NVV 优先于 English。
+- authority commit 前执行一次 exact compound transaction：按真实文件顺序补全缺失
+  ordinal，要求 fragment group 连续、完整、数字只在末片段，并记录 source/CTC index、
+  spans、unit_id 与 geometry operation。partial、extra、reordered、跨 CJK/NVV/punct 或
+  另一 English unit 均 fail-closed，不做部分修复。
+- producer 先裁剪并加入有效 padding，再用 padded duration 判断 segment eligibility；
+  MFA 缺失、空 phones、跨度不完整仍 rejected，不生成 fallback English phones。
+- freeze 后由 words 单向重建 hanzi/phones/pinyin_phones；publication audit 继续允许
+  missing punctuation，但保留 extra、错序、错边界、phone lineage ambiguity 和 owner
+  mismatch 门禁。
+
+### 验证
+
+新增/更新覆盖无 ordinal `tokens.jsonl`、`target1 + 和 + target2` 五片段、不同 unit_id
+共享 alignment token、partial/extra/reordered/numeric-not-final/cross-boundary 拒绝、
+120ms+两侧 50ms padding 后尝试 MFA、projection parity、no-reference/旧 English、
+freeze/derived sync 与 geometry 回归。验收运行以最终报告为准；本修复包未执行真实 fresh
+100 条 replay，不能据此推断生产样本计数。
+
+## Case 163: 静音合并后的词能量稀释与证据归属
+
+**日期**：2026-08-21
+**涉及文件**：`scripts/postprocess_textgrids.py`、
+`tests/test_postprocess_word_energy.py`、`README.md`
+
+### 根因
+
+旧的 `_word_rms` 使用 `mean(abs(samples))`，而噪声底使用 5ms/10ms frame RMS，
+导致 `filter_word_energy_ratio=2.0` 实际被隐藏的 `noise_floor * 10` 下限覆盖。`detect_issues`
+与 `process_one` 还各自实现了一套 word-in-silence 公式，内存 audio 入口会跳过能量；
+静音 owner 合并后则把扩张的最终 display span 当作词能量 span，真实词本体被稀释。
+此外，English/NVV 邻接只看 interval index，无法识别 `OK–<sp1>–you3`，派生 phones
+也不能作为新的声学证据。
+
+### 修复与保护
+
+- 建立 `word-energy-evidence-v1` 单一 helper：词和噪声都使用完整 10ms frame RMS，
+  优先显式纯静音 owner frame，缺失时回退全音频 15th percentile，阈值严格为
+  `noise_floor * ratio`，并保留旧 `alignment_issues` 的 energy/noise_floor 字段。
+- 每个 lexical ordinal 记录 final/premerge/source-phone/CTC spans、merge operation、
+  lineage、active-run 与分类。`silence_merge_dilution` 只诊断；原词低能量仍为
+  `word_in_silence`，phone hole/ambiguous、audio hole 或 ordinal 无法绑定为
+  `word_energy_evidence_unresolved`。
+- English/NVV 自身不做中文词能量检测，但最近 lexical owner 可跨纯静音连接，标点
+  会截断；显式关闭开关优先于 strict mode。审计只执行一次，顺序为 visual silence
+  commit → freeze/rebuild → strict English/phone owner → energy audit → publication
+  audit；不把 derived phones 当独立声学证据。
+
+### 真实 99 条 replay bounded correction
+
+真实 99 条 replay 显示，部分 MFA source phone span 会超出 CTC/final owner span，或
+只覆盖 final/premerge owner 的一部分；这些是 CTC 已确认词边界下的诊断现象，不应再被
+二次升级为 `word_energy_boundary_mismatch` 或
+`word_energy_evidence_unresolved`。当 lexical ordinal 有有效 `ctc_span` 时，CTC
+作为词边界锚点，source overhang、phone hole 和 audio hole 只保留在 energy evidence
+diagnostics；缺失/歧义 lineage、无 source owner，或没有有效 CTC evidence 时，原有
+hard reason 仍保持。
+
+新增回归覆盖 CTC `[0.50, 0.63]`、MFA source phone `[0.48, 0.71]`、final
+`[0.48, 0.63]`，以及 final 内部 phone hole；两者均不再产生 boundary mismatch 或
+unresolved。
+
+### 真实 100 条 ok 样本复跑：能量修复后的 baseline（2026-08-21）
+
+使用固定的 `configs/hecheng_ria_ok100_authority.selection.json` 样本集合，在既有
+MFA/英文 MFA/CTC 证据上只重新执行 postprocess，结果写入隔离目录
+`/tmp/mfa-word-energy-rerun-v2-FlDMfT/`：
+
+- 100 条样本中，99 条有 MFA TextGrid，1 条
+  `047714_弹幕互动_回应恶意攻击` 缺少 MFA 对齐，单独记录为
+  `missing_mfa_alignment`。
+- 99 条可处理样本：70 条 `ok`，29 条过滤；按完整 100 条集合统计为 70% 通过、
+  30% 非通过。
+- `word_in_silence`、`word_energy_boundary_mismatch`、
+  `word_energy_evidence_unresolved` 均为 0；词能量审计共 3469 个 lexical items，
+  均为 `energetic` 或 `not_applicable`。
+- 过滤原因不是词能量：25 条存在内部静音（28 个区间，其中 `<sp0>` 23 个、
+  `<sp2>` 5 个；`mid_sp` 与 `strict_interior_sp` 是同一批样本的两个门禁），7 条
+  英文严格 provenance 失败，其中 5 条同时有
+  `ctc_processed_lexical_count_mismatch`。
+- 99 个 `OK` 词中，92 个保留完整 `en:OW1–en:K–en:EY1`；7 个属于英文
+  provenance 被拒绝的过滤结果，英文 phone 被按过滤策略移除，不是音素对齐被能量
+  规则误删。
+
+剩余内部静音中，5 个 `<sp2>` 是超过当前普通短静音合并策略的长停顿；23 个 `<sp0>`
+分别由无连续活动能量、能量归属不明确、上下文比例不足、phone hole 或标点 owner
+保护而保留。`030687` 与 `041532` 的标点 owner 保护来自跨度过宽的 reference/CTC
+标点证据，虽然最终 words 层的标点并未紧邻该静音，属于下一轮标点邻接裁剪逻辑的
+剩余问题。
+
+### Visual silence bounded correction
+
+基于上述真实 99 条 replay，内部 `<sp0>` 在 energy owner 不可靠时不能继续 preserve，
+否则会留下未归属的词间静音。因此没有明确局部 punctuation owner 时，
+`preserve_*`、phone hole、低能量、模糊能量、缺音频和全零均使用
+`policy=unknown_sp0_forward` 并入左词。宽泛 punctuation span 若穿过 gap 两侧已有
+lexical owner，不再保护该 gap；只有局部 punctuation evidence 与显式静音 gap 同时
+存在时，gap 才替换/恢复为 punctuation interval。无显式静音不合成标点，`<sp1>` 强制
+策略、首静音和 `<sp2>/<sp3>` 规则保持不变。
+
+新增回归覆盖未知 `<sp0>` 左并、宽泛标点不保护后续 gap、局部显式标点 gap 写回，以及
+CTC-only 显式末尾静音标点恢复。
+
+### Visual silence correction 的真实复跑（2026-08-21）
+
+在上述 baseline 后，使用同一配置和同一 100 条固定样本重跑，输出位于
+`/tmp/mfa-sp0-forward-rerun-6kdUJX/`：
+
+- 99 条有 MFA 对齐的样本中，87 条 `ok`，12 条过滤；加上 1 条缺失 MFA，完整集合为
+  **87/100 通过、13/100 非通过**。
+- 过滤原因：5 条同时命中 `mid_sp` 和 `strict_interior_sp`（同一批内部
+  `<sp2>` 长停顿的两个门禁）；7 条英文 provenance 失败，其中 5 条同时命中
+  `ctc_processed_lexical_count_mismatch`。不存在词能量过滤。
+- 23 个内部、无局部标点 owner 的 `<sp0>` 全部以
+  `policy=unknown_sp0_forward` 向前并入前词；复跑结果中没有内部
+  `lexical–<sp0>–lexical` 保留项。
+- 5 个局部且有显式静音证据的 punctuation owner 被实际写回 punctuation interval，
+  不是只在报告里“保护”而仍保留 `<spN>`。宽泛 reference/CTC punctuation span
+  不再保护穿过其两侧 lexical owner 的后续 gap；`030687`、`041532` 的原错误已转为
+  `unknown_sp0_forward`。
+- `sp1` 的强制内部合并仍记录为 15 次，能量可靠时 9 次按能量方向合并；首部静音和
+  5 个 `<sp2>` 长停顿仍按结构规则保留。无显式静音时没有合成标点。
+
+本次根目录验证为 **370 passed**，并通过 `compileall` 与 `git diff --check`。
+
+### Subsequent sp1 forward-owner correction
+
+上述复跑中“能量可靠时 9 次按能量方向合并”是旧策略事实。当前 bounded 修复将所有
+有效内部 `lexical–<sp1>–lexical` 的最终提交统一为 `merged_left`，并记录
+`reason=forced_internal_sp1_forward`、`policy=forced_internal_sp1_forward`、
+`direction_source=forced_left`；双向能量只保留诊断。首部静音、NVV、edge、局部标点
+owner 不受影响，`<sp2>/<sp3>` 不参与合并，`<sp2>` 继续由
+`mid_sp/strict_interior_sp` gate 过滤。
+
+同一固定 100 条样本重新执行后，99 条有 MFA 的样本为 **87 条 `ok`、12 条过滤**，
+加上 1 条缺失 MFA 后完整集合为 **87/100 通过**。15 个内部 `<sp1>` 全部为
+`merged_left`，没有 `merged_right`；5 个内部 `<sp2>` 全部保持不动并命中
+`mid_sp/strict_interior_sp` 过滤。过滤原因仍只有 7 条英文 provenance（其中 5 条
+同时有 lexical count mismatch）和 5 条内部 `<sp2>` 长停顿。复跑报告位于
+`/tmp/mfa-sp1-forward-rerun-RHf7kJ/output/postprocess_report.jsonl`。
+
+### 长静音与标点归属审计
+
+复核这 5 个最终被 `mid_sp/strict_interior_sp` 过滤的内部长 `<sp2>`：
+`007210`（“开播—咱最近”）、`009522`（“直播了—刷”）、`014078`
+（“没有—纠结”）、`014260`（“们—咱”）和 `049412`（“没有—最近”）。它们在
+参考文本对应位置均没有标点，CTC punctuation anchor 也不覆盖这些 gap；MFA words
+和 phones 则都给出了连续约 0.52–0.71 秒的 `<eps>/sil`。因此这些是原音频中的真实
+停顿或转写未标注停顿，不是后处理把局部标点删除后留下的静音。
+
+同一批次另有 3 个尾部 `<sp2>` 和 2 个尾部 `<sp1>` 具有明确的局部标点证据，均执行
+了 `punctuation_gap_restore`，最终写回标点 interval。结论是：长停顿不必然对应标点；
+只有参考/CTC 标点与显式静音在同一局部区间相交时才恢复标点，不能因为停顿很长就猜测
+或合成标点。
+
+### 验证
+
+专项测试覆盖 RMS 量纲、ratio=2、silence pool/global fallback、合并稀释、原词低能量、
+20ms/30ms boundary mismatch、lineage hole、CTC 锚点赎回 MFA overhang/phone hole、
+`OK–<sp1>–you3` 跨静音邻接、English/NVV、显式关闭和 geometry 回归。最终根目录验证为
+`370 passed`；baseline 报告位于 `/tmp/mfa-word-energy-rerun-v2-FlDMfT/output/`，
+visual silence correction 报告位于 `/tmp/mfa-sp0-forward-rerun-6kdUJX/output/`。
+
+## Case 164: authority reference Arabic numerals leak into English projection
+
+**日期**：2026-08-21
+**涉及文件**：`scripts/pipeline_utils.py`、`scripts/postprocess_textgrids.py`、
+`tests/test_pipeline_utils_audio.py`、`tests/test_hyphenated_postprocess_provenance.py`、
+`README.md`
+
+### 根因
+
+通用 `normalize_reference_numerals` 为保护普通 alpha+digit identifier，会保护
+`target1`/`target2`；authority/reference mode 之前没有独立的 numeral normalization
+边界，导致这些 reference surface 直接进入 English semantic/strict count，CTC 的末尾
+ASCII `1`/`2` 也可能被当作同一个 English compound 的数字 suffix。随后 target unit、
+hanzi/pinyin projection 和 authority count 发生级联错位。当前环境未安装 `cn2an`，若
+直接让 authority 路径跳过转换则会复现相同问题。
+
+### 修复与保护
+
+- 新增 `reference-numeral-normalization-v1`：authority reference 只在 semantic/
+  English/pinyin/hanzi projection 前归一化；小写 `target1`/`target2` 变为
+  `target一`/`target二`，保留原始 reference text 和 raw SHA-256 provenance。
+- CTC raw lab/tokens、pinyin tone digits、NVV、uppercase identifier 与普通 English
+  numeric identifier 不参与转换。无 `cn2an` 的隔离环境使用等价 deterministic fallback，
+  有安装时调用 `cn2an.transform(..., "an2cn")`。
+- authority compound reconciliation 按真实 tokens 文件顺序消费无 ordinal fragments；
+  `1`/`2` 只在对应 normalized CJK numeral owner 上投影为 `yi1`/`er4`，不再作为完整
+  `target1`/`target2` English owner。partial/extra/reordered/cross-boundary 仍 fail-closed。
+
+### 验证
+
+新增回归覆盖 transform mode、raw/normalized mapping、无 ordinal `target`+`1`/`2` CTC
+fragments、最终 `target yi1 target er4` pinyin 与 `target/一/target/二` hanzi projection，
+以及 `rui4`、NVV、`OK2`、`ABC1` 的保护。本修复未执行 fresh replay。
+
+## Case 165: `ctc_prealign.limit` 未冻结 pre-CTC pad/MFA 分母
+
+**日期**：2026-08-21
+**涉及文件**：`scripts/run_pipeline.py`、`tests/test_run_pipeline_subset_denominator.py`、
+`README.md`
+
+### 根因
+
+`ctc_prealign.limit=1000` 只传给 CTC producer；`nvrasr_fallback` 的
+`step_pad_silence` 仍先枚举全部约 56000 个物理 WAV，导致小规模重跑在 pad 阶段越界。
+修复第一次接入共享 freeze helper 后，若用 freeze 后的非空 `expected_stems` 反推模式，
+还会丢失 `--pre-ctc`，并错误要求 CTC 目录已有 lab。
+
+### 修复与保护
+
+- 新增 `pre-ctc-stem-selection-v1` 逻辑：在 fresh `nvrasr_fallback/full` 且无既有
+  `expected_stems` 时，按排序去重 stem 选择 `ctc_prealign.limit` 前 N 条，写入
+  `pre_ctc_stems.txt`，并冻结 source/eligible/exclusion accounting。
+- pad 在 freeze 前捕获 `pre_ctc_mode`，即使 freeze 后 `expected_stems` 已填充，仍传递
+  `--pre-ctc`；resample/CTC/MFA/postprocess 继续使用同一 manifest，不二次恢复全量。
+- 已存在 expected stems 或 selection manifest 时 fail-closed 校验并复用，不覆盖扩大分母。
+
+### 验证
+
+回归覆盖 limit=2 的排序选择、manifest 复用、prealign 不再附加第二个 limit，以及 pad
+阶段同时传递 `--stems-file` 和 `--pre-ctc`。本修复未执行真实 1000 条 replay。
+
+## Case 166: authority 占位符数字的 hanzi/semantic projection 被花括号阻断
+
+**日期**：2026-08-21
+**涉及文件**：`scripts/english_units.py`、`scripts/postprocess_textgrids.py`、
+`scripts/audit_strict_ok.py`、`tests/test_hyphenated_postprocess_provenance.py`
+
+### 根因
+
+参考文本模式会先把 `target1`/`target2` 规范化为 `target一`/`target二`，再把 CTC
+中的数字片段投影为 `yi1`/`er4`。但 authority semantic stream 原先仍把 `{`、`}`
+作为 `other` token：`next_kind()` 在 `target` 后无法越过 `{` 消费“一”，导致 hanzi
+tier 生成 `target/yi1`；即使 hanzi 修正为 `target/一`，严格 semantic comparison
+仍会把参考文本里的花括号与派生 tier 的缺失花括号判为不一致。
+
+### 修复与保护
+
+- authority reference 的数字规范化保持 raw reference、raw SHA-256 和 mapping provenance；
+  semantic/CTC/pinyin/hanzi 使用同一份 normalized reference。
+- `{}` 明确作为 authority placeholder syntax，不再进入 semantic token stream；其他
+  未知字符仍保留并 fail-closed。
+- `target一`/`target二` 的 `target` 仍是 English owner，`一`/`二` 是 CJK owner，
+  `words/pinyin` 保持 `target yi1 target er4`，`hanzi` 输出 `target 一 target 二`。
+- 独立审计的 English provenance 使用 normalized reference，但保留 `V-Up` 等 lexical
+  hyphen surface；同时修正了审计分支误传 raw/hyphenless reference 导致的 owner mismatch。
+
+### 验证
+
+`000016_直播流程_开场介绍` 已实测通过：raw reference 保留 `target1/target2`，报告的
+normalized reference 为 `{target一}`/`{target二}`，最终 TextGrid 的 `hanzi` 为
+`target/一/target/二`，不再触发 numeric CJK/semantic mismatch。专项回归 57 passed。
+
+## Case 167: 参考文本模式 1000 条 fresh replay 最终验证
+
+**日期**：2026-08-21
+**配置**：`configs/hecheng_en_1000_test.yaml`
+**工作区**：`/mnt/nvme3/mfa_workspace_1000test_rerun_20260821_v7`
+
+CTC、pad/resample、中文 MFA、英文 MFA 均从冻结的前1000个 stem 重新执行；后续因
+数字语义修复重跑了 postprocess 和 strict-ok，不重用旧的输出 TextGrid。最终 strict
+publication 集合为 **349/1000 通过，651/1000 过滤**。postprocess 在独立审计前产生
+353 个候选；其中4条因 `evidence_repair_boundary_invalid`、
+`evidence_repair_dual_evidence_invalid`、`evidence_repair_geometry_invalid` 或
+`evidence_repair_owner_invalid` 被独立审计隔离，不能计入发布通过率。
+
+最终后处理的主要状态计数为：434 条 CTC lexical mismatch + MFA unknown source，
+161 条 English provenance rejected，17 条 CTC lexical mismatch，18 条内部静音与
+前述 CTC/MFA mismatch 组合，10 条 English provenance 与内部静音组合，7 条内部
+`mid_sp/strict_interior_sp`，其余为组合项。数字占位符样本不再产生
+`hanzi_cjk_mismatch` 或 `reference_semantic_sequence_mismatch`；仍被过滤的数字样本
+只因独立 English provenance 或其他真实证据问题，不是数字正则化失败。
+
+最终严格清单：
+`/mnt/nvme3/mfa_workspace_1000test_rerun_20260821_v7/strict_ok_runs/20260821T124358Z_3618688/output/strict_ok_manifest.json`
+
+## Case 168: 手工重跑 strict-ok 时的生命周期/证据目录污染
+
+**日期**：2026-08-21
+
+直接手工调用 postprocess 若不传 `CTC_RAW_MANIFEST` 与 `CTC_WORK_RECEIPT`，报告会退化
+为 legacy lifecycle，独立审计会拒绝全部候选。重复使用同一 strict run 目录时，旧的
+`output/_provenance/english` 也会触发 evidence collision；失败审计还可能按安全策略
+把 output 隔离到 filtered，造成下一次审计看到错误的集合。
+
+正式复核必须：传递 raw/work lifecycle 环境变量；postprocess 后刷新正式 output/filtered
+accounting receipt；清理本次 run 自己产生的 evidence 目录后再审计；需要只诊断时使用
+`--no-isolate`，发布前再用正式 isolate，并刷新 strict manifest accounting binding。
+
+## Case 169: CTC/MFA 首个英文词 `<unk>` 的 ordinal recovery 与 publication contract 脱节
+
+**日期**：2026-08-24
+**涉及文件**：`scripts/postprocess_textgrids.py`、`scripts/audit_strict_ok.py`、
+`tests/test_postprocess_recovery_geometry.py`、`tests/test_authority_publication_contract.py`
+
+### 现象与证据
+
+在 `/mnt/nvme3/mfa_workspace_1000test_rerun_20260821_v7` 的冻结 1000 条参考文本模式
+重放中，469 条 MFA words 的首个英文词都是 `<unk>`，对应 phone 都是 `spn`；CTC
+首 token 都是 `mira`。将唯一未知词按 lexical ordinal 0 投影为 `mira` 后，469/469
+条 source/CTC 词序完全一致，没有真实插入、删除或重排。
+
+其中 464 条 source unknown 与 CTC token 有时间重叠，5 条没有重叠，但五条的 source
+ordinal、CTC ordinal、reference ordinal 和最终 owner 均唯一且顺序一致。原逻辑要求
+Mira 在参考文本中全局只出现一次，因此包含第二个 Mira 的 452 条全部无法生成 proof；
+另外 5 条还因 raw 时间不重叠被拒绝。
+
+17 条旧逻辑已经生成 `mfa_unknown_source_redeemed`，但 publication contract 仍使用
+原始 source snapshot 中的 `<unk>` 比较 CTC，导致恢复证明没有真正消费，继续触发
+`ctc_lexical_sequence_mismatch`。
+
+另有 75 条只是最终 authority surface `v-tuber` 与 CTC surface `vtuber` 不同，lexical
+identity 实际相同，不属于词序错误。
+
+### 修复
+
+- unknown proof 按 `source lexical ordinal`、CTC `reference_ordinal` 和最终 owner 绑定，
+  不再要求参考文本中 Mira 全局唯一，也不再要求 raw MFA/CTC interval 必须相交。
+- 保留 raw MFA `<unk>/spn` 作为诊断证据，另建 resolved source projection；只有 proof
+  验证成功时，resolved source 才参与 publication contract。
+- postprocess 和 strict audit 统一使用 English lexical identity：`v-tuber`/`vtuber`、
+  `open-ai`/`openai` 比较为同一 lexical key，但最终 TextGrid 仍保留 authority surface。
+- strict audit 的 unknown semantic replay 使用保留连字符的 authority reference，避免
+  audit 自身先把 `v-tuber` 变成 `vtuber` 后再与最终 surface 产生假 mismatch。
+- 增加重复 Mira、无时间重叠、unknown proof 传递和英文 surface identity 回归测试。
+
+### 验证
+
+全量测试：**381 passed**。
+
+复用同一批冻结的 CTC/MFA/英文输入，仅重跑 postprocess 和 strict-ok：
+
+| 阶段 | 修复前 | 修复后 | 变化 |
+|---|---:|---:|---:|
+| postprocess 候选 | 353/1000 | 804/1000 | +451 |
+| strict publication | 349/1000 | 792/1000 | +443 |
+| CTC lexical mismatch | 469 | 0 | 已消除 |
+| MFA unknown source 过滤 | 452 | 0 | 已消除 |
+| unknown recovery proof | 17 | 469 | 全部绑定 |
+
+修复后剩余 196 条在 postprocess 阶段因英文 provenance 或真实内部静音过滤；另有
+12 条由 strict audit 的既有 evidence-repair contract 隔离，原因是
+`evidence_repair_boundary_invalid`、`evidence_repair_dual_evidence_invalid`、
+`evidence_repair_owner_invalid` 和 `evidence_repair_geometry_invalid`，与 CTC/MFA
+词序及未知词问题无关。
+
+本次正式运行目录：
+`/mnt/nvme3/mfa_workspace_1000test_rerun_20260821_v7/strict_ok_runs/20260824T030211Z_160646`
+
+## Case 170: 英文单帧 CTC 锚点被错误发布为最终词边界
+
+**日期**：2026-08-24
+**涉及文件**：`scripts/ctc_prealign.py`、`scripts/adjust_ctc_boundaries.py`、
+`scripts/align_english_mfa.py`、`scripts/pipeline_utils.py`
+
+### 症状
+
+CTC encoder 的一帧固定为 60 ms。英文词例如 `ria` 可能只获得一个 CTC frame，
+但原逻辑把这个 60 ms 的 `canonical_span` 同时当作最终 TextGrid/MFA 裁剪边界；
+相邻中文词之间真实可用的词区间没有被补全，最终英文 MFA 片段小于最短时长并触发
+`segment_too_short`，继而产生 `english_provenance_rejected`。
+
+### 根因
+
+英文 `canonical_unit` 同时承担了两种不同职责：
+
+1. raw CTC 词身份、source ordinal 和原始时间证据；
+2. processed CTC、TextGrid 和英文 MFA 的可变几何边界。
+
+普通词会参考下一个词的 start 补全边界，而 canonical English 分支直接使用 raw
+`canonical_span`，因此英文漏掉了边界补全。
+
+### 修复
+
+- `canonical_span`、`canonical_unit.canonical_span` 及 hash 只属于 raw CTC evidence，
+  producer 阶段不再写入 processed geometry。
+- `ctc_pretg_adj` work 阶段新增 `processed_ctc_span` 和
+  `processed_ctc_boundary_source`，英文 MFA、调整后 TextGrid 和 tokens 统一使用该
+  processed span。
+- 无硬边界时，英文右边界延伸到下一个 lexical token start；标点和 >=200 ms 长静音
+  是硬边界；句末仅使用有效 VAD speech end，否则保留 raw end。
+- raw CTC bundle 校验允许在 adjust 前缺少 processed span；最终 work/MFA 校验仍要求
+  processed span、owner、TextGrid geometry 一致。缺失、篡改或 owner 冲突 fail closed。
+- adjusted words tier 不再把标点写成 lexical CTC word，长静音在 pauses tier 中保留。
+
+### 验证
+
+- processed boundary、标点/长静音截断、VAD fallback、raw span/hash 不变及 raw/work
+  生命周期回归通过。
+- focused tests：**77 passed**。
+- 全量测试：**392 passed**。
+- 未降低英文 MFA 最短片段阈值，未生成 fallback English phones。
+
+## Case 171: 1000 条复跑耗时过长、严格审计误判最终层级
+
+**日期**：2026-08-24
+**涉及文件**：`scripts/run_pipeline.py`、`scripts/ctc_processed_geometry.py`、
+`scripts/ctc_prealign.py`、`scripts/adjust_ctc_boundaries.py`、
+`scripts/postprocess_textgrids.py`、`scripts/audit_strict_ok.py`、
+`tests/test_audit_sp3.py`
+
+> **证据边界**：本 Case 以下的 1000 条数字、`DONE: Success` 和 receipt 结论，均是
+> **v9 的 postprocess + strict-ok 下游诊断重跑**，不是 v10 GPU/NAS 全链路成功结论。
+> v7/v9 历史结果保留为审计基线；当前 Wave 4 不重新解释、覆盖或扩展这些历史数字。
+
+### 症状与耗时来源
+
+1000 条参考文本模式复跑时，表面上像是“后处理卡住”，实际耗时主要叠加在：
+
+1. 原 geometry-only 路径仍从 NAS 完整读取 WAV，并在 VAD 中再次读取同一文件；
+   1000 条数据发生重复 I/O，且旧实现按帧 Python 循环计算。
+2. 断点续跑没有恢复冻结的 pre-CTC stem/source index，导致 CTC、MFA 音频和嵌套源目录
+   的绑定被重新推断，随后出现假性的 missing binding/missing audio。
+3. 合成源 WAV 位于 `speaker/stem.wav`，旧 resample 保留了子目录；MFA 输入契约要求
+   `audio_16k/stem.wav`，因此已经生成的音频仍被判定为缺失。
+4. 首次 MFA retry 在“首批恢复 4 条、剩余 2 条”后提前终止；rescue 结果也因状态机
+   只识别固定索引而没有被计入恢复。
+5. postprocess 的 CTC accounting 使用物理全集 55998 条，而本次冻结分母只有 1000 条，
+   造成下游反复检查错误分母。
+6. TTS axis 和英文 provenance 仍假设 flat source path；嵌套路径使所有样本先触发
+   `tts_audio_axis_mismatch`，随后 canonical source ordinal 与实际 MFA words tier
+   ordinal 的差异又制造了 94 条 `english_word_unmatched`。
+
+### 根因与修复
+
+- 新增共享 `processed` geometry resolver：raw CTC 的 60 ms frame/`canonical_span`
+  保持不可变；后处理版本才按照下一个 lexical、标点、长停顿和 VAD speech end 补全
+  边界。geometry-only 使用音频 metadata，能量审计才读取音频；VAD 改为向量化窗口计算。
+- resample 统一输出 flat stem，并保留 source transform receipt；断点续跑先恢复冻结
+  selection 和 nested source index，再验证输入轴。
+- raw CTC receipt 不再被补写 binding；缺失 binding 写入独立的 derived input-axis receipt，
+  避免篡改 raw manifest/hash 导致整个 CTC work receipt 失效。
+- MFA retry 改为有界的 progressive batch retry，之后才进入 singleton isolation；
+  rescue 判定按状态语义而不是固定 retry index。
+- accounting 在进入 postprocess 前显式投影到冻结的 1000 条分母，并去重 exclusions。
+- postprocess/audit 从 transform receipt 读取真实 TTS source path；英文 strict audit
+  用“文本 + canonical span 起点”解析实际 CTC words tier ordinal，同时保留 source
+  ordinal 作为 provenance lineage。
+- strict audit 的两个误判也已修复：evidence repair 的 `word_indices` 是修复前 tier
+  的索引，不能作为最终 tier 主键，现按双证据词对和最终 boundary 重新定位；首 `<sp1>`
+  只要求 raw_text/pinyin 保留，derived tiers 可以从 t=0 直接由首个 lexical owner
+  开始，但不允许内部 `<sp1>`。
+- postprocess 子进程即使因质量过滤返回非零，只要 output/filtered/report 已形成完整分区，
+  父流程仍先刷新正式 receipt 再进入 strict audit；只有 exact-set/report 校验仍失败时才
+  终止。这样不会再把完整的 `100 output + 900 filtered` 覆盖成 `0 output + 1000 filtered`。
+
+### 验证
+
+同一冻结 1000 条只重跑 postprocess + strict-ok，最终结果为：
+
+| 阶段 | 结果 |
+|---|---:|
+| postprocess `ok` | 100/1000 |
+| strict publication `ok` | 100/1000 |
+| strict rejected | 900 |
+| 非历史误判（evidence/sp1 contract） | 0 |
+| 严格过滤主因 | `preexisting_filtered_candidate`，对应 postprocess 的真实质量 gate |
+
+本次最终运行正常退出（`DONE: Success`），正式 receipt 的 `eligible/output/filtered` 为
+`1000/100/900`，`strict_ok_manifest.global_reasons=[]`；此前的 receipt path/set 全局
+误报已消失。
+
+postprocess 的 900 条仍按实际证据过滤：`english_provenance_rejected` 899 条；其中
+470 条伴随 CTC lexical sequence mismatch/MFA unknown source，373 条伴随
+`mid_sp + strict_interior_sp`，另有 1 条 `sp3`、1 条短词。它们不再被错误归因于
+审计器 index 或首静音 contract。
+
+新增聚焦测试 **16 passed**，全量测试 **396 passed**。本次验证目录：
+`/mnt/nvme3/mfa_workspace_1000test_rerun_20260821_v9/strict_ok_runs/20260824T083035Z_781331`
+
+## Case 172: Wave 4 geometry/publication/artifact/freshness contract 收口与 v10 运行暴露的缓存回归
+
+**日期**：2026-08-24
+**涉及范围**：`scripts/ctc_processed_geometry.py`、`scripts/adjust_ctc_boundaries.py`、
+`scripts/postprocess_textgrids.py`、`scripts/pipeline_utils.py`、
+`scripts/align_english_mfa.py`、`scripts/run_pipeline.py` 及对应 geometry、recovery、
+publication、artifact、freshness 回归测试
+
+### 现象
+
+Wave 4 已完成 A（geometry-adjust）、B（publication-contract）、C（artifact-contract）
+和 D（pipeline-freshness）的实现及回归验证。首次 fresh v10 运行暴露了一个未被单测覆盖
+的输入轴绑定错误；修复后重试又暴露了两层 adjust 缓存命中错误。严格门禁始终安全拒绝
+不完整产物，没有发布伪结果。
+
+### 根因
+
+此前风险集中在四个契约边界：geometry resolver 可能把 raw canonical span 当作最终
+processed 边界；publication 可能在调整 worker 失败、输出缺失或语义错误时继续发布；
+artifact consumer 可能接受 `processed_end < canonical_end` 或丢失 raw hash/双轴证据；
+pipeline resume/compare 可能消费 stale/legacy 状态或错误 manifest 分母。
+
+### 修复
+
+- **A geometry-adjust**：使用共享 resolver，保证 owner 唯一化；过滤空 pause label；覆盖
+  199/200 ms 边界；忽略词内 hard boundary；当 `canonical end < next owner` 时结构化
+  fail-closed。adjust worker 失败、输出缺失或语义错误均不发布。
+- **B publication-contract**：保留并验证现有 freeze/rebuild/audit 保护；新增
+  `tests/test_postprocess_geometry.py` 与
+  `tests/test_postprocess_recovery_geometry.py` 的 publication/geometry 保护，不改生产
+  publication 语义。
+- **C artifact-contract**：`pipeline_utils` validator 与 `align_english_mfa` consumer
+  共同拒绝 `processed_end < canonical_end`；保留 raw hash、raw/work 双轴和 fingerprint
+  primitive，缺失或不一致时 fail-closed。
+- **D pipeline-freshness**：`run_pipeline` 全模式启用 fresh guard；冻结 manifest count
+  为 `1000`、SHA-256 为
+  `e22f9d2ea067ef7e9bfa3abbe6fe36d594e8197a10eaddc02536c025be91357b`；stale/legacy
+  resume 被拒绝，compare tool fail-closed。
+- **v10 运行期修复**：`_ensure_ctc_axis_receipt` 现在优先绑定当前 padded audio root，
+  不会把 padded CTC 时间轴与未 padding 的 NAS WAV 比较；`run_pipeline` 和
+  `adjust_ctc_boundaries` 的缓存命中都额外要求每个 canonical English row 具有有效的
+  `processed_ctc_span` 与 boundary source，不能仅凭 TextGrid/lab 齐全跳过 adjust。
+
+### 测试与证据
+
+| workstream | 验证结果 |
+|---|---|
+| A geometry-adjust | **35 focused tests** 通过 |
+| B publication-contract | 现有 freeze/rebuild/audit 保护通过；**75 owned、129 extended、99 audit tests** 通过 |
+| C artifact-contract | **45 tests** 通过 |
+| D pipeline-freshness | **18 tests** 通过；受影响回归 **59 tests** 通过 |
+
+上述均为代码/回归层面的证据，不等同于 v10 GPU/NAS 全链路验收。
+
+### v10 运行证据、阻塞与残余风险
+
+- 首次 fresh v10 run `20260824T113806Z_1052135` 在 normalize/MFA axis guard 停止：
+  CTC bounds 被错误地与 raw audio 比较；该目录保留为失败证据。
+- 修复 axis binding 后的 retry `20260824T114749Z_1127368` 完成 CTC、MFA、postprocess
+  和 strict audit，但因 adjust 缓存第二层回归，3265 个 English rows 缺少 processed
+  geometry，严格结果为 `0/1000`，安全停止且未发布；其比较报告不得作为 v10 质量结论。
+- retry2 `20260824T120950Z_1222822` fresh CTC 已完成 `1000/1000`；在中断后以原子
+  adjust 重跑验证，`3265/3265` canonical English rows 均有 processed span，缺失为 `0`。
+  MFA/postprocess/strict-ok 的完整 fresh 验收仍需在该 corrected work root 上继续，当前
+  不宣称 v10 publication 成功，也不推导通过率数字。
+- v7 与 v9 的历史运行结果仍保留为审计基线，Case 171 的下游诊断数字不变，但不得
+  作为 v10 全链路结果引用。
+
+## Case 173: corrected CTC work root cold-resume receipt owner isolation
+
+**日期**：2026-08-25
+**涉及文件**：`scripts/run_pipeline.py`、
+`tests/test_run_pipeline_subset_denominator.py`
+
+### 根因
+
+从 corrected `ctc_pretg_adj` work root 直接恢复到 MFA 时，新的进程上下文没有
+`ctc_axis_receipt`。旧的 `_guard_mfa_axis` fallback 因此在传入的 adjusted work root
+查找 `.ctc_run_receipt.json`，把 derived work owner 混淆成 CTC producer owner；raw
+producer receipt 属于 `ctx['ctc_pretg']`，work root 只允许持有 work receipt。
+
+### 修复与门禁
+
+缺失内存 receipt 时，`_guard_mfa_axis` 现在只调用已有的
+`_ensure_ctc_axis_receipt(ctx)`，由该 helper 从 raw `ctx['ctc_pretg']` 验证/恢复
+producer receipt。它不再从 adjusted `ctc_dir` 读取、复制或生成 `.ctc_run_receipt.json`。
+raw receipt 缺失或非法时恢复保持 fail-closed，且不会创建 MFA input-axis receipt；已有
+`ctx['ctc_axis_receipt']` 的 warm path 不变。
+
+### 回归证据
+
+新增测试覆盖 raw owner 恢复、work-root receipt 诱导下的 raw 缺失失败闭合，以及 warm
+path。测试确认 raw producer receipt 字节不变、work root 没有被引入 producer receipt，
+并且不触碰外部运行产物。
+
+### 真实冷恢复验收
+
+retry2 corrected work root 以 run `20260825T062203Z_2699533` 完成 cold resume、中文
+MFA、English MFA、postprocess、strict audit 和版本化发布。最终 strict/accounting 分区
+均为 `396 output / 604 filtered`，发布目录为
+`/mnt/Raw/0805test_v10_retry2_resume.runs/20260825T062203Z_2699533`，包含 396 个
+TextGrid、strict manifest、pipeline receipt 和 publish manifest。raw producer receipt
+SHA-256 在运行前后均为
+`5ed19127efae2ccda83665ed61add3716f7e855ae73eced90a1833500780f71a`；adjusted work
+root 仍不存在 `.ctc_run_receipt.json`。
+
+## Case 174: frozen pre-CTC selection scoped resume fingerprint
+
+**日期**：2026-08-25
+**涉及文件**：`scripts/run_pipeline.py`、
+`tests/test_run_pipeline_subset_denominator.py`
+
+### 根因
+
+固定 1000-stem retry2 在 strict audit 后恢复时，`_pipeline_resume_fingerprints()` 对
+整个 `data_dir` 调用 `_path_fingerprint()`，递归读取约 56k stem 的 NAS WAV，包括未选中
+数据，造成主进程长时间 D 状态。实际下游输入由 `_freeze_pre_ctc_stems()` 冻结的
+`expected_stems` 和 `pre_ctc_audio_index` 定义。
+
+### 所有权与范围契约
+
+当且仅当 `ctx` 同时拥有非空 `expected_stems` 和完整、有效的
+`pre_ctc_audio_index` 时，resume input fingerprint 使用
+`data-dir-scoped-fingerprint-v1`：每个选中 stem 绑定 index 指向的、位于 `data_dir` 下的
+普通非 symlink WAV，以及同目录同 stem 的 `.txt` authority sidecar。缺失 TXT 使用显式
+missing sentinel，因此后续创建 sidecar 会改变 digest；文件按 stem/role 排序，选择顺序
+不影响结果。index 不完整、越界、非法、WAV stem 不一致或 unsafe 时恢复到原有全目录
+`_path_fingerprint`，不缩小 freshness 保护面。没有 selected index 的模式保持旧行为，
+resume fingerprint 外层 schema 不变。
+
+### 回归证据
+
+测试证明 scoped 路径不扫描非选中树，非选中内容变化不改变 digest；选中 WAV、已有
+authority TXT 内容变化，以及 missing TXT 后创建都会改变 digest；非法或不完整 index
+均回退全目录 fingerprint。未触碰外部 NAS 或运行产物。
+
+实际 retry2 冻结索引验证返回 `data-dir-scoped-fingerprint-v1`、`selected_count=1000`、
+`files=2000`，耗时 38.639 秒。作为对照，启动时仍载入旧代码的首次验收进程在 strict
+audit 后递归读取全库，累计 `rchar` 超过 133 GB 并长时间处于 NAS I/O 等待，最终仍
+安全完成版本化发布。根级验证为 focused `56 passed`、全量 `429 passed`，且 scoped
+diff check 通过。
+
+## Case 175: strict English noncontiguous source span requires marked processed-token binding
+
+**日期**：2026-08-25
+**涉及文件**：`scripts/english_units.py`、`scripts/postprocess_textgrids.py`、
+`scripts/audit_strict_ok.py`、相关 English provenance/recovery tests
+
+### 根因
+
+Strict English consumers accepted only contiguous `source_ctc_ordinals` and therefore
+rejected valid producer records where a lexical hyphen separator was omitted from the
+processed CTC stream. The v10 ledger intentionally has no marker; the authoritative
+marker lives on the exact processed token as `hyphen_separator_omitted: true`. The old
+consumer path neither resolved that token nor checked its canonical binding.
+
+### 修复与门禁
+
+`english_units.py` now provides pure exact-token resolution and ledger↔processed-token
+validation. Noncontiguous spans must be strictly increasing, use only deltas 1 or 2,
+omit exactly the number of canonical hyphens, and bind the exact token whose marker is
+literally `true`; canonical unit identity, surface, normalized alignment token, source
+ordinals, first CTC ordinal, span, and represented metadata must agree. Contiguous spans
+remain compatible with marker-free v10 ledgers. Postprocess and the independent strict
+audit use the same validator; postprocess retains `strict_en_unit_span_invalid` on failure.
+
+### 回归证据
+
+Focused tests cover marker-free contiguous spans, K-Pop `[7,9]`, v-tuber `[18,20,21]`,
+V-Up/open-ai, v10 surface-vs-normalized token spelling, missing/false markers, ordinal
+and canonical tampering, and the unchanged evidence-bound initial-Mira recovery proof.
+Focused suite: `141 passed`; full suite: `441 passed`; `python -m compileall -q scripts`
+and `git diff --check` both passed. No external runtime replay or artifact mutation was
+performed.
+
+## Case 176: acoustically validate declared long-pause boundaries after canonical English
+
+**日期**：2026-08-25
+**涉及文件**：`scripts/ctc_processed_geometry.py`、
+`tests/test_ctc_english_units.py`、
+`tests/test_align_english_mfa_canonical_units.py`
+
+### 根因
+
+Processed English geometry previously treated every declared CTC pause of at least
+200 ms as an unconditional hard boundary. When that blank began inside an active
+English speech tail, a canonical 60 ms token could remain only 90 ms after processing;
+normal 50 ms padding on both sides then produced a 190 ms MFA clip and a false
+`segment_too_short` rejection at the unchanged 200 ms corpus floor.
+
+### 修复与门禁
+
+Each resolver invocation now decodes at most one WAV into globally aligned 5 ms RMS
+frames. The active floor is `max(3 * robust_noise_floor, 0.001)`, and silence requires
+six consecutive below-threshold frames (30 ms). A true silent pause onset keeps
+`raw_end_long_pause`. An active onset searches only inside that declared pause and
+before punctuation, the next lexical owner, and the audio/search end; the first proven
+sustained-silence onset uses the existing `energy_end_hard_boundary` source. If no
+such run exists, the false pause is ignored and ownership falls through to punctuation
+or the next lexical start. Missing or unreadable audio preserves the previous
+fail-closed declared-pause boundary. Raw `canonical_span`, `canonical_unit`, and its
+hash remain immutable, and the 200 ms pause and corpus thresholds are unchanged.
+
+### 回归证据
+
+Focused tests cover active and true-silence pause onsets, no-silence fallthrough,
+punctuation clamping, missing/unreadable WAV fallback, nonzero noise-floor behavior,
+exact 5 ms/30 ms run semantics, immutable canonical evidence, and corpus eligibility.
+A corrected 100 ms owner plus ordinary 50+50 ms padding passes the unchanged 200 ms
+floor, while the prior 90 ms owner remains `segment_too_short`. Focused suite:
+`58 passed`; full suite: `449 passed`; `python -m compileall -q scripts` and
+`git diff --check` passed. No external runtime replay or artifact mutation was
+performed; runtime rerun remains root-owned.
+
+## Case 177: isolated English replay, authoritative resume axis, and bounded singleton MFA retry
+
+**日期**：2026-08-25
+**涉及文件**：`scripts/run_pipeline.py`、`scripts/align_english_mfa.py`、
+`tests/test_ctc_artifact_versions.py`、
+`tests/test_run_pipeline_subset_denominator.py`、
+`tests/test_align_english_mfa_canonical_units.py`
+
+### 运行期继续暴露的根因
+
+Case 175/176 的真实 retry2 重放确认了三层独立问题。第一，普通 runner 把 English
+MFA 的 `en_phones` 和 `temp_en_mfa` 写死在 workspace，无法在不覆盖旧证据的前提下
+重算英文。第二，`--skip-to adjust` 恢复时 `audio_dir` 会重新指向原始 NAS WAV，然而
+CTC 时间戳属于 input-axis receipt 声明的 padded TTS 音频轴。第三，主 English MFA
+进程可以返回 0，但仍漏掉一个 utterance；本次唯一实例 `mira vtuber` 有完整 178 帧、
+无 OOV、graph/MFCC 均成功，但 beam 10/retry 40 没有 alignment likelihood 或输出
+TextGrid。相同 clip/lab 在独立单段 beam 100/retry 1000 下可正常对齐。
+
+### 修复与安全边界
+
+- `mfa_en.output_dir`、`mfa_en.temp_dir` 成为严格限制在 workspace 内的可配置 namespace，
+  默认值仍为旧目录名；绝对路径、`..`、workspace 逃逸和 symlink traversal 全部拒绝。
+- adjust 的音频输入显式使用 validated receipt 恢复的
+  `tts_authoritative_audio_dir`，不再在 cold resume 时回退到错误的原始音频轴。
+- 主 MFA 返回成功但缺少确切 segment TextGrid 时，最多对配置上限内的缺失段执行
+  singleton retry。每个 retry 只物理复制该段原始 WAV/lab 到独立目录，使用有界的
+  100/1000 beam；只有输出存在唯一 words/phones tiers、复制前后哈希一致时才原子发布
+  回主 aligned namespace。失败、超过上限、缺输入、alias 或 tier 非法均继续严格拒绝。
+  retry 命令、输入哈希、状态和输出 TextGrid 哈希写入 English MFA manifest；没有
+  G2P/均分/伪 phones fallback。
+- English 主跑与每个 singleton 都覆盖继承的共享环境，把 `MFA_ROOT_DIR` 和
+  `NUMBA_CACHE_DIR` 放到各自 run-local temp root；这消除了并发写坏
+  `models/mfa/command_history.yaml` 以及 Numba 尝试写 site-packages cache 的波动源。
+
+### retry2 真实 1000 条验收
+
+隔离 replay 使用
+`ctc_pretg_adj_pausefix_20260825`、`en_phones_pausefix_retry_20260825` 和
+`temp_en_mfa_pausefix_retry_20260825`，最终 strict run 为
+`20260825T085930Z_2941772`：
+
+| 检查 | 结果 |
+|---|---:|
+| Case 176 原 54 个 `segment_too_short` | 0 个仍短；3182 段全部进入 MFA |
+| English stems / words verified | 1000 / 3265 |
+| English rejected segments / words | 0 / 0 |
+| singleton decoder miss | 1/1 recovered，输出 hash `b0d746da…` |
+| strict output / filtered | 986 / 14 |
+| initial-Mira `<unk>` recovery proofs | 469 |
+| raw MFA `<unk>` 与 `spn` overlap | 469 / 469 |
+| canonical English unit/hash drift | 0 / 3265 |
+| receipt eligible/output/filtered | 1000 / 986 / 14 |
+
+基线 run `20260825T081720Z_2875189` 为 935/65，English provenance 是 947 verified /
+53 rejected；最终 run 为 1000/1000 English verified，净恢复 51 个 strict candidates。
+剩余 14 个均为 `mid_sp + strict_interior_sp`，不是 English 或 `<unk>`：6 个是
+570–870 ms 的 `<sp2>`，MFA epsilon 和 CTC pause/blank 双方都证明真实长停顿；另 8 个
+最终区间恰为 200 ms，虽然旧 label 为 `<sp0>`，但独立 MFA epsilon 为 200–1140 ms，
+CTC 也有 240–540 ms 显式 pause 或宽 blank。它们继续 fail-closed，不能把真实停顿
+吞入相邻词来提高通过率。
+
+14 个 stem 明细：
+
+| 分类 | stems |
+|---|---|
+| 570–870ms `<sp2>`（6） | `000090`, `000096`, `000239`, `000247`, `000365`, `000402` |
+| exact 200ms stale `<sp0>`（8） | `000153`, `000172`, `000210`, `000316`, `000335`, `000392`, `000424`, `000499` |
+
+旧 `ctc_pretg`、`ctc_pretg_adj`、`en_phones`、`temp_en_mfa`、`aligned` 和两份 axis
+receipt 的树/文件 hash 在运行前后完全一致。最终根目录验证为 **452 passed**，并通过
+`compileall` 与 `git diff --check`。run-local MFA/Numba 环境隔离的代码与单测已完成；
+当前 retry2 的 singleton recovery 为 **1/1 recovered**（输出 hash `b0d746da…`），但
+09:02 的 retry2 日志早于环境隔离代码，不能单独作为 clean-log 证据。代码更新后又在
+2026-08-25 09:12 UTC 对同一真实 singleton 做了 fresh 隔离重跑：work root
+`/tmp/mfa_singleton_000009/work3` 实际创建了独立 `mfa_root` 与 `numba_cache`，MFA 返回 0，
+输出 TextGrid SHA-256 为
+`b0d746daca859740197b355071fb422b1578022280c5df99c4ad12315ac645ba`；日志中没有
+ScannerError、共享 `command_history.yaml` 或 Numba cache 错误。因此环境隔离已有独立
+真实 runtime 证据，只是该证据不属于较早的 retry2 manifest。
+
+## Case 178: final internal silence labels normalize after owner commit
+
+**日期**：2026-08-25
+**涉及文件**：`scripts/postprocess_textgrids.py`、`tests/test_postprocess_geometry.py`、
+`tests/test_align_english_mfa_canonical_units.py`、`README.md`
+
+### 根因
+
+最终 visual silence owner 决策完成后，后续 geometry 的 serialized integer duration
+可能落在阈值边界，而保留 interval 仍带有旧的 `<spN>` 标签。典型是 exact 200ms
+interval 仍为 stale `<sp0>`；若在 owner decision 前修正，会提前触发 Case 161 的
+forced-left merge，改变 owner 分类。
+
+### 修复与边界
+
+新增 post-owner、pre-freeze 的最终规范化：只对最终保留的内部纯静音 interval 按
+`_duration_ticks` 分类，阈值保持 `<200ms`/`[200,500ms)`/`[500,1500ms)`/`>=1500ms`
+对应 `<sp0>`/`<sp1>`/`<sp2>`/`<sp3>`。只改 label，不改 interval geometry、owner、tier
+数量或过滤原因；leading `<sp1>` convention 不变，也不重新开启 owner arbitration。
+原 decision 的 `label`、`expected_label`、mismatch reason 保留，serialized label 与
+normalization status 单独写入 report；实际改写进入 processed geometry operation ledger，
+重复调用幂等。
+
+### 回归证据
+
+只读内存回放全部 14 个现有 filtered TextGrid，其中恰有 8 个 stem（`000153`,
+`000172`, `000210`, `000316`, `000335`, `000392`,
+`000424`, `000499`）发生 `200000us <sp0> -> <sp1>` 重标；6 个 stem（`000090`,
+`000096`, `000239`, `000247`, `000365`, `000402`）保持不变。14/14 的 interval count
+与 bounds 均未改变。另用合成单测覆盖 199999us `<sp0>`、100ms stale `<sp1>`、500ms、
+570–870ms `<sp2>`、ledger idempotence、leading `<sp1>`、freeze/derived rebuild，以及最终
+`mid_sp` + `strict_interior_sp` rejection；full suite 为 **463 passed**。代码/单测与文档
+修改完成；不启动生产或 publication runtime。
+
+## Case 179: pipelined multi-batch publication must be dataset-atomic
+
+**日期**：2026-08-25
+**涉及文件**：`scripts/streaming_pipeline.py`、
+`tests/test_streaming_publication_contract.py`、
+`configs/laria_v5_no_reference_8gpu_20260825.yaml`
+
+### 根因
+
+旧 pipelined CPU worker 直接把每个 batch 合并到 dataset 级 `output/`、`filtered/`
+和同名 receipt/report；多批次因此会互相覆盖 evidence，且在全部 batch 完成前即可写入
+dataset checkpoint，无法证明 source/eligible/output/filtered 的集合守恒。
+
+### 修复与边界
+
+每批先发布到 `.staging/batch_XXXX`，按相对路径、文件大小和 SHA-256 验证后才清理本地
+batch；receipt/report 固定写入 `.batch_evidence/batch_XXXX`。resume 只接受 identity
+和文件 hash 均匹配的 evidence，不以目标目录存在文件作为跳过条件。所有 batch 按 index
+排序聚合，生成 dataset 级 v2 receipt、report 和原子
+`.streaming_dataset_receipt_v1.json`；只有 COMPLETE receipt 写成功后才更新 checkpoint。
+任一冲突、缺失或 hash mismatch 均 fail closed，保留 staging/local evidence，不写 COMPLETE。
+
+### Launch-safety correction
+
+启动前在读取 cache 后立即校验 explicit source inventory；缺失、变更、symlink 或 WAV
+size/SHA-256 不匹配时，在 output/NAS 解析、目录创建和 GPU 工作前 fail closed。外层
+streaming worker 负责 GPU 分配，LAria 配置将 `ctc_prealign.all_gpus` 固定为 `false`；
+worker 的 CUDA 环境映射保留，子进程只接收 remapped `cuda:0`，不会再次 all-GPU fan-out。
+
+### 回归证据
+
+新增 publication contract 覆盖 staging 隔离、覆盖冲突、hash mismatch、batch index
+聚合顺序、集合守恒、config/cache identity 绑定和 no-reference LAria 配置。专用冻结 cache
+包含 1055 个唯一 stem 及每个 WAV 的 size/SHA-256；新增启动前 inventory invocation/failure
+和 worker device/no-all-GPU 测试。本次未启动 NAS/NVMe 生产任务。
+
+## 2026-08-25 本轮历史回归复现审计（非 Case）
+
+### 审计边界与最终 artifact
+
+本节是对当前影响面的历史审查和映射，不代表对 178 个 Case 全部动态重跑。本轮
+authority 1000、选定回归测试以及五类变更影响面构成当前证据边界；没有把历史目录或
+人工审阅结果冒充回归测试。retry2 最终 artifact 的 receipt、strict manifest、English
+manifest 和 postprocess report 相互一致：eligible/output/filtered 为
+`1000/986/14`，即 `1000 = 986 + 14`；English 为 `3182/3182` segments、
+`3265/3265` verified、0 rejects；469 个 raw `<unk>` 均与 `spn` overlap，且 469 个
+均有 proof；singleton 为 1/1 recovered。14 个 filtered 中，6 个为 570–870ms 的
+`<sp2>`，8 个为 200ms label-duration mismatch。`global_reasons[]` 为空，canonical
+English drift 为 0。
+
+14 个 filtered stem 与 Case 177 一致：`000090`, `000096`, `000239`, `000247`,
+`000365`, `000402`（真实长 `<sp2>`）以及 `000153`, `000172`, `000210`, `000316`,
+`000335`, `000392`, `000424`, `000499`（exact 200ms stale `<sp0>`）。
+
+用户刚完成的 `E:\音频\0825` 人工审阅副本由 root 独立校验：1000 WAV、1000 TextGrid，
+同名配对缺失 0、大小不匹配 0、空文件 0。这是操作性交付核验，不是回归测试，也不单独
+编号为 Case。
+
+### A. 新问题
+
+- Case 175：marker binding 的 strict English noncontiguous source span 问题。
+- Case 176：声明长停顿边界缺少声学验证的问题。
+- Case 177：run-local MFA/Numba 状态未隔离的问题。
+- Case 178：owner commit 后 stale internal silence label 的 serialized tick normalization。
+- Case 179：pipelined 多 batch dataset publication 的 staging/evidence/COMPLETE 契约。
+
+### B. 既有问题/症状复现
+
+- Case 170 的 `segment_too_short` 症状在 Case 176 重现，但根因不同：本次是
+  raw/processed span 与假长停顿起点的边界契约问题，标记为“症状复现/契约扩展”，
+  不是 Case 170 根因再次成立。
+- Cases 134/172/173 的音频轴/receipt owner 风险在 cold `--skip-to adjust` 路径级复现。
+- Cases 76/83 的“进程成功但产物不完整”条件再次真实出现；旧 fail-closed 没有失效，
+  本轮新增的是受限恢复，因此不能写成 silent-loss gate 回归。
+- Cases 125/168 的运行隔离问题扩展至 English 子流水线 namespace。
+
+### C. 最终证据未复现
+
+- Cases 139/162 的 canonical English owner 漂移未复现：`3265/3265` verified、0
+  rejected、canonical drift 0。
+- Case 169 的 initial-Mira proof 脱节未复现：469 proofs，469 个 raw `<unk>` 均有
+  `spn` 来源，最终无 unknown rejection。
+- Case 170/176 的短段最终为 0，且 `3182/3182` produced。
+- Cases 76/77/129/168 的漏分母、静默丢失、全局审计失败、证据污染未复现：
+  healthy，`silent_loss=0`，`1000=986+14`，`global_reasons[]`。
+- Case 140 的真实内部停顿保护保持有效：14 条继续 fail-closed。
+
+### D. 无法判定
+
+不在本轮 authority 1000、选定测试或五类变更影响面内的 Case 无法判定，包括
+no-reference、streaming、多 GPU、54k、其他 speaker/layout、生产发布，以及没有
+相同输入、配置、模型、schema 和路径的场景。它们既不能据此写成已复现，也不能据此
+写成最终未复现。
+
+## Case 180: no-reference NVV、内部静音和最终 geometry 的批量假阳性
+
+**日期**：2026-08-25
+**涉及文件**：`scripts/postprocess_textgrids.py`、相关 geometry/no-reference tests
+
+### 根因
+
+无参考文本路径把 NVASR 的 bare NVV 与最终 bracketed NVV 当成不同词面；内部静音检测
+只看到 silence interval 就判定，不要求左右均有 lexical owner；`unexpected_silence`
+又在最终 geometry/owner 修正前形成不可撤销的旧 reason。这三项在同一批数据上叠加，
+造成通过率看似随机波动：改动执行顺序或并行批次不改变声学结果，却会改变旧 reason
+是否残留。
+
+### 修复与边界
+
+bare/bracketed known NVV 使用同一 lexical identity；只有左右均存在 substantive lexical
+owner 的纯内部 silence 才进入 `strict_interior_sp`；所有 geometry mutation 完成后从最终
+tier 重新计算 unexpected-silence reasons。真实长停顿仍 fail closed，不通过降低阈值来
+提高通过率。
+
+### 生产证据
+
+LAria 1055 条无参考数据中，修复前观察到的 `strict_interior_sp`、
+`unexpected_silence`、`ctc_lexical_sequence_mismatch` 分别为 1046、991、867；v1 生产
+证据降为 865、855、188，输出为 142。最终 strict-English v2 为 857、847、188，输出
+171。`ctc_lexical_sequence_mismatch` 剩余项有具体 lexical 证据，不再由 known NVV
+括号形式单独触发。
+
+## Case 181: GPU fallback producer 被 CPU consumer 错换成 ctc_ready mode
+
+**日期**：2026-08-25
+**涉及文件**：`scripts/streaming_pipeline.py`、
+`tests/test_streaming_publication_contract.py`
+
+### 根因
+
+pipelined GPU worker 已按 `nvrasr_fallback` 生成并 seal raw CTC receipt，但 CPU queue 只传
+文件路径，consumer 根据“CTC 文件已存在”推断成 `ctc_ready`，重新进入 link，并在 sealed
+raw namespace 上附加全局 `--overwrite`。第一次八卡生产因此八批都在 CPU link 阶段失败；
+去掉 overwrite 后仍会因 producer/consumer mode fingerprint 不一致失败。
+
+### 修复与边界
+
+queue 显式携带 producer mode。fallback consumer 从 `resample` 继续，沿用原 raw/work
+receipt；只有真正的 `ctc_ready` import 才进入 link。sealed raw 禁止全局 overwrite，空
+CTC audio bindings 只在 downstream receipt 中补全，不改写 raw producer evidence。
+`restore_ctc_cache: false` 时，下游失败也不再向 dataset root 写共享 CTC cache。
+
+### 回归证据
+
+单测覆盖 fallback/ctc_ready 命令分支、sealed overwrite gate、raw/work receipt owner 和
+producer mode 传递。最终八批均复用同一批 GPU 结果完成 CPU 阶段，没有重新运行 NVASR；
+1055 个 frozen stem 全部进入最终 accounting denominator。
+
+## Case 182: batch evidence orphan recovery、发布诊断和 config/cache 输出身份漂移
+
+**日期**：2026-08-25
+**涉及文件**：`scripts/streaming_pipeline.py`、
+`configs/laria_v5_no_reference_strict_8gpu_20260825.yaml`、
+`cache/laria_v5_no_reference_strict_8gpu_20260825.cache.json`、
+`tests/test_streaming_publication_contract.py`
+
+### 根因
+
+一次 NAS rename 在 staging 已 commit 后、batch evidence 最终 rename 前瞬时失败，留下合法
+`.batch_XXXX.tmp.*`；旧 resume 不恢复它。随后 strict v2 从 v1 复制配置时只改 YAML，cache
+的 `output_root`/dataset `ctc_dir` 仍指向 v1。八批 CPU 均成功，却被 v1 已有 evidence 的
+config/cache hash gate 正确拒绝；早期 publication precondition 只返回 false，没有指出是
+receipt、partition、report 还是已有 evidence identity 冲突。
+
+### 修复与边界
+
+仅当 staging 已 commit、正式 evidence 不存在，且 orphan 的 stems/config/cache/report/
+artifact hash 全部通过同一 trusted gate 时，才原子恢复 orphan evidence。所有发布前置拒绝
+现在输出具体原因。新增 strict LAria contract，强制 YAML `output_dir` 等于 cache
+`output_root`，dataset `ctc_dir` 等于 `<output>/<dataset>`；不允许覆盖身份不匹配的旧 evidence。
+
+### 生产证据
+
+v1 orphan 经 trusted recovery 后聚合成功。v2 修正输出身份后生成 8 个 batch staging、8 个
+batch evidence 和 COMPLETE dataset receipt；checkpoint 为 `completed=[LAria]`、failed 0。
+失败重试留下的两份 132-stem shared-cache 被移动到
+`.failed_cache_evidence/`，保留可恢复证据且不混入正式输出。
+
+## Case 183: no-reference strict English provenance 与 authority strict-ok 错误耦合
+
+**日期**：2026-08-25
+**涉及文件**：`scripts/postprocess_textgrids.py`、`scripts/run_pipeline.py`、
+`scripts/audit_strict_ok.py`、`scripts/streaming_pipeline.py`、
+`tests/test_hyphenated_postprocess_provenance.py`、`tests/test_axis_contracts.py`、
+`tests/test_streaming_publication_contract.py`
+
+### 根因
+
+LAria v1 开启 English MFA，却未开启 strict provenance，238 个含英文 stem 因缺 ledger 被
+过滤。strict v2 已真实生成 `strict-en-mfa-v2` ledger，但 postprocess 过去仅用全局
+`--strict-ok` 作为读取 strict English 的开关；不开时仍报 missing，开启时又会启动仅适合
+authority reference 的独立最终审计。该审计最初还用 stdlib `wave` 读取原始 IEEE-float
+WAV（format tag 3）并崩溃；支持 float 后，authority-only 审计又按其设计把 no-reference
+文本修正和 preexisting filtered 全部拒绝为 safe-empty 0/1055。
+
+### 修复与边界
+
+新增独立 `--strict-en-provenance`：`mfa_en.strict_provenance: true` 同时控制 English MFA
+ledger 生产和 postprocess ledger 消费，不再要求全局 `postprocess.strict_ok`。LAria
+no-reference 配置保持 `strict_ok: false`，因此不会冒充 authority 审计。独立 auditor 的 WAV
+metadata 改用共享不可变 header reader：PCM 保持 stdlib 行为，仅对 WAV/WAVEX FLOAT/DOUBLE
+窄回退到 libsndfile。对应测试覆盖 strict-English/global-strict 解耦和 format-3 metadata。
+
+### 最终生产验收与 English 结论
+
+最终 UNC 路径为
+`\\RS3621\Research_TTS\Data\Raw\0825\laria-v5-no-reference-8gpu-20260825-v2\LAria`。
+dataset receipt 为 COMPLETE，`1055 = 171 output + 884 filtered`，交集 0、并集 1055；report
+1055 行/1055 unique stem，正式 accounting validation errors 为空，8 个 batch hash 全部绑定
+当前 config/cache。
+
+English provenance 为 811 `not_required`、220 `verified`、18 `rejected`、6 `absent`；不存在
+`english_provenance_missing`。18 个 rejected 中只有 2 个是实际 `<150ms` segment（最终约
+50ms/45ms），不是普遍的 60ms CTC 时间戳；另 16 个均同时有
+`ctc_lexical_sequence_mismatch`，其中 14 个是 final/ledger English word count mismatch、2 个
+是 compound split。6 个 absent 全部是 formal `missing_mfa_alignment`。因此早期 238 条 missing
+是配置/消费链问题，最终剩余 18 条是有明确证据的拒绝，而不是随机通过率波动。
+
+### 历史复现映射
+
+- Cases 134/172/173 的 receipt/axis owner 风险在 producer mode 丢失处症状复现，Case 181
+  增加 streaming queue mode contract。
+- Cases 76/83 的“子阶段成功但最终未发布”症状在 cache output identity 漂移处复现；最终
+  COMPLETE gate 有效，没有 silent loss。
+- Cases 139/162/170/176 的 English provenance/短段风险在新数据上部分复现：220 verified，
+  2 个真实短段 fail closed；不存在 238 条 provenance missing。
+- Case 140 的真实内部停顿保护仍有效；本轮未以放宽停顿 QC 换取通过率。
+
+## Case 184: no-reference BGM 候选必须由精确 CTC gap 支持
+
+**日期**：2026-08-26
+**涉及文件**：`scripts/postprocess_textgrids.py`、`tests/test_laria_bgm_ctc_gap.py`
+
+### 根因
+
+v10 no-reference baseline 的 1055 条中有 1049 条 ok、5 条 BGM 和 1 条 exact
+unknown/NVV conflict。按 unchanged-rule replay，LAria_00060、LAria_00092、
+LAria_00388 是 false BGM；LAria_00518、LAria_00634 是 true CTC-gap BGM。
+LAria_00160 的 exact source/CTC/final unknown-NVV mismatch 仍必须拒绝。另有
+LAria_00574 的 v8/v9 adjusted CTC SHA 相同，CTC ge4 为 1.59–1.95；v8 final ge4
+结束于 1.67，形成 false BGM，而 CTC-supported gap 为 1.95–3.06 且 high ratio 为 0。
+
+### 修复与边界
+
+仅在 no-reference fallback 中先重算并校验完整 digest-bound source→CTC→final
+correspondence，再为每个最终 silence 使用精确相邻 CTC lexical anchors：内部 gap 为
+`[left_ctc.end, right_ctc.start]`，首尾 gap 分别以 audio axis 起止为边界；最终 scan
+span 与 final silence、audio axis 相交后才应用原有最小时长门禁。缺失、malformed 或
+unsafe proof 保留 legacy full-final-silence scan。noise floor、50ms frame、half-hop、
+`>=.20` interval ratio、file-level ratio、duration 和 config 值均未改变，也未使用
+fallback pause qualification 作为 shortcut。报告记录 validation status/digest、原始
+silence、CTC gap、evaluated intersection、owner ordinals 和 excluded duration。
+
+### 验证证据
+
+新增 deterministic tests 覆盖 00574-style downstream geometry pair、leading/trailing
+audio-axis intersection 和 unsafe proof fail-closed 行为。v10 replay 目标投影为
+1052 ok、3 filtered；其中仅 LAria_00518/LAria_00634 为 BGM，LAria_00160 保持 exact
+conflict。历史 unchanged-rule 结果与上述 stem 分类作为运行证据保留；未修改 CTC/MFA/
+English/NVV producer、配置或生产 artifact。
+
+## Case 185: staged/普通八卡路径不得把 batch success 当成 dataset publication
+
+**日期**：2026-08-26
+**涉及文件**：`scripts/streaming_pipeline.py`、
+`tests/test_streaming_publication_contract.py`
+
+### 根因与真实复现
+
+Case179/182 已为一条八卡路径建立 isolated batch staging、batch evidence、dataset aggregate
+和 COMPLETE receipt，但普通 staged/非 staged worker 仍沿用旧的“直接复制后计成功”分支。
+LAria v10 因此得到 8 个本地成功批次和成功 checkpoint，却只有
+`LAria/.staging/batch_*`，没有正式 `output/filtered`、`.batch_evidence` 或 COMPLETE receipt。
+这不是展示问题：用户看到的“完成”不具备可审计的 1055-stem conservation。
+
+### 修复与边界
+
+所有并行路径现在统一发布到 dataset-local `batch_XXXX` staging，并以 stems、config/cache
+hash、batch receipt、report 和 artifact hash 建立 trusted evidence。resume 只接受 trusted
+evidence；batch index 在每个 dataset 内唯一。只有所有计划批次均可信、聚合后的
+`output ∪ filtered` 恰好等于 frozen source 且二者无交集、最终 report 和两个 COMPLETE
+receipt 复核通过后，dataset 才能进入 checkpoint。调整后的 CTC 只作为 batch evidence
+保留，不混入正式 TextGrid 输出。上传失败时本地目录改名为 `.FAILED` 保留，cleanup 不得
+删除；最终 ok_count 由 verified COMPLETE dataset 重新计算。
+
+### 历史复现映射
+
+这是 Cases76/83 的“子阶段成功不等于最终发布”和 Cases179/182 的“batch evidence/输出
+身份”风险在普通 staged route 上的再次复现。修复没有放宽任何语音质量门禁，只收紧
+publication authority。
+
+## Case 186: no-reference unknown recovery 必须是唯一有序单次消费投影
+
+**日期**：2026-08-26
+**涉及文件**：`scripts/postprocess_textgrids.py`、`tests/test_laria_fallback_mapping.py`
+
+### 根因
+
+fallback unknown 恢复过去对每个 `<unk>` 独立选择最大时间重叠的 CTC lexical token。
+连续宽 unknown 因而可能重复消费第一个 CTC owner；后续 `_snap_to_ctc` 的 Rule 0 已无法
+恢复第二个真实 owner，LAria_00160 的 `SURPRISE-WA`/`BREATHING` 对应关系被破坏。
+
+### 修复与边界
+
+新增 source→CTC 的 exact monotone projection：已知 source 只能按 canonical identity
+相等消费，unknown 只能消费已知 NVV/English，已知 source omission 显式记录；每个 CTC
+word 必须按序且只消费一次，并且完整解必须唯一。projection 在所有 lexical evidence
+通过前不修改 tier；非唯一、部分、重排、替换、畸形或非 NVV/English target 均保持原样。
+恢复证据记录 source ordinal/identity、CTC ordinal/identity/span 及 omission/recovery
+信息；后续 fallback NVV 边界恢复使用 ordinal authority，不再用宽时间重叠选择 owner。
+最终 correspondence ledger 继续独立校验 CTC→final identity、count、order 和 digest。
+
+### 验证边界
+
+新增 deterministic coverage 验证连续 unknown 的 distinct CTC ordinals/spans、known-source
+omission 不移位、重复 owner negative，以及所有拒绝分支的 all-or-nothing 行为。未运行
+v11；未修改 Case185、CTC/MFA/English/NVV producer、配置或 publication worker 文件。
+
+## Case 187: English 精确 150ms clip 不得因浮点下取整丢一帧
+
+**日期**：2026-08-26
+**涉及文件**：`scripts/align_english_mfa.py`、`config.yaml`、
+`tests/test_align_english_mfa_canonical_units.py`
+
+### 根因
+
+旧 eligibility 先用浮点秒数比较，再分别对 start/end 做截断。一个权威时长恰为 150ms
+的 English clip 会因二进制浮点和两端独立 floor 少一个 sample，被误报为 `<150ms`。
+同时 50ms context 对极短 CTC anchor 的辅音边界偏紧，容易放大 MFA singleton 波动；这
+解释了“像是只用了 60ms”的观感，但生产证据不支持所有英文都只有 60ms。
+
+### 修复与验证
+
+eligibility 现在以 MFA 实际看到的 sample interval 为准：两端使用 round，最低样本数使用
+ceil；恰好 150ms 的 clip 可进入 MFA，149ms 仍拒绝。默认/生产 context padding 调整为
+75ms，但 canonical word span、最终投影和 150ms 门槛不变。v11 八批 English producer
+均报告 `0 skipped (too short)`。历史上 Cases170/176/177/183 的短 anchor、processed
+geometry、singleton retry 和 provenance 风险在此处部分复现；本修复没有把 CTC 单帧直接
+发布为最终词边界。
+
+## Case 188: single-process MFA retry 必须携带原 CTC anchor
+
+**日期**：2026-08-26
+**涉及文件**：`scripts/run_pipeline.py`、
+`tests/test_laria_mfa_retry_contract.py`、`tests/test_single_process_mfa_partition.py`
+
+### 根因
+
+并行 MFA 对少量 utterance 不产出 TextGrid 时，single-process retry 分支过去只复制 WAV/
+lab，遗漏对应 `ctc_pretg_adj/<stem>.TextGrid`；另一个 fallback 132-batch 分支甚至没有在
+正式 accounting 前调用同等 retry。结果是同一份 CTC 在不同分片/调度下出现 6 条
+`missing_mfa_alignment` 波动，并非 ASR 文本随机变好变坏。
+
+### 修复与验证
+
+retry 输入现在是 exact stem 的 WAV、lab 和调整后 CTC anchor 三件套；缺任何一件即
+fail closed。首次单进程仍未产出时，才在相同 anchor 上使用有界高 beam rescue；每次尝试
+记录输入 hash、设置和输出。sharded 与 single-process 主路径都在最终 denominator 前运行
+同一 coordinator。v11 真实运行分别恢复了各批 1/1、2/2 等缺失项，最终 1055 条均有 MFA
+输出。该症状是 Case132 的 MFA 缺失问题和 Case177 的 bounded singleton retry 在新
+调度路径上的复现。
+
+## Case 189: fallback English unknown 需要 exact correspondence 和 strict ledger 双证据
+
+**日期**：2026-08-26
+**涉及文件**：`scripts/postprocess_textgrids.py`、
+`tests/test_laria_fallback_mapping.py`
+
+### 根因
+
+Case186 已允许 source `<unk>` 在唯一有序投影中恢复到已知 NVV 或 English，但最终
+`mfa_unknown_source` redemption gate 仍只承认 NVV。LAria_00571 的 source ordinal 0
+为 `<unk>`，CTC/final ordinal 0 均为 `ria`，English provenance 为 1/1 verified，完整
+correspondence 也是 safe，却仍被旧 veto 过滤。
+
+### 修复与边界
+
+新增统一 recovery gate：known NVV 需要完整 exact source→CTC→final correspondence；
+English 除同一 correspondence 外，还必须有全量 verified strict-English ledger。Chinese/
+pinyin target、partial/rejected English ledger、非唯一或不完整 projection 一律不赎回。
+报告区分 `known_nvv` 与 `strict_english`，并记录 ledger digest/provenance。该问题连接了
+Cases169/175/183 的 English owner/provenance 与 Case186 的 unknown ordinal ownership，
+没有把表面文本回填等同于无证据的声学成功。
+
+## Case 190: staged dataset finalize 必须只有一个 owner
+
+**日期**：2026-08-26
+**涉及文件**：`scripts/streaming_pipeline.py`、
+`tests/test_streaming_publication_contract.py`
+
+### 根因与 v11 证据
+
+Case185 修复后，`_execute_staged` 已生成 mode=`staged` 的最终 receipt 和 COMPLETE dataset
+receipt；外层 `run_batch` 又无条件按 mode=`streaming` 调用一次 finalize。第二次提交与数秒
+前的合法 receipt 冲突，v11 因而在 `8/8 batches uploaded` 后 fail closed。磁盘上已有
+1055-stem conservation 和 8 份 trusted evidence，因此没有数据丢失；错误是 finalize
+owner 重复，而不是应该绕过 conflict check。
+
+### 修复与历史复现
+
+staged route 只由 `_execute_staged` 完成 aggregate、COMPLETE verification 和 checkpoint；
+外层 finalize 仅服务 non-staged route。receipt mode 不再在同一运行中改变，已有冲突检查
+继续 fail closed。该问题再次体现 Cases76/83/179/182 的共同边界：完成状态必须由一个
+明确 publication owner 提交，不能由多个“都看似成功”的层重复认领。
+
+## Case 191: LAria v12 八卡无参考生产验收与历史回归复核
+
+**日期**：2026-08-26
+**涉及文件**：`configs/laria_v5_no_reference_strict_8gpu_20260826_v12.yaml`、
+`scripts/streaming_pipeline.py`、`scripts/run_pipeline.py`、
+`scripts/align_english_mfa.py`、`scripts/postprocess_textgrids.py`
+
+### 真实生产结果
+
+对 frozen source `/mnt/Raw/v5_0707/LAria/wavs` 的 1055 条音频以无参考文本、8 GPU、
+staged route 完整复跑。8/8 批次均处理并上传成功；dataset receipt 为 `COMPLETE`、
+`receipt_mode=staged`，run receipt 为 `run_health=healthy`、`silent_loss=0`。最终 report
+有 1055 个唯一 stem，恰好得到 1053 个 `ok` 和 2 个 `filtered_bgm_suspect`；正式 output
+与 report 的 ok 集合双向差集均为 0，output 与 filtered 交集为 0。
+
+唯一过滤项为 LAria_00518 与 LAria_00634。两者的 BGM 扫描均由 verified exact
+source→CTC→final correspondence 选出的相邻 CTC gap 支持：00518 在 1.05–1.59s 的
+540ms gap 内 high-energy ratio 为 0.450；00634 在 0.99–1.83s 的 840ms gap 内 ratio
+为 0.219，均超过既有 0.20 门槛。此前误报的 00060/00092/00388 未再过滤，因此
+Case184 的 false-positive 修复和 true-positive 门禁同时得到真实验证。
+
+### English、unknown 与 NVV 复核
+
+240 条含 English 的样本共要求 281 个词，281/281 strict provenance verified，失败词为
+0；不存在因 150ms 浮点下取整导致的 skipped English。LAria_00571 本轮直接产出 `RIA`
+且 1/1 English provenance verified，没有复现 v11 的 MFA `<unk>`，但 Case189 的 exact
+English redemption 负向/正向测试仍保留，防止该调度相关症状再次出现时被误过滤。
+
+本轮共有 126 条样本记录 `fallback-unknown-recovery-v2`，128 个 `<unk>` 全部以
+`known_nvv + exact_correspondence` 恢复；没有 Chinese/pinyin 或无证据恢复。LAria_00160
+的两个连续 unknown 分别单次消费 CTC ordinal 0/1，最终为 `SURPRISE-WA` 与
+`BREATHING`，验证 Case186 的有序唯一投影。所有 1055 条均取得 MFA 输出，Case188 的
+anchored retry 未再产生 `missing_mfa_alignment`。运行只产生一次 staged finalize，验证
+Cases185/190；历史 Cases169/170/175/176/177/179/182/183/184/186–190 均未发现违约复现。

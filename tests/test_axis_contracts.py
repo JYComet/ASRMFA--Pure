@@ -3,11 +3,15 @@ from __future__ import annotations
 import argparse
 import json
 import struct
+import sys
 import wave
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from scripts import audit_strict_ok as audit
 from scripts import postprocess_textgrids as post
+from scripts import run_pipeline
 
 
 def _wav(path: Path, seconds: float, rate: int = 16000) -> None:
@@ -22,6 +26,21 @@ def _wav(path: Path, seconds: float, rate: int = 16000) -> None:
 def _sha(path: Path) -> str:
     import hashlib
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_float_wav(path: Path, *, frames: int, sample_rate: int) -> None:
+    samples = b"\0\0\0\0" * frames
+    fmt = struct.pack("<HHIIHH", 3, 1, sample_rate, sample_rate * 4, 4, 32)
+    fact = struct.pack("<I", frames)
+    chunks = [
+        b"fmt " + struct.pack("<I", len(fmt)) + fmt,
+        b"fact" + struct.pack("<I", len(fact)) + fact,
+        b"data" + struct.pack("<I", len(samples)) + samples,
+    ]
+    path.write_bytes(
+        b"RIFF" + struct.pack("<I", 4 + sum(map(len, chunks)))
+        + b"WAVE" + b"".join(chunks)
+    )
 
 
 def _grid(path: Path, xmax: float) -> None:
@@ -75,6 +94,30 @@ def test_same_axis_positive(tmp_path):
     assert audit._axis_contract_reasons(args, {"fixture"}) == ([], {"fixture": []})
 
 
+def test_axis_wav_meta_supports_ieee_float_without_changing_pcm_duration(tmp_path):
+    float_wav = tmp_path / "float.wav"
+    _write_float_wav(float_wav, frames=12_000, sample_rate=16_000)
+    float_meta = post._axis_wav_meta(float_wav)
+    assert float_meta["duration_s"] == 0.75
+    assert float_meta["sample_rate"] == 16_000
+    assert float_meta["frames"] == 12_000
+    assert float_meta["channels"] == 1
+    assert float_meta["sample_width"] == 4
+    assert audit._axis_wav_meta(float_wav) == float_meta
+    assert audit._wav_duration(float_wav) == 0.75
+
+    pcm_wav = tmp_path / "pcm.wav"
+    _wav(pcm_wav, 0.5)
+    pcm_meta = post._axis_wav_meta(pcm_wav)
+    assert pcm_meta["duration_s"] == 0.5
+    assert pcm_meta["sample_rate"] == 16_000
+    assert pcm_meta["frames"] == 8_000
+    assert pcm_meta["channels"] == 1
+    assert pcm_meta["sample_width"] == 2
+    assert audit._axis_wav_meta(pcm_wav) == pcm_meta
+    assert audit._wav_duration(pcm_wav) == 0.5
+
+
 def test_tts_axis_mismatch_is_filterable(tmp_path):
     args, _, _ = _fixture(tmp_path, tts_seconds=1.1)
     errors, reasons = post._load_axis_contract(args)
@@ -117,6 +160,33 @@ def test_schema_digest_and_stem_tamper_are_infrastructure_failures(tmp_path):
     assert "axis_stem_conservation_invalid" in errors
     errors, _ = audit._axis_contract_reasons(args, {"fixture", "missing"})
     assert "axis_stem_conservation_invalid" in errors
+
+
+def test_partial_mfa_axis_keeps_missing_stem_in_denominator(tmp_path):
+    aligned = tmp_path / "aligned"
+    audio = tmp_path / "audio_16k"
+    aligned.mkdir(); audio.mkdir()
+    stems = ["aligned", "missing_mfa"]
+    bindings = []
+    for stem in stems:
+        wav = audio / f"{stem}.wav"
+        _wav(wav, 1.0)
+        bindings.append({"stem": stem, "path": str(wav.resolve()),
+                         **post._axis_wav_meta(wav)})
+    _grid(aligned / "aligned.TextGrid", 1.0)
+    ctx = {"mfa_input_axis_receipt": {
+        "schema": post.MFA_INPUT_AXIS_SCHEMA,
+        "stems": stems,
+        "audio": bindings,
+    }, "mfa_missing_stems": ("missing_mfa",)}
+
+    assert run_pipeline._write_mfa_alignment_axis_receipt(ctx, aligned) == 0
+    receipt = json.loads(
+        (tmp_path / ".mfa_alignment_axis_receipt.json").read_text(encoding="utf-8"))
+    assert receipt["stems"] == stems
+    assert receipt["status_counts"] == {"aligned": 1, "missing_mfa_alignment": 1}
+    status = {row["stem"]: row["status"] for row in receipt["alignments"]}
+    assert status == {"aligned": "aligned", "missing_mfa": "missing_mfa_alignment"}
 
 
 def test_minimal_historical_axis_fixture_is_18_rejections():

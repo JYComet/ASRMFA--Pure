@@ -221,7 +221,8 @@ def classify_ctc_bundle(root: Path, stem: str, wav_path: Path) -> tuple[str | No
             errors.append(str(exc))
     if errors:
         return None, errors, None
-    errors.extend(validate_ctc_transcript_bundle(root, stem))
+    errors.extend(validate_ctc_transcript_bundle(
+        root, stem, _require_processed=False))
     if errors:
         return None, errors, None
     try:
@@ -911,7 +912,8 @@ def _v4_json(path,punct,duration):
 
 def validate_standard_bundle(root,stem,audio):
     for suf in V4_SUFFIXES: require_regular(root/(stem+suf))
-    shared=validate_ctc_transcript_bundle(root,stem)
+    shared=validate_ctc_transcript_bundle(
+        root, stem, _require_processed=False)
     if shared: raise ValueError(shared[0])
     meta=_v4_wav(audio); tok=_v4_json(root/(stem+"_tokens.jsonl"),False,meta["duration_s"]); _v4_json(root/(stem+"_punct.json"),True,meta["duration_s"]); tg=parse_textgrid(root/(stem+".TextGrid"))
     if len(tg.tiers)!=2 or [x.name for x in tg.tiers] != ["words","pauses"] or abs(tg.xmin)>DOMAIN_TOL or abs(tg.xmax-meta["duration_s"])>DOMAIN_TOL: raise ValueError("not standard final-axis TextGrid")

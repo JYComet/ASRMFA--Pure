@@ -31,7 +31,11 @@ from audio_energy import (
     noise_floor_from_rms, global_noise_floor,
     speech_onset, speech_offset, median,
 )
-from pipeline_utils import find_wav
+from pipeline_utils import (
+    CTC_RAW_MANIFEST_NAME, CTC_WORK_RECEIPT_NAME,
+    write_ctc_work_receipt, validate_ctc_work_receipt,
+    find_wav,
+)
 
 
 # ===== Speech boundary search (vectorised) =====
@@ -126,6 +130,51 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
     def _is_nvv(w: str) -> bool:
         return bool(re.match(r'^[A-Z][A-Z0-9-]*[A-Z0-9]$', w))
 
+    def _canonical_span(tok: dict) -> tuple[float, float] | None:
+        unit = tok.get("canonical_unit")
+        span = tok.get("canonical_span")
+        if not isinstance(unit, dict) or not isinstance(span, (list, tuple)):
+            return None
+        if len(span) != 2 or span != list(unit.get("canonical_span", ())):
+            return None
+        return float(span[0]), float(span[1])
+
+    def _write_start(tok: dict, value: float, source: str = "energy_start") -> None:
+        canonical = _canonical_span(tok)
+        if canonical is not None:
+            value = canonical[0]
+            if float(tok["end_s"]) < canonical[1]:
+                tok["end_s"] = canonical[1]
+                tok["end_ms"] = round(canonical[1] * 1000, 1)
+        else:
+            value = round(float(value), 3)
+        tok["start_s"] = value
+        tok["start_ms"] = round(value * 1000, 1)
+        if canonical is not None:
+            tok["processed_ctc_span"] = [value, float(tok["end_s"])]
+            tok["processed_ctc_boundary_source"] = source
+
+    def _write_end(tok: dict, value: float, source: str = "energy_end") -> None:
+        canonical = _canonical_span(tok)
+        if canonical is not None:
+            value = max(float(value), canonical[1])
+        else:
+            value = round(float(value), 3)
+        tok["end_s"] = value
+        tok["end_ms"] = round(value * 1000, 1)
+        if canonical is not None:
+            tok["processed_ctc_span"] = [float(tok["start_s"]), value]
+            tok["processed_ctc_boundary_source"] = source
+
+    def _hard_boundary(tok: dict, next_tok: dict | None) -> float | None:
+        """Return punctuation/long-pause boundary that energy must not cross."""
+        candidates = [p["start_s"] for p in punct
+                      if tok["end_s"] - 0.03 <= p["start_s"]
+                      and (next_tok is None or p["start_s"] <= next_tok["start_s"] + 0.03)]
+        if next_tok is not None and next_tok["start_s"] - tok["end_s"] >= 0.2 - 1e-9:
+            candidates.append(next_tok["start_s"])
+        return min(candidates) if candidates else None
+
     # Pre-compute global RMS once (reused for noise floor)
     full_rms, rms_frame_dur = frame_rms(audio, sr, frame_ms=20.0)
     nf = noise_floor_from_rms(full_rms, bottom_pct=0.15)
@@ -156,8 +205,7 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
             continue
 
         old_start = tok["start_s"]
-        tok["start_s"] = round(new_start, 3)
-        tok["start_ms"] = round(new_start * 1000, 1)
+        _write_start(tok, new_start)
 
         if onset >= tok["end_s"]:
             pushed_end = onset + min_dur
@@ -168,8 +216,7 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
                 # still occupies time — content word cannot cross into it.
                 pushed_end = min(pushed_end, next_tok["start_s"] - 0.02)
             if pushed_end > tok["end_s"]:
-                tok["end_s"] = round(pushed_end, 3)
-                tok["end_ms"] = round(pushed_end * 1000, 1)
+                _write_end(tok, pushed_end)
 
         stats["start_adj"] += 1
 
@@ -189,10 +236,7 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
             check = True
         else:
             next_tok = tokens[idx + 1]
-            for p in punct:
-                if tok["end_s"] - 0.03 <= p["start_s"] <= next_tok["start_s"] + 0.03:
-                    check = True
-                    break
+            check = _hard_boundary(tok, next_tok) is not None
         if not check:
             continue
 
@@ -202,6 +246,9 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
 
         old_end = tok["end_s"]
         new_end = round(offset, 3)
+        hard_boundary = _hard_boundary(tok, next_tok)
+        if hard_boundary is not None:
+            new_end = min(new_end, hard_boundary)
 
         if new_end > old_end:
             if next_tok:
@@ -210,8 +257,8 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
                     new_end = next_tok["start_s"] - 0.02
             if new_end <= old_end + 0.02:
                 continue
-            tok["end_s"] = new_end
-            tok["end_ms"] = round(new_end * 1000, 1)
+            _write_end(tok, new_end, "energy_end_hard_boundary"
+                       if hard_boundary is not None else "energy_end")
             stats["end_extend"] += 1
             for p in punct:
                 if abs(p["start_s"] - old_end) < 0.03:
@@ -227,8 +274,8 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
                 prev_nvv_end = tokens[idx - 1]["end_s"]
                 if new_end < prev_nvv_end + 0.02:
                     new_end = prev_nvv_end + 0.02
-            tok["end_s"] = new_end
-            tok["end_ms"] = round(new_end * 1000, 1)
+            _write_end(tok, new_end, "energy_end_hard_boundary"
+                       if hard_boundary is not None else "energy_end")
             stats["end_shorten"] += 1
             for p in punct:
                 if abs(p["start_s"] - old_end) < 0.03:
@@ -237,6 +284,59 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
                     stats["punct_adj"] += 1
 
     return tokens, punct, stats
+
+
+def _protect_processed_english_geometry(tokens: list[dict]) -> None:
+    """Restore immutable canonical floors after optional energy refinement."""
+    for token in tokens:
+        unit = token.get("canonical_unit")
+        span = token.get("canonical_span")
+        unit_span = unit.get("canonical_span") if isinstance(unit, dict) else None
+        if (not isinstance(span, (list, tuple)) or len(span) != 2
+                or span != list(unit_span or ())):
+            continue
+        canonical_start, canonical_end = float(span[0]), float(span[1])
+        current_end = max(float(token.get("end_s", canonical_end)), canonical_end)
+        token["start_s"] = canonical_start
+        token["end_s"] = current_end
+        token["start_ms"] = round(canonical_start * 1000, 1)
+        token["end_ms"] = round(current_end * 1000, 1)
+        token["processed_ctc_span"] = [canonical_start, current_end]
+        if current_end > canonical_end:
+            token.setdefault("processed_ctc_boundary_source", "energy_end")
+        else:
+            token["processed_ctc_boundary_source"] = (
+                token.get("processed_ctc_boundary_source") or "canonical_end_floor")
+
+
+def _processed_geometry_cache_complete(ctc_dir: Path,
+                                       stems: set[str]) -> bool:
+    """Return whether an adjusted cache has derived spans for all authority rows."""
+    for stem in stems:
+        token_path = ctc_dir / f"{stem}_tokens.jsonl"
+        if not token_path.is_file() or token_path.is_symlink():
+            return False
+        try:
+            rows = [json.loads(line) for line in
+                    token_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(
+                    row.get("canonical_unit"), dict):
+                continue
+            span = row.get("processed_ctc_span")
+            source = row.get("processed_ctc_boundary_source")
+            if (not isinstance(span, list) or len(span) != 2
+                    or not all(isinstance(value, (int, float))
+                               and not isinstance(value, bool)
+                               and math.isfinite(float(value))
+                               for value in span)
+                    or span[1] <= span[0]
+                    or not isinstance(source, str) or not source):
+                return False
+    return True
 
 
 # ===== File processing =====
@@ -249,27 +349,80 @@ def _quote(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
+def _read_pause_intervals(textgrid_path: Path) -> list[dict]:
+    """Read explicit raw CTC pauses for processed-boundary ownership."""
+    if not textgrid_path.is_file():
+        return []
+    text = textgrid_path.read_text(encoding="utf-8")
+    pauses: list[dict] = []
+    current_name = ""
+    xmin = xmax = None
+    in_interval = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("name = "):
+            current_name = line.split("=", 1)[1].strip().strip('"')
+        elif line.startswith("intervals ["):
+            in_interval = True
+            xmin = xmax = None
+        elif in_interval and line.startswith("xmin = "):
+            xmin = float(line.split("=", 1)[1].strip())
+        elif in_interval and line.startswith("xmax = "):
+            xmax = float(line.split("=", 1)[1].strip())
+        elif in_interval and line.startswith("text = "):
+            label = line.split("=", 1)[1].strip().strip('"')
+            if (current_name == "pauses" and label.strip() and xmin is not None
+                    and xmax is not None and xmax > xmin):
+                pauses.append({"start_s": xmin, "end_s": xmax})
+            in_interval = False
+    return pauses
+
+
 def rebuild_textgrid(orig_tg: Path, out_tg: Path,
                      tokens: list[dict], punct: list[dict]) -> None:
     tg_text = orig_tg.read_text(encoding="utf-8")
     m = re.search(r'^xmax = ([\d.]+)', tg_text, re.MULTILINE)
     duration_s = float(m.group(1)) if m else tokens[-1]["end_s"] + 1.0
 
-    all_items = []
-    for t in tokens:
-        all_items.append({"text": t["word"], "start": t["start_s"], "end": t["end_s"]})
-    for p in punct:
-        all_items.append({"text": p["word"], "start": p["start_s"], "end": p["end_s"]})
-    all_items.sort(key=lambda x: x["start"])
+    # Preserve the explicit CTC pauses tier when present.  The words tier is
+    # rebuilt from processed token geometry, but long pauses remain evidence
+    # and must not disappear during adjustment.
+    pause_intervals: list[tuple[float, float, str]] = []
+    current_name = ""
+    pending_start = pending_end = None
+    in_interval = False
+    for raw in tg_text.splitlines():
+        line = raw.strip()
+        if line.startswith('name = '):
+            current_name = line.split('=', 1)[1].strip().strip('"')
+        elif line.startswith('intervals ['):
+            in_interval = True
+            pending_start = pending_end = None
+        elif in_interval and line.startswith('xmin = '):
+            pending_start = float(line.split('=', 1)[1].strip())
+        elif in_interval and line.startswith('xmax = '):
+            pending_end = float(line.split('=', 1)[1].strip())
+        elif in_interval and line.startswith('text = '):
+            label = line.split('=', 1)[1].strip().strip('"')
+            if (current_name == "pauses" and pending_start is not None
+                    and pending_end is not None and pending_end > pending_start):
+                pause_intervals.append((pending_start, pending_end, label))
+            in_interval = False
 
+    events = [{"start": t["start_s"], "kind": "word"} for t in tokens]
+    events += [{"start": p["start_s"], "kind": "punct"} for p in punct]
+    events.sort(key=lambda x: (x["start"], x["kind"] == "word"))
+    next_event_starts = [event["start"] for event in events]
     intervals = []
     cursor = 0.0
-    for i, item in enumerate(all_items):
-        ws = item["start"]
-        we = all_items[i + 1]["start"] if i + 1 < len(all_items) else item["end"]
+    for token in sorted(tokens, key=lambda item: item["start_s"]):
+        ws = token["start_s"]
+        following = [start for start in next_event_starts if start > ws + 0.001]
+        we = min(token["end_s"], following[0]) if following else token["end_s"]
+        we = max(ws, min(we, duration_s))
         if ws > cursor + 0.005:
             intervals.append((cursor, ws, ""))
-        intervals.append((ws, we, item["text"]))
+        intervals.append((ws, we, token["word"]))
         cursor = we
     if cursor < duration_s - 0.005:
         intervals.append((cursor, duration_s, ""))
@@ -277,7 +430,7 @@ def rebuild_textgrid(orig_tg: Path, out_tg: Path,
     lines = [
         'File type = "ooTextFile"', 'Object class = "TextGrid"', "",
         f"xmin = {_fmt(0)} ", f"xmax = {_fmt(duration_s)} ",
-        "tiers? <exists> ", "size = 1 ", "item []: ",
+        "tiers? <exists> ", f"size = {2 if pause_intervals else 1} ", "item []: ",
         "    item [1]:", '        class = "IntervalTier" ',
         '        name = "words" ',
         f"        xmin = {_fmt(0)} ",
@@ -291,11 +444,26 @@ def rebuild_textgrid(orig_tg: Path, out_tg: Path,
             f"            xmax = {_fmt(e)} ",
             f"            text = {_quote(txt)} ",
         ])
+    if pause_intervals:
+        lines.extend([
+            "    item [2]:", '        class = "IntervalTier" ',
+            '        name = "pauses" ', f"        xmin = {_fmt(0)} ",
+            f"        xmax = {_fmt(duration_s)} ",
+            f"        intervals: size = {len(pause_intervals)} ",
+        ])
+        for k, (s, e, txt) in enumerate(pause_intervals, start=1):
+            lines.extend([
+                f"        intervals [{k}]:",
+                f"            xmin = {_fmt(s)} ",
+                f"            xmax = {_fmt(e)} ",
+                f"            text = {_quote(txt)} ",
+            ])
     out_tg.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def process_one(stem: str, ctc_dir: Path, audio_dir: Path,
-                out_dir: Path, blas_num_threads: int = 1) -> dict:
+                out_dir: Path, blas_num_threads: int = 1,
+                apply_energy: bool = True) -> dict:
     """Process a single stem — safe for parallel execution.
 
     Each worker limits its own BLAS threads to *blas_num_threads* so
@@ -320,9 +488,38 @@ def process_one(stem: str, ctc_dir: Path, audio_dir: Path,
     tokens = [json.loads(l) for l in
               tokens_path.read_text(encoding="utf-8").splitlines() if l.strip()]
     punct = json.loads(punct_path.read_text(encoding="utf-8")) if punct_path.exists() else []
-    audio, sr = load_audio(wav_path)
+    if apply_energy:
+        # Energy refinement needs samples.  Geometry-only mode must not load
+        # every WAV merely to obtain its duration; the final English VAD, if
+        # needed, is the only audio read in that mode.
+        audio, sr = load_audio(wav_path)
+        duration_s = len(audio) / sr
+    else:
+        import soundfile as sf
+        audio = None
+        sr = None
+        duration_s = float(sf.info(str(wav_path)).duration)
 
-    adj_tokens, adj_punct, stats = adjust_boundaries(tokens, punct, audio, sr)
+    orig_tg = ctc_dir / f"{stem}.TextGrid"
+    pauses = _read_pause_intervals(orig_tg)
+    try:
+        # Raw canonical spans are created by ctc_prealign and are immutable.
+        # Resolve the mutable processed geometry only in the copied work root.
+        # Keep this stage runnable in the MFA environment, which deliberately
+        # does not install torch.  The CTC producer owns raw evidence, while
+        # this torch-free helper owns the mutable processed geometry.
+        from ctc_processed_geometry import resolve_processed_english_spans
+        resolve_processed_english_spans(
+            tokens, punct, pauses, duration_s, wav_path)
+    except (OSError, ValueError, TypeError) as exc:
+        return {"stem": stem, "error": f"processed English span: {exc}"}
+
+    if apply_energy:
+        adj_tokens, adj_punct, stats = adjust_boundaries(tokens, punct, audio, sr)
+    else:
+        adj_tokens, adj_punct = tokens, punct
+        stats = {"start_adj": 0, "end_extend": 0, "end_shorten": 0, "punct_adj": 0}
+    _protect_processed_english_geometry(adj_tokens)
 
     # Guard: fix invalid intervals where Part 1 and Part 2 independently
     # adjusted punct start_s / end_s into a crossing state (NVV between
@@ -359,7 +556,6 @@ def process_one(stem: str, ctc_dir: Path, audio_dir: Path,
     with open(out_dir / f"{stem}_punct.json", "w", encoding="utf-8") as f:
         json.dump(adj_punct, f, ensure_ascii=False)
 
-    orig_tg = ctc_dir / f"{stem}.TextGrid"
     if orig_tg.exists():
         rebuild_textgrid(orig_tg, out_dir / f"{stem}.TextGrid",
                         adj_tokens, adj_punct)
@@ -368,12 +564,6 @@ def process_one(stem: str, ctc_dir: Path, audio_dir: Path,
         src = ctc_dir / f"{stem}{suffix}"
         if src.exists():
             shutil.copy2(src, out_dir / f"{stem}{suffix}")
-
-    # Preserve the producer receipt alongside adjusted anchors for MFA axis
-    # validation of the same CTC/audio namespace.
-    receipt = ctc_dir / ".ctc_run_receipt.json"
-    if receipt.is_file():
-        shutil.copy2(receipt, out_dir / receipt.name)
 
     stats["stem"] = stem
     return stats
@@ -390,11 +580,47 @@ def main():
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true",
                         help="Re-run adjustment even if output files exist.")
+    parser.add_argument("--raw-manifest", type=Path, default=None,
+                        help="Immutable raw manifest used to bind the work receipt.")
     parser.add_argument("--verbose", action="store_true",
                         help="Print per-stem adjustment details.")
+    parser.add_argument("--geometry-only", action="store_true",
+                        help="Create processed CTC geometry without energy refinement.")
     args = parser.parse_args()
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.output_dir.parent.mkdir(parents=True, exist_ok=True)
+    raw_manifest = args.raw_manifest or (args.ctc_dir / CTC_RAW_MANIFEST_NAME)
+    if not raw_manifest.is_file() or raw_manifest.is_symlink():
+        print(f"ERROR: raw manifest unavailable: {raw_manifest}")
+        return 1
+
+    # All writes land in a fresh directory.  The existing work tree is kept
+    # intact until every selected stem has completed and the full namespace
+    # has been verified.
+    staging_dir = args.output_dir.parent / (
+        f".{args.output_dir.name}.adjust-staging.{os.getpid()}")
+    if staging_dir.exists() or staging_dir.is_symlink():
+        print(f"ERROR: adjustment staging collision: {staging_dir}")
+        return 1
+    staging_dir.mkdir(parents=True, exist_ok=False)
+
+    # Preserve the complete current work namespace in staging.  This makes a
+    # limited adjustment an atomic replacement of the whole work tree rather
+    # than a partial tree that could lose unselected stems.
+    for source in args.ctc_dir.iterdir():
+        if source.name in {CTC_WORK_RECEIPT_NAME, CTC_RAW_MANIFEST_NAME}:
+            continue
+        if source.is_file() and not source.is_symlink():
+            shutil.copyfile(source, staging_dir / source.name)
+    # Retain already-adjusted stems when this run skips them.  The raw CTC
+    # tree is the fallback namespace; the current output overlays it.
+    if args.output_dir.is_dir() and not args.output_dir.is_symlink():
+        for source in args.output_dir.iterdir():
+            if source.name in {CTC_WORK_RECEIPT_NAME, CTC_RAW_MANIFEST_NAME}:
+                continue
+            if source.is_file() and not source.is_symlink():
+                shutil.copyfile(source, staging_dir / source.name)
+    output_dir_for_workers = staging_dir
 
     stems = sorted(set(
         p.stem.replace("_tokens", "")
@@ -404,7 +630,15 @@ def main():
 
     # Skip stems that already have adjusted output (unless --overwrite)
     if not args.overwrite:
-        existing = {p.stem for p in args.output_dir.glob("*.TextGrid")}
+        required_suffixes = (".TextGrid", ".lab", "_tokens.jsonl",
+                             "_punct.json", "_text_cn.txt", "_text_raw.txt")
+        existing = {
+            stem for stem in stems
+            if all((args.output_dir / f"{stem}{suffix}").is_file()
+                   and not (args.output_dir / f"{stem}{suffix}").is_symlink()
+                   for suffix in required_suffixes)
+            and _processed_geometry_cache_complete(args.output_dir, {stem})
+        }
         if existing:
             new_stems = [s for s in stems if s not in existing]
             skipped = len(stems) - len(new_stems)
@@ -414,6 +648,7 @@ def main():
 
     if not stems:
         print("  All stems already have adjusted output. Nothing to do.")
+        shutil.rmtree(staging_dir, ignore_errors=True)
         return 0
 
     import multiprocessing as mp
@@ -453,11 +688,26 @@ def main():
         n_workers = min(n_workers, 8)    # network FS → safe cap
     totals = {"start_adj": 0, "end_extend": 0, "end_shorten": 0,
               "punct_adj": 0, "files": 0}
+    expected = set(stems)
+    completed_stems: set[str] = set()
+    worker_errors: list[tuple[str, str]] = []
 
     if n_workers <= 1 or len(stems) <= 2:
         # Sequential for tiny jobs — avoid process overhead
         for stem in stems:
-            s = process_one(stem, args.ctc_dir, args.audio_dir, args.output_dir)
+            try:
+                s = process_one(stem, args.ctc_dir, args.audio_dir,
+                                output_dir_for_workers,
+                                apply_energy=not args.geometry_only)
+            except Exception as exc:
+                worker_errors.append((stem, f"worker exception: {exc}"))
+                print(f"  FAIL {stem}: {exc}")
+                continue
+            if s.get("error"):
+                worker_errors.append((stem, str(s["error"])))
+                print(f"  FAIL {stem}: {s['error']}")
+                continue
+            completed_stems.add(stem)
             totals["files"] += 1
             parts = []
             if s.get("start_adj", 0) > 0:
@@ -477,7 +727,8 @@ def main():
         with _Pool(max_workers=n_workers) as pool:
             futures = {
                 pool.submit(process_one, stem, args.ctc_dir, args.audio_dir,
-                            args.output_dir, 1): stem
+                            output_dir_for_workers, 1,
+                            not args.geometry_only): stem
                 for stem in stems
             }
             for fut in as_completed(futures):
@@ -485,8 +736,14 @@ def main():
                 try:
                     s = fut.result()
                 except Exception as e:
+                    worker_errors.append((stem, f"worker exception: {e}"))
                     print(f"  FAIL {stem}: {e}")
                     continue
+                if s.get("error"):
+                    worker_errors.append((stem, str(s["error"])))
+                    print(f"  FAIL {stem}: {s['error']}")
+                    continue
+                completed_stems.add(stem)
                 totals["files"] += 1
                 parts = []
                 if s.get("start_adj", 0) > 0:
@@ -503,12 +760,69 @@ def main():
                 if totals["files"] % 100 == 0:
                     print(f"  ... {totals['files']}/{len(stems)} files adjusted", flush=True)
 
+    if worker_errors or completed_stems != expected:
+        missing = sorted(expected - completed_stems)
+        print(f"ERROR: adjustment workers failed; missing={missing}")
+        print(f"Staging preserved: {staging_dir}")
+        return 1
+
     print(f"\n{'='*50}")
     print(f"Total: {totals['files']} files")
     print(f"  Start adjustments:   {totals['start_adj']}")
     print(f"  End extended:        {totals['end_extend']}")
     print(f"  End shortened:       {totals['end_shorten']}")
     print(f"  Punct adjustments:   {totals['punct_adj']}")
+    actual = {p.stem for p in staging_dir.glob("*.TextGrid")}
+    if not expected <= actual:
+        print(f"ERROR: adjustment staging stem mismatch: missing={len(expected - actual)}")
+        print(f"Staging preserved: {staging_dir}")
+        return 1
+    for stem in sorted(expected):
+        for suffix in (".TextGrid", ".lab", "_tokens.jsonl", "_punct.json",
+                       "_text_cn.txt", "_text_raw.txt"):
+            path = staging_dir / f"{stem}{suffix}"
+            if not path.is_file() or path.is_symlink():
+                print(f"ERROR: adjustment staging artifact missing: {path}")
+                print(f"Staging preserved: {staging_dir}")
+                return 1
+
+    # Capture lineage before moving the old work tree aside.  The old receipt
+    # is the source of truth for all prior normalization/RIA/English stages.
+    prior_ledger = []
+    prior_receipt = args.ctc_dir / CTC_WORK_RECEIPT_NAME
+    if prior_receipt.is_file() and not prior_receipt.is_symlink():
+        try:
+            prior_ledger = json.loads(prior_receipt.read_text(encoding="utf-8")).get(
+                "transform_ledger", [])
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            print("ERROR: existing CTC work receipt is unreadable")
+            print(f"Staging preserved: {staging_dir}")
+            return 1
+    ledger = [*prior_ledger, {
+        "stage": "adjust", "status": "completed",
+        "input_root": str(args.ctc_dir.resolve()),
+        "atomic_staging": str(staging_dir),
+    }]
+    staged_receipt = write_ctc_work_receipt(
+        staging_dir, raw_manifest, transform_ledger=ledger,
+        work_root=args.output_dir)
+    if validate_ctc_work_receipt(staging_dir, raw_manifest, staged_receipt):
+        print("ERROR: adjustment staging work receipt failed validation")
+        print(f"Staging preserved: {staging_dir}")
+        return 1
+
+    # Atomic directory publication.  An old work tree is renamed aside, never
+    # deleted, so failed/restarted runs retain recoverable evidence.
+    previous = None
+    if args.output_dir.exists() or args.output_dir.is_symlink():
+        previous = args.output_dir.with_name(
+            f"{args.output_dir.name}.previous.{os.getpid()}")
+        if previous.exists() or previous.is_symlink():
+            print(f"ERROR: adjustment backup collision: {previous}")
+            print(f"Staging preserved: {staging_dir}")
+            return 1
+        os.replace(args.output_dir, previous)
+    os.replace(staging_dir, args.output_dir)
     print(f"Output: {args.output_dir}")
 
 

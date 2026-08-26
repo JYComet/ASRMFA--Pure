@@ -50,7 +50,9 @@ def make_v21(root: Path) -> tuple[Path, Path, Path, Path, Path]:
         dictionary_paths.append(path)
         roles[name] = {"path": str(path), "sha256": sha(path)}
 
-    parent_bytes = b'{"schema":"strict-en-mfa-v1","strict_provenance":true}\n'
+    parent_bytes = (b'{"schema":"strict-en-mfa-v2",'
+                    b'"canonical_units":"canonical-english-units-v1",'
+                    b'"strict_provenance":true}\n')
     source_parent = workspace / "authoritative-parent.json"
     source_parent.write_bytes(parent_bytes)
     parent_path.write_bytes(parent_bytes)
@@ -81,9 +83,20 @@ def make_v21(root: Path) -> tuple[Path, Path, Path, Path, Path]:
         "missing_mfa_alignment": excluded,
     }
     replay_path.write_text(json.dumps(replay), encoding="utf-8")
-    records = [{"stem": stem} for stem in eligible]
+    records = [{
+        "stem": stem,
+        "status": "english_required",
+        "schema": "strict-en-mfa-v2",
+        "canonical_units": "canonical-english-units-v1",
+        "ledger": {
+            "schema": "strict-en-mfa-v2",
+            "canonical_units": "canonical-english-units-v1",
+        },
+    } for stem in eligible]
     payload = {
         "schema": verifier.ENGLISH_IMPORT_V21_SCHEMA, "scope": "strict_replay",
+        "english_schema": "strict-en-mfa-v2",
+        "canonical_units": "canonical-english-units-v1",
         "run_id": "fixture", "timestamp_utc": "2026-01-01T00:00:00Z",
         "canonical_manifest_path": str(workspace / "canonical.json"),
         "canonical_manifest_sha256": "0" * 64,
@@ -131,6 +144,33 @@ def main() -> int:
         errors = verifier.verify_english_import_active(import_path, replay_path=replay_path)
         if not any("slot_stem_mapping" in error for error in errors):
             print("slots-only fixture did not expose slot_stem_mapping error:", errors)
+            return 1
+
+        # A historical parent must fail closed even when its explicit hash is
+        # refreshed.  This guards the direct verifier path against accepting
+        # v1 as a fresh v2 success.
+        parent_path.write_bytes(b'{"schema":"strict-en-mfa-v1","strict_provenance":true}\n')
+        errors = verifier.verify_english_import_active(
+            import_path, parent_path=parent_path, parent_sha256=sha(parent_path))
+        if not any("schema" in error or "canonical" in error for error in errors):
+            print("historical v1 parent was accepted as v2:", errors)
+            return 1
+
+        # The same fail-closed rule applies to a ledger record, not only its
+        # parent manifest.  Use a fresh valid fixture so this assertion is
+        # isolated from the preceding parent mutation.
+        legacy_root = Path(raw) / "legacy-ledger"
+        legacy_root.mkdir()
+        legacy_import, legacy_replay, legacy_subset, legacy_parent, _ = make_v21(legacy_root)
+        legacy_payload = json.loads(legacy_import.read_text())
+        legacy_payload["records"][0]["schema"] = "strict-en-mfa-v1"
+        legacy_payload["records"][0]["ledger"]["schema"] = "strict-en-mfa-v1"
+        legacy_import.write_text(json.dumps(legacy_payload))
+        errors = verifier.verify_english_import_active(
+            legacy_import, replay_path=legacy_replay, subset_path=legacy_subset,
+            parent_path=legacy_parent)
+        if not any("schema" in error for error in errors):
+            print("historical v1 ledger was accepted as v2:", errors)
             return 1
 
     source = (SCRIPTS / "audit_strict_ok.py").read_text(encoding="utf-8")

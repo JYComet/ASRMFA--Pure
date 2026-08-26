@@ -39,6 +39,8 @@ from postprocess_textgrids import (
     Tier,
     _finalize_textgrid,
     _reference_pinyin_text,
+    _inject_punctuation,
+    _reconcile_publication_geometry,
     _restore_reference_punctuation,
     _clip_pinyin_phones_to_words,
     _fix_non_english_pp_overlaps,
@@ -306,14 +308,16 @@ def _case_reference_coverage_protects_nvv_punct_and_sp1() -> None:
         Interval(0.0, 0.1, "<sp1>"),
         Interval(0.1, 0.3, "ni3"),
         Interval(0.3, 0.5, "hao3"),
-        Interval(0.5, 0.7, "<LAUGHTER>"),
+        Interval(0.5, 0.55, "，"),
+        Interval(0.55, 0.7, "<LAUGHTER>"),
         Interval(0.7, 0.8, "！"),
     ])
     hanzi = Tier("hanzi", 0.0, 1.0, [
         Interval(0.0, 0.1, "<sp1>"),
         Interval(0.1, 0.3, "你"),
         Interval(0.3, 0.5, "好"),
-        Interval(0.5, 0.7, "<LAUGHTER>"),
+        Interval(0.5, 0.55, "，"),
+        Interval(0.55, 0.7, "<LAUGHTER>"),
         Interval(0.7, 0.8, "！"),
     ])
     coverage, reasons = assess_reference_coverage(
@@ -422,6 +426,13 @@ def _case_postprocess_contract_passes_tone_ref_to_run() -> None:
         (aligned / "demo.TextGrid").write_text(
             'name = "words"\nname = "phones"\n', encoding="utf-8")
 
+        receipt = make_pipeline_accounting_receipt(
+            source_stems=["demo"], eligible_stems=["demo"], exclusions={},
+            output_stems=["demo"], filtered_stems=[], run_id="postprocess-fixture",
+            mode="postprocess", paths={"output": str(output), "filtered": str(filtered)})
+        receipt_path = root / ".pipeline_run_receipt_v2.json"
+        write_pipeline_accounting_receipt(receipt_path, receipt)
+
         captured: list[str] = []
         original_run_python = pipeline.run_python
 
@@ -450,6 +461,7 @@ def _case_postprocess_contract_passes_tone_ref_to_run() -> None:
                 "models_dir": root,
                 "data_dir": root,
                 "raw_text_dir": root,
+                "accounting_receipt_path": receipt_path,
             }
             assert step_postprocess(
                 types.SimpleNamespace(overwrite=True),
@@ -497,11 +509,15 @@ def _case_versioned_publish_refuses_nonempty_destination() -> None:
                 source_stems=["demo"], eligible_stems=["demo"],
                 exclusions={}, output_stems=["demo"], filtered_stems=[],
                 run_id="reference-authority-fixture", mode="strict"))
+        (source / "postprocess_report.jsonl").write_text(
+            json.dumps({"stem": "demo", "status": "ok"}) + "\n",
+            encoding="utf-8")
         digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
         (source / "strict_ok_manifest.json").write_text(json.dumps({
             "policy_version": "strict-ok-v3.2",
             "english_provenance_policy": {
-                "schema": "strict-en-mfa-v1", "required": True,
+                "schema": "strict-en-mfa-v2", "canonical_units": "canonical-english-units-v1",
+                "required": True,
                 "evidence_root": "_provenance/english",
             },
             "safe_empty": False,
@@ -521,6 +537,10 @@ def _case_versioned_publish_refuses_nonempty_destination() -> None:
                 "schema": "pipeline-run-receipt-v2",
                 "path": str(receipt_path),
                 "sha256": digest(receipt_path),
+            },
+            "postprocess_report": {
+                "path": str(source / "postprocess_report.jsonl"),
+                "sha256": digest(source / "postprocess_report.jsonl"),
             },
         }) + "\n", encoding="utf-8")
         write_publish_manifest(source)
@@ -571,7 +591,8 @@ def _case_publish_v2_receipt_fail_closed_before_target() -> None:
         digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
         (source / "strict_ok_manifest.json").write_text(json.dumps({
             "policy_version": "strict-ok-v3.2",
-            "english_provenance_policy": {"schema": "strict-en-mfa-v1", "required": True,
+            "english_provenance_policy": {"schema": "strict-en-mfa-v2",
+                                            "canonical_units": "canonical-english-units-v1", "required": True,
                                             "evidence_root": "_provenance/english"},
             "safe_empty": False, "global_reasons": [], "output_dir": str(source),
             "expected_stems": ["demo"], "rejected": [],
@@ -612,7 +633,7 @@ def _case_link_keeps_optional_bundled_reference() -> None:
         audio_out = root / "workspace" / "audio"
         ctc_src.mkdir()
         audio_src.mkdir()
-        (audio_src / "demo.wav").write_bytes(b"RIFF")
+        _write_pcm_wav(audio_src / "demo.wav", 1.0)
         for suffix, content in {
             ".TextGrid": 'File type = "ooTextFile"\n',
             ".lab": "life\n",
@@ -623,6 +644,20 @@ def _case_link_keeps_optional_bundled_reference() -> None:
             "_ref.txt": "life\n",
         }.items():
             (ctc_src / f"demo{suffix}").write_text(content, encoding="utf-8")
+        audio_sha = hashlib.sha256((audio_src / "demo.wav").read_bytes()).hexdigest()
+        (ctc_src / ".ctc_run_receipt.json").write_text(json.dumps({
+            "schema": "ctc-run-receipt-v2",
+            "input_stems": ["demo"],
+            "output_stems": ["demo"],
+            "audio_bindings": [{
+                "stem": "demo",
+                "path": str(audio_out / "demo.wav"),
+                "sha256": audio_sha,
+                "sample_rate": 16000,
+                "frames": 16000,
+                "duration_s": 1.0,
+            }],
+        }) + "\n", encoding="utf-8")
 
         args = types.SimpleNamespace(overwrite=True, scan_only=False)
         cfg = {
@@ -652,7 +687,7 @@ def _case_stale_normalization_marker_is_invalidated() -> None:
         assert _skip_if_ctc_normalized({"ctc_pretg": d}) is False
 
         marker.write_text(CTC_NORMALIZATION_MARKER, encoding="utf-8")
-        assert _skip_if_ctc_normalized({"ctc_pretg": d}) is True
+        assert _skip_if_ctc_normalized({"ctc_pretg": d}) is False
 
 
 # ── D1: Case 98/100 — WAV axis + blank-run coordinates ──────────
@@ -996,12 +1031,16 @@ def _case_reference_projection_preserves_hyphen_punctuation_and_phone_ownership(
     words = Tier("words", 0.0, 1.0, [
         Interval(0.0, 0.45, "jia3"),
         Interval(0.45, 0.55, "，"),
-        Interval(0.55, 1.0, "yi3"),
+        Interval(0.55, 0.94, "yi3"),
+        Interval(0.94, 1.0, "<sp1>"),
     ])
     restored = _restore_reference_punctuation(
         words, "甲，乙！",
         [{"word": "，", "start_s": 0.45, "end_s": 0.55},
          {"word": "！", "start_s": 0.94, "end_s": 1.0}])
+    # Both marks are already backed by validated authority anchors.  The
+    # restore count is the number of accepted punctuation owners, not a
+    # legacy mixture of existing and newly materialized intervals.
     assert restored == 2
     assert [iv.text for iv in words.intervals if is_punct(iv.text)] == ["，", "！"]
 
@@ -1018,6 +1057,24 @@ def _case_reference_projection_preserves_hyphen_punctuation_and_phone_ownership(
     _fix_non_english_pp_overlaps(pp)
     en_after = next(iv for iv in pp.intervals if iv.text == "en:K")
     assert (en_before.xmin, en_before.xmax) == (en_after.xmin, en_after.xmax)
+
+
+def _case_publication_boundary_reconciliation_preserves_edge_silence() -> None:
+    """W3 synthetic publication contract: CTC-only tail marks cannot own silence."""
+    words = Tier("words", 0.0, 1.0, [
+        Interval(0.0, 0.05, "<sp0>"),
+        Interval(0.05, 0.72, "huan1"),
+        Interval(0.72, 1.0, "<sp1>"),
+    ])
+    words, _ = _inject_punctuation(
+        words, None, [{"word": ".", "start_s": 0.72, "end_s": 1.0}])
+    _restore_reference_punctuation(
+        words, "欢", [{"word": ".", "start_s": 0.72, "end_s": 1.0}])
+    words = _reconcile_publication_geometry(words)
+    assert [(iv.xmin, iv.xmax, iv.text) for iv in words.intervals] == [
+        (0.0, 0.05, "<sp0>"), (0.05, 0.72, "huan1"),
+        (0.72, 1.0, "<sp1>"),
+    ]
 
 
 def main() -> int:
@@ -1051,6 +1108,7 @@ def main() -> int:
         # Case 83 (R7): strict MFA TextGrid validator
         _case_strict_mfa_textgrid_validator_rejects_damaged_tiers,
         _case_reference_projection_preserves_hyphen_punctuation_and_phone_ownership,
+        _case_publication_boundary_reconciliation_preserves_edge_silence,
     ]
     failures = 0
     for case in cases:

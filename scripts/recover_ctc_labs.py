@@ -18,6 +18,9 @@ from pipeline_utils import (
     validate_ctc_transcript_bundle,
 )
 
+RECOVERY_SCHEMA = "ctc-lab-recovery-v2"
+HISTORICAL_RECOVERY_SCHEMA = 1
+
 
 def recover_directory(ctc_dir: Path, *, apply: bool) -> tuple[dict, int]:
     token_paths = sorted(ctc_dir.glob("*_tokens.jsonl"))
@@ -55,7 +58,8 @@ def recover_directory(ctc_dir: Path, *, apply: bool) -> tuple[dict, int]:
                 })
                 if apply:
                     rebuild_lab_from_tokens(tokens_path, lab_path)
-                    errors = validate_ctc_transcript_bundle(ctc_dir, stem)
+                    errors = validate_ctc_transcript_bundle(
+                        ctc_dir, stem, _require_processed=False)
                     if errors:
                         raise ValueError("; ".join(errors))
                     # Invalidate stale normalization marker — the .lab
@@ -84,7 +88,8 @@ def recover_directory(ctc_dir: Path, *, apply: bool) -> tuple[dict, int]:
     invalid += len(missing_tokens)
 
     summary = {
-        "schema": 1,
+        "schema": RECOVERY_SCHEMA,
+        "historical_schema": HISTORICAL_RECOVERY_SCHEMA,
         "mode": "apply" if apply else "dry_run",
         "ctc_dir": str(ctc_dir.resolve()),
         "token_bundles": len(token_paths),

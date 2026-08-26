@@ -60,8 +60,33 @@ def _detect_smb_mounts() -> dict[str, str]:
 _WIN_UNC_MAP = _detect_smb_mounts()
 
 
+def classify_input_path(path_str: str | os.PathLike[str] | None) -> str:
+    """Classify a path before any filesystem probe is attempted.
+
+    ``pathlib.Path`` on POSIX treats ``C:\\...`` and ``\\\\server\\share``
+    as ordinary relative strings.  That is unsafe for pipeline inputs: a
+    Windows path can otherwise silently resolve below the active workspace.
+    Keep this classifier lexical and side-effect free so callers can reject
+    or translate the path before calling ``exists``/``stat``.
+    """
+    if path_str is None or str(path_str) == "":
+        return "empty"
+    raw = os.fspath(path_str)
+    if re.match(r"^[A-Za-z]:[\\/]", raw):
+        return "windows_drive"
+    if raw.startswith("\\\\") or raw.startswith("//"):
+        return "unc"
+    if raw.startswith("/"):
+        return "posix_absolute"
+    return "relative"
+
+
 def translate_path(path_str: str) -> str:
-    """Convert Windows UNC -> Linux mount path."""
+    """Convert Windows UNC -> Linux mount path.
+
+    Unknown UNC and Windows-drive paths are deliberately left untouched;
+    ``resolve_input_path`` performs the platform-aware safety decision.
+    """
     if not path_str or platform.system() == "Windows":
         return path_str
     normalized = path_str.replace("\\", "/")
@@ -74,13 +99,47 @@ def translate_path(path_str: str) -> str:
     return path_str
 
 
-def resolve_input_path(raw: str, base: Path = PROJECT_ROOT) -> Path:
-    """Translate UNC + resolve relative -> absolute Path."""
-    if not raw:
+def resolve_input_path(raw: str | os.PathLike[str] | None,
+                       base: Path = PROJECT_ROOT) -> Path:
+    """Classify, translate, and resolve an input path safely.
+
+    On POSIX, unmapped UNC and Windows-drive paths are rejected rather than
+    being interpreted as local workspace paths.  Backslash-relative paths
+    are normalized to POSIX separators.  On Windows, native drive/UNC paths
+    remain native and are resolved by ``pathlib``.
+    """
+    kind = classify_input_path(raw)
+    if kind == "empty":
         return base
-    translated = translate_path(raw)
+    raw_text = os.fspath(raw)
+    if kind == "windows_drive" and platform.system() != "Windows":
+        raise ValueError(f"Windows drive path is not mapped on POSIX: {raw_text}")
+    translated = translate_path(raw_text)
+    if kind == "unc" and platform.system() != "Windows":
+        translated_kind = classify_input_path(translated)
+        if translated_kind == "unc":
+            raise ValueError(f"UNC path is not mapped to a local mount: {raw_text}")
+    if platform.system() != "Windows" and kind == "relative":
+        translated = translated.replace("\\", "/")
     p = Path(translated)
     return p if p.is_absolute() else (base / p)
+
+
+def cuda_visible_token(logical_index: int,
+                       environ: dict[str, str] | None = None) -> str:
+    """Map a logical GPU index to the outer CUDA visibility token.
+
+    A parent launched with ``CUDA_VISIBLE_DEVICES=2,5`` exposes logical
+    devices 0 and 1, but child processes must receive physical tokens 2 and
+    5.  Preserve UUID tokens too; never collapse the outer mapping to a new
+    logical index.
+    """
+    env = os.environ if environ is None else environ
+    visible = env.get("CUDA_VISIBLE_DEVICES", "")
+    tokens = [token.strip() for token in visible.split(",") if token.strip()]
+    if tokens and 0 <= int(logical_index) < len(tokens):
+        return tokens[int(logical_index)]
+    return str(int(logical_index))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -171,6 +230,13 @@ CTC_SUFFIXES: list[str] = [
     ".TextGrid", ".lab", "_tokens.jsonl", "_punct.json",
     "_text_cn.txt", "_text_raw.txt",
 ]
+
+# CTC raw/work lifecycle.  The raw directory is the producer-owned input
+# namespace; all pipeline transforms must operate on the physical work copy.
+CTC_RAW_MANIFEST_SCHEMA = "ctc-raw-manifest-v1"
+CTC_WORK_RECEIPT_SCHEMA = "ctc-work-receipt-v1"
+CTC_RAW_MANIFEST_NAME = ".ctc_raw_manifest.json"
+CTC_WORK_RECEIPT_NAME = ".ctc_work_receipt.json"
 
 
 def build_ctc_presence(ctc_dir: Path) -> "tuple[set[str], dict[str, set[str]]]":
@@ -621,6 +687,288 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _ctc_regular_file(path: Path, label: str) -> Path:
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} must be an ordinary file: {path}")
+    return path
+
+
+def _ctc_manifest_payload(raw_dir: Path, producer_receipt: Path,
+                          stems: list[str] | None = None) -> dict:
+    """Build the canonical six-file inventory for an immutable CTC raw root."""
+    raw_dir = Path(raw_dir)
+    if raw_dir.is_symlink() or not raw_dir.is_dir():
+        raise ValueError(f"CTC raw root is not an ordinary directory: {raw_dir}")
+    if stems is None:
+        stems = sorted({p.name[:-len("_tokens.jsonl")]
+                        for p in raw_dir.iterdir()
+                        if p.name.endswith("_tokens.jsonl")
+                        and p.is_file() and not p.is_symlink()})
+    stems = sorted(str(stem) for stem in stems)
+    if not stems or len(stems) != len(set(stems)):
+        raise ValueError("CTC raw manifest stem set is empty or duplicated")
+    files: list[dict] = []
+    for stem in stems:
+        for suffix in CTC_SUFFIXES:
+            path = _ctc_regular_file(raw_dir / f"{stem}{suffix}",
+                                     f"CTC raw artifact {stem}{suffix}")
+            files.append({"stem": stem, "suffix": suffix,
+                          "name": path.name, "size": path.stat().st_size,
+                          "sha256": _sha256_file(path)})
+    receipt = _ctc_regular_file(Path(producer_receipt), "CTC producer receipt")
+    receipt_record = {"name": receipt.name, "path": str(receipt.resolve()),
+                      "size": receipt.stat().st_size,
+                      "sha256": _sha256_file(receipt)}
+    payload = {"schema": CTC_RAW_MANIFEST_SCHEMA,
+               "raw_root": str(raw_dir.resolve()),
+               "stems": stems, "stem_count": len(stems),
+               "stem_digest": _stable_json_digest(stems),
+               "artifact_suffixes": list(CTC_SUFFIXES),
+               "files": files, "producer_receipt": receipt_record}
+    payload["identity"] = _stable_json_digest(payload)
+    return payload
+
+
+def write_ctc_raw_manifest(raw_dir: Path, *, producer_receipt: Path | None = None,
+                           stems: list[str] | None = None) -> dict:
+    """Seal a CTC raw root exactly once and return its manifest payload.
+
+    Existing manifests are never overwritten.  A changed raw namespace is a
+    hard failure, which prevents later normalization or adjustment from
+    silently changing producer-owned bytes.
+    """
+    raw_dir = Path(raw_dir)
+    manifest_path = raw_dir / CTC_RAW_MANIFEST_NAME
+    if manifest_path.is_file() and not manifest_path.is_symlink():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        errors = validate_ctc_raw_manifest(raw_dir, manifest)
+        if errors:
+            raise ValueError("CTC raw manifest is stale: " + "; ".join(errors))
+        return manifest
+    if producer_receipt is None:
+        producer_receipt = raw_dir / ".ctc_run_receipt.json"
+    payload = _ctc_manifest_payload(raw_dir, Path(producer_receipt), stems)
+    encoded = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    tmp = manifest_path.with_name(f".{manifest_path.name}.{os.getpid()}.tmp")
+    tmp.write_text(encoded, encoding="utf-8")
+    os.replace(tmp, manifest_path)
+    return json.loads(encoded)
+
+
+def validate_ctc_raw_manifest(raw_dir: Path, manifest: dict | None = None) -> list[str]:
+    """Validate raw manifest identity, stem membership, and every six-file hash."""
+    raw_dir = Path(raw_dir)
+    errors: list[str] = []
+    try:
+        path = raw_dir / CTC_RAW_MANIFEST_NAME
+        if manifest is None:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or manifest.get("schema") != CTC_RAW_MANIFEST_SCHEMA:
+            return ["CTC raw manifest schema mismatch"]
+        stems = manifest.get("stems")
+        files = manifest.get("files")
+        if (not isinstance(stems, list) or stems != sorted(set(stems))
+                or manifest.get("stem_count") != len(stems)
+                or manifest.get("stem_digest") != _stable_json_digest(stems)):
+            errors.append("CTC raw manifest stem set invalid")
+        if manifest.get("artifact_suffixes") != list(CTC_SUFFIXES):
+            errors.append("CTC raw manifest artifact classes mismatch")
+        if not isinstance(files, list) or len(files) != len(stems) * len(CTC_SUFFIXES):
+            errors.append("CTC raw manifest file inventory cardinality mismatch")
+        else:
+            expected = {(stem, suffix) for stem in stems for suffix in CTC_SUFFIXES}
+            actual = {(row.get("stem"), row.get("suffix")) for row in files
+                      if isinstance(row, dict)}
+            if actual != expected:
+                errors.append("CTC raw manifest file membership mismatch")
+            for row in files:
+                if not isinstance(row, dict):
+                    errors.append("CTC raw manifest file row malformed")
+                    continue
+                artifact = raw_dir / str(row.get("name", ""))
+                try:
+                    _ctc_regular_file(artifact, "CTC raw artifact")
+                    if artifact.stat().st_size != row.get("size"):
+                        errors.append(f"raw size mismatch:{artifact.name}")
+                    if _sha256_file(artifact) != row.get("sha256"):
+                        errors.append(f"raw hash mismatch:{artifact.name}")
+                except (OSError, ValueError):
+                    errors.append(f"raw artifact missing/unsafe:{artifact.name}")
+        producer = manifest.get("producer_receipt")
+        if not isinstance(producer, dict):
+            errors.append("CTC producer receipt binding missing")
+        else:
+            receipt_path = raw_dir / str(producer.get("name", ".ctc_run_receipt.json"))
+            try:
+                _ctc_regular_file(receipt_path, "CTC producer receipt")
+                if _sha256_file(receipt_path) != producer.get("sha256"):
+                    errors.append("CTC producer receipt hash mismatch")
+            except (OSError, ValueError):
+                errors.append("CTC producer receipt missing/unsafe")
+        identity = dict(manifest)
+        identity.pop("identity", None)
+        if manifest.get("identity") != _stable_json_digest(identity):
+            errors.append("CTC raw manifest identity mismatch")
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        errors.append(f"CTC raw manifest unreadable: {exc}")
+    return errors
+
+
+def _ctc_physical_copy(source: Path, destination: Path) -> None:
+    source = _ctc_regular_file(source, "CTC copy source")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() or destination.is_symlink():
+        raise ValueError(f"CTC copy destination already exists: {destination}")
+    shutil.copyfile(source, destination)
+    if (destination.is_symlink() or not destination.is_file()
+            or _sha256_file(destination) != _sha256_file(source)
+            or os.path.samestat(source.stat(), destination.stat())):
+        raise ValueError(f"CTC physical copy verification failed: {destination}")
+    shutil.copystat(source, destination)
+
+
+def _ctc_work_files(work_dir: Path, raw_manifest: dict) -> tuple[list[dict], list[dict]]:
+    records = []
+    for row in raw_manifest.get("files", []):
+        path = _ctc_regular_file(work_dir / row["name"], "CTC work artifact")
+        records.append({"stem": row["stem"], "suffix": row["suffix"],
+                        "name": path.name, "size": path.stat().st_size,
+                        "sha256": _sha256_file(path)})
+    ref_rows = []
+    for stem in raw_manifest.get("stems", []):
+        ref = work_dir / f"{stem}_ref.txt"
+        if ref.is_file() and not ref.is_symlink():
+            ref_rows.append({"stem": stem, "suffix": "_ref.txt", "name": ref.name,
+                             "size": ref.stat().st_size, "sha256": _sha256_file(ref)})
+    return records, ref_rows
+
+
+def write_ctc_work_receipt(work_dir: Path, raw_manifest_path: Path,
+                           *, transform_ledger: list[dict] | None = None,
+                           work_root: Path | None = None) -> dict:
+    """Refresh the derived work receipt after a completed work transform."""
+    work_dir = Path(work_dir); raw_manifest_path = Path(raw_manifest_path)
+    raw_manifest = json.loads(raw_manifest_path.read_text(encoding="utf-8"))
+    errors = validate_ctc_raw_manifest(Path(raw_manifest["raw_root"]), raw_manifest)
+    if errors:
+        raise ValueError("cannot bind invalid raw manifest: " + "; ".join(errors))
+    records, ref_rows = _ctc_work_files(work_dir, raw_manifest)
+    ledger = list(transform_ledger or [])
+    payload = {
+        "schema": CTC_WORK_RECEIPT_SCHEMA,
+        "work_root": str(Path(work_root or work_dir).resolve()),
+        "raw_manifest": {
+            "path": str(raw_manifest_path.resolve()),
+            "sha256": _sha256_file(raw_manifest_path),
+            "identity": raw_manifest.get("identity"),
+        },
+        "stems": list(raw_manifest["stems"]),
+        "stem_digest": raw_manifest["stem_digest"],
+        "files": records,
+        "ref": ref_rows,
+        "transform_ledger": ledger,
+    }
+    payload["identity"] = _stable_json_digest(payload)
+    receipt_path = work_dir / CTC_WORK_RECEIPT_NAME
+    tmp = receipt_path.with_name(f".{receipt_path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, receipt_path)
+    return payload
+
+
+def validate_ctc_work_receipt(work_dir: Path, raw_manifest_path: Path,
+                              receipt: dict | None = None) -> list[str]:
+    errors: list[str] = []
+    try:
+        work_dir = Path(work_dir); raw_manifest_path = Path(raw_manifest_path)
+        if receipt is None:
+            receipt = json.loads((work_dir / CTC_WORK_RECEIPT_NAME).read_text(encoding="utf-8"))
+        if not isinstance(receipt, dict) or receipt.get("schema") != CTC_WORK_RECEIPT_SCHEMA:
+            return ["CTC work receipt schema mismatch"]
+        raw = json.loads(raw_manifest_path.read_text(encoding="utf-8"))
+        if receipt.get("raw_manifest", {}).get("path") != str(raw_manifest_path.resolve()):
+            errors.append("CTC work raw manifest path mismatch")
+        if receipt.get("raw_manifest", {}).get("sha256") != _sha256_file(raw_manifest_path):
+            errors.append("CTC work raw manifest digest mismatch")
+        if receipt.get("raw_manifest", {}).get("identity") != raw.get("identity"):
+            errors.append("CTC work raw manifest identity mismatch")
+        expected = {(r.get("stem"), r.get("suffix")) for r in raw.get("files", [])}
+        actual = {(r.get("stem"), r.get("suffix")) for r in receipt.get("files", [])}
+        if expected != actual:
+            errors.append("CTC work file membership mismatch")
+        for row in receipt.get("files", []):
+            path = work_dir / str(row.get("name", ""))
+            try:
+                _ctc_regular_file(path, "CTC work artifact")
+                if path.stat().st_size != row.get("size") or _sha256_file(path) != row.get("sha256"):
+                    errors.append(f"CTC work hash mismatch:{path.name}")
+            except (OSError, ValueError):
+                errors.append(f"CTC work artifact missing/unsafe:{path.name}")
+        for row in receipt.get("ref", []):
+            if not isinstance(row, dict) or row.get("suffix") != "_ref.txt":
+                errors.append("CTC work ref row malformed")
+                continue
+            path = work_dir / str(row.get("name", ""))
+            try:
+                _ctc_regular_file(path, "CTC work ref")
+                if path.stat().st_size != row.get("size") or _sha256_file(path) != row.get("sha256"):
+                    errors.append(f"CTC work ref hash mismatch:{path.name}")
+            except (OSError, ValueError):
+                errors.append(f"CTC work ref missing/unsafe:{path.name}")
+        identity = dict(receipt); identity.pop("identity", None)
+        if receipt.get("identity") != _stable_json_digest(identity):
+            errors.append("CTC work receipt identity mismatch")
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        errors.append(f"CTC work receipt unreadable: {exc}")
+    return errors
+
+
+def materialize_ctc_work(raw_dir: Path, work_dir: Path, *,
+                         raw_manifest_path: Path | None = None,
+                         overwrite: bool = False,
+                         transform_ledger: list[dict] | None = None) -> dict:
+    """Create an independent work tree from a sealed raw tree."""
+    raw_dir = Path(raw_dir); work_dir = Path(work_dir)
+    raw_manifest_path = raw_manifest_path or raw_dir / CTC_RAW_MANIFEST_NAME
+    raw_manifest = json.loads(Path(raw_manifest_path).read_text(encoding="utf-8"))
+    errors = validate_ctc_raw_manifest(raw_dir, raw_manifest)
+    if errors:
+        raise ValueError("invalid CTC raw input: " + "; ".join(errors))
+    receipt_path = work_dir / CTC_WORK_RECEIPT_NAME
+    if work_dir.is_dir() and receipt_path.is_file() and not overwrite:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        errors = validate_ctc_work_receipt(work_dir, Path(raw_manifest_path), receipt)
+        if errors:
+            raise ValueError("existing CTC work cache is invalid: " + "; ".join(errors))
+        return receipt
+    if work_dir.exists() and not work_dir.is_dir():
+        raise ValueError(f"CTC work root is not a directory: {work_dir}")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    if overwrite:
+        for child in list(work_dir.iterdir()):
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            elif child.is_file() or child.is_symlink():
+                child.unlink()
+    for row in raw_manifest["files"]:
+        _ctc_physical_copy(raw_dir / row["name"], work_dir / row["name"])
+    for stem in raw_manifest["stems"]:
+        for name in (f"{stem}_ref.txt", ".ctc_normalized", "manifest.json", "summary.txt"):
+            source = raw_dir / name
+            if source.is_file() and not source.is_symlink():
+                target = work_dir / name
+                if not target.exists():
+                    _ctc_physical_copy(source, target)
+    ledger = list(transform_ledger or [{
+        "stage": "raw_copy", "operation": "physical_copy",
+        "raw_manifest_identity": raw_manifest.get("identity"),
+    }])
+    return write_ctc_work_receipt(work_dir, Path(raw_manifest_path),
+                                  transform_ledger=ledger)
+
+
 def _validate_publish_accounting(src: Path, strict_manifest_path: Path) -> list[str]:
     """Validate frozen v2 accounting and strict membership before publishing."""
     try:
@@ -837,6 +1185,14 @@ def parse_ctc_normalization_marker(text: str) -> dict | None:
 # ── Silence / pause tokens ──────────────────────────────────────
 SILENCE_LABELS: set[str] = {"<eps>", "<sil>", "sil", "<sp0>", "<sp1>", "<sp2>", "<sp3>", "spn"}
 
+# Processed geometry may be refined by the energy stage, but its owner must
+# remain one of these bounded deterministic sources.
+CTC_PROCESSED_BOUNDARY_SOURCES = frozenset({
+    "next_lexical_token_start", "raw_end_punctuation", "raw_end_long_pause",
+    "vad_speech_end", "raw_end_fallback", "energy_start", "energy_end",
+    "energy_end_hard_boundary", "legacy_ctc",
+})
+
 
 def is_silence(text: str) -> bool:
     """Check if *text* is a silence / pause token."""
@@ -1032,24 +1388,23 @@ def is_unknown_token(token: str) -> bool:
 
 
 def is_english_token(token: str) -> bool:
-    """Token is an English lexical token, including hyphenated spellings."""
-    if not token or not token.isalpha():
-        # Hyphens are lexical inside forms such as ``K-Pop`` and ``V-up``;
-        # reject leading/trailing/repeated hyphens so punctuation is not
-        # accidentally classified as an English word.
-        if (not token or token[0] == '-' or token[-1] == '-'
-                or '--' in token
-                or not all(ch.isascii() and (ch.isalpha() or ch == '-')
-                           for ch in token)
-                or not any(ch.isalpha() for ch in token)):
-            return False
-    if not token.isascii():
-        return False
+    """Return whether *token* satisfies the shared English-unit contract.
+
+    Keep this wrapper here because it is a hot-path classifier used by the
+    older pipeline helpers, but make ``english_units.py`` the authority for
+    syntax, NVV precedence, and hyphen canonicalization.  The import is
+    deliberately lazy: ``english_units`` imports ``NVV_NAMES`` from this
+    module while it is initializing.
+    """
     if is_unknown_token(token):
         return False
-    if is_nvv_token(token):
-        return False
-    if _re.match(r'^[a-z]+[1-5]$', token):
+    try:
+        try:
+            from english_units import canonicalize_english_token
+        except ImportError:  # package-style imports in tests/tools
+            from scripts.english_units import canonicalize_english_token
+        canonicalize_english_token(token)
+    except (ImportError, ValueError, TypeError):
         return False
     return True
 
@@ -1129,6 +1484,52 @@ _NUMERAL_PROTECTED_RE = _re.compile(
     r"(\[[^\]]+\]|<[^>]+>|(?<![A-Za-z0-9])[a-z]+[1-5](?![A-Za-z0-9])"
     r"|[A-Z][A-Z0-9-]*[A-Z0-9])"
 )
+REFERENCE_NUMERAL_NORMALIZATION_SCHEMA = "reference-numeral-normalization-v1"
+_AUTHORITY_TARGET_NUMERAL_RE = _re.compile(r"(?<![A-Za-z0-9])target([12])(?![A-Za-z0-9])")
+_ARABIC_NUMERAL_RE = _re.compile(r"(?<![A-Za-z0-9])[0-9]+(?![A-Za-z0-9])")
+_CN_NUMERAL_DIGITS = "零一二三四五六七八九"
+_CN_NUMERAL_UNITS = ("", "十", "百", "千", "万", "十万", "百万", "千万")
+
+
+def _fallback_an2cn(value: str) -> str:
+    """Small deterministic ``an2cn`` fallback for isolated deployments.
+
+    Production environments normally provide :mod:`cn2an`; keeping this
+    narrow fallback makes authority provenance deterministic in test/wheel
+    environments without ever applying it to CTC or pinyin token streams.
+    """
+    if not _re.fullmatch(r"[0-9]+", value):
+        return value
+    number = int(value)
+    if number == 0:
+        return "零"
+    if number > 99_999_999:
+        return value
+    def four_digits(n: int) -> str:
+        result: list[str] = []
+        zero = False
+        for power in range(3, -1, -1):
+            divisor = 10 ** power
+            digit, n = divmod(n, divisor)
+            if digit:
+                if zero and result:
+                    result.append("零")
+                if not (power == 1 and digit == 1 and not result):
+                    result.append(_CN_NUMERAL_DIGITS[digit])
+                result.append(_CN_NUMERAL_UNITS[power])
+                zero = False
+            elif result:
+                zero = True
+        return "".join(result).rstrip("零")
+    if number < 10_000:
+        return four_digits(number)
+    high, low = divmod(number, 10_000)
+    result = four_digits(high) + "万"
+    if low:
+        if low < 1000:
+            result += "零"
+        result += four_digits(low)
+    return result
 
 
 def normalize_reference_numerals(text: str, transform) -> str:
@@ -1149,6 +1550,61 @@ def normalize_reference_numerals(text: str, transform) -> str:
             # changing a transcript on a best-effort guess.
             parts[index] = part
     return "".join(parts)
+
+
+def normalize_authority_reference_numerals(
+        text: str, transform=None, *, return_report: bool = False):
+    """Normalize authority reference numerals before semantic projection.
+
+    The ordinary reference normalizer intentionally protects alpha+digit
+    identifiers.  Authority references have one explicit compatibility rule:
+    the lowercase ``target1``/``target2`` surfaces are converted to
+    ``target一``/``target二`` so the suffix is projected as Chinese, while
+    pinyin tone tokens, NVV/control labels, uppercase identifiers, and other
+    English numeric identifiers remain byte-for-byte unchanged.  CTC files
+    are never passed through this helper.
+
+    ``return_report`` exposes the contract and exact replacements for audit.
+    """
+    if not isinstance(text, str):
+        raise TypeError("authority reference text must be str")
+    engine = "cn2an" if transform is not None else "builtin-fallback"
+
+    def converter(value: str, mode: str) -> str:
+        if transform is not None:
+            return transform(value, mode)
+        match = _re.fullmatch(r"(\s*)([0-9]+)(\s*)", value)
+        if match:
+            return (match.group(1) + _fallback_an2cn(match.group(2))
+                    + match.group(3))
+        return value
+    mappings: list[dict] = []
+
+    def target_replacement(match):
+        source = match.group(0)
+        converted = converter(match.group(1), "an2cn")
+        mappings.append({"source": source, "replacement": "target" + converted,
+                         "rule": "lowercase_target_suffix"})
+        return "target" + converted
+
+    targeted = _AUTHORITY_TARGET_NUMERAL_RE.sub(target_replacement, text)
+    normalized = normalize_reference_numerals(targeted, converter)
+    if normalized != targeted:
+        for match in _ARABIC_NUMERAL_RE.finditer(targeted):
+            replacement = converter(match.group(0), "an2cn")
+            if replacement != match.group(0):
+                mappings.append({"source": match.group(0), "replacement": replacement,
+                                 "rule": "standalone_arabic_numeral"})
+    report = {
+        "schema": REFERENCE_NUMERAL_NORMALIZATION_SCHEMA,
+        "engine": engine,
+        "changed": normalized != text,
+        "normalized_text": normalized,
+        "source_length": len(text),
+        "normalized_length": len(normalized),
+        "mappings": mappings,
+    }
+    return (normalized, report) if return_report else normalized
 
 
 def load_ctc_token_entries(tokens_path: Path) -> list[dict]:
@@ -1258,6 +1714,42 @@ def read_ctc_textgrid_words(textgrid_path: Path) -> list[str]:
     return words
 
 
+def _read_ctc_textgrid_lexical_intervals(
+    textgrid_path: Path,
+) -> list[tuple[str, float, float]]:
+    """Read non-empty words-tier intervals with their published geometry."""
+    content = Path(textgrid_path).read_text(encoding="utf-8-sig")
+    words_match = _re.search(
+        r'^\s*name\s*=\s*"words"\s*$', content, _re.MULTILINE)
+    if words_match is None:
+        raise ValueError(f"Missing words tier in {textgrid_path}")
+    pauses_match = _re.search(
+        r'^\s*name\s*=\s*"pauses"\s*$',
+        content[words_match.end():], _re.MULTILINE)
+    end = (words_match.end() + pauses_match.start()
+           if pauses_match is not None else len(content))
+    segment = content[words_match.end():end]
+    pattern = _re.compile(
+        r'intervals\s*\[\d+\]:\s*'
+        r'xmin\s*=\s*([^\n]+)\s*'
+        r'xmax\s*=\s*([^\n]+)\s*'
+        r'text\s*=\s*"((?:""|[^"])*)"',
+        _re.MULTILINE,
+    )
+    intervals: list[tuple[str, float, float]] = []
+    for match in pattern.finditer(segment):
+        text = match.group(3).replace('""', '"')
+        if not text:
+            continue
+        try:
+            intervals.append((text, float(match.group(1)), float(match.group(2))))
+        except ValueError as exc:
+            raise ValueError(f"invalid words-tier interval in {textgrid_path}") from exc
+    if not intervals:
+        raise ValueError(f"Empty words tier in {textgrid_path}")
+    return intervals
+
+
 def rebuild_lab_from_tokens(tokens_path: Path, lab_path: Path) -> list[str]:
     """Atomically rebuild an MFA lab transcript from validated CTC words."""
     words = [entry["word"].strip()
@@ -1269,8 +1761,20 @@ def rebuild_lab_from_tokens(tokens_path: Path, lab_path: Path) -> list[str]:
     return words
 
 
-def validate_ctc_transcript_bundle(ctc_dir: Path, stem: str) -> list[str]:
-    """Return contract violations for lab/tokens/CTC words of stem."""
+def validate_ctc_transcript_bundle(
+    ctc_dir: Path,
+    stem: str,
+    reference_text: str | None = None,
+    *,
+    _include_authority: bool = True,
+    _require_processed: bool = True,
+) -> list[str]:
+    """Return contract violations for one CTC transcript bundle.
+
+    Canonical authority rows are validated here as well as by the explicit
+    authority validator, so callers of the historical entry point cannot
+    accidentally publish a tampered canonical bundle.
+    """
     lab_path = ctc_dir / f"{stem}.lab"
     tokens_path = ctc_dir / f"{stem}_tokens.jsonl"
     textgrid_path = ctc_dir / f"{stem}.TextGrid"
@@ -1313,6 +1817,221 @@ def validate_ctc_transcript_bundle(ctc_dir: Path, stem: str) -> list[str]:
         errors.append(
             "tone digit converted to CJK numeral: " + ", ".join(contaminated[:5])
         )
+    if _include_authority:
+        try:
+            authority_entries = load_ctc_token_entries(tokens_path)
+        except (OSError, ValueError):
+            authority_entries = []
+        if any(isinstance(entry.get("canonical_unit"), dict)
+               for entry in authority_entries):
+            errors.extend(validate_ctc_authority_bundle(
+                ctc_dir, stem, reference_text, _include_basic=False,
+                require_processed=_require_processed))
+    return errors
+
+
+def validate_ctc_authority_bundle(
+    ctc_dir: Path,
+    stem: str,
+    reference_text: str | None = None,
+    timing_tolerance_s: float = 0.003,
+    *,
+    _include_basic: bool = True,
+    require_processed: bool = True,
+) -> list[str]:
+    """Validate canonical English metadata in one authority CTC bundle.
+
+    This is intentionally a second, stricter contract layered on the legacy
+    lab/tokens/TextGrid validator.  It checks the reference identity, exact
+    Wave 1 unit fields, source ordinal ledger, timed canonical span, and the
+    canonical-unit content hash.  A missing reference or metadata is an
+    error when this validator is requested; no fallback spelling is inferred.
+    """
+    errors = (validate_ctc_transcript_bundle(
+        ctc_dir, stem, reference_text, _include_authority=False)
+              if _include_basic else [])
+    tokens_path = Path(ctc_dir) / f"{stem}_tokens.jsonl"
+    ref_path = Path(ctc_dir) / f"{stem}_ref.txt"
+    if reference_text is None and ref_path.is_file() and not ref_path.is_symlink():
+        try:
+            reference_text = ref_path.read_text(encoding="utf-8-sig").rstrip("\r\n")
+        except OSError as exc:
+            errors.append(f"cannot read authority reference: {exc}")
+    if not isinstance(reference_text, str) or not reference_text:
+        return errors + ["authority reference identity missing"]
+
+    try:
+        entries = load_ctc_token_entries(tokens_path)
+    except (OSError, ValueError) as exc:
+        return errors + [str(exc)]
+    try:
+        from english_units import parse_english_units
+    except ImportError:  # package-style imports in tests/tools
+        from scripts.english_units import parse_english_units
+
+    authorities = parse_english_units(reference_text)
+    canonical_entries = [entry for entry in entries
+                         if isinstance(entry.get("canonical_unit"), dict)]
+    expected_identity = hashlib.sha256(reference_text.encode("utf-8")).hexdigest()
+    if len(canonical_entries) != len(authorities):
+        errors.append(
+            f"authority canonical unit count mismatch ({len(canonical_entries)} != "
+            f"{len(authorities)})")
+
+    previous_ordinal = -1
+    for index, (entry, authority) in enumerate(
+            zip(canonical_entries, authorities)):
+        unit = entry.get("canonical_unit")
+        if entry.get("word") != authority.alignment_token:
+            errors.append(f"authority text mismatch at {index}")
+        if entry.get("reference_identity") != expected_identity:
+            errors.append(f"authority reference identity mismatch at {index}")
+        if entry.get("reference_ordinal") != authority.reference_ordinal:
+            errors.append(f"authority reference ordinal mismatch at {index}")
+        if entry.get("surface_text") != authority.surface_text:
+            errors.append(f"authority surface text mismatch at {index}")
+
+        expected_unit = authority.to_dict()
+        if not isinstance(unit, dict):
+            errors.append(f"authority unit metadata missing at {index}")
+            continue
+        for key in ("surface_text", "alignment_token", "match_key", "unit_id",
+                    "reference_ordinal", "merge_kind"):
+            if unit.get(key) != expected_unit.get(key):
+                errors.append(f"authority unit field mismatch {key} at {index}")
+
+        ordinals = entry.get("source_ctc_ordinals")
+        _hyphen_gap_allowed = ("-" in authority.surface_text
+                               and entry.get("hyphen_separator_omitted") is True)
+        if (not isinstance(ordinals, list) or not ordinals
+                or any(not isinstance(value, int) or isinstance(value, bool)
+                       or value < 0 for value in ordinals)
+                or ordinals != sorted(set(ordinals))
+                or (ordinals and not _hyphen_gap_allowed and ordinals != list(
+                    range(ordinals[0], ordinals[0] + len(ordinals))))):
+            errors.append(f"authority source ordinal ledger invalid at {index}")
+            ordinals = []
+        if ordinals and ordinals[0] <= previous_ordinal:
+            errors.append(f"authority source ordinal order mismatch at {index}")
+        if ordinals:
+            previous_ordinal = ordinals[-1]
+        if unit.get("source_ctc_ordinals") != ordinals:
+            errors.append(f"authority unit source ordinal mismatch at {index}")
+
+        span = entry.get("canonical_span")
+        unit_span = unit.get("canonical_span")
+        # Processed geometry is a separate owner.  It must never be embedded
+        # in the hashed canonical unit, whose raw span/hash remain immutable.
+        if "processed_ctc_span" in unit or "processed_ctc_boundary_source" in unit:
+            errors.append(f"authority processed geometry owner conflict at {index}")
+        if (not isinstance(span, list) or len(span) != 2
+                or not isinstance(unit_span, list) or len(unit_span) != 2):
+            errors.append(f"authority canonical span missing at {index}")
+        else:
+            canonical_values: tuple[float, float] | None = None
+            for left, right, label in (
+                    (span[0], unit_span[0], "start"),
+                    (span[1], unit_span[1], "end")):
+                try:
+                    left_value = float(left)
+                    right_value = float(right)
+                    if not math.isfinite(left_value) or not math.isfinite(right_value):
+                        raise ValueError
+                    if abs(left_value - right_value) > timing_tolerance_s + 1e-9:
+                        errors.append(f"authority canonical {label} mismatch at {index}")
+                except (TypeError, ValueError):
+                    errors.append(f"authority canonical {label} invalid at {index}")
+            try:
+                canonical_start = float(span[0])
+                canonical_end = float(span[1])
+                if (not math.isfinite(canonical_start)
+                        or not math.isfinite(canonical_end)
+                        or canonical_end <= canonical_start):
+                    raise ValueError
+                canonical_values = (canonical_start, canonical_end)
+            except (TypeError, ValueError):
+                canonical_values = None
+            if require_processed:
+                processed_span = entry.get("processed_ctc_span")
+                source = entry.get("processed_ctc_boundary_source")
+                unit_id = (unit.get("unit_id") if isinstance(unit, dict) else None)
+                context = (f"stem={stem}; unit={unit_id or f'index-{index}'}; "
+                           "scale=1.0")
+                if (not isinstance(processed_span, list) or len(processed_span) != 2
+                        or not isinstance(source, str)
+                        or source not in CTC_PROCESSED_BOUNDARY_SOURCES):
+                    errors.append(
+                        f"authority processed span missing at {index}; "
+                        f"reason_code=processed_geometry_missing; {context}")
+                    processed_span = None
+                elif (not all(isinstance(value, (int, float))
+                              and not isinstance(value, bool)
+                              and math.isfinite(float(value))
+                              for value in processed_span)):
+                    errors.append(
+                        f"authority processed span invalid at {index}; "
+                        f"reason_code=processed_geometry_non_numeric; {context}")
+                    processed_span = None
+                elif canonical_values is None:
+                    errors.append(
+                        f"authority processed span invalid at {index}; "
+                        f"reason_code=processed_geometry_canonical_invalid; {context}")
+                    processed_span = None
+                elif processed_span[1] <= processed_span[0]:
+                    errors.append(
+                        f"authority processed span invalid at {index}; "
+                        f"reason_code=processed_geometry_non_positive; {context}")
+                    processed_span = None
+                elif abs(float(processed_span[0]) - canonical_values[0]) > timing_tolerance_s + 1e-9:
+                    errors.append(
+                        f"authority processed start/raw start mismatch at {index}; "
+                        f"reason_code=processed_geometry_start_mismatch; {context}")
+                elif (float(processed_span[1]) + timing_tolerance_s
+                      < canonical_values[1]):
+                    errors.append(
+                        f"authority processed span invalid at {index}; "
+                        f"reason_code=processed_geometry_end_before_canonical_end; "
+                        f"{context}")
+                for actual, expected, label in (
+                        (entry.get("start_s"),
+                         processed_span[0] if processed_span is not None else None,
+                         "start"),
+                        (entry.get("end_s"),
+                         processed_span[1] if processed_span is not None else None,
+                         "end")):
+                    try:
+                        if expected is None or abs(float(actual) - float(expected)) > timing_tolerance_s + 1e-9:
+                            errors.append(f"authority timed span {label} mismatch at {index}")
+                    except (TypeError, ValueError):
+                        errors.append(f"authority timed span {label} invalid at {index}")
+
+        encoded = json.dumps(unit, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8")
+        expected_hash = hashlib.sha256(encoded).hexdigest()
+        if entry.get("canonical_unit_sha256") != expected_hash:
+            errors.append(f"authority canonical content hash mismatch at {index}")
+
+    try:
+        textgrid_intervals = _read_ctc_textgrid_lexical_intervals(
+            Path(ctc_dir) / f"{stem}.TextGrid")
+    except (OSError, ValueError) as exc:
+        errors.append(str(exc))
+    else:
+        if len(textgrid_intervals) != len(entries):
+            errors.append("authority TextGrid lexical interval count mismatch")
+        for index, entry in enumerate(entries[:len(textgrid_intervals)]):
+            label, start, end = textgrid_intervals[index]
+            if label != entry.get("word"):
+                errors.append(f"authority TextGrid text mismatch at {index}")
+            if isinstance(entry.get("canonical_unit"), dict):
+                try:
+                    if abs(start - float(entry["start_s"])) > timing_tolerance_s + 1e-9:
+                        errors.append(f"authority TextGrid start mismatch at {index}")
+                    if abs(end - float(entry["end_s"])) > timing_tolerance_s + 1e-9:
+                        errors.append(f"authority TextGrid end mismatch at {index}")
+                except (TypeError, ValueError):
+                    errors.append(f"authority TextGrid timing invalid at {index}")
+
     return errors
 
 
@@ -1793,14 +2512,31 @@ def _axis_sha256(path: Path) -> str:
 
 
 def _axis_audio_metadata(path: Path) -> dict:
-    """Read immutable PCM WAV metadata without invoking an audio process."""
+    """Read immutable PCM or IEEE-float WAV metadata without an audio process."""
     import wave
     path = Path(path)
-    with wave.open(str(path), "rb") as handle:
-        frames = handle.getnframes()
-        sample_rate = handle.getframerate()
-        channels = handle.getnchannels()
-        sample_width = handle.getsampwidth()
+    try:
+        with wave.open(str(path), "rb") as handle:
+            frames = handle.getnframes()
+            sample_rate = handle.getframerate()
+            channels = handle.getnchannels()
+            sample_width = handle.getsampwidth()
+    except wave.Error as pcm_error:
+        # The stdlib wave module rejects WAVE_FORMAT_IEEE_FLOAT (tag 3).
+        # soundfile is an existing runtime dependency and can inspect those
+        # headers; keep the fallback narrow so unrelated formats retain the
+        # previous wave.Error behavior.
+        try:
+            import soundfile as sf
+            info = sf.info(str(path))
+        except Exception:
+            raise pcm_error
+        if info.format not in {"WAV", "WAVEX"} or info.subtype not in {"FLOAT", "DOUBLE"}:
+            raise pcm_error
+        frames = info.frames
+        sample_rate = info.samplerate
+        channels = info.channels
+        sample_width = {"FLOAT": 4, "DOUBLE": 8}[info.subtype]
     if sample_rate <= 0 or frames < 0:
         raise ValueError(f"invalid WAV metadata: {path}")
     return {"sha256": _axis_sha256(path), "duration_s": frames / sample_rate,
@@ -2377,6 +3113,11 @@ def write_pipeline_run_receipt(
 # exclusions.  Consumers that need a resumable/strict receipt must use v2.
 PIPELINE_ACCOUNTING_SCHEMA = "pipeline-run-receipt-v2"
 PIPELINE_ACCOUNTING_RECEIPT_NAME = ".pipeline_run_receipt_v2.json"
+PIPELINE_RESUME_FINGERPRINT_SCHEMA = "pipeline-resume-fingerprints-v1"
+PIPELINE_RESUME_FINGERPRINT_KEYS = (
+    "producer", "effective_config", "dependencies", "inputs",
+    "expected_stems", "outputs",
+)
 _ACCOUNTING_REASONS_DISALLOWED = {
     "filtered", "quality_rejection", "processed_quality_rejection",
 }
@@ -2508,6 +3249,7 @@ def make_pipeline_accounting_receipt(
     paths: dict[str, str] | None = None,
     shards: list[dict] | None = None,
     extra: dict | None = None,
+    fingerprints: dict | None = None,
 ) -> dict:
     """Build a machine-readable v2 source-denominator receipt.
 
@@ -2547,6 +3289,12 @@ def make_pipeline_accounting_receipt(
         receipt["shards"] = _normalize_shards(shards)
     if extra:
         receipt["extra"] = dict(extra)
+    if fingerprints is not None:
+        if fingerprints.get("schema") == PIPELINE_RESUME_FINGERPRINT_SCHEMA:
+            receipt["fingerprints"] = dict(fingerprints)
+        else:
+            receipt["fingerprints"] = make_pipeline_resume_fingerprints(
+                **fingerprints)
     derived = classify_receipt_accounting(receipt)
     receipt["derived"] = derived
     # Flat count aliases make the contract convenient for shell/audit callers.
@@ -2555,6 +3303,60 @@ def make_pipeline_accounting_receipt(
     if errors:
         raise ValueError("invalid accounting receipt: " + "; ".join(errors))
     return receipt
+
+
+def make_pipeline_resume_fingerprints(
+    *, producer: object, effective_config: object, dependencies: object,
+    inputs: object, expected_stems: object, outputs: object,
+) -> dict:
+    """Build the minimum identity block required for a fresh resume.
+
+    Values are caller-owned content fingerprints (or structured manifests),
+    not mtimes.  The block is deliberately separate from accounting: a
+    valid denominator receipt without this identity evidence is audit-only.
+    """
+    payload = {
+        "schema": PIPELINE_RESUME_FINGERPRINT_SCHEMA,
+        "producer": producer,
+        "effective_config": effective_config,
+        "dependencies": dependencies,
+        "inputs": inputs,
+        "expected_stems": expected_stems,
+        "outputs": outputs,
+    }
+    payload["digest"] = _stable_json_digest(payload)
+    return payload
+
+
+def validate_pipeline_resume_receipt(
+    receipt: dict, *, expected_fingerprints: dict | None = None,
+) -> list[str]:
+    """Reject legacy or fingerprint-less accounting receipts for fresh resume.
+
+    Legacy receipts remain readable through :func:`read_pipeline_accounting_receipt`
+    with ``allow_legacy=True`` for audit, but this gate never promotes them.
+    """
+    if not isinstance(receipt, dict) or receipt.get("schema") != PIPELINE_ACCOUNTING_SCHEMA:
+        return ["legacy_receipt_not_resumable"]
+    errors = validate_pipeline_accounting_receipt(receipt)
+    fingerprints = receipt.get("fingerprints")
+    if not isinstance(fingerprints, dict):
+        errors.append("fresh_resume_fingerprints_missing")
+        return errors
+    if fingerprints.get("schema") != PIPELINE_RESUME_FINGERPRINT_SCHEMA:
+        errors.append("fresh_resume_fingerprint_schema_mismatch")
+    if any(key not in fingerprints for key in PIPELINE_RESUME_FINGERPRINT_KEYS):
+        errors.append("fresh_resume_fingerprint_fields_missing")
+    digest_payload = dict(fingerprints)
+    digest = digest_payload.pop("digest", None)
+    if digest != _stable_json_digest(digest_payload):
+        errors.append("fresh_resume_fingerprint_digest_mismatch")
+    if expected_fingerprints is not None:
+        expected = make_pipeline_resume_fingerprints(**expected_fingerprints)
+        for key in ("schema", *PIPELINE_RESUME_FINGERPRINT_KEYS, "digest"):
+            if fingerprints.get(key) != expected.get(key):
+                errors.append(f"fresh_resume_fingerprint_mismatch:{key}")
+    return errors
 
 
 def validate_pipeline_accounting_receipt(

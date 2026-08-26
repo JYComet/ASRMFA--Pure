@@ -1,0 +1,176 @@
+# Isolated 100-stem authority canary.  This is a runnable ctc_ready plan,
+# not a production 54k configuration.  It never writes the historical source
+# tree; linked/copied artifacts and all outputs belong under the fresh paths
+# below.  The same fixed stem vector is recorded in the selection JSON.
+#
+# Validation-only command (does not run MFA/GPU):
+#   python scripts/run_pipeline.py --config configs/hecheng_ria_ok100_authority.yaml --scan-only
+# Full canary execution is intentionally separate and requires explicit user
+# approval for MFA/English-MFA runtime resources.
+
+mode: ctc_ready
+reference_mode: authority
+
+data_dir: /mnt/nvme3/mfa_workspace_54k_fresh/padded_audio
+workspace: /mnt/nvme3/mfa_workspace_54k_ok100_authority_validation_v9
+output_dir: /mnt/nvme3/mfa_workspace_54k_ok100_authority_validation_v9/output
+filtered_dir: /mnt/nvme3/mfa_workspace_54k_ok100_authority_validation_v9/filtered
+require_fresh_workspace: true
+models_dir: /mnt/local_E/MFA_Pause/repo/models/mfa
+output_staging: false
+keep_16k_audio: true
+temp_dir: temp
+
+ctc_ready:
+  ctc_dir: /mnt/nvme3/mfa_workspace_54k_mfa_20260812/ctc_pretg
+  require_all: true
+  stems:
+    - 038294_弹幕互动_回答问题
+    - 049412_弹幕互动_回应挑逗调戏
+    - 014078_杂谈互动_节目后感想
+    - 030417_杂谈互动_分享服装搭配
+    - 044425_弹幕互动_互动游戏
+    - 025968_杂谈互动_与特定人物对话
+    - 042326_弹幕互动_回应要求
+    - 011952_杂谈互动_讲故事
+    - 028083_杂谈互动_与特定人物对话
+    - 028990_杂谈互动_与特定人物对话
+    - 024498_杂谈互动_数据里程牌庆祝
+    - 010755_杂谈互动_讲故事
+    - 050808_礼物互动_礼物连击反馈
+    - 014260_杂谈互动_节目后感想
+    - 028092_杂谈互动_与特定人物对话
+    - 052653_礼物互动_专属礼物反馈
+    - 020943_杂谈互动_日常分享
+    - 020482_杂谈互动_日常分享
+    - 041240_弹幕互动_回应要求
+    - 002226_直播流程_感谢观众
+    - 012282_杂谈互动_讲故事
+    - 011615_杂谈互动_讲故事
+    - 029412_杂谈互动_与特定人物对话
+    - 039628_弹幕互动_回应要求
+    - 008531_杂谈互动_讲笑话
+    - 016368_杂谈互动_节目后感想
+    - 000898_直播流程_节目投票
+    - 037818_弹幕互动_回答问题
+    - 003265_直播流程_谢场告别
+    - 004794_直播流程_进度汇报
+    - 025953_杂谈互动_与特定人物对话
+    - 024932_杂谈互动_与特定人物对话
+    - 018524_杂谈互动_日常分享
+    - 013978_杂谈互动_节目后感想
+    - 022678_杂谈互动_引导送礼
+    - 015072_杂谈互动_节目后感想
+    - 027386_杂谈互动_与特定人物对话
+    - 027236_杂谈互动_与特定人物对话
+    - 010704_杂谈互动_讲故事
+    - 044252_弹幕互动_互动游戏
+    - 013529_杂谈互动_节目后感想
+    - 036851_弹幕互动_回应吐槽弹幕
+    - 023798_杂谈互动_数据里程牌庆祝
+    - 015986_杂谈互动_节目后感想
+    - 011506_杂谈互动_讲故事
+    - 006035_直播流程_休息
+    - 009465_杂谈互动_讲故事
+    - 031281_杂谈互动_推荐音乐
+    - 016735_杂谈互动_日常分享
+    - 039376_弹幕互动_回应要求
+    - 036151_弹幕互动_回应吐槽弹幕
+    - 016725_杂谈互动_日常分享
+    - 052509_礼物互动_专属礼物反馈
+    - 021987_杂谈互动_日常分享
+    - 043701_弹幕互动_互动游戏
+    - 019488_杂谈互动_日常分享
+    - 020039_杂谈互动_日常分享
+    - 042938_弹幕互动_互动游戏
+    - 039218_弹幕互动_回应要求
+    - 024577_杂谈互动_数据里程牌庆祝
+    - 031283_杂谈互动_推荐音乐
+    - 000240_直播流程_开场介绍
+    - 047714_弹幕互动_回应恶意攻击
+    - 007210_杂谈互动_欢迎入场
+    - 047303_弹幕互动_回应恶意攻击
+    - 026800_杂谈互动_与特定人物对话
+    - 041532_弹幕互动_回应要求
+    - 026285_杂谈互动_与特定人物对话
+    - 049347_弹幕互动_回应挑逗调戏
+    - 027512_杂谈互动_与特定人物对话
+    - 043616_弹幕互动_互动游戏
+    - 029227_杂谈互动_与特定人物对话
+    - 007602_杂谈互动_引导关注
+    - 030687_杂谈互动_分享服装搭配
+    - 003288_直播流程_谢场告别
+    - 003995_直播流程_谢场告别
+    - 039723_弹幕互动_回应要求
+    - 018174_杂谈互动_日常分享
+    - 007590_杂谈互动_欢迎入场
+    - 053657_礼物互动_专属礼物反馈
+    - 031922_杂谈互动_推荐音乐
+    - 049022_弹幕互动_回应恶意攻击
+    - 001535_直播流程_节目投票
+    - 045661_弹幕互动_互动游戏
+    - 029796_杂谈互动_分享服装搭配
+    - 014622_杂谈互动_节目后感想
+    - 053591_礼物互动_专属礼物反馈
+    - 023389_杂谈互动_引导送礼
+    - 004601_直播流程_进度汇报
+    - 024227_杂谈互动_数据里程牌庆祝
+    - 009522_杂谈互动_讲故事
+    - 002587_直播流程_感谢观众
+    - 016223_杂谈互动_节目后感想
+    - 015338_杂谈互动_节目后感想
+    - 030317_杂谈互动_分享服装搭配
+    - 002618_直播流程_感谢观众
+    - 052332_礼物互动_特殊礼物反馈
+    - 030644_杂谈互动_分享服装搭配
+    - 037001_弹幕互动_回应吐槽弹幕
+    - 008759_杂谈互动_讲笑话
+
+audio_axis:
+  mfa_axis_role: mfa_axis_audio
+  tts_authoritative_role: tts_authoritative_audio
+  reuse_ctc_requires_receipt: true
+  post_ctc_pad_silence: forbidden
+
+pad_silence:
+  enabled: false
+
+mfa:
+  num_jobs: 16
+  single_speaker: true
+  output_format: long_textgrid
+  clean: false
+  no_tokenization: true
+  skip_validate: true
+  fine_tune: false
+  beam: 20
+  retry_beam: 80
+  allow_partial: true
+  min_output_ratio: 0.99
+
+mfa_en:
+  enabled: true
+  strict_provenance: true
+  num_jobs: 4
+  padding_ms: 50
+  min_segment_dur_ms: 150
+  max_gap_merge_s: 0.35
+  beam: 10
+  retry_beam: 40
+  fine_tune: false
+  acoustic_model: /mnt/local_E/MFA_Pause/pretrained_models/acoustic/english_us_arpa.zip
+  dictionary: dict/cmudict.dict
+  g2p_model: /mnt/local_E/MFA_Pause/pretrained_models/g2p/english_us_arpa.zip
+
+postprocess:
+  strict_ok: true
+  allow_filtered_integrity_failures: true
+  merge_silence: true
+  # Use the same final visual energy-owner policy for <sp0> and <sp1>.
+  min_sil_merge_sec: 0.5
+  fix_short_word: false
+  detect_bgm: false
+  filter_suspicious: true
+  enable_word_in_silence_filter: true
+  enable_text_correction: true
+  handle_unexpected_sil: false

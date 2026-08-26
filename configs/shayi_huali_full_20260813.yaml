@@ -3,6 +3,8 @@
 # 输入没有同名 .txt，必须使用 nvrasr_fallback 从音频生成转录和 CTC 结果。
 
 mode: nvrasr_fallback
+# Explicitly ASR-only: ignore any accidental/stale reference TXT sidecars.
+reference_mode: fallback
 
 # 原始数据标识；批处理实际通过 streaming.batch_cache 使用 NVMe 缓存。
 data_dir: //RS3621/Research_TTS/Data/Raw/shayi_huali_wav

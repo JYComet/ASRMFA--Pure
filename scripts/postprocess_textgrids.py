@@ -19,9 +19,11 @@ Also generates tone_mapping.json — bidirectional IPA↔pinyin tone reference t
 import argparse
 import array
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import sys
@@ -46,9 +48,22 @@ from pipeline_utils import (
     CHINESE_SHORT_WORDS,
     is_cjk, is_nvv_token, is_english_token, is_pinyin_syllable,
     is_unknown_token, is_word_like, is_punct, extract_word_chars,
+    normalize_authority_reference_numerals,
+    REFERENCE_NUMERAL_NORMALIZATION_SCHEMA,
     is_english_phone, is_english_vowel_phone, is_english_consonant_phone,
     en_ipa_to_arpabet, apply_arpabet_stress, align_sequences,
     is_silence, EN_PHONE_PREFIX,
+    validate_ctc_raw_manifest, validate_ctc_work_receipt,
+)
+from english_units import (
+    EnglishUnitError,
+    canonicalize_english_token,
+    is_english_fragment_token,
+    merge_authority_fragment_group,
+    parse_english_units,
+    project_authority_semantics,
+    resolve_processed_english_token,
+    validate_processed_english_token_binding,
 )
 
 SHORT_PAUSE_PUNCT = set("，、：；,")
@@ -59,24 +74,45 @@ LONG_PAUSE_TOKEN = "<PAUSE>"
 # This schema is intentionally duplicated rather than imported from
 # align_english_mfa: post-processing must be able to reject malformed or
 # legacy producer output without creating an import cycle.
-STRICT_EN_MFA_SCHEMA = "strict-en-mfa-v1"
+STRICT_EN_MFA_SCHEMA = "strict-en-mfa-v2"
+HISTORICAL_STRICT_EN_MFA_SCHEMA = "strict-en-mfa-v1"
+CANONICAL_UNITS_SCHEMA = "canonical-english-units-v1"
+SOS_PRONUNCIATION_POLICY_ID = "sos-exact-override-v1"
+SOS_EXPECTED_PRONUNCIATION = ("EH2", "S", "OW2", "EH1", "S")
+APP_EXPECTED_PRONUNCIATION = ("AE1", "P")
 _STRICT_EN_SILENCE = {"sil", "sp", "spn", "<eps>"}
 MFA_INPUT_AXIS_SCHEMA = "mfa-input-axis-receipt-v1"
 MFA_ALIGNMENT_AXIS_SCHEMA = "mfa-alignment-axis-receipt-v1"
 MFA_ALIGNMENT_AXIS_V2_SCHEMA = "mfa-alignment-axis-receipt-v2"
 AXIS_EPS = 0.003
+_EVIDENCE_REPAIR_FLOOR_S = 0.030
+_EVIDENCE_REPAIR_SCHEMA = "evidence-constrained-repair-v1"
+_UNKNOWN_REPAIR_PROOF_SCHEMA = "mfa-unknown-recovery-proof-v1"
+FALLBACK_CORRESPONDENCE_SCHEMA = "fallback-lexical-correspondence-v1"
+WORD_ENERGY_EVIDENCE_SCHEMA = "word-energy-evidence-v1"
+_OVERLAP_EVIDENCE_STEMS = frozenset({"000240", "000314", "001776", "001802"})
 _SEMANTIC_NVV = re.compile(r"<([A-Za-z][A-Za-z-]*)>")
-_SEMANTIC_ENGLISH = re.compile(r"[A-Za-z]+")
+_SEMANTIC_ENGLISH = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)*[0-9]*")
 _SEMANTIC_SP1 = re.compile(r"<sp1>", re.I)
 _SEMANTIC_SILENCE = re.compile(r"<sp[0-3]>", re.I)
 _SEMANTIC_PUNCT_MAP = str.maketrans({
     ",": "，", ".": "。", "?": "？", "!": "！", ";": "；", ":": "：",
 })
+_AUTHORITY_NUMERAL_PINYIN = {
+    "零": "ling2", "一": "yi1", "二": "er4", "三": "san1",
+    "四": "si4", "五": "wu3", "六": "liu4", "七": "qi1",
+    "八": "ba1", "九": "jiu3", "十": "shi2",
+}
 
 
 def _axis_digest(value: object) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False,
                                      sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _evidence_digest(value: object) -> str:
+    """Digest a proof value without depending on whitespace or key order."""
+    return _axis_digest(value)
 
 
 def _axis_sha(path: Path) -> str:
@@ -88,15 +124,34 @@ def _axis_sha(path: Path) -> str:
 
 
 def _axis_wav_meta(path: Path) -> dict:
-    with wave.open(str(path), "rb") as handle:
-        rate = handle.getframerate()
-        frames = handle.getnframes()
-        if rate <= 0:
-            raise ValueError("invalid WAV sample rate")
-        return {"sha256": _axis_sha(path), "duration_s": frames / rate,
-                "sample_rate": rate, "frames": frames,
-                "channels": handle.getnchannels(),
-                "sample_width": handle.getsampwidth()}
+    path = Path(path)
+    try:
+        with wave.open(str(path), "rb") as handle:
+            frames = handle.getnframes()
+            rate = handle.getframerate()
+            channels = handle.getnchannels()
+            sample_width = handle.getsampwidth()
+    except wave.Error as pcm_error:
+        # The stdlib wave module rejects WAVE_FORMAT_IEEE_FLOAT (tag 3).
+        # soundfile is an existing runtime dependency and can inspect those
+        # headers; keep this fallback narrow so PCM metadata semantics stay
+        # on the historical wave.open path.
+        try:
+            import soundfile as _sf
+            info = _sf.info(str(path))
+        except Exception:
+            raise pcm_error
+        if info.format not in {"WAV", "WAVEX"} or info.subtype not in {"FLOAT", "DOUBLE"}:
+            raise pcm_error
+        frames = info.frames
+        rate = info.samplerate
+        channels = info.channels
+        sample_width = {"FLOAT": 4, "DOUBLE": 8}[info.subtype]
+    if rate <= 0 or frames < 0:
+        raise ValueError(f"invalid WAV metadata: {path}")
+    return {"sha256": _axis_sha(path), "duration_s": frames / rate,
+            "sample_rate": rate, "frames": frames,
+            "channels": channels, "sample_width": sample_width}
 
 
 def _strict_semantic_tokens(text: str) -> list[tuple[str, str]]:
@@ -109,40 +164,94 @@ def _strict_semantic_tokens(text: str) -> list[tuple[str, str]]:
     mismatch.  Canonical ``<sp0>``–``<sp3>`` labels are non-lexical and are
     removed before tokenization.
     """
-    # Silence labels are alignment artifacts, not lexical content.  Strip
-    # every canonical ``<spN>`` label before tokenizing; leaving ``<sp2>``
-    # behind would be parsed as English ``sp`` plus the digit ``2`` and cause
-    # a false semantic mismatch (notably for punctuation-adjacent labels).
-    text = _SEMANTIC_SILENCE.sub("", text).translate(_SEMANTIC_PUNCT_MAP)
-    result: list[tuple[str, str]] = []
-    index = 0
-    while index < len(text):
-        char = text[index]
-        if char.isspace():
-            index += 1
-            continue
-        nvv = _SEMANTIC_NVV.match(text, index)
-        if nvv:
-            label = nvv.group(1).upper()
-            result.append(("nvv", label) if is_nvv_token(label)
-                          else ("other", nvv.group(0)))
-            index = nvv.end()
-            continue
-        english = _SEMANTIC_ENGLISH.match(text, index)
-        if english:
-            word = english.group(0)
-            if not is_nvv_token(word):
-                result.append(("english", word.lower()))
-            index = english.end()
-            continue
-        if is_cjk(char):
-            result.append(("cjk", char))
-        elif is_punct(char):
-            result.append(("punct", char))
-        elif char not in "<>[]":
-            result.append(("other", char))
-        index += 1
-    return result
+    return [(item["kind"], item["surface"].casefold()
+             if item["kind"] == "english" else item["surface"])
+            for item in project_authority_semantics(text)]
+
+
+def _lexical_identity(value: object, *, ctc_item: dict | None = None) -> str:
+    """Return the comparison identity while preserving the display surface.
+
+    CTC canonical units already carry the producer's identity (for example
+    ``vtuber`` for both ``v-tuber`` and ``vtuber``).  Fall back to the shared
+    English parser for source/final labels, and only then use case-folded text
+    for pinyin/other lexical labels.  This function is deliberately used only
+    for ordered evidence comparisons; TextGrid surfaces are never rewritten.
+    """
+    text = str(value or "").strip()
+    if isinstance(ctc_item, dict):
+        canonical = ctc_item.get("canonical_unit")
+        if isinstance(canonical, dict):
+            match_key = canonical.get("match_key")
+            if isinstance(match_key, str) and match_key:
+                nvv_key = _canonical_nvv_identity(match_key)
+                return nvv_key if nvv_key is not None else match_key.casefold()
+    nvv_key = _canonical_nvv_identity(text)
+    if nvv_key is not None:
+        return nvv_key
+    if is_unknown_token(text):
+        return "<unknown>"
+    if is_english_token(text):
+        try:
+            return canonicalize_english_token(text)
+        except (EnglishUnitError, TypeError, ValueError):
+            pass
+    return text.casefold()
+
+
+def _canonical_nvv_identity(value: object) -> str | None:
+    """Canonicalize only the known NVV labels for lexical evidence.
+
+    Final display tiers conventionally use bracketed uppercase NVV labels,
+    while source/CTC evidence may carry the same label bare and lowercase.
+    Unknown angle-bracketed text is intentionally left alone so arbitrary
+    English identity comparisons do not become more permissive.
+    """
+    text = str(value or "").strip()
+    bare = text.strip("<>").strip()
+    known = {str(name).strip("<>").casefold() for name in NVV_NAMES}
+    if bare and bare.casefold() in known:
+        return f"<{bare.upper()}>"
+    return None
+
+
+def _is_substantive_interior_silence(
+        intervals: list["Interval"], index: int) -> bool:
+    """Return whether a silence has lexical owners on both sides.
+
+    Punctuation, empty labels, and other silence intervals do not own a
+    lexical gap.  Scanning past them prevents a normal tail silence before
+    terminal punctuation (and a leading punctuation/silence chain) from being
+    mistaken for an unowned interior pause, while preserving a genuine
+    lexical-silence-lexical pause.
+    """
+    if index < 0 or index >= len(intervals):
+        return False
+    if not is_silence(intervals[index].text):
+        return False
+
+    def _has_lexical_owner(step: int) -> bool:
+        cursor = index + step
+        while 0 <= cursor < len(intervals):
+            label = (intervals[cursor].text or "").strip()
+            if not label or is_silence(label) or is_punct(label):
+                cursor += step
+                continue
+            return True
+        return False
+
+    return _has_lexical_owner(-1) and _has_lexical_owner(1)
+
+
+def _final_unexpected_silence_reasons(words_tier: "Tier | None") -> list[str]:
+    """Recompute unexpected-silence evidence from finalized word geometry."""
+    if words_tier is None:
+        return []
+    for index, interval in enumerate(words_tier.intervals):
+        if (interval.text.strip() in {"<sp1>", "<sp2>", "<sp3>"}
+                and _is_substantive_interior_silence(words_tier.intervals, index)):
+            return ["unexpected_silence"]
+    return []
 
 
 def _load_axis_contract(args) -> tuple[list[str], dict[str, list[str]]]:
@@ -294,12 +403,21 @@ def _load_axis_contract(args) -> tuple[list[str], dict[str, list[str]]]:
             except (OSError, ValueError, TypeError, KeyError):
                 reasons.append("mfa_alignment_axis_mismatch")
         try:
-            tts = tts_root / f"{stem}.wav"
+            # The TTS source namespace may be nested (speaker/voice), while
+            # the MFA axis is intentionally flat.  The transform receipt is
+            # the authoritative stem-to-physical-source binding; falling
+            # back to ``tts_root/stem.wav`` incorrectly rejects every nested
+            # source as an axis mismatch.
+            transform = transforms.get(stem)
+            transform_input = (transform.get("input", {})
+                               if isinstance(transform, dict) else {})
+            bound_tts = Path(str(transform_input.get("path", "")))
+            tts = (bound_tts if bound_tts.is_absolute()
+                   else tts_root / f"{stem}.wav")
             tts_meta = _axis_wav_meta(tts)
             identity = all(tts_meta[key] == actual[key]
                            for key in ("sha256", "sample_rate", "frames", "channels", "sample_width")) and abs(
                                tts_meta["duration_s"] - actual["duration_s"]) <= AXIS_EPS
-            transform = transforms.get(stem)
             if transform is not None:
                 inp, out = transform.get("input"), transform.get("output")
                 valid_transform = (
@@ -345,6 +463,327 @@ class TextGrid:
     xmin: float
     xmax: float
     tiers: list[Tier]
+
+
+def _copy_tier_metadata(source: Tier, target: Tier) -> Tier:
+    """Carry non-serialized provenance across an in-memory tier rebuild.
+
+    Several post-processing stages construct a fresh ``Tier`` object.  CTC
+    boundary authority is deliberately not serialized as a TextGrid label,
+    but it must survive those rebuilds or a later stage can unknowingly
+    overwrite a previously accepted CTC decision.
+    """
+    for name in ("_ctc_word_authority", "_phone_lineage_invalid",
+                 "_processed_geometry_ledger", "_processed_geometry_frozen",
+                 "_processed_geometry_digest", "_canonical_authority_units",
+                 "_word_energy_premerge_spans", "_word_energy_merge_ledger",
+                 "_fallback_unknown_projection"):
+        if hasattr(source, name):
+            setattr(target, name, getattr(source, name))
+    return target
+
+
+def _load_ctc_lifecycle(txt_dir: Path, stem: str) -> dict | None:
+    """Read the producer's raw/work contract without mutating either tree.
+
+    The normal pipeline supplies both environment bindings.  Tiny historical
+    fixtures intentionally do not, so absence of both bindings remains a
+    compatibility mode.  Once either binding is present, every identity and
+    stem/path relationship is mandatory: a partially bound run must fail
+    closed instead of silently treating mutable work files as raw evidence.
+    """
+    raw_value = os.environ.get("CTC_RAW_MANIFEST")
+    work_value = os.environ.get("CTC_WORK_RECEIPT")
+    if not raw_value and not work_value:
+        return None
+    if not raw_value or not work_value:
+        raise ValueError("CTC raw/work lifecycle bindings are incomplete")
+
+    raw_path = Path(raw_value)
+    work_receipt_path = Path(work_value)
+    if (raw_path.is_symlink() or not raw_path.is_file()
+            or work_receipt_path.is_symlink() or not work_receipt_path.is_file()):
+        raise ValueError("CTC raw manifest or work receipt is missing/unsafe")
+    raw_dir = raw_path.parent
+    work_dir = work_receipt_path.parent
+    errors = list(validate_ctc_raw_manifest(raw_dir))
+    errors.extend(validate_ctc_work_receipt(work_dir, raw_path))
+    if work_dir.resolve() != Path(txt_dir).resolve():
+        errors.append("CTC work receipt root does not match txt_dir")
+    try:
+        raw_manifest = json.loads(raw_path.read_text(encoding="utf-8"))
+        work_receipt = json.loads(work_receipt_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"CTC lifecycle metadata unreadable: {exc}") from exc
+    stems = raw_manifest.get("stems") if isinstance(raw_manifest, dict) else None
+    if not isinstance(stems, list) or stem not in stems:
+        errors.append(f"CTC lifecycle stem missing from raw manifest:{stem}")
+    if (not isinstance(work_receipt, dict)
+            or work_receipt.get("work_root") != str(Path(txt_dir).resolve())):
+        errors.append("CTC work receipt lineage root mismatch")
+    ledger = work_receipt.get("transform_ledger") if isinstance(work_receipt, dict) else None
+    if not isinstance(ledger, list):
+        errors.append("CTC work receipt lineage missing")
+    if errors:
+        raise ValueError("invalid CTC raw/work lifecycle: " + "; ".join(errors))
+    return {
+        "schema": "ctc-processed-input-lifecycle-v1",
+        "raw_manifest": {
+            "path": str(raw_path.resolve()),
+            "sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+            "identity": raw_manifest.get("identity"),
+        },
+        "work_receipt": {
+            "path": str(work_receipt_path.resolve()),
+            "sha256": hashlib.sha256(work_receipt_path.read_bytes()).hexdigest(),
+            "identity": work_receipt.get("identity"),
+            "lineage_entries": len(ledger),
+        },
+        "stem": stem,
+    }
+
+
+def _processed_geometry_ledger(words_tier: Tier | None) -> list[dict]:
+    ledger = getattr(words_tier, "_processed_geometry_ledger", None)
+    return ledger if isinstance(ledger, list) else []
+
+
+def _ensure_processed_geometry_state(words_tier: Tier | None) -> list[dict]:
+    """Attach mutable publication provenance while preserving raw spans."""
+    if words_tier is None:
+        return []
+    ledger = _processed_geometry_ledger(words_tier)
+    if not hasattr(words_tier, "_processed_geometry_ledger"):
+        ledger = []
+        for entry in _ctc_authority_entries(words_tier) or []:
+            if not isinstance(entry, dict):
+                continue
+            operations = entry.setdefault("operations", [])
+            if entry.get("arbitration") == "ctc_neighbor_compensation":
+                operation = {"operation": "ctc_neighbor_compensation",
+                             "lexical_ordinal": entry.get("lexical_ordinal")}
+                if operation not in operations:
+                    operations.append(operation)
+                if operation not in ledger:
+                    ledger.append(operation)
+            initial = entry.get("initial_resolved_span")
+            if not isinstance(initial, list):
+                resolved = entry.get("resolved_span")
+                if isinstance(resolved, (list, tuple)) and len(resolved) == 2:
+                    entry["initial_resolved_span"] = [float(resolved[0]), float(resolved[1])]
+            entry.setdefault("published_span", None)
+        words_tier._processed_geometry_ledger = ledger
+    return ledger
+
+
+def _record_processed_geometry_operation(words_tier: Tier | None,
+                                         operation: str,
+                                         **details: object) -> None:
+    """Record a processed mutation; never rewrite ``ctc_span`` evidence."""
+    if words_tier is None:
+        return
+    ledger = _ensure_processed_geometry_state(words_tier)
+    record = {"operation": operation, **details}
+    if record not in ledger:
+        ledger.append(record)
+    for entry in _ctc_authority_entries(words_tier) or []:
+        if isinstance(entry, dict):
+            entry.setdefault("operations", [])
+            if record not in entry["operations"]:
+                entry["operations"].append(record)
+
+
+def _processed_geometry_digest(words_tier: Tier | None) -> str:
+    rows = []
+    for interval in (words_tier.intervals if words_tier is not None else []):
+        # TextGrid serialization uses _fmt(...:.6f).  Bind the report to the
+        # published, serialized geometry rather than pre-serialization float
+        # noise; otherwise strict audit rejects otherwise identical files.
+        rows.append({"xmin": round(float(interval.xmin), 6),
+                     "xmax": round(float(interval.xmax), 6),
+                     "text": interval.text})
+    return _evidence_digest(rows)
+
+
+def _freeze_processed_geometry(textgrid: TextGrid) -> tuple[Tier | None, list[str]]:
+    """Freeze current words geometry; validation is deliberately non-repairing.
+
+    ``resolved_span`` and ``ctc_span`` remain historical/raw evidence.  The
+    interval list present at this point is the only publication authority.
+    """
+    words_tier = tier_by_name(textgrid, "words")
+    if words_tier is None:
+        return None, ["words_missing_at_boundary_freeze"]
+    _ensure_processed_geometry_state(words_tier)
+    reasons: list[str] = []
+    previous_end = words_tier.xmin
+    for index, interval in enumerate(words_tier.intervals):
+        if (not math.isfinite(interval.xmin) or not math.isfinite(interval.xmax)
+                or interval.xmax <= interval.xmin):
+            reasons.append(f"invalid_words_interval:{index}")
+        if interval.xmin < previous_end - AXIS_EPS:
+            reasons.append(f"words_overlap_at_freeze:{index}")
+        previous_end = max(previous_end, interval.xmax)
+    lexical = [iv for iv in words_tier.intervals
+               if iv.text.strip() and not is_silence(iv.text) and not is_punct(iv.text)]
+    entries = _ctc_authority_entries(words_tier) or []
+    if not entries:
+        # Small in-memory geometry fixtures and no-CTC runs have no authority
+        # ledger to publish; the visual interval list is still a valid freeze.
+        pass
+    elif len(entries) == len(lexical):
+        for entry, interval in zip(entries, lexical):
+            entry["published_span"] = [float(interval.xmin), float(interval.xmax)]
+    else:
+        reasons.append("ctc_processed_lexical_count_mismatch")
+    digest = _processed_geometry_digest(words_tier)
+    _record_processed_geometry_operation(words_tier, "boundary_freeze",
+                                         geometry_digest=digest,
+                                         interval_count=len(words_tier.intervals))
+    words_tier._processed_geometry_frozen = True
+    words_tier._processed_geometry_digest = digest
+    textgrid._processed_geometry_frozen = True
+    textgrid._processed_geometry_digest = digest
+    textgrid._processed_geometry_ledger = list(_processed_geometry_ledger(words_tier))
+    return words_tier, reasons
+
+
+def _rebuild_derived_from_frozen_words(textgrid: TextGrid, ipa_to_pinyin: dict[str, str],
+                                       pinyin_dict: dict[str, list[str]] | None,
+                                       raw_text: str, en_mfa_windows=None,
+                                       warnings: list[str] | None = None,
+                                       reference_authoritative: bool = False) -> None:
+    """Rebuild derived tiers from frozen words without reopening arbitration."""
+    words_tier = tier_by_name(textgrid, "words")
+    if words_tier is None or not getattr(textgrid, "_processed_geometry_frozen", False):
+        raise RuntimeError("derived rebuild requires frozen processed words")
+    phones_tier = tier_by_name(textgrid, "phones")
+    lineage = getattr(textgrid, "_phone_lineage", None)
+    if phones_tier is not None and isinstance(lineage, dict):
+        rebuilt = _rebuild_phones_from_lineage(words_tier, phones_tier, lineage)
+        if rebuilt is not None:
+            phones_tier = rebuilt
+            for index, tier in enumerate(textgrid.tiers):
+                if tier.name == "phones":
+                    textgrid.tiers[index] = phones_tier
+                    break
+    hanzi_tier = _build_hanzi_tier(
+        words_tier, raw_text, warnings or [],
+        reference_authoritative=reference_authoritative)
+    if hanzi_tier is not None:
+        for index, tier in enumerate(textgrid.tiers):
+            if tier.name == "hanzi":
+                textgrid.tiers[index] = hanzi_tier
+                break
+    if phones_tier is not None and pinyin_dict is not None:
+        synced = build_pinyin_phones_tier(
+            phones_tier, ipa_to_pinyin, words_tier, pinyin_dict,
+            en_mfa_windows=en_mfa_windows)
+        if synced is not None:
+            for index, tier in enumerate(textgrid.tiers):
+                if tier.name == "pinyin_phones":
+                    textgrid.tiers[index] = synced
+                    break
+
+
+def _ctc_authority_entries(words_tier: Tier | None) -> list[dict] | None:
+    entries = getattr(words_tier, "_ctc_word_authority", None)
+    return entries if isinstance(entries, list) else None
+
+
+def _ctc_authoritative_ordinal(words_tier: Tier | None,
+                               interval_index: int) -> int | None:
+    """Return the lexical ordinal for a CTC-authoritative interval."""
+    if words_tier is None or interval_index < 0:
+        return None
+    lexical_ordinal = 0
+    for index, interval in enumerate(words_tier.intervals):
+        if not interval.text.strip() or is_silence(interval.text) or is_punct(interval.text):
+            continue
+        if index == interval_index:
+            entries = _ctc_authority_entries(words_tier)
+            if entries is not None and lexical_ordinal < len(entries):
+                entry = entries[lexical_ordinal]
+                if (isinstance(entry, dict)
+                        and entry.get("boundary_source") == "ctc"):
+                    return lexical_ordinal
+            return None
+        lexical_ordinal += 1
+    return None
+
+
+def _ctc_authoritative_ordinals(words_tier: Tier | None) -> set[int]:
+    entries = _ctc_authority_entries(words_tier)
+    if entries is None:
+        return set()
+    return {index for index, entry in enumerate(entries)
+            if isinstance(entry, dict)
+            and entry.get("boundary_source") == "ctc"}
+
+
+def _reassert_ctc_word_authority_tier(words_tier: Tier | None
+                                      ) -> tuple[Tier | None, int]:
+    """Restore the accepted word decision after a mutating stage.
+
+    This is intentionally a narrow reapplication of an already accepted
+    decision.  It does not invent anchors or repair CTC sequence errors.  A
+    later punctuation pass may still clip the two immediate lexical owners,
+    but generic energy, gap, or overlap code cannot silently replace the
+    accepted CTC/MFA decision with a new interval.  CTC-owned entries use the
+    CTC-derived resolved span; MFA-owned entries use the span produced by the
+    original snap decision and therefore retain the original arbitration.
+    """
+    entries = _ctc_authority_entries(words_tier)
+    if words_tier is None or entries is None:
+        return words_tier, 0
+    lexical_positions = [index for index, interval in enumerate(words_tier.intervals)
+                          if interval.text.strip()
+                          and not is_silence(interval.text)
+                          and not is_punct(interval.text)]
+    if len(lexical_positions) != len(entries):
+        return words_tier, 0
+    intervals = list(words_tier.intervals)
+    changed = 0
+    for lexical_ordinal, entry in enumerate(entries):
+        if (not isinstance(entry, dict)
+                or entry.get("boundary_source") not in {"ctc", "mfa"}):
+            continue
+        span = entry.get("resolved_span") or entry.get("ctc_span")
+        if not isinstance(span, (list, tuple)) or len(span) != 2:
+            continue
+        try:
+            start, end = float(span[0]), float(span[1])
+        except (TypeError, ValueError):
+            continue
+        start = max(words_tier.xmin, start)
+        end = min(words_tier.xmax, end)
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start + AXIS_EPS:
+            continue
+        position = lexical_positions[lexical_ordinal]
+        current = intervals[position]
+        if abs(current.xmin - start) > AXIS_EPS or abs(current.xmax - end) > AXIS_EPS:
+            intervals[position] = Interval(start, end, current.text)
+            changed += 1
+        if entry.get("boundary_source") == "mfa":
+            mfa_span = entry.get("mfa_span")
+            ctc_span = entry.get("ctc_span")
+            if (isinstance(mfa_span, (list, tuple)) and len(mfa_span) == 2
+                    and isinstance(ctc_span, (list, tuple)) and len(ctc_span) == 2):
+                mfa_overlap = min(end, float(mfa_span[1])) - max(
+                    start, float(mfa_span[0]))
+                ctc_overlap = min(end, float(ctc_span[1])) - max(
+                    start, float(ctc_span[0]))
+                # A later CTC-boundary compensation may have happened in a
+                # tier rebuild that preserved the original decision metadata.
+                # Promote provenance here as the final publication contract
+                # is evaluated after that rebuild, not only inside snap.
+                if (mfa_overlap <= AXIS_EPS and ctc_overlap > AXIS_EPS):
+                    entry["boundary_source"] = "ctc"
+                    entry["arbitration"] = "ctc_neighbor_compensation"
+    if not changed:
+        return words_tier, 0
+    return _copy_tier_metadata(
+        words_tier, Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals)), changed
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +1125,92 @@ def silence_label(duration: float) -> str:
     return "<sp3>"
 
 
+def _silence_label_from_ticks(duration_ticks: int) -> str:
+    """Classify a serialized interval using integer microsecond ticks."""
+    if duration_ticks < 200_000:
+        return "<sp0>"
+    if duration_ticks < 500_000:
+        return "<sp1>"
+    if duration_ticks < 1_500_000:
+        return "<sp2>"
+    return "<sp3>"
+
+
+def _pure_silence_label(text: object) -> str | None:
+    """Return a canonical ``<spN>`` label, excluding attached text."""
+    label = str(text).strip().casefold()
+    if label in {"<sp0>", "<sp1>", "<sp2>", "<sp3>"}:
+        return label
+    return None
+
+
+def _reconcile_publication_geometry(words_tier: Tier) -> Tier:
+    """Canonicalize the display owner partition without enlarging words.
+
+    Reference/CTC reconciliation may leave a small frame residual or a real
+    pause between lexical owners.  Only residuals within ``AXIS_EPS`` snap to
+    the adjacent owner; every larger gap becomes an explicit canonical
+    silence.  Overlaps are trimmed at the already-established owner boundary,
+    so a punctuation anchor can never extend a lexical word over a pause.
+    """
+    axis_start, axis_end = float(words_tier.xmin), float(words_tier.xmax)
+    if not (math.isfinite(axis_start) and math.isfinite(axis_end)
+            and axis_end > axis_start):
+        return words_tier
+
+    source = []
+    for interval in words_tier.intervals:
+        start, end = float(interval.xmin), float(interval.xmax)
+        if not (math.isfinite(start) and math.isfinite(end)):
+            continue
+        start = max(axis_start, start)
+        end = min(axis_end, end)
+        if end > start:
+            source.append(Interval(start, end, interval.text))
+    source.sort(key=lambda interval: (interval.xmin, interval.xmax))
+
+    result: list[Interval] = []
+    cursor = axis_start
+
+    def append_silence(start: float, end: float) -> None:
+        if end <= start:
+            return
+        duration = end - start
+        label = silence_label(duration)
+        result.append(Interval(start, end, label))
+
+    for interval in source:
+        start, end = interval.xmin, interval.xmax
+        gap = start - cursor
+        if gap > AXIS_EPS:
+            append_silence(cursor, start)
+        elif gap > 0:
+            start = cursor
+        if start < cursor:
+            start = cursor
+        if end <= start:
+            continue
+        text = interval.text
+        if is_silence(text):
+            # Compute the canonical label once for this owner.  The hanzi
+            # tier mirrors this interval after the words tier is rebuilt.
+            text = silence_label(end - start)
+        result.append(Interval(start, end, text))
+        cursor = end
+
+    if cursor < axis_end - AXIS_EPS:
+        append_silence(cursor, axis_end)
+    elif cursor < axis_end:
+        # The residual is an axis tick, not a substantive edge pause.
+        if result:
+            last = result[-1]
+            result[-1] = Interval(last.xmin, axis_end, last.text)
+        else:
+            append_silence(axis_start, axis_end)
+    return _copy_tier_metadata(
+        words_tier, Tier(words_tier.name, axis_start, axis_end, result))
+
+
 # TextGrid timestamps are decimal seconds, but they arrive here as binary
 # floats after parsing.  QC boundaries such as 30 ms are policy ticks, not
 # approximate floating-point tolerances: 30.000 ms is valid while 29.999 ms
@@ -695,9 +1220,13 @@ _TIME_TICK_HZ = 1_000_000
 
 
 def _duration_ticks(xmin: float, xmax: float) -> int:
-    """Return duration in integer microsecond ticks (truncating sub-ticks)."""
+    """Return duration on the six-decimal serialized TextGrid axis."""
     try:
-        raw = (Decimal(str(xmax)) - Decimal(str(xmin))) * _TIME_TICK_HZ
+        # QC audits the artifact that will be written.  Internal arithmetic
+        # can leave ``11.57`` as ``11.569999999...``; using ``str(float)``
+        # directly then reports a false 29,999 us interval even though both
+        # endpoints serialize to an exact 30 ms span.
+        raw = (Decimal(_fmt(xmax)) - Decimal(_fmt(xmin))) * _TIME_TICK_HZ
         if not raw.is_finite():
             return 0
         return int(raw)
@@ -1027,9 +1556,14 @@ def _find_internal_pp_gaps(pp_tier: Tier | None, words_tier: Tier | None,
         gap_ticks = _duration_ticks(left.xmax, right.xmin)
         if gap_ticks <= threshold_ticks:
             continue
+        # A gap at a word boundary is legal sparse-tier coverage.  Require
+        # both endpoints to be strictly inside the same content word; the
+        # 1 ms tolerance prevents a boundary phone ending at 10.830 and the
+        # next phone starting at 10.830/10.890 from being assigned to either
+        # adjacent word (fix02).
         owner = next((row for row in content_ranges
-                      if row[0] <= left.xmax + 0.001
-                      and right.xmin <= row[1] + 0.001), None)
+                      if row[0] + 0.001 < left.xmax
+                      and right.xmin < row[1] - 0.001), None)
         if owner is None:
             continue
         gaps.append({
@@ -1147,6 +1681,584 @@ def _tier_desync_counts(hanzi_tier: Tier | None,
     return mismatches, max(len(hanzi), semantic_words + extra_words)
 
 
+def _align_reference_punctuation(ref_punct: list[dict],
+                                 observed_punct: list[dict]) -> tuple[list[tuple[int, int]], list[dict], list[dict]]:
+    """Align displayed punctuation without turning omission into misownership.
+
+    Reference punctuation is allowed to be missing.  Therefore matching from
+    each reference mark to the first later observed mark is incorrect when
+    repeated labels are present: ``，！...！`` can leave only the final ``！``
+    and that mark must be matched to the final reference occurrence.  This
+    dynamic-programming alignment keeps both sequences ordered, prefers an
+    exact lexical boundary, and only falls back to an observed ``extra`` mark
+    when no ordered reference occurrence can explain it.
+    """
+    ref_count = len(ref_punct)
+    obs_count = len(observed_punct)
+
+    @lru_cache(maxsize=None)
+    def solve(obs_index: int, ref_start: int):
+        if obs_index >= obs_count:
+            return (0, 0, 0, ())
+
+        candidates = []
+        observed = observed_punct[obs_index]
+        for ref_index in range(ref_start, ref_count):
+            reference = ref_punct[ref_index]
+            if observed["label"] != reference["label"]:
+                continue
+            tail = solve(obs_index + 1, ref_index + 1)
+            boundary_error = int(observed["boundary"] != reference["boundary"])
+            distance = abs(observed["boundary"] - reference["boundary"])
+            candidates.append((
+                tail[0],
+                tail[1] + boundary_error,
+                tail[2] + distance,
+                ((obs_index, ref_index),) + tail[3],
+            ))
+
+        # If this observed mark cannot be explained by a later reference
+        # occurrence, it is genuinely extra.  The extra-count component is
+        # deliberately ordered before boundary distance so an out-of-order
+        # mark remains a boundary error rather than being hidden as omission.
+        tail = solve(obs_index + 1, ref_start)
+        candidates.append((tail[0] + 1, tail[1], tail[2],
+                           ((obs_index, None),) + tail[3]))
+        return min(candidates, key=lambda item: item[:3])
+
+    mapping = solve(0, 0)[3]
+    matched = [(ref_index, obs_index)
+               for obs_index, ref_index in mapping
+               if ref_index is not None]
+    used_ref = {ref_index for ref_index, _ in matched}
+    used_observed = {obs_index for _, obs_index in matched}
+    missing = [{"index": ref_index, **ref_punct[ref_index]}
+               for ref_index in range(ref_count)
+               if ref_index not in used_ref]
+    extra = [dict(index=obs_index, **observed_punct[obs_index])
+             for obs_index in range(obs_count)
+             if obs_index not in used_observed]
+    matched.sort()
+    return matched, missing, extra
+
+
+def _publication_contract_audit(
+        words_tier: Tier | None,
+        hanzi_tier: Tier | None,
+        pinyin_phones_tier: Tier | None,
+        phones_tier: Tier | None,
+        reference_text: str,
+        source_words: list[dict] | None,
+        ctc_tokens: list[dict] | None,
+        reference_authoritative: bool,
+        english_provenance: dict | None = None,
+        unknown_recovery_proof: dict | None = None,
+        fallback_correspondence: dict | None = None,
+        reference_mode: str | None = None) -> tuple[list[str], dict]:
+    """Audit final publication ownership without repairing uncertainty.
+
+    This is deliberately a veto, not a normalizer.  Words/hanzi must be a
+    complete display partition; every source/derived phone must have exactly
+    one word owner; source CTC lexical order and spans must agree exactly; and
+    reference punctuation/semantic ownership must be local.  The numeric
+    ``AXIS_EPS`` is used only for serialized-axis ticks, never to turn an
+    unowned interval into a publishable owner.
+    """
+    reasons: list[str] = []
+    details: dict[str, object] = {}
+    fallback_pause_gate = _fallback_pause_qualification(
+        words_tier, reference_mode, fallback_correspondence,
+        source_words, ctc_tokens)
+    if fallback_pause_gate["pause_count"]:
+        details["fallback_pause_qualification"] = fallback_pause_gate
+
+    def _authority_evidence_projection(final_items, source_items, ctc_items):
+        """Project ordered fragment evidence into authority semantic owners."""
+        def value(item):
+            if isinstance(item, dict):
+                return item.get("text", item.get("word", ""))
+            return item
+
+        semantic = [item for item in project_authority_semantics(reference_text)
+                    if item["kind"] != "punct"]
+        if not any(item["kind"] == "english" for item in semantic):
+            return None
+        if len(final_items) != len(semantic):
+            return None
+        cursors = [0, 0]
+        groups = []
+        for expected, final in zip(semantic, final_items):
+            observed = final.text.strip()
+            if expected["kind"] == "english":
+                if (re.sub(r"[^a-z0-9]", "", observed.casefold())
+                        != re.sub(r"[^a-z0-9]", "", expected["surface"].casefold())):
+                    return None
+            elif expected["kind"] == "cjk":
+                if not is_pinyin_syllable(observed):
+                    return None
+            for slot, items in enumerate((source_items, ctc_items)):
+                while (cursors[slot] < len(items)
+                       and is_punct(str(value(items[cursors[slot]])))):
+                    cursors[slot] += 1
+                start = cursors[slot]
+                if expected["kind"] == "english":
+                    compact = ""
+                    while cursors[slot] < len(items):
+                        item = items[cursors[slot]]
+                        item_value = str(value(item))
+                        if not is_english_fragment_token(item_value):
+                            break
+                        compact += re.sub(r"[^a-z0-9]", "", item_value.casefold())
+                        cursors[slot] += 1
+                        target = re.sub(r"[^a-z0-9]", "", expected["surface"].casefold())
+                        if compact == target:
+                            break
+                    if compact != re.sub(r"[^a-z0-9]", "", expected["surface"].casefold()):
+                        return None
+                else:
+                    if cursors[slot] >= len(items):
+                        return None
+                    item_value = str(value(items[cursors[slot]]))
+                    if expected["kind"] == "cjk" and not is_pinyin_syllable(item_value):
+                        return None
+                    cursors[slot] += 1
+                groups.append((expected["unit_id"], final.text.strip(), start,
+                               cursors[slot], slot))
+        if any(cursors[slot] < len(items)
+               and not all(is_punct(str(value(item)))
+                           for item in items[cursors[slot]:])
+               for slot, items in enumerate((source_items, ctc_items))):
+            return None
+        return groups
+
+    def add(reason: str, value: object) -> None:
+        if reason not in reasons:
+            reasons.append(reason)
+        details[reason] = value
+
+    def _partition(tier: Tier | None, name: str, *, full_axis: bool) -> None:
+        if tier is None or not tier.intervals:
+            add(f"{name}_missing", {"count": 0})
+            return
+        rows = tier.intervals
+        local: list[dict] = []
+        for index, iv in enumerate(rows):
+            if (not math.isfinite(iv.xmin) or not math.isfinite(iv.xmax)
+                    or iv.xmax <= iv.xmin):
+                local.append({"index": index, "label": iv.text,
+                              "start_s": iv.xmin, "end_s": iv.xmax})
+                continue
+            if iv.xmin < tier.xmin - AXIS_EPS or iv.xmax > tier.xmax + AXIS_EPS:
+                local.append({"index": index, "label": iv.text,
+                              "start_s": iv.xmin, "end_s": iv.xmax})
+            if index:
+                delta = iv.xmin - rows[index - 1].xmax
+                # Derived phone tiers are intentionally sparse across
+                # punctuation/inter-word gaps; only overlap is a structural
+                # violation there.  Words/hanzi are the complete display
+                # partition and must also reject holes.
+                if delta < -AXIS_EPS or (full_axis and delta > AXIS_EPS):
+                    local.append({"index": index, "gap_s": round(max(delta, 0.0), 6),
+                                  "overlap_s": round(max(-delta, 0.0), 6)})
+        if full_axis:
+            if rows[0].xmin > tier.xmin + AXIS_EPS:
+                local.append({"edge": "head", "gap_s": rows[0].xmin - tier.xmin})
+            if rows[-1].xmax < tier.xmax - AXIS_EPS:
+                local.append({"edge": "tail", "gap_s": tier.xmax - rows[-1].xmax})
+            interior_silence = [
+                {"index": index, "label": iv.text.strip(),
+                 "start_s": iv.xmin, "end_s": iv.xmax}
+                for index, iv in enumerate(rows)
+                if _is_substantive_interior_silence(rows, index)
+            ]
+            if interior_silence:
+                # This is evidence for strict filtering, not a publishable
+                # owner.  Keep it separate from structural gaps so a
+                # materialized silence can never be mistaken for repair.
+                details["strict_interior_sp"] = interior_silence[:20]
+                if not fallback_pause_gate["reason_qualification"].get(
+                        "strict_interior_sp", False):
+                    add("strict_interior_sp", interior_silence[:20])
+        if local:
+            add(f"{name}_owner_partition_mismatch", local[:20])
+
+    _partition(words_tier, "words", full_axis=True)
+    _partition(hanzi_tier, "hanzi", full_axis=True)
+    _partition(pinyin_phones_tier, "pinyin_phones", full_axis=False)
+    _partition(phones_tier, "phones", full_axis=False)
+
+    lineage_invalid = getattr(phones_tier, "_phone_lineage_invalid", None)
+    if lineage_invalid:
+        add("phone_lineage_ambiguous", lineage_invalid)
+
+    if words_tier is not None and hanzi_tier is not None:
+        if len(words_tier.intervals) != len(hanzi_tier.intervals):
+            add("words_hanzi_bounds_mismatch", {
+                "words": len(words_tier.intervals),
+                "hanzi": len(hanzi_tier.intervals),
+            })
+        else:
+            mismatches: list[dict] = []
+            for index, (word, label) in enumerate(
+                    zip(words_tier.intervals, hanzi_tier.intervals)):
+                if (abs(word.xmin - label.xmin) > AXIS_EPS
+                        or abs(word.xmax - label.xmax) > AXIS_EPS):
+                    mismatches.append({"index": index,
+                                       "word": [word.xmin, word.xmax],
+                                       "hanzi": [label.xmin, label.xmax]})
+                    continue
+                word_text, label_text = word.text.strip(), label.text.strip()
+                if ((is_silence(word_text) or is_punct(word_text))
+                        and word_text != label_text):
+                    mismatches.append({"index": index, "word": word_text,
+                                       "hanzi": label_text})
+                elif (is_english_token(word_text)
+                      and word_text.casefold() != label_text.casefold()):
+                    mismatches.append({"index": index, "word": word_text,
+                                       "hanzi": label_text})
+            if mismatches:
+                add("words_hanzi_bounds_mismatch", mismatches[:20])
+
+    # Every source and derived phone must be wholly owned by one final words
+    # interval.  A phone crossing a boundary is ambiguous even if its overlap
+    # ratio happens to be high.
+    if words_tier is not None:
+        for tier_name, tier in (("phones", phones_tier),
+                                ("pinyin_phones", pinyin_phones_tier)):
+            if tier is None:
+                continue
+            bad: list[dict] = []
+            for index, phone in enumerate(tier.intervals):
+                owners = [word for word in words_tier.intervals
+                          if phone.xmin >= word.xmin - AXIS_EPS
+                          and phone.xmax <= word.xmax + AXIS_EPS]
+                if len(owners) != 1:
+                    overlaps = []
+                    for owner_index, word in enumerate(words_tier.intervals):
+                        overlap = min(phone.xmax, word.xmax) - max(
+                            phone.xmin, word.xmin)
+                        if overlap > AXIS_EPS:
+                            overlaps.append({
+                                "index": owner_index,
+                                "label": word.text.strip(),
+                                "overlap_s": round(overlap, 6),
+                            })
+                    overlaps.sort(key=lambda row: row["overlap_s"], reverse=True)
+                    bad.append({"index": index, "label": phone.text,
+                                "start_s": phone.xmin, "end_s": phone.xmax,
+                                "owner_count": len(owners),
+                                "candidate_owners": overlaps[:4]})
+            if bad:
+                add(f"{tier_name}_owner_mismatch", bad[:20])
+
+        # A phone gap strictly inside one lexical word is not a natural
+        # inter-word pause.  Preserve it as evidence for filtering.
+        if pinyin_phones_tier is not None:
+            internal: list[dict] = []
+            for left, right in zip(pinyin_phones_tier.intervals,
+                                   pinyin_phones_tier.intervals[1:]):
+                owner = next((word for word in words_tier.intervals
+                              if left.xmax > word.xmin + AXIS_EPS
+                              and right.xmin < word.xmax - AXIS_EPS
+                              and not is_silence(word.text)
+                              and not is_punct(word.text)), None)
+                if owner is not None and right.xmin - left.xmax > AXIS_EPS:
+                    internal.append({"word": owner.text.strip(),
+                                     "start_s": left.xmax,
+                                     "end_s": right.xmin})
+            if internal:
+                add("pinyin_phones_internal_hole", internal[:20])
+
+    if reference_authoritative and words_tier is not None:
+        ref_units = _extract_word_chars(reference_text)
+        ref_punct = []
+        ref_lexical_count = 0
+        for unit in ref_units:
+            if is_punct(unit):
+                ref_punct.append({"label": unit.strip(),
+                                  "boundary": ref_lexical_count})
+            elif is_word_like(unit):
+                ref_lexical_count += 1
+        # A missing mark is not proof of an alignment error: punctuation is
+        # often swallowed by a long pause or omitted by CTC.  Extra marks,
+        # reordered marks, and a mark attached to the wrong lexical boundary
+        # are errors because they change the displayed segmentation.
+        observed_punct = []
+        lexical = [iv for iv in words_tier.intervals
+                   if iv.text.strip() and not is_silence(iv.text)
+                   and not is_punct(iv.text)]
+        for iv in words_tier.intervals:
+            if not (is_punct(iv.text) and not is_silence(iv.text)):
+                continue
+            boundary = sum(1 for word in lexical
+                           if word.xmax <= iv.xmin + AXIS_EPS)
+            observed_punct.append({"label": iv.text.strip(),
+                                   "boundary": boundary,
+                                   "interval": [iv.xmin, iv.xmax]})
+
+        matched, missing, extra = _align_reference_punctuation(
+            ref_punct, observed_punct)
+        boundary_errors = []
+        for ref_index, obs_index in matched:
+            expected = ref_punct[ref_index]
+            actual = observed_punct[obs_index]
+            if actual["boundary"] != expected["boundary"]:
+                boundary_errors.append({
+                    "reference_index": ref_index,
+                    "observed_index": obs_index,
+                    "label": actual["label"],
+                    "expected_boundary": expected["boundary"],
+                    "observed_boundary": actual["boundary"],
+                    "interval": actual["interval"],
+                })
+        punct_projection = {
+            "reference": [item["label"] for item in ref_punct],
+            "observed": [item["label"] for item in observed_punct],
+            "missing_allowed": missing,
+            "extra": extra,
+            "boundary_errors": boundary_errors,
+        }
+        details["reference_punctuation_projection"] = punct_projection
+        if extra or boundary_errors:
+            add("reference_punctuation_ownership_mismatch", punct_projection)
+        punct_bad: list[dict] = []
+        lexical = [iv for iv in words_tier.intervals
+                   if iv.text.strip() and not is_silence(iv.text)
+                   and not is_punct(iv.text)]
+        for index, punct in enumerate(
+                iv for iv in words_tier.intervals
+                if is_punct(iv.text) and not is_silence(iv.text)):
+            prev = next((word for word in reversed(lexical)
+                         if word.xmax <= punct.xmin + AXIS_EPS), None)
+            nxt = next((word for word in lexical
+                        if word.xmin >= punct.xmax - AXIS_EPS), None)
+            local_start = prev.xmax if prev is not None else words_tier.xmin
+            local_end = nxt.xmin if nxt is not None else words_tier.xmax
+            if (punct.xmin < local_start - AXIS_EPS
+                    or punct.xmax > local_end + AXIS_EPS):
+                punct_bad.append({"index": index, "label": punct.text,
+                                  "interval": [punct.xmin, punct.xmax],
+                                  "local_gap": [local_start, local_end]})
+        if punct_bad:
+            add("punctuation_local_owner_mismatch", punct_bad[:20])
+
+    # CTC lexical identity is exact, but geometry is an evidence envelope:
+    # final words may be reconstructed from the ordered source-MFA and CTC
+    # owners, rather than being required to fit one raw CTC interval.  This
+    # preserves provenance while allowing a boundary repair to use the
+    # convex hull of its independent lexical evidence.
+    current_lexical = [iv for iv in (words_tier.intervals if words_tier else [])
+                       if iv.text.strip() and not is_silence(iv.text)
+                       and not is_punct(iv.text)]
+    # Keep the raw MFA snapshot immutable for diagnostics, but let a
+    # separately verified recovery proof participate in the lexical contract.
+    # Without this projection, a proven ``<unk> -> Mira`` recovery was still
+    # compared as ``<unk>`` here and vetoed after all earlier processing.
+    resolved_source_words = [dict(item) for item in (source_words or [])]
+    if isinstance(unknown_recovery_proof, dict):
+        source_interval = (unknown_recovery_proof.get("source", {})
+                           .get("interval", {}))
+        source_ordinal = source_interval.get("ordinal")
+        resolved_word = (unknown_recovery_proof.get("ctc", {})
+                         .get("token", {}).get("word", ""))
+        if (type(source_ordinal) is int and isinstance(resolved_word, str)
+                and resolved_word.strip()):
+            for item in resolved_source_words:
+                if item.get("ordinal") == source_ordinal:
+                    item["raw_text"] = item.get("text", "")
+                    item["text"] = resolved_word.strip()
+                    break
+            else:
+                resolved_source_words = [dict(item) for item in (source_words or [])]
+        details["ctc_lexical_source_resolution"] = {
+            "schema": "ctc-lexical-source-resolution-v1",
+            "raw_unknown": source_interval.get("text"),
+            "resolved_text": resolved_word.strip() if isinstance(resolved_word, str) else "",
+            "source_ordinal": source_ordinal,
+            "proof_schema": unknown_recovery_proof.get("schema"),
+        }
+    source_lexical = [item for item in resolved_source_words
+                      if str(item.get("text", "")).strip()
+                      and not is_silence(str(item.get("text", "")))
+                      and not is_punct(str(item.get("text", "")))]
+    ctc_lexical: list[dict] = []
+    for token in ctc_tokens or []:
+        if not isinstance(token, dict) or str(token.get("type", "word")) != "word":
+            continue
+        text = str(token.get("word", "")).strip()
+        if text and not is_silence(text) and not is_punct(text):
+            ctc_lexical.append(token)
+    lexical_evidence: list[dict] = []
+    if current_lexical and (not source_lexical or not ctc_lexical):
+        add("ctc_lexical_evidence_missing", {
+            "current": len(current_lexical),
+            "source": len(source_lexical), "ctc": len(ctc_lexical)})
+    elif current_lexical:
+        current_text = [_lexical_identity(iv.text) for iv in current_lexical]
+        source_text = [_lexical_identity(item.get("text", ""))
+                       for item in source_lexical]
+        ctc_text = [_lexical_identity(item.get("word", ""), ctc_item=item)
+                    for item in ctc_lexical]
+        if (not reference_authoritative
+                and isinstance(fallback_correspondence, dict)
+                and fallback_correspondence.get("safe")):
+            mapped_source = [entry for entry in
+                             fallback_correspondence.get("entries", [])
+                             if entry.get("status") == "mapped"]
+            if len(mapped_source) == len(current_lexical):
+                source_by_ordinal = {
+                    item.get("ordinal"): item for item in (source_words or [])
+                    if isinstance(item, dict)
+                }
+                source_lexical = [
+                    {**source_by_ordinal.get(entry.get("source_ordinal"), {}),
+                     "text": entry.get("resolved_text", "")}
+                    for entry in mapped_source
+                ]
+                source_text = [_lexical_identity(entry.get("resolved_text", ""))
+                               for entry in mapped_source]
+                details["fallback_correspondence_projection"] = {
+                    "digest": fallback_correspondence.get("digest"),
+                    "mapped_count": len(mapped_source),
+                }
+        authority_projection = None
+        if reference_authoritative:
+            authority_projection = _authority_evidence_projection(
+                current_lexical, source_lexical, ctc_lexical)
+            if authority_projection is not None:
+                details["ctc_lexical_evidence_projection"] = authority_projection
+        if (authority_projection is None
+                and (current_text != source_text or current_text != ctc_text)):
+            add("ctc_lexical_sequence_mismatch", {
+                "current": current_text[:20], "source": source_text[:20],
+                "ctc": ctc_text[:20],
+                "current_surface": [iv.text.strip() for iv in current_lexical[:20]],
+                "source_surface": [str(item.get("text", "")).strip()
+                                   for item in source_lexical[:20]],
+                "ctc_surface": [str(item.get("word", "")).strip()
+                                for item in ctc_lexical[:20]],
+            })
+        else:
+            # Source MFA and CTC remain lexical identity/order evidence, but
+            # neither span is a publication geometry fence.  The processed
+            # words tier may deliberately move outside both raw spans after
+            # CTC/MFA arbitration, energy refinement, punctuation ownership,
+            # or silence compensation.  Geometry is retained below for
+            # diagnostics only; it must not veto a valid processed owner.
+            previous_word_end = -math.inf
+            previous_source_start = -math.inf
+            previous_ctc_start = -math.inf
+            punctuation_intervals = [iv for iv in (words_tier.intervals if words_tier else [])
+                                     if is_punct(iv.text) and not is_silence(iv.text)]
+            authority_entries = _ctc_authority_entries(words_tier) or []
+            for index, (word, source_item, token) in enumerate(
+                    zip(current_lexical, source_lexical, ctc_lexical)):
+                try:
+                    ctc_start, ctc_end = float(token["start_s"]), float(token["end_s"])
+                    source_start = float(source_item.get("start", source_item.get("xmin")))
+                    source_end = float(source_item.get("end", source_item.get("xmax")))
+                except (KeyError, TypeError, ValueError):
+                    lexical_evidence.append({"index": index, "error": "invalid_span"})
+                    continue
+                envelope_start = min(source_start, ctc_start)
+                envelope_end = max(source_end, ctc_end)
+                source_overlap = min(word.xmax, source_end) - max(word.xmin, source_start)
+                ctc_overlap = min(word.xmax, ctc_end) - max(word.xmin, ctc_start)
+                final_word_order = word.xmin >= previous_word_end - AXIS_EPS
+                source_order = source_start >= previous_source_start - AXIS_EPS
+                ctc_order = ctc_start >= previous_ctc_start - AXIS_EPS
+                punct_overlap = [punct.text.strip() for punct in punctuation_intervals
+                                 if min(word.xmax, punct.xmax) - max(word.xmin, punct.xmin)
+                                 > AXIS_EPS]
+                authority = (authority_entries[index]
+                             if index < len(authority_entries)
+                             and isinstance(authority_entries[index], dict)
+                             else {})
+                ctc_authoritative = (
+                    authority.get("boundary_source") == "ctc"
+                    # Provenance can be lost when a late reference/geometry
+                    # rebuild replaces the words tier.  If the final word
+                    # has no MFA evidence at all but is positively contained
+                    # in its CTC span, infer the same safe CTC ownership from
+                    # geometry instead of rejecting the CTC reconstruction.
+                    or (source_overlap <= AXIS_EPS
+                        and ctc_overlap > AXIS_EPS))
+                valid = (
+                    all(math.isfinite(value) for value in
+                        (ctc_start, ctc_end, source_start, source_end))
+                    and ctc_end > ctc_start and source_end > source_start
+                    # Raw CTC/MFA geometry is advisory.  The final processed
+                    # interval is allowed to be compensated beyond either
+                    # evidence span; only lexical order and punctuation
+                    # ownership remain publication contracts here.
+                    and final_word_order and source_order and ctc_order
+                    and not punct_overlap)
+                proof = {
+                    "index": index,
+                    "lexical_ordinal": index,
+                    "word": word.text.strip(),
+                    "word_span": [word.xmin, word.xmax],
+                    "source_mfa_span": [source_start, source_end],
+                    "ctc_span": [ctc_start, ctc_end],
+                    "ctc_authoritative": ctc_authoritative,
+                    "evidence_envelope": [envelope_start, envelope_end],
+                    "source_overlap_s": max(0.0, source_overlap),
+                    "ctc_overlap_s": max(0.0, ctc_overlap),
+                    "punctuation_overlap": punct_overlap,
+                    "monotone": final_word_order,
+                    "final_word_order": final_word_order,
+                    "source_order": source_order,
+                    "ctc_order": ctc_order,
+                    "accepted": valid,
+                }
+                previous_word_end = max(previous_word_end, word.xmax)
+                previous_source_start = source_start
+                previous_ctc_start = ctc_start
+                if not valid:
+                    lexical_evidence.append(proof)
+                else:
+                    lexical_evidence.append(proof)
+            if lexical_evidence:
+                # Geometry failures are diagnostic evidence only.  The
+                # processed interval is allowed to be compensated outside
+                # raw CTC/MFA spans; sequence/order and punctuation contracts
+                # are enforced by the remaining checks above.
+                # This is a publication binding, not a diagnostic preview.
+                # The independent strict audit compares it one-for-one with
+                # the final lexical words tier; truncating at 20 silently
+                # rejected every longer utterance even when all spans were
+                # valid.
+                details["ctc_lexical_evidence_proof"] = lexical_evidence
+
+    english_count = sum(1 for iv in current_lexical if is_english_token(iv.text))
+    if current_lexical and english_count:
+        if not isinstance(english_provenance, dict):
+            add("english_provenance_missing", {"english_words": english_count})
+        elif english_provenance.get("status") != "verified":
+            add("english_provenance_rejected", english_provenance)
+        else:
+            if int(english_provenance.get("verified_words", 0)) < english_count:
+                add("english_provenance_word_count_mismatch", {
+                    "english_words": english_count,
+                    "verified_words": english_provenance.get("verified_words")})
+            if pinyin_phones_tier is not None:
+                missing: list[str] = []
+                for word in current_lexical:
+                    if not is_english_token(word.text):
+                        continue
+                    owned = [phone.text.strip() for phone in pinyin_phones_tier.intervals
+                             if phone.xmax > word.xmin + AXIS_EPS
+                             and phone.xmin < word.xmax - AXIS_EPS
+                             and not is_silence(phone.text)]
+                    if not owned or any(not label.startswith(EN_PHONE_PREFIX)
+                                        for label in owned):
+                        missing.append(word.text.strip())
+                if missing:
+                    add("english_phone_owner_mismatch", missing[:20])
+
+    return sorted(set(reasons)), details
+
+
 def _record_filterable_qc(report: dict, filter_reasons: list[str],
                           enabled: bool, name: str, details) -> None:
     """Always retain diagnostics; filter only when quality filtering is on."""
@@ -1177,15 +2289,13 @@ def _resolve_spn(phone_iv: Interval, words_tier: Tier | None,
 # ---------------------------------------------------------------------------
 
 def handle_unexpected_silences(textgrid: TextGrid, pinyin_text: str) -> list[str]:
-    """Merge sp0 gaps unconditionally; flag sp1-3 gaps for filtering.
+    """Diagnose unexpected inter-word silences without changing geometry.
 
-    After the punctuation–silence cross-check, any silence between words that
-    has *no* corresponding punctuation is an unexpected pause:
-      - ``<sp0>`` (< 0.2 s)  -> merge unconditionally (into adjacent
-        punctuation when present, otherwise into the previous word).
-        Short gaps have no semantic meaning in any context.
-      - ``<sp1-3>`` (≥ 0.2 s) -> return as filter reasons (when no punct
-        is present; <sp1-3> after punct is handled by the absorb pass).
+    Silence ownership is resolved once, from the final visual words snapshot,
+    by :func:`_resolve_visual_short_silence_merges`.  This historical helper
+    remains part of the public processing API, but is intentionally
+    diagnostic-only so an early ``<sp0>`` pass cannot consume the same gap a
+    second time.
     """
     words_tier = tier_by_name(textgrid, "words")
     phones_tier = tier_by_name(textgrid, "phones")
@@ -1228,139 +2338,14 @@ def handle_unexpected_silences(textgrid: TextGrid, pinyin_text: str) -> list[str
                             for i in range(lo, hi))
 
     filter_reasons = []
-
-    # Build delete markers for sp0 merges (avoid O(n²) list deletion)
-    to_delete_words: set[int] = set()
-    to_delete_phones: set[int] = set()
-    to_delete_pp: set[int] = set()
-    merge_ops: list[tuple[int, int, float]] = []  # (word_idx, sil_idx, sil_xmax)
-
     for k in range(1, n):
         sil_label = gap_sil[k]
         has_punct = gap_punct[k]
-        if sil_label is None:
+        if sil_label is None or has_punct:
             continue
-        if sil_label == "<sp0>":
-            pass  # Always merge <sp0> regardless of punctuation — 15 ms
-            # gaps have no semantic meaning in any context.
-        elif has_punct:
-            continue  # <sp1-3> + punct: skip (handled by absorb phase later)
-        elif sil_label in ("<sp1>", "<sp2>", "<sp3>"):
-            prev_text = word_items[tg_word_idx[k - 1]][0]
-            next_text = word_items[tg_word_idx[k]][0]
-            if not (is_english_token(prev_text) or is_english_token(next_text)
-                    or is_nvv_token(prev_text) or is_nvv_token(next_text)):
-                # Regular Chinese words: flag the unexpected silence
-                # but still merge it into the previous word.  The silence
-                # IS unexpected (hence the filter flag), but leaving it
-                # in the words tier creates a mid_sp hit downstream.
-                filter_reasons.append("unexpected_silence")
-                # Fall through to the merge block below.
-            else:
-                # English/NVV-adjacent gaps: MFA artifacts (MFA can't
-                # model English phones, inserts spn).  Skip.
-                continue
-
-        # <sp0>: merge into previous word (or adjacent punctuation).
-        prev_word_idx = tg_word_idx[k - 1]
-        sil_idx = None
-        for j in range(prev_word_idx + 1, tg_word_idx[k]):
-            if word_items[j][1]:
-                sil_idx = j
-                break
-        if sil_idx is None:
-            continue
-
-        sil_iv = words_tier.intervals[sil_idx]
-
-        # When punct exists, absorb <sp0> into the adjacent punctuation
-        # rather than the previous word (extending the word over punct
-        # would create an overlap).
-        if has_punct:
-            # Find the punctuation interval nearest to the <sp0>.
-            punct_idx = sil_idx - 1
-            while punct_idx > prev_word_idx:
-                if is_punct(word_items[punct_idx][0]):
-                    break
-                punct_idx -= 1
-            if punct_idx > prev_word_idx and is_punct(word_items[punct_idx][0]):
-                # Extend punctuation to absorb the <sp0>.
-                words_tier.intervals[punct_idx].xmax = sil_iv.xmax
-                to_delete_words.add(sil_idx)
-                # Clean up matching silence in phones & pp tiers
-                # (punct has no phone entries, just delete the sil).
-                for pi, p in enumerate(phones_tier.intervals):
-                    if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
-                       and abs(p.xmax - sil_iv.xmax) < 0.01:
-                        to_delete_phones.add(pi)
-                        break
-                for pi, p in enumerate(pp_tier.intervals):
-                    if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
-                       and abs(p.xmax - sil_iv.xmax) < 0.01:
-                        to_delete_pp.add(pi)
-                        break
-            else:
-                # Fallback: merge into previous word (no punct found adjacent).
-                merge_ops.append((prev_word_idx, sil_idx, sil_iv.xmax))
-                to_delete_words.add(sil_idx)
-                for pi, p in enumerate(phones_tier.intervals):
-                    if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
-                       and abs(p.xmax - sil_iv.xmax) < 0.01:
-                        to_delete_phones.add(pi)
-                        break
-                for pi, p in enumerate(pp_tier.intervals):
-                    if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
-                       and abs(p.xmax - sil_iv.xmax) < 0.01:
-                        to_delete_pp.add(pi)
-                        break
-        else:
-            # No punct — original behaviour: merge into previous word.
-            merge_ops.append((prev_word_idx, sil_idx, sil_iv.xmax))
-            to_delete_words.add(sil_idx)
-
-            # Find matching silence in phones & pp tiers
-            for pi, p in enumerate(phones_tier.intervals):
-                if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
-                   and abs(p.xmax - sil_iv.xmax) < 0.01:
-                    to_delete_phones.add(pi)
-                    break
-            for pi, p in enumerate(pp_tier.intervals):
-                if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
-                   and abs(p.xmax - sil_iv.xmax) < 0.01:
-                    to_delete_pp.add(pi)
-                    break
-
-    # Apply merge ops (extend word + last phone)
-    for prev_wi, sil_idx, sil_xmax in merge_ops:
-        prev_w = words_tier.intervals[prev_wi]
-        prev_w.xmax = sil_xmax
-        # Extend last phone of previous word
-        for pi in range(len(phones_tier.intervals) - 1, -1, -1):
-            p = phones_tier.intervals[pi]
-            if not is_silence(p.text) and p.text != 'spn' \
-               and abs(p.xmax - words_tier.intervals[sil_idx].xmin) < 0.01:
-                p.xmax = sil_xmax
-                if pi + 1 < len(phones_tier.intervals):
-                    phones_tier.intervals[pi + 1].xmin = sil_xmax
-                break
-
-    # One-pass filter: keep non-deleted intervals (O(n) instead of O(n²))
-    if to_delete_words:
-        words_tier.intervals = [iv for i, iv in enumerate(words_tier.intervals)
-                                if i not in to_delete_words]
-    if to_delete_phones:
-        phones_tier.intervals = [iv for i, iv in enumerate(phones_tier.intervals)
-                                 if i not in to_delete_phones]
-    if to_delete_pp:
-        pp_tier.intervals = [iv for i, iv in enumerate(pp_tier.intervals)
-                             if i not in to_delete_pp]
-
-    # Clean up zero-duration remnants in all tiers
-    for tier in (words_tier, phones_tier, pp_tier):
-        tier.intervals = [iv for iv in tier.intervals
-                          if iv.duration > 0.001 or not iv.text.strip()]
-
-    return filter_reasons
+        if sil_label in ("<sp1>", "<sp2>", "<sp3>"):
+            filter_reasons.append("unexpected_silence")
+    return sorted(set(filter_reasons))
 
 
 def absorb_nvv_trailing(textgrid: TextGrid) -> None:
@@ -1389,9 +2374,12 @@ def absorb_nvv_trailing(textgrid: TextGrid) -> None:
     to_delete_words: set[int] = set()
     to_delete_phones: set[int] = set()
     to_delete_pp: set[int] = set()
-
     for i in range(len(intervals)):
         if not is_nvv_token(intervals[i].text):
+            continue
+        if _ctc_authoritative_ordinal(words_tier, i) is not None:
+            # NVV may use CTC as its only valid acoustic boundary.  Do not
+            # later absorb punctuation/silence and overwrite that anchor.
             continue
 
         # Absorb trailing punct + silence chain.
@@ -1498,12 +2486,38 @@ def _fix_overlapping_boundaries(words_tier) -> int:
                           and not is_silence(nxt_text))
         cur_is_en_nvv = is_english_token(cur_text) or is_nvv_token(cur_text)
         nxt_is_en_nvv = is_english_token(nxt_text) or is_nvv_token(nxt_text)
+        cur_ctc = _ctc_authoritative_ordinal(words_tier, i) is not None
+        nxt_ctc = _ctc_authoritative_ordinal(words_tier, i + 1) is not None
 
         # ── Two content words with mild overlap (incl. English/NVV adjacent) ──
         # Regr. Case 38: when one side is English/NVV (no MFA acoustic model),
         # clip that side to the content word's boundary.
         if cur_is_content and nxt_is_content and overlap_ticks < 30_000:
-            if cur_is_en_nvv and not nxt_is_en_nvv:
+            if cur_ctc and nxt_ctc:
+                # Both owners came from CTC.  If a later punctuation or
+                # geometry pass introduced an overlap, split only the CTC
+                # overlap region; never use MFA duration or midpoint of the
+                # mutated intervals as a new authority.
+                entries = _ctc_authority_entries(words_tier) or []
+                left_ord = _ctc_authoritative_ordinal(words_tier, i)
+                right_ord = _ctc_authoritative_ordinal(words_tier, i + 1)
+                left_span = entries[left_ord].get("resolved_span") if left_ord is not None and left_ord < len(entries) else None
+                right_span = entries[right_ord].get("resolved_span") if right_ord is not None and right_ord < len(entries) else None
+                if (isinstance(left_span, list) and len(left_span) == 2
+                        and isinstance(right_span, list) and len(right_span) == 2
+                        and left_span[1] > right_span[0]):
+                    boundary = (float(left_span[1]) + float(right_span[0])) / 2.0
+                else:
+                    boundary = (cur.xmax + nxt.xmin) / 2.0
+                intervals[i] = Interval(cur.xmin, boundary, cur.text)
+                intervals[i + 1] = Interval(boundary, nxt.xmax, nxt.text)
+            elif cur_ctc:
+                # Preserve the CTC owner's end; move only the non-CTC word.
+                intervals[i + 1] = Interval(cur.xmax, nxt.xmax, nxt.text)
+            elif nxt_ctc:
+                # Preserve the CTC owner's start; trim only the non-CTC word.
+                intervals[i] = Interval(cur.xmin, nxt.xmin, cur.text)
+            elif cur_is_en_nvv and not nxt_is_en_nvv:
                 # English/NVV → content: clip English/NVV end
                 intervals[i] = Interval(cur.xmin, nxt.xmin, cur.text)
             elif nxt_is_en_nvv and not cur_is_en_nvv:
@@ -1590,19 +2604,142 @@ def _fix_pp_phone_overlaps(pp_tier: Tier) -> int:
     return fixed
 
 
-def _absorb_tiny_gaps(words_tier: Tier, max_gap_s: float = 0.030) -> Tier:
-    """Absorb sub-frame gaps (< 30 ms) between consecutive content words.
+def _build_gap_ownership_evidence(
+        words_tier: Tier,
+        source_words: list[dict] | None,
+        ctc_tokens: list[dict] | None,
+        reference_text: str = "",
+        reference_authoritative: bool = False,
+        max_gap_s: float = 0.030) -> dict[tuple[int, int], dict]:
+    """Build an explicit proof map for mechanical word-boundary residuals.
 
-    Regr. Case 39: MFA frame-level precision gaps (5-30 ms) that survive
-    _snap_to_ctc's gap absorption pass (e.g. because they were introduced
-    later by _inject_punctuation or Phase 4 operations) are absorbed into
-    adjacent words.  Only targets gaps between two non-punct, non-silence
-    content intervals.
+    A duration is only a candidate here.  The proof also requires exact
+    lexical order agreement across the current words tier, the source words
+    snapshot, and CTC lexical tokens; contiguous/overlapping CTC spans; and
+    no source silence, source punctuation, CTC punctuation, or authoritative
+    reference punctuation at the boundary.  Missing or ambiguous evidence is
+    represented by a false decision, so callers fail closed.
+
+    Keys are interval-index pairs in ``words_tier``.  A direct content gap is
+    keyed by ``(left_index, right_index)``.  An explicit silence interval
+    between content owners uses the same outer-owner key.
+    """
+    result: dict[tuple[int, int], dict] = {}
+    intervals = list(words_tier.intervals)
+    current_lexical = [
+        (index, iv.text.strip()) for index, iv in enumerate(intervals)
+        if iv.text.strip() and not is_silence(iv.text) and not is_punct(iv.text)
+    ]
+    if not source_words or not ctc_tokens or len(current_lexical) < 2:
+        return result
+
+    source_lexical = [
+        (index, str(item.get("text", "")).strip())
+        for index, item in enumerate(source_words)
+        if str(item.get("text", "")).strip()
+        and not is_silence(str(item.get("text", "")))
+        and not is_punct(str(item.get("text", "")))
+    ]
+    ctc_rows: list[tuple[int, dict]] = []
+    for index, token in enumerate(ctc_tokens):
+        if not isinstance(token, dict) or str(token.get("type", "word")) != "word":
+            continue
+        text = str(token.get("word", "")).strip()
+        try:
+            start, end = float(token["start_s"]), float(token["end_s"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (not text or is_silence(text) or is_punct(text)
+                or not math.isfinite(start) or not math.isfinite(end)
+                or end <= start):
+            continue
+        ctc_rows.append((index, {"text": text, "start": start, "end": end}))
+
+    def _same_sequence(left: list[tuple[int, str]], right: list[tuple[int, str]]) -> bool:
+        return (len(left) == len(right)
+                and all(a[1].casefold() == b[1].casefold()
+                        for a, b in zip(left, right)))
+
+    if (not _same_sequence(current_lexical, source_lexical)
+            or not _same_sequence(current_lexical,
+                                   [(index, row["text"]) for index, row in ctc_rows])):
+        return result
+
+    reference_punctuation_boundaries: set[int] = set()
+    if reference_authoritative:
+        reference_lexical_count = 0
+        for unit in _extract_word_chars(reference_text):
+            if is_punct(unit):
+                reference_punctuation_boundaries.add(reference_lexical_count)
+            elif is_word_like(unit):
+                reference_lexical_count += 1
+        if reference_lexical_count != len(current_lexical):
+            return result
+
+    max_gap_ticks = _threshold_ticks(max_gap_s)
+    for lexical_index in range(len(current_lexical) - 1):
+        left_index, _ = current_lexical[lexical_index]
+        right_index, _ = current_lexical[lexical_index + 1]
+        left_ctc_index, left_ctc = ctc_rows[lexical_index]
+        right_ctc_index, right_ctc = ctc_rows[lexical_index + 1]
+        current_left = intervals[left_index]
+        current_right = intervals[right_index]
+        gap_ticks = _duration_ticks(current_left.xmax, current_right.xmin)
+        source_between = source_words[source_lexical[lexical_index][0] + 1:
+                                     source_lexical[lexical_index + 1][0]]
+        ctc_between = ctc_tokens[left_ctc_index + 1:right_ctc_index]
+        source_owner = any(
+            is_silence(str(item.get("text", "")))
+            or is_punct(str(item.get("text", ""))) for item in source_between)
+        ctc_owner = any(
+            is_silence(str(item.get("word", "")))
+            or is_punct(str(item.get("word", ""))) for item in ctc_between
+            if isinstance(item, dict))
+        reference_owner = lexical_index + 1 in reference_punctuation_boundaries
+        ctc_contiguous = (left_ctc["end"] + AXIS_EPS >= right_ctc["start"])
+        mechanical = (0 < gap_ticks < max_gap_ticks and ctc_contiguous
+                      and not source_owner and not ctc_owner
+                      and not reference_owner)
+        result[(left_index, right_index)] = {
+            "mechanical_frame_residual": mechanical,
+            "source_ctc_contiguous": ctc_contiguous,
+            "source_owner": source_owner,
+            "ctc_owner": ctc_owner,
+            "reference_owner": reference_owner,
+            "gap_duration_us": gap_ticks,
+        }
+    return result
+
+
+def _gap_evidence_allows_absorption(
+        ownership_evidence: dict[tuple[int, int], dict] | None,
+        left_index: int, right_index: int) -> bool:
+    """Return true only for an explicit, positive ownership decision."""
+    if not isinstance(ownership_evidence, dict):
+        return False
+    decision = ownership_evidence.get((left_index, right_index))
+    return (isinstance(decision, dict)
+            and decision.get("mechanical_frame_residual") is True
+            and decision.get("source_owner") is False
+            and decision.get("ctc_owner") is False
+            and decision.get("reference_owner") is False
+            and decision.get("source_ctc_contiguous") is True)
+
+
+def _absorb_tiny_gaps(
+        words_tier: Tier, max_gap_s: float = 0.030,
+        ownership_evidence: dict[tuple[int, int], dict] | None = None) -> Tier:
+    """Remove only serialization-scale residuals (``AXIS_EPS`` or less).
+
+    Real positive-duration gaps, including old source-proven 10–30 ms gaps,
+    belong to the final visual silence resolver.  Keeping this helper narrow
+    prevents a derived-tier sync from consuming a gap before the immutable
+    visual snapshot is taken.
     """
     intervals = list(words_tier.intervals)
     n = len(intervals)
     to_delete: set[int] = set()
-    max_gap_ticks = _threshold_ticks(max_gap_s)
+    residual_ticks = _threshold_ticks(AXIS_EPS)
 
     for i in range(n - 1):
         if i in to_delete:
@@ -1612,36 +2749,42 @@ def _absorb_tiny_gaps(words_tier: Tier, max_gap_s: float = 0.030) -> Tier:
         cur_text = cur.text.strip() if cur.text else ""
         nxt_text = nxt.text.strip() if nxt.text else ""
 
-        # Only absorb gaps between two content words (not punct, not silence)
+        # Only an AXIS_EPS serialization residual may be removed here.
         if not cur_text or not nxt_text:
             continue
         if is_punct(cur_text) or is_punct(nxt_text):
             continue
+        direct_gap_ticks = _duration_ticks(cur.xmax, nxt.xmin)
+        if (not is_silence(cur_text) and not is_silence(nxt_text)
+                and 0 < direct_gap_ticks <= residual_ticks):
+            intervals[i] = Interval(cur.xmin, nxt.xmin, cur.text)
+            continue
         if is_silence(cur_text):
-            # Silence gap between two content words — absorb if tiny
-            if _duration_ticks(cur.xmin, cur.xmax) < max_gap_ticks:
-                # Absorb into the longer neighbouring word
-                prev_word = intervals[i - 1] if i > 0 else None
-                if (prev_word and not is_silence(prev_word.text)
-                        and prev_word.duration >= nxt.duration):
-                    intervals[i - 1] = Interval(prev_word.xmin, nxt.xmin, prev_word.text)
-                else:
-                    intervals[i + 1] = Interval(cur.xmin, nxt.xmax, nxt.text)
+            if (_duration_ticks(cur.xmin, cur.xmax) <= residual_ticks
+                    and i > 0
+                    and i + 1 < n
+                    and not is_silence(intervals[i - 1].text)
+                    and not is_silence(nxt.text)):
+                intervals[i - 1] = Interval(
+                    intervals[i - 1].xmin, nxt.xmin, intervals[i - 1].text)
                 to_delete.add(i)
         elif is_silence(nxt_text):
-            continue  # word→silence: not a gap, silence is intentional
+            continue
 
     intervals = [iv for idx, iv in enumerate(intervals) if idx not in to_delete]
     # Remove zero-duration remnants
     intervals = [iv for iv in intervals if iv.duration > 0.001]
-    return Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals)
+    return _copy_tier_metadata(
+        words_tier, Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals))
 
 
 def _sync_derived_tiers(textgrid: TextGrid, ipa_to_pinyin: dict[str, str],
                         pinyin_dict: dict[str, list[str]] | None = None,
                         raw_text: str = "",
                         en_mfa_windows: dict[tuple[str, float], tuple[float, float]] | None = None,
-                        report_warnings: list[str] | None = None) -> None:
+                        report_warnings: list[str] | None = None,
+                        reference_authoritative: bool = False,
+                        gap_ownership_evidence: dict[tuple[int, int], dict] | None = None) -> None:
     """Rebuild hanzi and pinyin_phones from the current words + phones tiers.
 
     Call this after ANY in-place modification to words tier boundaries
@@ -1656,11 +2799,36 @@ def _sync_derived_tiers(textgrid: TextGrid, ipa_to_pinyin: dict[str, str],
     if words_tier is None:
         return
 
-    # 0. Absorb frame-precision gaps before rebuilding derived tiers.
-    #    Regr. Case 39: gaps < 30 ms are MFA alignment residuals, not
-    #    real silences.  Absorb them now so hanzi + pinyin_phones don't
-    #    inherit unnecessary gaps.
-    words_tier = _absorb_tiny_gaps(words_tier)
+    # Rebuild source phones from the pre-mutation lineage before deriving
+    # pinyin_phones.  Ambiguous lineage is retained as a veto; it is never
+    # repaired by strongest-overlap assignment.
+    lineage = getattr(textgrid, "_phone_lineage", None)
+    if phones_tier is not None and isinstance(lineage, dict):
+        rebuilt_phones = _rebuild_phones_from_lineage(words_tier, phones_tier, lineage)
+        if rebuilt_phones is None:
+            invalid = lineage.get("reasons", ["phone_lineage_rebuild_failed"])
+            textgrid._phone_lineage_invalid = invalid
+            phones_tier._phone_lineage_invalid = invalid
+        else:
+            phones_tier = rebuilt_phones
+            for index, tier in enumerate(textgrid.tiers):
+                if tier.name == "phones":
+                    textgrid.tiers[index] = phones_tier
+                    break
+            if lineage.get("status") in {"verified", "partial"}:
+                # A partial lineage is safe after its nonlexical crossings
+                # have been clipped; do not carry a stale all-tier veto from
+                # an earlier failed rebuild into the publication contract.
+                if hasattr(textgrid, "_phone_lineage_invalid"):
+                    delattr(textgrid, "_phone_lineage_invalid")
+                if hasattr(phones_tier, "_phone_lineage_invalid"):
+                    delattr(phones_tier, "_phone_lineage_invalid")
+
+    # 0. Absorb only source-proven frame residuals before rebuilding derived
+    #    tiers.  An absent evidence map deliberately preserves every gap.
+    words_tier = _absorb_tiny_gaps(
+        words_tier, ownership_evidence=gap_ownership_evidence)
+    words_tier = _reconcile_publication_geometry(words_tier)
     # Update the tier in-place in the textgrid
     for i, t in enumerate(textgrid.tiers):
         if t.name == "words":
@@ -1672,8 +2840,9 @@ def _sync_derived_tiers(textgrid: TextGrid, ipa_to_pinyin: dict[str, str],
     # must never survive a failed rebuild (Regression Case 66).
     if raw_text:
         try:
-            hanzi_tier = _build_hanzi_tier(words_tier, raw_text,
-                                            report_warnings or [])
+            hanzi_tier = _build_hanzi_tier(
+                words_tier, raw_text, report_warnings or [],
+                reference_authoritative=reference_authoritative)
             if hanzi_tier:
                 found = False
                 for i, t in enumerate(textgrid.tiers):
@@ -1781,7 +2950,8 @@ def strip_edge_punctuation(textgrid: TextGrid) -> None:
 
     # ── Apply changes ──
     intervals = [iv for iv in intervals if iv.xmax > iv.xmin + 0.001]
-    new_words = Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals)
+    new_words = _copy_tier_metadata(
+        words_tier, Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals))
     for i, t in enumerate(textgrid.tiers):
         if t.name == "words":
             textgrid.tiers[i] = new_words
@@ -1800,12 +2970,13 @@ def strip_edge_punctuation(textgrid: TextGrid) -> None:
 
 
 def absorb_silence_into_punct(textgrid: TextGrid) -> None:
-    """Absorb trailing ``<spN>`` silence intervals into preceding punctuation.
+    """Absorb punctuation-adjacent ``<spN>`` intervals into punctuation.
 
-    Punctuation is silent by nature — the silence that follows it is its
-    realised duration.  This is the **fallback** pass: it handles residual
-    ``<spN>`` after punctuation that was not already absorbed by an NVV
-    in :func:`absorb_nvv_trailing`.
+    Punctuation is silent by nature — the silence immediately before or after
+    it is its realised duration.  This is the **fallback** pass: it handles
+    residual ``<spN>`` adjacent to punctuation that was not already absorbed
+    by an NVV in :func:`absorb_nvv_trailing`.  Silence strictly between two
+    lexical owners is deliberately untouched and remains a filterable pause.
 
     Without this step, a 5 ms ``！`` followed by a 695 ms ``<sp2>`` leaves
     an orphaned silence in the middle of the words tier, which the
@@ -1823,16 +2994,44 @@ def absorb_silence_into_punct(textgrid: TextGrid) -> None:
     to_delete_words: set[int] = set()
     to_delete_phones: set[int] = set()
     to_delete_pp: set[int] = set()
+    absorbed_count = 0
 
     i = 0
     while i < len(intervals) - 1:
         cur_text = intervals[i].text.strip()
         next_text = intervals[i + 1].text.strip()
-        if is_punct(cur_text) and is_silence(next_text) and next_text:
+        if is_silence(cur_text) and is_punct(next_text) and cur_text:
+            sil_iv = intervals[i]
+            punct_iv = intervals[i + 1]
+            # A pause before punctuation is punctuation-owned, just like a
+            # pause after punctuation.  Keeping it as a separate word tier
+            # interval is what used to make every reference sample fail the
+            # strict interior-sp audit.
+            intervals[i + 1] = Interval(sil_iv.xmin, punct_iv.xmax,
+                                         punct_iv.text)
+            to_delete_words.add(i)
+            absorbed_count += 1
+            if phones_tier:
+                for pi, p in enumerate(phones_tier.intervals):
+                    if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
+                       and abs(p.xmax - sil_iv.xmax) < 0.01:
+                        to_delete_phones.add(pi)
+                        break
+            if pp_tier:
+                for pi, p in enumerate(pp_tier.intervals):
+                    if is_silence(p.text) and abs(p.xmin - sil_iv.xmin) < 0.01 \
+                       and abs(p.xmax - sil_iv.xmax) < 0.01:
+                        to_delete_pp.add(pi)
+                        break
+            # Keep the punctuation at i+1 as the current candidate so a
+            # pause on both sides is collapsed in one pass.
+            i += 1
+        elif is_punct(cur_text) and is_silence(next_text) and next_text:
             sil_iv = intervals[i + 1]
             # Extend punctuation to absorb the silence duration.
             intervals[i] = Interval(intervals[i].xmin, sil_iv.xmax, intervals[i].text)
             to_delete_words.add(i + 1)
+            absorbed_count += 1
 
             # Remove matching silence from phones & pp tiers.
             if phones_tier:
@@ -1871,10 +3070,13 @@ def absorb_silence_into_punct(textgrid: TextGrid) -> None:
         if tier:
             tier.intervals = [iv for iv in tier.intervals
                               if iv.duration > 0.001 or not iv.text.strip()]
+    _record_processed_geometry_operation(
+        words_tier, "punct_pause_absorption", count=absorbed_count)
 
 
 def _finalise_textgrid(textgrid: TextGrid, raw_text: str, pinyin_text: str,
-                       args, warnings: list | None = None) -> TextGrid:
+                       args, warnings: list | None = None,
+                       *, reference_authoritative: bool = False) -> TextGrid:
     """Clean up corrected text and restructure tiers for final output.
 
     1. Remove ``[sp]`` markers from corrected_text (merged as sp0).
@@ -1910,7 +3112,10 @@ def _finalise_textgrid(textgrid: TextGrid, raw_text: str, pinyin_text: str,
 
     # 5. Build hanzi tier — one CJK char per word interval
     words_tier = tier_by_name(textgrid, "words")
-    hanzi_tier = _build_hanzi_tier(words_tier, raw_text, warnings) if words_tier else None
+    hanzi_tier = (_build_hanzi_tier(
+        words_tier, raw_text, warnings,
+        reference_authoritative=reference_authoritative)
+        if words_tier else None)
 
     # 6. Remove corrected_text, reorder tiers
     new_tiers = []
@@ -1993,6 +3198,27 @@ def _extract_word_chars(text: str) -> list[str]:
     return result
 
 
+def _canonicalize_reference_hyphens(text: str) -> str:
+    """Remove lexical ASCII hyphens from an in-memory processing string.
+
+    Hyphens outside angle-bracket labels are lexical separators, so
+    ``v-tuber`` and ``open-ai`` become ``vtuber`` and ``openai``.  Hyphens
+    inside bracketed NVV labels are preserved (for example
+    ``<QUESTION-YI>``), keeping the NVV label and its provenance unchanged.
+    This helper never writes back to the source/reference file.
+    """
+    result: list[str] = []
+    label_closers: list[str] = []
+    for char in str(text):
+        if char in "<[":
+            label_closers.append(">" if char == "<" else "]")
+        elif label_closers and char == label_closers[-1]:
+            label_closers.pop()
+        if char != "-" or label_closers:
+            result.append(char)
+    return "".join(result)
+
+
 def _reference_pinyin_text(reference_text: str, source_pinyin: str) -> str:
     """Render the pinyin tier from the authoritative reference sequence.
 
@@ -2009,9 +3235,11 @@ def _reference_pinyin_text(reference_text: str, source_pinyin: str) -> str:
     for unit in _extract_word_chars(reference_text):
         if is_cjk(unit):
             if cjk_index >= len(source_cjk):
-                # The later coverage audit will reject a genuinely truncated
-                # lab; do not invent a tone here.
-                rendered.append(unit)
+                # Numerals introduced by the authority normalizer have a
+                # deterministic Mandarin reading even when the legacy lab
+                # still exposes the ASCII suffix (target1/target2).
+                # Other missing CJK tones remain fail-closed as before.
+                rendered.append(_AUTHORITY_NUMERAL_PINYIN.get(unit, unit))
             else:
                 rendered.append(source_cjk[cjk_index])
                 cjk_index += 1
@@ -2069,18 +3297,27 @@ def _repair_authority_punctuation_geometry(
             continue
         anchor_start, anchor_end = anchors[occurrence]
 
-        # Establish the local lexical gap around this punctuation.  An anchor
-        # from a different repeated punctuation occurrence must not move this
-        # interval across a neighbouring word.
+        # Establish the immediate lexical owner envelope.  The old MFA gap
+        # may be zero or stale; only the two adjacent lexical owners may
+        # overlap this authoritative anchor.
         prev = next((current[i] for i in range(punct_index - 1, -1, -1)
                      if current[i].text.strip() and not is_silence(current[i].text)
                      and not is_punct(current[i].text.strip())), None)
         nxt = next((current[i] for i in range(punct_index + 1, len(current))
                     if current[i].text.strip() and not is_silence(current[i].text)
                     and not is_punct(current[i].text.strip())), None)
-        gap_start = prev.xmax if prev is not None else words_tier.xmin
-        gap_end = nxt.xmin if nxt is not None else words_tier.xmax
-        if anchor_start < gap_start - 0.01 or anchor_end > gap_end + 0.01:
+        left_bound = prev.xmin if prev is not None else words_tier.xmin
+        right_bound = nxt.xmax if nxt is not None else words_tier.xmax
+        if (anchor_start < left_bound - AXIS_EPS
+                or anchor_end > right_bound + AXIS_EPS):
+            continue
+        if any(
+                iv is not prev and iv is not nxt
+                and iv.text.strip() and not is_silence(iv.text)
+                and not is_punct(iv.text)
+                and iv.xmax > anchor_start + AXIS_EPS
+                and iv.xmin < anchor_end - AXIS_EPS
+                for iv in current):
             continue
 
         local_silence = []
@@ -2092,10 +3329,8 @@ def _repair_authority_punctuation_geometry(
         if not local_silence:
             continue
 
-        owner_start = min(punct.xmin, anchor_start)
-        owner_end = max(punct.xmax, anchor_end)
-        owner_start = max(words_tier.xmin, gap_start, owner_start)
-        owner_end = min(words_tier.xmax, gap_end, owner_end)
+        owner_start = max(words_tier.xmin, anchor_start)
+        owner_end = min(words_tier.xmax, anchor_end)
         if owner_end <= owner_start + 0.001:
             continue
         owner_ranges.append((owner_start, owner_end))
@@ -2178,8 +3413,8 @@ def _repair_reference_authority_colocated_silence(
     return len(remove)
 
 
-def _restore_reference_punctuation(words_tier: Tier, reference_text: str,
-                                   punct_entries: list[dict] | None = None) -> int:
+def _restore_reference_punctuation_legacy(words_tier: Tier, reference_text: str,
+                                          punct_entries: list[dict] | None = None) -> int:
     """Make the words tier's punctuation sequence equal the authority.
 
     CTC punctuation is an alignment anchor, not lexical authority.  When a
@@ -2187,9 +3422,12 @@ def _restore_reference_punctuation(words_tier: Tier, reference_text: str,
     terminal full stop, rebuilding only from CTC punctuation can silently
     change the transcript.  This pass keeps lexical word intervals, removes
     the current punctuation projection, and restores the reference sequence.
-    Anchor timing is used only when it lies in the local word gap; otherwise
-    the local gap/boundary is used so a long pause cannot erase neighbouring
-    words.
+    Anchor timing is bound to the reference lexical boundary and the
+    immediate lexical owners.  It may cross an old MFA boundary when it
+    overlaps only those two owners; it may never consume a non-adjacent word.
+    A missing punctuation interval is restored only when its CTC anchor has
+    explicit local silence evidence.  Voiced lexical audio is never carved
+    solely to make room for a reference mark.
     """
     ref_puncts: list[tuple[str, int]] = []
     lexical_count = 0
@@ -2205,13 +3443,17 @@ def _restore_reference_punctuation(words_tier: Tier, reference_text: str,
                       if iv.text.strip() in '，。…！？、；：,.!?;:～']
     desired_puncts = [char for char, _ in ref_puncts]
     if current_puncts == desired_puncts:
-        # Even when the labels already match, an authoritative punctuation
-        # anchor may own an explicit silence interval.  Repair only that
-        # colocated geometry; unrelated unexplained silence remains untouched.
+        # When the punctuation label is already present, preserve it.  A CTC
+        # anchor without a local silence is not permission to re-carve the
+        # neighbouring lexical words.  With local silence, only repair the
+        # punctuation-owned geometry.
         anchored = _repair_authority_punctuation_geometry(
             words_tier, reference_text, punct_entries)
-        return anchored + _repair_reference_authority_colocated_silence(
+        repaired = anchored + _repair_reference_authority_colocated_silence(
             words_tier, reference_text)
+        canonical = _reconcile_publication_geometry(words_tier)
+        words_tier.intervals = canonical.intervals
+        return repaired
 
     lexical = [iv for iv in current
                if iv.text.strip() and not is_silence(iv.text)
@@ -2269,23 +3511,155 @@ def _restore_reference_punctuation(words_tier: Tier, reference_text: str,
         if gap_end < gap_start:
             gap_start = gap_end = max(words_tier.xmin, min(words_tier.xmax, gap_start))
 
-        # Reuse an existing interval of the same ordinal first.  Otherwise
-        # use the corresponding CTC anchor only if it is local to the gap.
+        # Reuse the corresponding authoritative CTC anchor.  Its duration is
+        # allowed to be wider than the old MFA gap: punctuation commonly owns
+        # a long realised pause, and CTC may continue that owner beyond the
+        # next lexical boundary.  The *publication* owner is still local to
+        # the two reference-adjacent lexical words.  In particular, a broad
+        # anchor must not make the next spoken word part of punctuation.
         occurrence = sum(1 for c, _ in ref_puncts[:ref_index] if c == char)
         candidates = anchors_by_char.get(char, [])
         anchor = candidates[occurrence] if occurrence < len(candidates) else None
-        if anchor is not None and anchor[0] >= gap_start - 0.01 and anchor[1] <= gap_end + 0.01:
-            start, end = anchor
-        elif gap_end - gap_start > 0.001:
-            start, end = gap_start, gap_end
+        anchor_accepted = False
+        if anchor is not None:
+            raw_start, raw_end = anchor
+            # A reference mark may be restored from CTC timing only when the
+            # timing has local silence evidence.  Otherwise placing the mark
+            # would steal voiced audio from a lexical word merely because an
+            # anchor numerically overlaps it.
+            local_silences = [iv for iv in current
+                              if is_silence(iv.text) and iv.text.strip()
+                              and iv.xmax > raw_start + AXIS_EPS
+                              and iv.xmin < raw_end - AXIS_EPS]
+            if not local_silences:
+                # An edge anchor immediately adjacent to an existing silence
+                # may remain an anchor-only punctuation interval (e.g. a
+                # terminal mark after a retained tail pause), but it still
+                # must not clip a lexical owner.  A bare anchor in voiced
+                # audio, or across a word boundary with no silence, is not
+                # restored.
+                adjacent_silence = any(
+                    is_silence(iv.text) and iv.text.strip()
+                    and iv.xmax >= raw_start - AXIS_EPS
+                    and iv.xmin <= raw_end + AXIS_EPS
+                    for iv in current)
+                overlaps_lexical = any(
+                    not is_silence(iv.text) and iv.text.strip()
+                    and not is_punct(iv.text.strip())
+                    and iv.xmax > raw_start + AXIS_EPS
+                    and iv.xmin < raw_end - AXIS_EPS
+                    for iv in current)
+                if not adjacent_silence or overlaps_lexical:
+                    continue
+                start, end = raw_start, raw_end
+            else:
+                # Replace the supporting silence itself, not any voiced
+                # prefix/suffix included in the broad CTC anchor.
+                support = max(
+                    local_silences,
+                    key=lambda iv: min(iv.xmax, raw_end)
+                    - max(iv.xmin, raw_start))
+                start, end = support.xmin, support.xmax
+                if end <= start + AXIS_EPS:
+                    continue
+            has_local_silence = any(
+                is_silence(iv.text) and iv.text.strip()
+                and iv.xmax >= start - AXIS_EPS
+                and iv.xmin <= end + AXIS_EPS
+                for iv in current)
+            if not has_local_silence:
+                continue
+            left_bound = prev.xmin if prev is not None else words_tier.xmin
+            right_bound = nxt.xmax if nxt is not None else words_tier.xmax
+            if prev is not None and nxt is not None:
+                # The reference sequence is authoritative.  A CTC/MFA
+                # boundary adjustment may have extended either immediate
+                # lexical owner across the punctuation anchor.  Such an
+                # anchor is still valid: the repair below clips the owner
+                # on the correct side and gives the interval back to the
+                # punctuation.  Only an anchor outside the two adjacent
+                # owners is unrelated and must be rejected.
+                crosses_local_boundary = (
+                    end > prev.xmin + AXIS_EPS
+                    and start < nxt.xmax - AXIS_EPS)
+            elif prev is not None:
+                crosses_local_boundary = end > prev.xmin + AXIS_EPS
+            elif nxt is not None:
+                crosses_local_boundary = start < nxt.xmax - AXIS_EPS
+            else:
+                crosses_local_boundary = True
+            anchor_accepted = (
+                math.isfinite(start) and math.isfinite(end)
+                and end > start + AXIS_EPS
+                and end > left_bound + AXIS_EPS
+                and start < right_bound - AXIS_EPS
+                and crosses_local_boundary)
+            if anchor_accepted:
+                # Project the (possibly very wide) CTC owner onto the local
+                # reference boundary.  If the anchor starts in the left
+                # lexical owner, retain that partial overlap; otherwise the
+                # preceding gap belongs to punctuation from the left owner's
+                # end.  Symmetrically, if the anchor runs through the right
+                # owner and beyond, stop at the right owner's start instead
+                # of consuming the next word and all later speech.
+                if prev is not None:
+                    if start > prev.xmin + AXIS_EPS and start < prev.xmax - AXIS_EPS:
+                        owner_start = start
+                    elif start >= prev.xmax - AXIS_EPS and (
+                            nxt is None or end <= nxt.xmax + AXIS_EPS):
+                        # Preserve the actual CTC punctuation onset when it
+                        # begins inside the local gap.  Only a broad anchor
+                        # that runs through the next lexical owner is widened
+                        # back to the preceding owner's end.
+                        owner_start = start
+                    else:
+                        owner_start = prev.xmax
+                else:
+                    owner_start = words_tier.xmin
+                if nxt is not None:
+                    if end > nxt.xmin + AXIS_EPS and end < nxt.xmax - AXIS_EPS:
+                        owner_end = end
+                    elif end <= nxt.xmin + AXIS_EPS:
+                        owner_end = end
+                    else:
+                        owner_end = nxt.xmin
+                else:
+                    # Terminal punctuation may have a wide but finite CTC
+                    # duration.  Preserve that duration, bounded by the
+                    # TextGrid axis, rather than extending it to the axis end
+                    # when the anchor itself ends earlier.
+                    owner_end = min(end, words_tier.xmax)
+
+                # A broad anchor is useful only when it actually covers the
+                # local boundary.  Do not synthesize punctuation from a
+                # distant anchor when there is no local silence/overlap.
+                if (owner_end > owner_start + AXIS_EPS
+                        and end > owner_start + AXIS_EPS
+                        and start < owner_end - AXIS_EPS):
+                    punctuation.append((mapped_boundary,
+                                        Interval(owner_start, owner_end, char)))
+                    continue
+                anchor_accepted = False
+            # An authoritative-looking anchor that crosses a non-adjacent
+            # owner with no local overlap is not replaceable by a guessed
+            # interval.
+            continue
+        if gap_end - gap_start > 0.001:
+            # Reference-only punctuation may reuse an exact existing local
+            # nonlexical owner, but it cannot synthesize the whole lexical
+            # gap merely because the gap is nonzero.
+            local_nonlexical = [iv for iv in current
+                                if (is_silence(iv.text) or is_punct(iv.text))
+                                and iv.xmax > gap_start and iv.xmin < gap_end]
+            if not local_nonlexical:
+                continue
+            start = max(gap_start, min(iv.xmin for iv in local_nonlexical))
+            end = min(gap_end, max(iv.xmax for iv in local_nonlexical))
         else:
-            center = gap_start
-            width = min(0.060, max(0.010, words_tier.xmax - words_tier.xmin))
-            start, end = center - width / 2.0, center + width / 2.0
-            if prev is not None:
-                start = max(start, prev.xmin + 0.001)
-            if nxt is not None:
-                end = min(end, nxt.xmax - 0.001)
+            # No local owner range means there is no evidence-backed time
+            # for this reference mark.  Do not synthesize a centered interval
+            # or claim audio from either lexical neighbour.
+            continue
         start = max(words_tier.xmin, start)
         end = min(words_tier.xmax, end)
         if end <= start + 0.001:
@@ -2296,26 +3670,266 @@ def _restore_reference_punctuation(words_tier: Tier, reference_text: str,
     # English MFA word instances stay untouched; only their ownership ranges
     # are shortened where a punctuation anchor crosses a word boundary.
     for boundary, punct in punctuation:
-        for index, iv in enumerate(lexical):
-            if index < boundary and iv.xmax > punct.xmin:
-                lexical[index] = Interval(iv.xmin, min(iv.xmax, punct.xmin), iv.text)
-            elif index >= boundary and iv.xmin < punct.xmax:
-                lexical[index] = Interval(max(iv.xmin, punct.xmax), iv.xmax, iv.text)
+        # Clip only the immediate left/right owners.  In particular, do not
+        # shorten every word on one side of the boundary: that would turn a
+        # local punctuation anchor into a global lexical extension.
+        left_update = None
+        right_update = None
+        if boundary > 0:
+            left = lexical[boundary - 1]
+            left_end = min(left.xmax, punct.xmin)
+            if left_end <= left.xmin + AXIS_EPS:
+                continue
+            left_update = Interval(left.xmin, left_end, left.text)
+        if boundary < len(lexical):
+            right = lexical[boundary]
+            right_start = max(right.xmin, punct.xmax)
+            if right_start >= right.xmax - AXIS_EPS:
+                continue
+            right_update = Interval(right_start, right.xmax, right.text)
+        if left_update is not None:
+            lexical[boundary - 1] = left_update
+        if right_update is not None:
+            lexical[boundary] = right_update
     lexical = [iv for iv in lexical if iv.xmax > iv.xmin + 0.001]
 
     # Preserve silence intervals and replace only punctuation/lexical content.
-    silences = [iv for iv in current if is_silence(iv.text) or not iv.text.strip()]
+    # Accepted punctuation owns only its authoritative anchor.  Split any
+    # explicit silence intersecting that anchor and preserve every uncovered
+    # remainder as silence for the strict interior-SP audit.
+    silences: list[Interval] = []
+    for silence in (iv for iv in current if is_silence(iv.text) or not iv.text.strip()):
+        pieces = [(silence.xmin, silence.xmax)]
+        for _, punct in punctuation:
+            next_pieces: list[tuple[float, float]] = []
+            for piece_start, piece_end in pieces:
+                if piece_end <= punct.xmin + AXIS_EPS or piece_start >= punct.xmax - AXIS_EPS:
+                    next_pieces.append((piece_start, piece_end))
+                    continue
+                if piece_start < punct.xmin - AXIS_EPS:
+                    next_pieces.append((piece_start, punct.xmin))
+                if piece_end > punct.xmax + AXIS_EPS:
+                    next_pieces.append((punct.xmax, piece_end))
+            pieces = next_pieces
+        silences.extend(Interval(start, end, silence.text)
+                        for start, end in pieces if end > start + AXIS_EPS)
     words_tier.intervals = sorted(lexical + silences + [iv for _, iv in punctuation],
                                   key=lambda iv: (iv.xmin, iv.xmax, iv.text))
     geometry_fixed = _repair_authority_punctuation_geometry(
         words_tier, reference_text, punct_entries)
     reference_fixed = _repair_reference_authority_colocated_silence(
         words_tier, reference_text)
+    canonical = _reconcile_publication_geometry(words_tier)
+    words_tier.intervals = canonical.intervals
     return len(punctuation) + geometry_fixed + reference_fixed
 
 
+def _restore_reference_punctuation(words_tier: Tier, reference_text: str,
+                                   punct_entries: list[dict] | None = None) -> int:
+    """Incrementally reconcile reference punctuation ownership.
+
+    The current words interval list is transactional input: every observed
+    punctuation interval is carried into the output.  A partial projection is
+    repaired by adding only missing marks, never by rebuilding lexical and
+    silence intervals from scratch.  A new mark may own one explicit local
+    silence when a matching CTC anchor overlaps it, or when that silence is
+    the unique gap at the authoritative boundary.  Voiced lexical intervals
+    are never carved by this resolver.
+    """
+    allowed = '，。…！？、；：,.!?;:～'
+    ref_puncts: list[dict] = []
+    ref_lexical: list[str] = []
+    for unit in _extract_word_chars(reference_text):
+        if is_punct(unit) and unit.strip() in allowed:
+            ref_puncts.append({"label": unit.strip(),
+                               "boundary": len(ref_lexical)})
+        elif is_word_like(unit):
+            ref_lexical.append(unit)
+
+    current = list(words_tier.intervals)
+    lexical = [iv for iv in current
+               if iv.text.strip() and not is_silence(iv.text)
+               and not is_punct(iv.text.strip())]
+    desired = [item["label"] for item in ref_puncts]
+
+    # Preserve the existing hyphenated-English grouping rule when projecting
+    # reference lexical boundaries onto timed lexical intervals.
+    current_boundary = [0]
+    current_index = 0
+    for unit in ref_lexical:
+        target = re.sub(r'[^a-z0-9]', '', unit.lower())
+        if '-' in unit and target:
+            compact = ''
+            start = current_index
+            while current_index < len(lexical):
+                probe = lexical[current_index].text.strip()
+                if not is_english_token(probe):
+                    break
+                compact += re.sub(r'[^a-z0-9]', '', probe.lower())
+                current_index += 1
+                if compact == target:
+                    break
+            if current_index == start and current_index < len(lexical):
+                current_index += 1
+        elif current_index < len(lexical):
+            current_index += 1
+        current_boundary.append(current_index)
+
+    def boundary_owners(boundary: int) -> tuple[Interval | None, Interval | None,
+                                                  float, float]:
+        mapped = (current_boundary[boundary]
+                  if 0 <= boundary < len(current_boundary)
+                  else len(lexical))
+        prev = lexical[mapped - 1] if mapped > 0 else None
+        nxt = lexical[mapped] if mapped < len(lexical) else None
+        start = prev.xmax if prev is not None else words_tier.xmin
+        end = nxt.xmin if nxt is not None else words_tier.xmax
+        return prev, nxt, min(start, end), max(start, end)
+
+    # Alignment is used only to identify missing occurrences.  All observed
+    # punctuation, including extras and wrong-boundary marks, remains in the
+    # transaction and stays available to the publication veto.
+    observed: list[dict] = []
+    lexical_before = 0
+    for index, interval in enumerate(current):
+        text = interval.text.strip()
+        if text and not is_silence(text) and not is_punct(text):
+            lexical_before += 1
+        elif text in allowed:
+            observed.append({"label": text, "boundary": lexical_before,
+                             "interval_index": index})
+    matched, missing, extra = _align_reference_punctuation(ref_puncts, observed)
+    boundary_errors = {
+        ref_index for ref_index, obs_index in matched
+        if ref_puncts[ref_index]["boundary"] != observed[obs_index]["boundary"]
+    }
+    safe_projection = not extra and not boundary_errors
+    missing_indices = {item["index"] for item in missing}
+
+    # Parse anchors once in CTC order.  Matching an anchor to the missing
+    # occurrence is local-gap based rather than same-character ordinal based,
+    # which is important when the same mark occurs more than once.
+    anchors: list[dict] = []
+    for entry_index, entry in enumerate(punct_entries or []):
+        char = str(entry.get('word', '')).strip()
+        if char not in allowed:
+            continue
+        try:
+            start, end = float(entry['start_s']), float(entry['end_s'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(start) and math.isfinite(end) and end > start:
+            anchors.append({"label": char, "start": start, "end": end,
+                            "index": entry_index})
+    anchors.sort(key=lambda item: (item["start"], item["end"], item["index"]))
+
+    used_anchor_indices: set[int] = set()
+    last_anchor_position = -1
+    additions: list[tuple[Interval, int]] = []
+    removed_silence_indices: set[int] = set()
+    for ref_index, item in enumerate(ref_puncts):
+        if ref_index not in missing_indices:
+            continue
+        char = item["label"]
+        prev, nxt, gap_start, gap_end = boundary_owners(item["boundary"])
+        if gap_end <= gap_start + AXIS_EPS:
+            continue
+        local_silences = [
+            (index, interval) for index, interval in enumerate(current)
+            if is_silence(interval.text) and interval.text.strip()
+            and interval.xmin >= gap_start - AXIS_EPS
+            and interval.xmax <= gap_end + AXIS_EPS
+            and interval.xmax > interval.xmin + AXIS_EPS
+        ]
+
+        def supports(anchor: dict, silence: Interval) -> bool:
+            return (anchor["label"] == char
+                    and anchor["end"] > silence.xmin + AXIS_EPS
+                    and anchor["start"] < silence.xmax - AXIS_EPS)
+
+        candidates = [anchor for anchor in anchors
+                      if anchor["index"] not in used_anchor_indices
+                      and anchor["index"] > last_anchor_position
+                      and any(supports(anchor, silence)
+                              for _, silence in local_silences)]
+        same_char_anchors = [anchor for anchor in anchors
+                             if anchor["label"] == char
+                             and anchor["index"] not in used_anchor_indices
+                             and anchor["index"] > last_anchor_position]
+        if candidates:
+            def anchor_key(anchor: dict) -> tuple[float, float, int]:
+                overlap = max(
+                    min(anchor["end"], silence.xmax)
+                    - max(anchor["start"], silence.xmin)
+                    for _, silence in local_silences
+                    if supports(anchor, silence))
+                gap_center = (gap_start + gap_end) / 2.0
+                anchor_center = (anchor["start"] + anchor["end"]) / 2.0
+                return (-overlap, abs(anchor_center - gap_center),
+                        anchor["index"])
+            anchor = min(candidates, key=anchor_key)
+            used_anchor_indices.add(anchor["index"])
+            last_anchor_position = anchor["index"]
+            supported = [(index, silence) for index, silence in local_silences
+                         if supports(anchor, silence)]
+            # Multiple disjoint local gaps are ambiguous; retain them as
+            # explicit silence rather than assigning one by guesswork.
+            if len(supported) != 1:
+                continue
+            silence_index, silence = supported[0]
+        elif not same_char_anchors and len(local_silences) == 1:
+            # Reference-only fallback: a unique local gap is evidence, but a
+            # missing gap must never be synthesized from lexical duration.
+            silence_index, silence = local_silences[0]
+        else:
+            continue
+
+        additions.append((Interval(silence.xmin, silence.xmax, char),
+                          silence_index))
+        removed_silence_indices.add(silence_index)
+
+    if additions:
+        # Commit only after all missing occurrences have been resolved.  This
+        # is the transactional boundary: existing punctuation is untouched.
+        committed = [interval for index, interval in enumerate(current)
+                     if index not in removed_silence_indices]
+        committed.extend(interval for interval, _ in additions)
+        committed.sort(key=lambda interval: (interval.xmin, interval.xmax,
+                                             interval.text))
+        words_tier.intervals = committed
+
+    changed = len(additions)
+    current_puncts = [iv.text.strip() for iv in words_tier.intervals
+                      if iv.text.strip() in allowed]
+    if current_puncts == desired and safe_projection:
+        # Existing exact projections may still contain an authority anchor
+        # duplicated by explicit silence.  This is a local repair only.
+        changed += _repair_authority_punctuation_geometry(
+            words_tier, reference_text, punct_entries)
+        changed += _repair_reference_authority_colocated_silence(
+            words_tier, reference_text)
+        canonical = _reconcile_publication_geometry(words_tier)
+        words_tier.intervals = canonical.intervals
+    return changed
+
+
+def _normalize_authority_short_interword_silence(
+        textgrid: TextGrid, reference_text: str,
+        punct_entries: list[dict] | None = None) -> int:
+    """Compatibility no-op; final ownership belongs to the energy resolver.
+
+    The former implementation performed a fixed-left authority merge and
+    directly edited source/derived phones.  Keeping that second owner pass
+    would make final words disagree with the immutable visual snapshot.
+    """
+    return 0
+
 def _clip_pinyin_phones_to_words(pp_tier: Tier, words_tier: Tier) -> int:
-    """Keep each derived phone inside its strongest-overlap word owner."""
+    """Keep phones only when one semantic owner contains them uniquely.
+
+    Strongest-overlap assignment is deliberately forbidden: a crossing phone
+    remains unchanged so the publication audit can veto its ambiguous lineage.
+    """
     words = [iv for iv in words_tier.intervals if iv.text.strip()]
     changed = 0
     clipped: list[Interval] = []
@@ -2324,13 +3938,12 @@ def _clip_pinyin_phones_to_words(pp_tier: Tier, words_tier: Tier) -> int:
             clipped.append(phone)
             continue
         owners = [word for word in words
-                  if phone.xmax > word.xmin and phone.xmin < word.xmax]
-        if not owners:
+                  if phone.xmin >= word.xmin - AXIS_EPS
+                  and phone.xmax <= word.xmax + AXIS_EPS]
+        if len(owners) != 1:
             clipped.append(phone)
             continue
-        owner = max(owners, key=lambda word:
-                    max(0.0, min(phone.xmax, word.xmax)
-                        - max(phone.xmin, word.xmin)))
+        owner = owners[0]
         start = max(phone.xmin, owner.xmin)
         end = min(phone.xmax, owner.xmax)
         if end <= start + 0.001:
@@ -2342,6 +3955,99 @@ def _clip_pinyin_phones_to_words(pp_tier: Tier, words_tier: Tier) -> int:
     pp_tier.intervals = [iv for iv in clipped if iv.xmax > iv.xmin + 0.001
                          or not iv.text.strip()]
     return changed
+
+
+def _resolve_phone_owner_overlaps(
+        phone_tier: Tier | None, words_tier: Tier | None) -> tuple[int, list[dict]]:
+    """Resolve a crossing phone only when its semantic owner is clear.
+
+    A phone that crosses a word boundary is not automatically an error.  MFA
+    can place a transition a few frames on the wrong side of the word edge.
+    The owner is inferred from the amount of acoustic time inside each display
+    owner.  A strict majority with a meaningful margin is clipped to that
+    owner's boundary; ties and silence phones remain untouched and are
+    reported as ambiguous.
+
+    This deliberately does not use ``strongest overlap`` as a universal
+    assignment rule.  It is allowed only for a non-silence phone with a
+    majority owner (>=55% of the phone and >=10% more than the runner-up).
+    Otherwise the publication contract must reject the interval rather than
+    silently moving a phoneme to a neighbouring word.
+    """
+    if phone_tier is None or words_tier is None:
+        return 0, []
+
+    owners = [iv for iv in words_tier.intervals if iv.xmax > iv.xmin + AXIS_EPS]
+    fixed = 0
+    ambiguous: list[dict] = []
+    resolved: list[Interval] = []
+    for index, phone in enumerate(phone_tier.intervals):
+        if not phone.text.strip() or phone.duration <= AXIS_EPS:
+            resolved.append(phone)
+            continue
+
+        containing = [owner for owner in owners
+                      if phone.xmin >= owner.xmin - AXIS_EPS
+                      and phone.xmax <= owner.xmax + AXIS_EPS]
+        if len(containing) == 1:
+            resolved.append(phone)
+            continue
+
+        candidates = []
+        for owner_index, owner in enumerate(owners):
+            overlap = min(phone.xmax, owner.xmax) - max(phone.xmin, owner.xmin)
+            if overlap > AXIS_EPS:
+                candidates.append((overlap, owner_index, owner))
+        candidates.sort(key=lambda row: (row[0], -row[1]), reverse=True)
+        candidate_detail = [
+            {"owner_index": owner_index, "label": owner.text.strip(),
+             "overlap_s": round(overlap, 6)}
+            for overlap, owner_index, owner in candidates[:4]
+        ]
+
+        # A silence phone is evidence of a pause, not a lexical phone.  Never
+        # assign it to one of two neighbouring words by overlap strength.
+        if is_silence(phone.text) or not candidates:
+            ambiguous.append({"index": index, "label": phone.text.strip(),
+                              "start_s": phone.xmin, "end_s": phone.xmax,
+                              "reason": "silence_or_no_owner" if is_silence(phone.text)
+                              else "no_owner",
+                              "candidate_owners": candidate_detail})
+            resolved.append(phone)
+            continue
+
+        duration = max(phone.duration, AXIS_EPS)
+        top_overlap, _, top_owner = candidates[0]
+        second_overlap = candidates[1][0] if len(candidates) > 1 else 0.0
+        clear_majority = (
+            top_overlap / duration >= 0.55
+            and top_overlap - second_overlap >= max(AXIS_EPS, duration * 0.10)
+        )
+        if not clear_majority:
+            ambiguous.append({"index": index, "label": phone.text.strip(),
+                              "start_s": phone.xmin, "end_s": phone.xmax,
+                              "reason": "owner_tie_or_weak_majority",
+                              "candidate_owners": candidate_detail})
+            resolved.append(phone)
+            continue
+
+        start = max(phone.xmin, top_owner.xmin)
+        end = min(phone.xmax, top_owner.xmax)
+        if end <= start + AXIS_EPS:
+            ambiguous.append({"index": index, "label": phone.text.strip(),
+                              "start_s": phone.xmin, "end_s": phone.xmax,
+                              "reason": "owner_clip_empty",
+                              "candidate_owners": candidate_detail})
+            resolved.append(phone)
+            continue
+        resolved.append(Interval(start, end, phone.text))
+        if start != phone.xmin or end != phone.xmax:
+            fixed += 1
+
+    phone_tier.intervals = [iv for iv in resolved
+                            if iv.xmax > iv.xmin + AXIS_EPS
+                            or not iv.text.strip()]
+    return fixed, ambiguous
 
 
 def _fix_non_english_pp_overlaps(pp_tier: Tier) -> int:
@@ -2392,6 +4098,10 @@ def _word_matches(ctc_token: str, ref_unit: str) -> bool:
     # Alpha group (English word or NVV tag)
     if not r.isascii():
         return False
+    # A tone-bearing pinyin token is never an English candidate, even when
+    # its spelling is a substring/equal match for an authority token.
+    if is_pinyin_syllable(c) or re.fullmatch(r"[0-9]+", c):
+        return False
 
     # Direct substring containment
     if c in r or r in c:
@@ -2406,12 +4116,6 @@ def _word_matches(ctc_token: str, ref_unit: str) -> bool:
     r_clean = r.strip('<>')
     if c_clean in r_clean or r_clean in c_clean:
         return True
-
-    # Never infer an English reference word from a pinyin syllable.  Named
-    # variants such as rui4+ya4 -> ria are handled only by the explicit,
-    # reference-bound RIA canonicalization path before English MFA.
-    if len(c) >= 2 and c[-1].isdigit() and c[:-1].isalpha():
-        return False
 
     return False
 
@@ -2481,6 +4185,12 @@ def _alpha_text_matches(token: str, ref: str) -> bool:
     c = token.strip().lower()
     r = ref.lower()
 
+    # Never infer an English reference word from a pinyin syllable.  Named
+    # variants such as rui4+ya4 -> ria are handled only by an explicit,
+    # reference-bound canonicalization path before English MFA.
+    if is_pinyin_syllable(c) or re.fullmatch(r"[0-9]+", c):
+        return False
+
     c_compact = re.sub(r'[^a-z0-9]', '', c)
     r_compact = re.sub(r'[^a-z0-9]', '', r)
     if c_compact and r_compact and c_compact == r_compact:
@@ -2507,15 +4217,238 @@ def _alpha_text_matches(token: str, ref: str) -> bool:
     return False
 
 
+def _fallback_cjk_alignment(raw_text: str, words_tier: Tier | None) -> dict:
+    """Align fallback CJK source characters to realised pinyin words.
+
+    A no-reference run has no lexical authority: the ASR transcript can have
+    insertions/deletions while the MFA words tier still contains a valid,
+    monotonic acoustic sequence.  The old positional projection treated one
+    missing source character as a global pinyin shift.  This small global
+    alignment keeps that shift local and returns only exact pinyin matches as
+    safe projection evidence.  It never makes a non-matching token look
+    correct.
+    """
+    source = [ch for ch in raw_text.replace("<sp1>", "") if is_cjk(ch)]
+    actual: list[str] = []
+    if words_tier is not None:
+        actual = [iv.text.strip() for iv in words_tier.intervals
+                  if is_pinyin_syllable(iv.text.strip())]
+
+    def _base(value: str) -> str:
+        return re.sub(r"\d+$", "", value).lower()
+
+    expected = []
+    for char in source:
+        try:
+            values = lazy_pinyin(char, style=Style.TONE3,
+                                 neutral_tone_with_five=True)
+        except Exception:
+            values = []
+        expected.append(_base(values[0]) if values else "")
+    observed = [_base(token) for token in actual]
+
+    n, m = len(expected), len(observed)
+    if not n or not m:
+        return {
+            "source_count": n, "actual_count": m, "exact_matches": 0,
+            "source_only": n, "actual_only": m, "exact_rate": 0.0,
+            "actual_to_source": {}, "source_only_internal": False,
+            "actual_only_internal": False, "safe": False,
+        }
+
+    # Exact matches are free.  A substitution is deliberately more expensive
+    # than deleting/inserting one item, so a wrong pinyin cannot consume a
+    # source character and create another global shift.
+    inf = n + m + 20
+    dp = [[inf] * (m + 1) for _ in range(n + 1)]
+    dp[0][0] = 0
+    for i in range(1, n + 1):
+        dp[i][0] = i
+    for j in range(1, m + 1):
+        dp[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            match = 0 if expected[i - 1] and expected[i - 1] == observed[j - 1] else 3
+            dp[i][j] = min(dp[i - 1][j] + 1,
+                           dp[i][j - 1] + 1,
+                           dp[i - 1][j - 1] + match)
+
+    pairs: list[tuple[int | None, int | None]] = []
+    i, j = n, m
+    while i or j:
+        # Prefer exact diagonal matches, then source/actual gaps, then a
+        # substitution.  This is deterministic for repeated syllables.
+        if (i and j and expected[i - 1] and expected[i - 1] == observed[j - 1]
+                and dp[i][j] == dp[i - 1][j - 1]):
+            pairs.append((i - 1, j - 1))
+            i -= 1; j -= 1
+        elif i and dp[i][j] == dp[i - 1][j] + 1:
+            pairs.append((i - 1, None))
+            i -= 1
+        elif j and dp[i][j] == dp[i][j - 1] + 1:
+            pairs.append((None, j - 1))
+            j -= 1
+        else:
+            pairs.append((i - 1, j - 1))
+            i -= 1; j -= 1
+    pairs.reverse()
+
+    exact_pairs = [(si, ai) for si, ai in pairs
+                   if si is not None and ai is not None
+                   and expected[si] and expected[si] == observed[ai]]
+    matched_source = {si for si, _ in exact_pairs}
+    matched_actual = {ai for _, ai in exact_pairs}
+    source_only = [idx for idx in range(n) if idx not in matched_source]
+    actual_only = [idx for idx in range(m) if idx not in matched_actual]
+    last_source = max(matched_source, default=-1)
+    last_actual = max(matched_actual, default=-1)
+    source_only_internal = any(idx < last_source for idx in source_only)
+    actual_only_internal = any(idx < last_actual for idx in actual_only)
+    exact_rate = len(exact_pairs) / m if m else 0.0
+    # A safe fallback repair requires every realised pinyin token to map to a
+    # source character.  Source-only tokens are tolerated because ASR can
+    # over-transcribe, but only within a bounded amount.
+    source_budget = max(3, int(math.ceil(n * 0.20)))
+    safe = bool(matched_source) and not actual_only and exact_rate >= 0.85 \
+        and len(source_only) <= source_budget
+    return {
+        "source_count": n,
+        "actual_count": m,
+        "exact_matches": len(exact_pairs),
+        "source_only": len(source_only),
+        "actual_only": len(actual_only),
+        "exact_rate": round(exact_rate, 3),
+        "source_only_internal": source_only_internal,
+        "actual_only_internal": actual_only_internal,
+        "safe": safe,
+        "actual_to_source": {ai: si for si, ai in exact_pairs},
+    }
+
+
+def _build_authority_hanzi_tier(words_tier: Tier, raw_text: str,
+                                warnings: list | None = None) -> Tier:
+    """Project final words against the ordered authority semantic stream."""
+    semantic = list(project_authority_semantics(raw_text))
+    cursor = 0
+    intervals: list[Interval] = []
+    hidden_hyphen_fragments: set[int] = set()
+    pinyin_count = 0
+    cjk_count = sum(item["kind"] == "cjk" for item in semantic)
+
+    def next_kind(kind: str) -> dict | None:
+        nonlocal cursor
+        # ``{target1}``/``{target2}`` are authority placeholders.  The braces
+        # are syntax, not lexical units, and must not block the semantic
+        # transition target -> 一/二 (or the following CJK word).  Treat only
+        # these two wrapper marks as transparent; all other ``other`` units
+        # remain visible and therefore continue to fail closed.
+        while cursor < len(semantic) and (
+                semantic[cursor]["kind"] == "punct"
+                or (semantic[cursor]["kind"] == "other"
+                    and semantic[cursor]["surface"] in {"{", "}"})):
+            cursor += 1
+        if cursor < len(semantic) and semantic[cursor]["kind"] == kind:
+            item = semantic[cursor]
+            cursor += 1
+            return item
+        return None
+
+    for word_index, iv in enumerate(words_tier.intervals):
+        token = iv.text.strip()
+        if word_index in hidden_hyphen_fragments:
+            intervals.append(Interval(iv.xmin, iv.xmax, ""))
+            continue
+        if is_silence(token) or not token:
+            intervals.append(Interval(iv.xmin, iv.xmax, silence_label(iv.duration)))
+            continue
+        if is_punct(token):
+            # Punctuation is optional in the publication projection.  Consume
+            # only an exact next mark; a different/extra mark remains visible
+            # for the audit rather than shifting later semantic units.
+            expected = semantic[cursor] if cursor < len(semantic) else None
+            if expected and expected["kind"] == "punct":
+                if expected["surface"] == token:
+                    cursor += 1
+                intervals.append(Interval(iv.xmin, iv.xmax, token))
+            else:
+                intervals.append(Interval(iv.xmin, iv.xmax, token))
+            continue
+        if is_pinyin_syllable(token):
+            pinyin_count += 1
+            item = next_kind("cjk")
+            intervals.append(Interval(iv.xmin, iv.xmax,
+                                      item["surface"] if item else token))
+            continue
+        clean = token.strip("<>")
+        if is_nvv_token(clean):
+            item = next_kind("nvv")
+            intervals.append(Interval(iv.xmin, iv.xmax,
+                                      item["surface"] if item else clean))
+            continue
+        if is_english_token(clean) or is_english_fragment_token(clean):
+            item = next_kind("english")
+            if item is not None:
+                observed = re.sub(r"[^a-z0-9]", "", clean.casefold())
+                expected = re.sub(r"[^a-z0-9]", "", item["surface"].casefold())
+                if "-" in item["surface"] and observed != expected:
+                    compact = observed
+                    group = [word_index]
+                    for probe_index in range(word_index + 1,
+                                             min(word_index + 6,
+                                                 len(words_tier.intervals))):
+                        probe = words_tier.intervals[probe_index].text.strip()
+                        probe_clean = probe.strip("<>")
+                        if not is_english_fragment_token(probe_clean):
+                            break
+                        compact += re.sub(r"[^a-z0-9]", "", probe_clean.casefold())
+                        group.append(probe_index)
+                        if compact == expected:
+                            hidden_hyphen_fragments.update(group[1:])
+                            break
+                    if compact == expected:
+                        label = item["surface"]
+                        extra_index = group[-1] + 1
+                        if (extra_index < len(words_tier.intervals)
+                                and is_english_fragment_token(
+                                    words_tier.intervals[extra_index].text.strip("<>"))
+                                and (cursor >= len(semantic)
+                                     or semantic[cursor]["kind"] != "english")):
+                            if warnings is not None:
+                                marker = "reference_hyphen_fragment_mismatch"
+                                if marker not in warnings:
+                                    warnings.append(marker)
+                    else:
+                        label = clean
+                        if warnings is not None:
+                            marker = "reference_hyphen_fragment_mismatch"
+                            if marker not in warnings:
+                                warnings.append(marker)
+                else:
+                    label = item["surface"] if observed == expected else clean
+            else:
+                label = clean
+            intervals.append(Interval(iv.xmin, iv.xmax, label))
+            continue
+        item = next_kind("other")
+        intervals.append(Interval(iv.xmin, iv.xmax,
+                                  item["surface"] if item else clean))
+
+    if warnings is not None and pinyin_count != cjk_count:
+        warnings.append(
+            f"hanzi tier mismatch: {pinyin_count} pinyin tokens vs "
+            f"{cjk_count} reference CJK chars")
+    return Tier("hanzi", words_tier.xmin, words_tier.xmax, intervals)
+
+
 def _build_hanzi_tier(words_tier: Tier, raw_text: str,
-                      warnings: list | None = None) -> Tier:
+                      warnings: list | None = None,
+                      *, reference_authoritative: bool = False) -> Tier:
     """Build the *hanzi* tier by sequential mapping of word tokens to
     reference text units.
 
-    **CJK characters**: each pinyin-syllable token in *words_tier*
-    consumes the next unused CJK character from the reference text
-    in order.  This mapping is purely positional — it does not depend
-    on pypinyin tone accuracy or any dictionary.
+    **CJK characters**: authoritative references retain the historical
+    positional projection.  Fallback transcripts use a monotonic pinyin/CJK
+    alignment so one ASR insertion or deletion cannot shift every later label.
 
     **English / NVV tokens**: greedy substring matching against alpha
     reference units, handling tokenizer fragmentation (``li`` + ``ve``
@@ -2530,6 +4463,9 @@ def _build_hanzi_tier(words_tier: Tier, raw_text: str,
     pinyin-syllable tokens does not equal the number of reference CJK
     characters.
     """
+    if reference_authoritative:
+        return _build_authority_hanzi_tier(words_tier, raw_text, warnings)
+
     clean = raw_text.replace('<sp1>', '')
     char_units = _extract_word_chars(clean)
 
@@ -2549,9 +4485,15 @@ def _build_hanzi_tier(words_tier: Tier, raw_text: str,
     cjk_idx = 0
     alpha_idx = 0
     hidden_hyphen_fragments: set[int] = set()
+    failed_hyphen_fragments: set[int] = set()
 
     # Track pinyin-syllable count for defensive mismatch detection
     pinyin_count = 0
+    fallback_projection = {}
+    if not reference_authoritative:
+        fallback_projection = _fallback_cjk_alignment(raw_text, words_tier).get(
+            "actual_to_source", {})
+    fallback_pinyin_ordinal = 0
 
     for word_index, iv in enumerate(words_tier.intervals):
         token = iv.text.strip()
@@ -2562,10 +4504,24 @@ def _build_hanzi_tier(words_tier: Tier, raw_text: str,
             intervals.append(Interval(iv.xmin, iv.xmax, ""))
             continue
 
-        # Silence → keep silence label
+        if word_index in failed_hyphen_fragments:
+            # A malformed reference-only group is deliberately left visible;
+            # preserving the source fragment makes the later hard audit fail
+            # closed instead of silently projecting a partial spelling.
+            intervals.append(Interval(iv.xmin, iv.xmax, token.strip('<>')))
+            continue
+
+        # Silence → preserve the already-normalized words label exactly.
+        # Reclassifying ``iv.duration`` here crosses the 200/500 ms boundary
+        # through binary-float noise (for example 1.77 - 1.57 can be just
+        # below 0.2), desynchronizing the derived hanzi tier from its frozen
+        # owner tier.  Non-canonical legacy silence still uses integer ticks.
         if is_silence(iv.text) or not token:
-            intervals.append(Interval(iv.xmin, iv.xmax,
-                                      silence_label(iv.duration)))
+            canonical_silence = _pure_silence_label(token)
+            intervals.append(Interval(
+                iv.xmin, iv.xmax,
+                canonical_silence or _silence_label_from_ticks(
+                    _duration_ticks(iv.xmin, iv.xmax))))
             continue
 
         # Punctuation → pass through, consume no cursor
@@ -2576,7 +4532,13 @@ def _build_hanzi_tier(words_tier: Tier, raw_text: str,
         # ── Pinyin syllable → consume next CJK character ──
         if is_pinyin_syllable(token):
             pinyin_count += 1
-            if cjk_idx < len(ref_cjk):
+            if not reference_authoritative and fallback_pinyin_ordinal in fallback_projection:
+                label = ref_cjk[fallback_projection[fallback_pinyin_ordinal]]
+                fallback_pinyin_ordinal += 1
+            elif not reference_authoritative:
+                label = token
+                fallback_pinyin_ordinal += 1
+            elif cjk_idx < len(ref_cjk):
                 label = ref_cjk[cjk_idx]
                 cjk_idx += 1
             else:
@@ -2618,13 +4580,44 @@ def _build_hanzi_tier(words_tier: Tier, raw_text: str,
                     matched_refs.append(target)
                     alpha_idx += 1
                     hidden_hyphen_fragments.update(group_indices[1:])
+                    if reference_authoritative:
+                        # An immediately following English fragment is an
+                        # extra only when it cannot begin the next reference
+                        # unit.  Mark it so a trailing/foreign fragment does
+                        # not pass as an unrelated lexical word.
+                        extra_index = group_indices[-1] + 1
+                        if extra_index < len(words_tier.intervals):
+                            extra = words_tier.intervals[extra_index].text.strip()
+                            next_ref = ref_alpha[alpha_idx] if alpha_idx < len(ref_alpha) else ""
+                            if (is_english_token(extra)
+                                    and (not next_ref
+                                         or not _alpha_text_matches(extra, next_ref))):
+                                failed_hyphen_fragments.add(extra_index)
+                                if warnings is not None:
+                                    marker = "reference_hyphen_fragment_mismatch"
+                                    if marker not in warnings:
+                                        warnings.append(marker)
                     break
-                # CTC fragments need not be contiguous inside a hyphenated
-                # spelling (``kp`` is a subsequence of ``kpop``).
-                probe_iter = iter(target_compact)
-                if not all(any(ch == target_ch for target_ch in probe_iter)
-                           for ch in compact):
-                    break
+                if reference_authoritative:
+                    # Reference-only projection accepts only an exact ordered
+                    # concatenation.  A subsequence/substring match can
+                    # consume a partial, reordered, or foreign fragment.
+                    if not target_compact.startswith(compact):
+                        break
+                else:
+                    # Preserve legacy no-reference behaviour, including its
+                    # permissive fragment matching.
+                    probe_iter = iter(target_compact)
+                    if not all(any(ch == target_ch for target_ch in probe_iter)
+                               for ch in compact):
+                        break
+
+            if reference_authoritative and not matched_refs:
+                failed_hyphen_fragments.update(group_indices)
+                if warnings is not None:
+                    marker = "reference_hyphen_fragment_mismatch"
+                    if marker not in warnings:
+                        warnings.append(marker)
 
         if matched_refs:
             intervals.append(Interval(iv.xmin, iv.xmax, matched_refs[0]))
@@ -2688,8 +4681,17 @@ def assess_reference_coverage(
     *,
     reference_source: str,
     unknown_source_count: int = 0,
+    reference_authoritative: bool | None = None,
 ) -> tuple[dict, list[str]]:
-    """Assess hard lexical integrity independently of optional acoustic QC."""
+    """Assess hard lexical integrity independently of optional acoustic QC.
+
+    ASR/lab fallback text is a source for rebuilding derived tiers, not an
+    original/reference transcript.  Keep the source CJK sequence available
+    for the independent fallback structural check, but do not apply the
+    reference semantic contract to it.  ``reference_authoritative`` is
+    passed by the production branch; the source-name inference keeps direct
+    helper callers and older focused tests backwards compatible.
+    """
     reference_cjk = "".join(ch for ch in reference_text if is_cjk(ch))
     word_intervals = words_tier.intervals if words_tier is not None else []
     pinyin_tokens = [
@@ -2701,9 +4703,55 @@ def assess_reference_coverage(
         label for iv in hanzi_intervals
         if len((label := iv.text.strip())) == 1 and is_cjk(label)
     )
+    if reference_authoritative is None:
+        reference_authoritative = reference_source not in {
+            "asr_fallback", "lab_fallback"
+        }
+    if not reference_authoritative:
+        reasons = ["mfa_unknown_source"] if unknown_source_count else []
+        return {
+            "reference_source": reference_source,
+            "reference_validation_applied": False,
+            "reference_cjk_count": None,
+            "pinyin_token_count": len(pinyin_tokens),
+            "assigned_cjk_count": len(hanzi_cjk),
+            "missing_cjk_count": None,
+            "extra_pinyin_count": None,
+            "unknown_source_count": unknown_source_count,
+            "exact_cjk_sequence": None,
+            "exact_semantic_sequence": None,
+            "source_cjk": reference_cjk,
+            "reference_cjk": "",
+            "hanzi_cjk": hanzi_cjk,
+        }, reasons
+
     reference_semantic = _strict_semantic_tokens(reference_text)
     hanzi_semantic = _strict_semantic_tokens(" ".join(
         iv.text for iv in hanzi_intervals if iv.text).strip())
+
+    def _semantic_compatible_with_missing_punctuation(
+            reference: list[tuple[str, str]],
+            observed: list[tuple[str, str]]) -> bool:
+        """Allow reference punctuation to disappear, but not mutate/order/add.
+
+        Lexical and NVV tokens remain an exact ordered contract.  While
+        walking the observed sequence, only unmatched reference punctuation
+        may be skipped.  Consequently a missing comma is tolerated, whereas
+        a period in its place, an extra mark, or a reordered mark fails.
+        """
+        cursor = 0
+        for actual in observed:
+            while (cursor < len(reference)
+                   and reference[cursor][0] == "punct"
+                   and reference[cursor] != actual):
+                cursor += 1
+            if cursor >= len(reference) or reference[cursor] != actual:
+                return False
+            cursor += 1
+        return all(kind == "punct" for kind, _ in reference[cursor:])
+
+    semantic_compatible = _semantic_compatible_with_missing_punctuation(
+        reference_semantic, hanzi_semantic)
 
     lexical_reference = re.sub(r"<sp\d+>", "", reference_text)
     has_lexical_reference = bool(
@@ -2732,13 +4780,14 @@ def assess_reference_coverage(
     # their reference position (for example ``第N天，Noa``).  The strict disk
     # auditor remains the publication authority; this is an earlier,
     # deterministic postprocess veto for the same lexical corruption.
-    if reference_semantic != hanzi_semantic:
+    if not semantic_compatible:
         reasons.append("reference_semantic_sequence_mismatch")
     if unknown_source_count:
         reasons.append("mfa_unknown_source")
 
     coverage = {
         "reference_source": reference_source,
+        "reference_validation_applied": True,
         "reference_cjk_count": len(reference_cjk),
         "pinyin_token_count": len(pinyin_tokens),
         "assigned_cjk_count": len(hanzi_cjk),
@@ -2746,14 +4795,23 @@ def assess_reference_coverage(
         "extra_pinyin_count": max(0, len(pinyin_tokens) - len(reference_cjk)),
         "unknown_source_count": unknown_source_count,
         "exact_cjk_sequence": reference_cjk == hanzi_cjk,
-        "exact_semantic_sequence": reference_semantic == hanzi_semantic,
+        # The publication contract treats missing punctuation as a tolerated
+        # projection loss.  Keep the historical field name for consumers,
+        # but report the contract-compatible result rather than re-rejecting a
+        # candidate solely because a reference punctuation mark disappeared.
+        "exact_semantic_sequence": semantic_compatible,
+        "semantic_sequence_missing_punctuation": [
+            token for token in reference_semantic
+            if token[0] == "punct" and token not in hanzi_semantic
+        ],
         "reference_cjk": reference_cjk,
         "hanzi_cjk": hanzi_cjk,
     }
     return coverage, list(dict.fromkeys(reasons))
 
 
-def _normalize_word_spellings(words_tier: Tier, raw_text: str) -> None:
+def _normalize_word_spellings(words_tier: Tier, raw_text: str,
+                              *, authority_strict: bool = False) -> None:
     """Replace tokenizer-damaged English words with canonical reference spellings.
 
     Uses Needleman-Wunsch alignment (:func:`_align_word_sequences`) to
@@ -2789,7 +4847,9 @@ def _normalize_word_spellings(words_tier: Tier, raw_text: str) -> None:
     # model and must keep their canonical <>-wrapped form).
     en_ref_positions: dict[int, str] = {}   # ref_units index → english word
     for ri, (ci, u) in enumerate(ref_units):
-        if u.isascii() and u.isalpha() and len(u) >= 2 and not is_nvv_token(u):
+        if (u.isascii() and (u.isalpha() or is_english_token(u))
+                and len(re.sub(r"[^a-z0-9]", "", u)) >= 2
+                and not is_nvv_token(u)):
             en_ref_positions[ri] = u
 
     # Word-tier tokens (silence & punct filtered)
@@ -2802,6 +4862,13 @@ def _normalize_word_spellings(words_tier: Tier, raw_text: str) -> None:
         word_entries.append((i, iv.text.strip()))
 
     if not word_entries or not ref_units:
+        return
+
+    # Authority mode is transactional: do not rename one interval and leave
+    # the remaining CTC fragments for a later heuristic pass.  The caller
+    # performs one exact compound reconciliation against the immutable source
+    # ledger before committing the final words owner.
+    if authority_strict:
         return
 
     # Align
@@ -2948,6 +5015,327 @@ def _normalize_word_spellings(words_tier: Tier, raw_text: str) -> None:
                            if iv.xmax - iv.xmin > 0.001]
 
 
+def _merge_authority_alpha_digit_fragments(
+        words_tier: Tier, reference_text: str,
+        ctc_tokens: list[dict] | None = None,
+        report: dict | None = None) -> list[str]:
+    """Commit one exact authority compound projection.
+
+    The historical name is retained for callers, but the transaction handles
+    every reference English unit, not only alpha+digit spellings.  CTC rows
+    are consumed in file order when the real ``tokens.jsonl`` has no ordinal;
+    an explicitly malformed ordinal still fails closed.  All candidate groups
+    are validated before the words tier is replaced, so a partial repair can
+    never hide a CJK/NVV/punctuation boundary or a missing fragment.
+    """
+    try:
+        units = parse_english_units(reference_text)
+    except (EnglishUnitError, TypeError, ValueError):
+        return []
+    if not isinstance(ctc_tokens, list) or not ctc_tokens:
+        return []
+    # Authority numeral normalization turns ``target1`` into the semantic
+    # stream ``target`` + ``一``.  Keep the ASCII suffix out of the English
+    # fragment transaction, then bind it to the corresponding CJK owner.
+    # Direct callers using the historical ``target1`` reference retain the
+    # old alpha+digit transaction below.
+    semantic = list(project_authority_semantics(reference_text))
+    numeral_surfaces = [item["surface"] for item in semantic
+                        if item.get("kind") == "cjk"
+                        and item.get("surface") in {"一", "二"}]
+    numeral_digit_to_surface = {"1": "一", "2": "二"}
+    authority_has_cjk_numerals = bool(numeral_surfaces)
+
+    ctc_rows: list[dict] = []
+    all_rows: list[dict] = []
+    for index, token in enumerate(ctc_tokens):
+        if not isinstance(token, dict) or str(token.get("type", "word")) != "word":
+            continue
+        text = str(token.get("word", "")).strip().lstrip("▁")
+        try:
+            start = float(token["start_s"])
+            end = float(token["end_s"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        raw_ordinals = token.get("source_ctc_ordinals")
+        explicit = raw_ordinals is not None or any(
+            key in token for key in ("source_ctc_ordinal", "ordinal"))
+        if raw_ordinals is None:
+            raw_ordinal = token.get("source_ctc_ordinal", token.get("ordinal"))
+            raw_ordinals = [raw_ordinal] if raw_ordinal is not None else None
+        if explicit and (not isinstance(raw_ordinals, (list, tuple))
+                         or len(raw_ordinals) != 1
+                         or not isinstance(raw_ordinals[0], int)
+                         or isinstance(raw_ordinals[0], bool)
+                         or raw_ordinals[0] < 0):
+            if report is not None:
+                report.setdefault("authority_compound_reconciliation", {})[
+                    "status"] = "rejected"
+                report["authority_compound_reconciliation"]["reason"] = (
+                    "invalid_source_ctc_ordinal")
+            return []
+        if (not text or not math.isfinite(start) or not math.isfinite(end)
+                or end <= start):
+            continue
+        row = {"index": index, "text": text, "start": start, "end": end,
+               "ordinal": (raw_ordinals[0] if raw_ordinals is not None
+                           else index),
+               "ordinal_source": "explicit" if explicit else "file_order"}
+        all_rows.append(row)
+        if (is_english_fragment_token(text)
+                and not (authority_has_cjk_numerals
+                         and text in numeral_digit_to_surface)):
+            ctc_rows.append(row)
+    if not ctc_rows:
+        if report is not None:
+            report["authority_compound_reconciliation"] = {
+                "status": "rejected", "reason": "ctc_evidence_missing"}
+        return []
+
+    planned: list[dict] = []
+    cursor = 0
+    for unit in units:
+        matched = None
+        for end in range(cursor + 1, len(ctc_rows) + 1):
+            try:
+                merged = merge_authority_fragment_group(unit, ctc_rows[cursor:end])
+            except EnglishUnitError:
+                continue
+            matched = (end, merged)
+            break
+        if matched is None:
+            if report is not None:
+                report.setdefault("authority_compound_reconciliation", {})[
+                    "status"] = "rejected"
+                report["authority_compound_reconciliation"]["reason"] = (
+                    "fragment_group_not_exact")
+            return []
+        end, merged = matched
+        group = ctc_rows[cursor:end]
+        source_window = [row for row in all_rows
+                         if group[0]["index"] <= row["index"] <= group[-1]["index"]]
+        if len(source_window) != len(group):
+            if report is not None:
+                report["authority_compound_reconciliation"] = {
+                    "status": "rejected", "reason": "cross_non_english_boundary",
+                    "unit_id": unit.unit_id,
+                }
+            return []
+        source_start, source_end = group[0]["start"], group[-1]["end"]
+        if any(right["start"] - left["end"] > AXIS_EPS
+               for left, right in zip(group, group[1:])):
+            if report is not None:
+                report["authority_compound_reconciliation"] = {
+                    "status": "rejected", "reason": "source_span_gap",
+                    "unit_id": unit.unit_id}
+            return []
+        owner_indices: set[int] = set()
+        for row in group:
+            row_compact = re.sub(r"[^a-z0-9]", "", row["text"].casefold())
+            candidates = [index for index, interval in enumerate(words_tier.intervals)
+                          if (is_english_fragment_token(interval.text.strip())
+                              and interval.xmax > row["start"] - AXIS_EPS
+                              and interval.xmin < row["end"] + AXIS_EPS
+                              and (lambda compact: compact == row_compact
+                                   or compact.startswith(row_compact)
+                                   or row_compact.startswith(compact))(
+                                       re.sub(r"[^a-z0-9]", "", interval.text.strip().casefold()))) ]
+            if len(candidates) != 1:
+                # A pre-merged owner is acceptable only if it covers the
+                # complete source group and has the exact authority surface.
+                candidates = [index for index, interval in enumerate(words_tier.intervals)
+                              if (interval.xmin <= source_start + AXIS_EPS
+                                  and interval.xmax >= source_end - AXIS_EPS
+                                  and re.sub(r"[^a-z0-9]", "", interval.text.strip().casefold())
+                                     == re.sub(r"[^a-z0-9]", "", unit.surface_text.casefold()))]
+            if len(candidates) != 1:
+                if report is not None:
+                    report.setdefault("authority_compound_reconciliation", {})[
+                        "status"] = "rejected"
+                    report["authority_compound_reconciliation"]["reason"] = (
+                        "word_owner_not_exact")
+                return []
+            owner_indices.add(candidates[0])
+        first_index, last_index = min(owner_indices), max(owner_indices)
+        for index in range(first_index, last_index + 1):
+            text = words_tier.intervals[index].text.strip()
+            if (not is_silence(text) and not is_english_fragment_token(text)):
+                if report is not None:
+                    report.setdefault("authority_compound_reconciliation", {})[
+                        "status"] = "rejected"
+                    report["authority_compound_reconciliation"]["reason"] = (
+                        "cross_non_english_boundary")
+                return []
+        planned.append({"unit": unit, "merged": merged, "first": first_index,
+                        "last": last_index, "indices": owner_indices,
+                        "source_rows": group, "source_span": [source_start, source_end]})
+        cursor = end
+    if cursor != len(ctc_rows):
+        if report is not None:
+            report["authority_compound_reconciliation"] = {
+                "status": "rejected", "reason": "extra_ctc_fragment"}
+        return []
+
+    numeral_plans: list[dict] = []
+    if authority_has_cjk_numerals:
+        numeral_rows = [row for row in all_rows
+                        if row["text"] in numeral_digit_to_surface]
+        if numeral_rows:
+            expected = iter(numeral_surfaces)
+            for row in numeral_rows:
+                surface = numeral_digit_to_surface[row["text"]]
+                try:
+                    expected_surface = next(expected)
+                except StopIteration:
+                    expected_surface = None
+                if expected_surface != surface:
+                    if report is not None:
+                        report["authority_compound_reconciliation"] = {
+                            "status": "rejected",
+                            "reason": "numeral_fragment_order_or_surface_mismatch",
+                            "source_ctc_index": row["index"],
+                        }
+                    return []
+                candidates = [index for index, interval in enumerate(words_tier.intervals)
+                              if (interval.xmax > row["start"] - AXIS_EPS
+                                  and interval.xmin < row["end"] + AXIS_EPS
+                                  and (interval.text.strip() == row["text"]
+                                       or interval.text.strip()
+                                          == _AUTHORITY_NUMERAL_PINYIN.get(surface)))]
+                if len(candidates) != 1:
+                    if report is not None:
+                        report["authority_compound_reconciliation"] = {
+                            "status": "rejected",
+                            "reason": "numeral_fragment_owner_not_exact",
+                            "source_ctc_index": row["index"],
+                        }
+                    return []
+                owner = words_tier.intervals[candidates[0]]
+                if owner.text.strip() == row["text"]:
+                    words_tier.intervals[candidates[0]] = Interval(
+                        owner.xmin, owner.xmax,
+                        _AUTHORITY_NUMERAL_PINYIN[surface])
+                numeral_plans.append({
+                    "surface": surface,
+                    "pinyin": _AUTHORITY_NUMERAL_PINYIN[surface],
+                    "source_row": row,
+                    "owner_index": candidates[0],
+                    "geometry_operation": "authority_numeral_fragment_projection",
+                })
+            try:
+                next(expected)
+            except StopIteration:
+                pass
+            else:
+                if report is not None:
+                    report["authority_compound_reconciliation"] = {
+                        "status": "rejected",
+                        "reason": "missing_numeral_fragment",
+                    }
+                return []
+
+    replacements: dict[int, dict] = {}
+    removed: set[int] = set()
+    for item in planned:
+        first, last = item["first"], item["last"]
+        if any(index in replacements or index in removed
+               for index in range(first, last + 1)):
+            return []
+        owner = words_tier.intervals[first]
+        replacements[first] = {
+            "interval": Interval(owner.xmin, words_tier.intervals[last].xmax,
+                                  item["unit"].surface_text),
+            "unit": item["unit"],
+        }
+        removed.update(range(first + 1, last + 1))
+    changed_unit_ids = [item["unit"].unit_id for item in planned
+                        if len(item["source_rows"]) > 1
+                        or item["first"] != item["last"]
+                        or words_tier.intervals[item["first"]].text.strip()
+                           != item["unit"].surface_text]
+    if planned:
+        words_tier.intervals = [replacements[index]["interval"]
+                                if index in replacements else interval
+                                for index, interval in enumerate(words_tier.intervals)
+                                if index not in removed]
+        words_tier._canonical_authority_units = [
+            {"unit_id": item["unit"].unit_id,
+             "surface": item["unit"].surface_text,
+             "alignment_token": item["unit"].alignment_token,
+             "source_ctc_indices": [row["index"] for row in item["source_rows"]],
+             "source_ctc_ordinals": list(item["merged"].source_ctc_ordinals),
+             "source_spans": [[row["start"], row["end"]]
+                              for row in item["source_rows"]],
+             "geometry_operation": "authority_compound_reconciliation"}
+            for item in planned]
+    elif not hasattr(words_tier, "_canonical_authority_units"):
+        words_tier._canonical_authority_units = []
+    if numeral_plans:
+        words_tier._canonical_authority_units.extend({
+            "unit_id": None,
+            "surface": item["surface"],
+            "alignment_token": item["pinyin"],
+            "source_ctc_indices": [item["source_row"]["index"]],
+            "source_ctc_ordinals": [item["source_row"]["ordinal"]],
+            "source_spans": [[item["source_row"]["start"],
+                              item["source_row"]["end"]]],
+            "geometry_operation": item["geometry_operation"],
+        } for item in numeral_plans)
+    restored = changed_unit_ids
+    if report is not None:
+        report["authority_compound_reconciliation"] = {
+            "status": "accepted" if planned else "not_required",
+            "units": [entry for entry in getattr(words_tier, "_canonical_authority_units", [])],
+        }
+        if numeral_plans:
+            report["authority_compound_reconciliation"]["numeral_fragments"] = [
+                {"surface": item["surface"], "pinyin": item["pinyin"],
+                 "source_ctc_index": item["source_row"]["index"],
+                 "source_span": [item["source_row"]["start"],
+                                 item["source_row"]["end"]],
+                 "geometry_operation": item["geometry_operation"]}
+                for item in numeral_plans]
+    return restored
+
+
+def _restore_reference_surfaces(words_tier: Tier | None,
+                                hanzi_tier: Tier | None,
+                                reference_text: str) -> list[str]:
+    """Restore canonical reference spelling on the two user-visible tiers.
+
+    ``english_units`` owns the hyphenated surface, while CTC/MFA and the
+    internal processing string use its hyphenless alignment token.  Surface
+    restoration is therefore deliberately late and limited to ``words`` and
+    ``hanzi``; raw/pinyin tiers remain the established processing projection.
+    A surface is changed only for a single ordered owner whose compact text
+    is exactly the canonical unit token.
+    """
+    if words_tier is None or hanzi_tier is None or not reference_text:
+        return []
+    try:
+        units = parse_english_units(reference_text)
+    except (EnglishUnitError, TypeError, ValueError):
+        return []
+    owners = [iv for iv in words_tier.intervals if is_english_token(iv.text.strip())]
+    if len(owners) != len(units):
+        return []
+    restored: list[str] = []
+    for unit, owner in zip(units, owners):
+        compact = re.sub(r"[^a-z0-9]", "", owner.text.strip().casefold())
+        if compact != unit.alignment_token:
+            continue
+        owner.text = unit.surface_text
+        matching = [iv for iv in hanzi_tier.intervals
+                    if is_english_token(iv.text.strip())
+                    and abs(iv.xmin - owner.xmin) <= AXIS_EPS
+                    and abs(iv.xmax - owner.xmax) <= AXIS_EPS
+                    and re.sub(r"[^a-z0-9]", "", iv.text.strip().casefold()) == compact]
+        if len(matching) == 1:
+            matching[0].text = unit.surface_text
+        restored.append(unit.unit_id)
+    return restored
+
+
 # ---------------------------------------------------------------------------
 # Audio I/O (NumPy-based — shared with audio_energy.py)
 # ---------------------------------------------------------------------------
@@ -2979,14 +5367,366 @@ def _frame_rms_vec(audio, sr: int, frame_ms: float = 5.0
     return rms.astype(_np.float32), fs / sr
 
 
-def _word_rms(audio, sr: int, xmin: float, xmax: float) -> float:
-    """Mean absolute amplitude in time slice [xmin, xmax)."""
+def _rms_frames_in_span(audio, sr: int, xmin: float, xmax: float,
+                        frame_ms: float = 10.0) -> tuple["np.ndarray", list[tuple[float, float]]]:
+    """Return complete, globally aligned RMS frames in ``[xmin, xmax)``.
+
+    Word-energy evidence is deliberately based on the same 10 ms RMS
+    primitive everywhere.  Partial frames are excluded: treating a short
+    boundary fragment as a complete acoustic observation was the source of
+    the old mean-absolute/RMS unit mismatch.
+    """
     import numpy as _np
-    s = max(0, int(xmin * sr))
-    e = min(len(audio), int(xmax * sr))
-    if e <= s:
-        return 0.0
-    return float(_np.mean(_np.abs(audio[s:e])))
+    if audio is None or sr <= 0 or xmax <= xmin:
+        return _np.array([], dtype=_np.float32), []
+    frame_samples = max(1, int(round(frame_ms / 1000.0 * sr)))
+    start_sample = max(0, int(math.ceil(float(xmin) * sr - 1e-9)))
+    end_sample = min(len(audio), int(math.floor(float(xmax) * sr + 1e-9)))
+    first = ((start_sample + frame_samples - 1) // frame_samples) * frame_samples
+    last = end_sample - frame_samples
+    if last < first:
+        return _np.array([], dtype=_np.float32), []
+    starts = list(range(first, last + 1, frame_samples))
+    frame_array = _np.asarray(
+        [audio[start:start + frame_samples] for start in starts],
+        dtype=_np.float64)
+    if frame_array.size == 0:
+        return _np.array([], dtype=_np.float32), []
+    values = _np.sqrt(_np.mean(frame_array ** 2, axis=1))
+    spans = [(start / sr, (start + frame_samples) / sr)
+             for start in starts]
+    return values.astype(_np.float32), spans
+
+
+def _word_rms(audio, sr: int, xmin: float, xmax: float) -> float:
+    """Mean 10 ms frame RMS in time slice ``[xmin, xmax)``."""
+    values, _ = _rms_frames_in_span(audio, sr, xmin, xmax, frame_ms=10.0)
+    return float(np.mean(values)) if len(values) else 0.0
+
+
+def _word_energy_enabled(args) -> bool:
+    """Resolve the tri-state detector switch without strict-mode side effects."""
+    explicit = getattr(args, "enable_word_in_silence_filter", None)
+    if explicit is False:
+        return False
+    ratio = float(getattr(args, "filter_word_energy_ratio", 0.0) or 0.0)
+    return bool(explicit is True or (explicit is None and ratio > 0.0))
+
+
+def _word_energy_noise_model(audio, sr: int, words_tier: Tier | None,
+                             args) -> dict:
+    """Build the single noise model used by both energy-entry points."""
+    ratio = float(getattr(args, "filter_word_energy_ratio", 0.0) or 0.0)
+    silence_values: list[float] = []
+    if words_tier is not None and audio is not None:
+        for interval in words_tier.intervals:
+            if not is_silence(interval.text):
+                continue
+            values, _ = _rms_frames_in_span(
+                audio, sr, interval.xmin, interval.xmax, frame_ms=10.0)
+            silence_values.extend(float(value) for value in values)
+    if silence_values:
+        values = np.asarray(silence_values, dtype=np.float32)
+        source = "explicit_silence_owner"
+    elif audio is not None and sr > 0:
+        values, _ = _frame_rms_vec(audio, sr, frame_ms=10.0)
+        source = "global_audio_percentile_15"
+    else:
+        values = np.asarray([], dtype=np.float32)
+        source = "unavailable"
+    noise_floor = float(np.percentile(values, 15)) if len(values) else 0.0
+    return {
+        "source": source,
+        "frame_count": int(len(values)),
+        "frame_ms": 10.0,
+        "percentile": 15 if source == "global_audio_percentile_15" else None,
+        "noise_floor": noise_floor,
+        "ratio": ratio,
+        "threshold": noise_floor * ratio,
+    }
+
+
+def _nearest_lexical_neighbors(words_tier: Tier | None) -> dict[int, dict]:
+    """Map each word index to nearest lexical owners, crossing silence only."""
+    if words_tier is None:
+        return {}
+    result: dict[int, dict] = {}
+    for index, interval in enumerate(words_tier.intervals):
+        if not interval.text.strip() or is_silence(interval.text):
+            continue
+        prev = index - 1
+        while prev >= 0 and is_silence(words_tier.intervals[prev].text):
+            prev -= 1
+        next_index = index + 1
+        while (next_index < len(words_tier.intervals)
+               and is_silence(words_tier.intervals[next_index].text)):
+            next_index += 1
+        prev_iv = words_tier.intervals[prev] if prev >= 0 else None
+        next_iv = (words_tier.intervals[next_index]
+                   if next_index < len(words_tier.intervals) else None)
+        result[index] = {
+            "previous": (prev_iv.text.strip() if prev_iv is not None else None),
+            "next": (next_iv.text.strip() if next_iv is not None else None),
+            "previous_index": prev,
+            "next_index": next_index if next_iv is not None else None,
+            "crossed_silence_previous": prev >= 0 and prev < index - 1,
+            "crossed_silence_next": next_iv is not None and next_index > index + 1,
+        }
+    return result
+
+
+def _word_energy_audit(words_tier: Tier | None, args, audio=None, sr: int = 16000,
+                       *, textgrid: TextGrid | None = None,
+                       ctc_tokens: list[dict] | None = None) -> dict:
+    """Audit lexical owners using immutable source/merge evidence.
+
+    This is intentionally a pure report builder.  It never changes words or
+    derived tiers and never treats rebuilt phones as fresh acoustic evidence.
+    """
+    model = _word_energy_noise_model(audio, sr, words_tier, args)
+    threshold = float(model["threshold"])
+    premerge = getattr(words_tier, "_word_energy_premerge_spans", {}) if words_tier else {}
+    merge_ledger = getattr(words_tier, "_word_energy_merge_ledger", []) if words_tier else []
+    lineage = getattr(textgrid, "_phone_lineage", None) if textgrid is not None else None
+    lineage_invalid = getattr(textgrid, "_phone_lineage_invalid", None) if textgrid is not None else None
+    ctc_entries = _ctc_authority_entries(words_tier) or []
+    neighbours = _nearest_lexical_neighbors(words_tier)
+    lexical_rows = []
+    if words_tier is not None:
+        for index, interval in enumerate(words_tier.intervals):
+            label = interval.text.strip()
+            if label and not is_silence(label) and not is_punct(label):
+                lexical_rows.append((index, len(lexical_rows), interval))
+    items: list[dict] = []
+
+    def _span(value):
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            try:
+                return [float(value[0]), float(value[1])]
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _valid_span(value):
+        span = _span(value)
+        if (span is None or not all(math.isfinite(point) for point in span)
+                or span[1] <= span[0] + AXIS_EPS):
+            return None
+        return span
+
+    for index, ordinal, interval in lexical_rows:
+        final_span = [float(interval.xmin), float(interval.xmax)]
+        old_span = _span(premerge.get(str(ordinal), premerge.get(ordinal)))
+        if old_span is None:
+            old_span = list(final_span)
+        ctc_span = None
+        if ordinal < len(ctc_entries) and isinstance(ctc_entries[ordinal], dict):
+            entry = ctc_entries[ordinal]
+            # A malformed explicit ctc_span must not be upgraded by a stale
+            # resolved_span.  The bounded correction below is enabled only by
+            # an actually valid CTC boundary anchor.
+            if entry.get("ctc_span") is not None:
+                ctc_span = _valid_span(entry.get("ctc_span"))
+            else:
+                ctc_span = _valid_span(entry.get("resolved_span"))
+        if ctc_span is None and ctc_tokens:
+            # Keep ordinal binding positional.  This fallback is deliberately
+            # not word-string matching, so repeated tokens cannot steal one
+            # another's evidence.
+            lexical_ctc = [token for token in ctc_tokens
+                            if isinstance(token, dict)
+                            and str(token.get("word", token.get("text", ""))).strip()
+                            and not is_silence(str(token.get("word", token.get("text", ""))))
+                            and not is_punct(str(token.get("word", token.get("text", ""))))]
+            if ordinal < len(lexical_ctc):
+                token = lexical_ctc[ordinal]
+                ctc_span = _span([token.get("start_s", token.get("start")),
+                                  token.get("end_s", token.get("end"))])
+        source_phone_spans: list[list[float]] = []
+        lineage_reason = None
+        if not isinstance(lineage, dict):
+            lineage_reason = "phone_lineage_missing"
+        else:
+            if lineage_invalid or lineage.get("status") == "rejected":
+                lineage_reason = "phone_lineage_ambiguous"
+            elif lineage.get("status") == "partial":
+                for reason in lineage.get("reasons", []) or []:
+                    if (isinstance(reason, dict)
+                            and not is_silence(str(reason.get("label", "")))):
+                        lineage_reason = "phone_lineage_ambiguous"
+                        break
+            for rows in (lineage.get("owners", {}) or {}).values():
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if isinstance(row, dict) and row.get("lexical_ordinal") == ordinal:
+                        span = _span([row.get("start"), row.get("end")])
+                        if span is not None:
+                            source_phone_spans.append(span)
+            if not source_phone_spans and lineage_reason is None:
+                lineage_reason = "phone_lineage_missing_owner"
+        operation = None
+        merge_policy = None
+        for merge in merge_ledger if isinstance(merge_ledger, list) else []:
+            if not isinstance(merge, dict):
+                continue
+            if ordinal in {merge.get("left_lexical_ordinal"),
+                           merge.get("right_lexical_ordinal"),
+                           merge.get("lexical_ordinal")}:
+                operation = merge.get("operation")
+                if operation not in {"energy_short_sp_merge",
+                                     "forced_internal_sp1_merge"}:
+                    operation = None
+                merge_policy = merge.get("policy")
+                break
+        core_values, core_frames = _rms_frames_in_span(
+            audio, sr, old_span[0], old_span[1], frame_ms=10.0)
+        final_values, final_frames = _rms_frames_in_span(
+            audio, sr, final_span[0], final_span[1], frame_ms=10.0)
+        active_floor = max(threshold, 1e-12)
+        active = core_values > active_floor if len(core_values) else np.asarray([], dtype=bool)
+        max_run = run = 0
+        for flag in active:
+            run = run + 1 if bool(flag) else 0
+            max_run = max(max_run, run)
+        adjacency = neighbours.get(index, {})
+        english_nvv_adjacency = {
+            "previous": adjacency.get("previous") if (
+                adjacency.get("previous") and (
+                    is_english_token(adjacency["previous"])
+                    or is_nvv_token(adjacency["previous"]))) else None,
+            "next": adjacency.get("next") if (
+                adjacency.get("next") and (
+                    is_english_token(adjacency["next"])
+                    or is_nvv_token(adjacency["next"]))) else None,
+            "crossed_silence": bool(adjacency.get("crossed_silence_previous")
+                                     or adjacency.get("crossed_silence_next")),
+        }
+        item = {
+            "lexical_ordinal": ordinal,
+            "word": interval.text.strip(),
+            "final_span": final_span,
+            "premerge_span": old_span,
+            "source_phone_spans": source_phone_spans,
+            "ctc_span": ctc_span,
+            "merge_operation": operation,
+            "merge_policy": merge_policy,
+            "english_nvv_adjacency": english_nvv_adjacency,
+            "lineage": {"status": lineage.get("status") if isinstance(lineage, dict) else None,
+                        "reason": lineage_reason,
+                        "source_phone_count": len(source_phone_spans)},
+            "rms": {
+                "frame_ms": 10.0,
+                "premerge_frame_count": int(len(core_values)),
+                "final_frame_count": int(len(final_values)),
+                "premerge_rms": float(np.mean(core_values)) if len(core_values) else 0.0,
+                "final_rms": float(np.mean(final_values)) if len(final_values) else 0.0,
+                "active_frame_count": int(np.sum(active)),
+                "max_continuous_active_frames": int(max_run),
+            },
+            "classification": "not_applicable",
+            "resulting_reason": None,
+        }
+        if lineage_reason is None and source_phone_spans:
+            cursor = old_span[0]
+            for start, end in sorted(source_phone_spans):
+                if start > cursor + AXIS_EPS:
+                    lineage_reason = "phone_hole"
+                    break
+                cursor = max(cursor, end)
+            if cursor < old_span[1] - AXIS_EPS:
+                lineage_reason = "phone_hole"
+        if (audio is not None and sr > 0 and source_phone_spans
+                and (min(span[0] for span in source_phone_spans) < -AXIS_EPS
+                     or max(span[1] for span in source_phone_spans) > len(audio) / sr + AXIS_EPS)):
+            lineage_reason = "audio_hole"
+        ctc_boundary_authority = ctc_span is not None
+        diagnostic_reasons: list[str] = []
+        if (ctc_boundary_authority
+                and lineage_reason in {"phone_hole", "audio_hole"}):
+            diagnostic_reasons.append(lineage_reason)
+            lineage_reason = None
+        if ctc_boundary_authority and source_phone_spans:
+            source_start = min(span[0] for span in source_phone_spans)
+            source_end = max(span[1] for span in source_phone_spans)
+            outside_anchor = (
+                source_start < ctc_span[0] - AXIS_EPS
+                or source_end > ctc_span[1] + AXIS_EPS)
+            outside_final = (
+                source_start < final_span[0] - AXIS_EPS
+                or source_end > final_span[1] + AXIS_EPS)
+            if outside_anchor or outside_final:
+                diagnostic_reasons.append("source_phone_outside_ctc_or_final")
+        if lineage_reason:
+            item["lineage"]["reason"] = lineage_reason
+        item["lineage"]["ctc_boundary_authority"] = ctc_boundary_authority
+        item["lineage"]["diagnostic_reasons"] = diagnostic_reasons
+        item["diagnostics"] = {
+            "ctc_boundary_authority": ctc_boundary_authority,
+            "phone_hole_or_audio_hole_suppressed": bool(diagnostic_reasons and any(
+                reason in {"phone_hole", "audio_hole"}
+                for reason in diagnostic_reasons)),
+            "source_phone_outside_ctc_or_final": (
+                "source_phone_outside_ctc_or_final" in diagnostic_reasons),
+        }
+        if (is_english_token(interval.text) or is_nvv_token(interval.text)
+                or interval.xmin <= words_tier.xmin + AXIS_EPS
+                or interval.xmax >= words_tier.xmax - AXIS_EPS):
+            classification = "not_applicable"
+        elif lineage_reason or audio is None or sr <= 0 or not len(core_values):
+            classification = "word_energy_evidence_unresolved"
+            item["resulting_reason"] = "word_energy_evidence_unresolved"
+        else:
+            # A source-phone owner with active material outside the lexical
+            # core identifies a boundary defect, not a quiet word.  Require
+            # three consecutive 10 ms frames to avoid AXIS_EPS noise.
+            mismatch = False
+            if source_phone_spans and not ctc_boundary_authority:
+                source_start = min(span[0] for span in source_phone_spans)
+                source_end = max(span[1] for span in source_phone_spans)
+                excluded = []
+                # Check both the immutable lexical core and the final
+                # display span.  A late boundary trim must remain visible as
+                # a boundary mismatch even when the premerge core was wider.
+                for boundary_start, boundary_end in (old_span, final_span):
+                    if source_start < boundary_start - AXIS_EPS:
+                        excluded.append((source_start,
+                                         min(source_end, boundary_start)))
+                    if source_end > boundary_end + AXIS_EPS:
+                        excluded.append((max(source_start, boundary_end),
+                                         source_end))
+                for start, end in excluded:
+                    values, _ = _rms_frames_in_span(
+                        audio, sr, start, end, frame_ms=10.0)
+                    flags = values > max(threshold, 1e-12)
+                    run = 0
+                    for flag in flags:
+                        run = run + 1 if bool(flag) else 0
+                        if run >= 3:
+                            mismatch = True
+                            break
+                    if mismatch:
+                        break
+            if mismatch:
+                classification = "word_energy_boundary_mismatch"
+                item["resulting_reason"] = "word_energy_boundary_mismatch"
+            elif float(np.max(core_values)) <= 1e-12 or float(np.mean(core_values)) < threshold:
+                classification = "true_low_energy"
+                item["resulting_reason"] = "word_in_silence"
+            elif (operation is not None
+                  and float(np.mean(final_values)) < threshold):
+                classification = "silence_merge_dilution"
+                item["resulting_reason"] = None
+            else:
+                classification = "energetic"
+        item["classification"] = classification
+        items.append(item)
+    return {
+        "schema": WORD_ENERGY_EVIDENCE_SCHEMA,
+        "noise_model": model,
+        "enabled": _word_energy_enabled(args),
+        "items": items,
+    }
 
 
 def _noise_floor(audio, sr: int, bottom_pct: float = 0.10) -> float:
@@ -2997,6 +5737,635 @@ def _noise_floor(audio, sr: int, bottom_pct: float = 0.10) -> float:
         return 0.0
     k = max(1, int(len(rms) * bottom_pct))
     return float(_np.partition(rms, k)[k])
+
+
+def _visual_words_snapshot(words_tier: Tier | None) -> tuple[tuple[dict, ...], str]:
+    """Copy the final visual words intervals and return their stable digest."""
+    rows = tuple(
+        {"index": index, "xmin": float(interval.xmin),
+         "xmax": float(interval.xmax), "text": interval.text}
+        for index, interval in enumerate(words_tier.intervals if words_tier else [])
+    )
+    digest_rows = [{key: value for key, value in row.items() if key != "index"}
+                   for row in rows]
+    return rows, _evidence_digest(digest_rows)
+
+
+def _resolve_visual_short_silence_merges(
+        textgrid: TextGrid, audio, sr: int, args,
+        report: dict | None = None,
+        ctc_tokens: list[dict] | None = None,
+        reference_punct_entries: list[dict] | None = None) -> list[dict]:
+    """Resolve final visual ``<sp0>``/``<sp1>`` owners from local audio energy.
+
+    The snapshot is immutable for the complete decision pass.  Raw CTC/MFA
+    spans are used only to identify punctuation ownership; all gap coordinates
+    and lexical owners come from the snapshot.  Actual source/derived phone
+    synchronization is deliberately deferred to the existing freeze and
+    lineage rebuild barrier.  ``<sp1>`` is eligible only when its configured
+    upper bound is raised above the default 0.2 seconds.
+    """
+    words_tier = tier_by_name(textgrid, "words")
+    if words_tier is None:
+        return []
+    snapshot, visual_digest = _visual_words_snapshot(words_tier)
+    decisions: list[dict] = []
+    lexical_ordinals = {}
+    _lexical_count = 0
+    for _row in snapshot:
+        _label = str(_row["text"]).strip()
+        if _label and not is_silence(_label) and not is_punct(_label):
+            lexical_ordinals[int(_row["index"])] = _lexical_count
+            _lexical_count += 1
+    # The premerge display spans are immutable evidence for the later word
+    # energy audit.  Keep them on the tier so every copy/freeze boundary can
+    # carry the ledger without matching repeated word labels.
+    words_tier._word_energy_premerge_spans = {
+        str(ordinal): [float(row["xmin"]), float(row["xmax"])]
+        for index, ordinal in lexical_ordinals.items()
+        for row in (snapshot[index],)
+    }
+    if report is not None:
+        report.setdefault("silence_merges", [])
+        report["visual_reference_digest"] = visual_digest
+
+    configured_max_sil = getattr(
+        args, "merge_max_sil_sec", getattr(args, "min_sil_merge_sec", 0.2))
+    effective_max_sil = min(float(configured_max_sil), 0.5)
+    merge_enabled = bool(getattr(args, "merge_silence", True))
+    energy_threshold = float(getattr(args, "merge_energy_threshold", 0.5))
+    phone_tier = tier_by_name(textgrid, "phones")
+    lineage = getattr(textgrid, "_phone_lineage", None)
+    lineage_invalid = getattr(textgrid, "_phone_lineage_invalid", None)
+    lineage_ambiguous = bool(lineage_invalid)
+    if isinstance(lineage, dict):
+        lineage_ambiguous = lineage_ambiguous or lineage.get("status") in {
+            "rejected", "partial"}
+        lineage_ambiguous = lineage_ambiguous or bool(lineage.get("reasons"))
+
+    def _lexical(row: dict) -> bool:
+        text = str(row["text"]).strip()
+        return bool(text) and not is_silence(text) and not is_punct(text)
+
+    def _overlap(start: float, end: float, other_start: object,
+                 other_end: object) -> bool:
+        try:
+            return (min(end, float(other_end)) > max(start, float(other_start))
+                    + AXIS_EPS)
+        except (TypeError, ValueError):
+            return False
+
+    def _punctuation_owner(start: float, end: float) -> str | None:
+        def _local_entry(entries, *, reference: bool):
+            candidates = []
+            for entry in entries or []:
+                if not isinstance(entry, dict):
+                    continue
+                label = str(entry.get("word", entry.get("text", ""))).strip()
+                kind = str(entry.get("type", entry.get("kind", ""))).casefold()
+                if not is_punct(label):
+                    continue
+                if (not reference
+                        and kind not in {"punct", "punctuation"}
+                        and not is_punct(label)):
+                    continue
+                try:
+                    entry_start = float(entry.get("start_s"))
+                    entry_end = float(entry.get("end_s"))
+                except (TypeError, ValueError):
+                    continue
+                if (not math.isfinite(entry_start)
+                        or not math.isfinite(entry_end)
+                        or entry_end <= entry_start
+                        or not _overlap(start, end, entry_start, entry_end)):
+                    continue
+                # A broad punctuation span that crosses a lexical owner is
+                # not local evidence for this gap.  Without this guard a
+                # punctuation anchor around word N also vetoes the gap
+                # between word N+1 and N+2.
+                crosses_lexical = any(
+                    _lexical(row)
+                    and _overlap(entry_start, entry_end,
+                                 float(row["xmin"]), float(row["xmax"]))
+                    for row in snapshot)
+                if crosses_lexical:
+                    continue
+                candidates.append((entry_end - entry_start, entry))
+            if not candidates:
+                return None
+            _, selected = min(candidates, key=lambda pair: pair[0])
+            return selected
+
+        if _local_entry(reference_punct_entries, reference=True) is not None:
+            return "reference_punctuation_owner"
+        if _local_entry(ctc_tokens, reference=False) is not None:
+            return "ctc_punctuation_owner"
+        return None
+
+    def _punctuation_entry(start: float, end: float) -> dict | None:
+        """Return the local explicit punctuation evidence for a silence run."""
+        for entries, reference in ((reference_punct_entries, True),
+                                   (ctc_tokens, False)):
+            for entry in entries or []:
+                if not isinstance(entry, dict):
+                    continue
+                label = str(entry.get("word", entry.get("text", ""))).strip()
+                kind = str(entry.get("type", entry.get("kind", ""))).casefold()
+                if not is_punct(label):
+                    continue
+                if (not reference and kind not in {"punct", "punctuation"}
+                        and not is_punct(label)):
+                    continue
+                try:
+                    entry_start = float(entry.get("start_s"))
+                    entry_end = float(entry.get("end_s"))
+                except (TypeError, ValueError):
+                    continue
+                if (not math.isfinite(entry_start)
+                        or not math.isfinite(entry_end)
+                        or entry_end <= entry_start
+                        or not _overlap(start, end, entry_start, entry_end)):
+                    continue
+                if any(
+                        _lexical(row)
+                        and _overlap(entry_start, entry_end,
+                                     float(row["xmin"]), float(row["xmax"]))
+                        for row in snapshot):
+                    continue
+                return {"label": label,
+                        "source": "reference" if reference else "ctc",
+                        "evidence_span": [entry_start, entry_end]}
+        return None
+
+    def _phone_reason(start: float, end: float) -> str | None:
+        if lineage_ambiguous:
+            return "phone_lineage_ambiguous"
+        if phone_tier is None:
+            return None
+        overlaps = [phone for phone in phone_tier.intervals
+                     if _overlap(start, end, phone.xmin, phone.xmax)]
+        if not overlaps:
+            return "phone_hole"
+        if any(not is_silence(phone.text) for phone in overlaps):
+            return "phone_lineage_ambiguous"
+        cursor = start
+        for phone in sorted(overlaps, key=lambda iv: (iv.xmin, iv.xmax)):
+            if phone.xmin > cursor + AXIS_EPS:
+                return "phone_hole"
+            cursor = max(cursor, phone.xmax)
+        if cursor < end - AXIS_EPS:
+            return "phone_hole"
+        return None
+
+    def _rms_segment(start: float, end: float):
+        import numpy as _np
+        if end <= start:
+            return _np.array([], dtype=_np.float32)
+        ss = max(0, int(round(start * sr)))
+        ee = min(len(audio), int(round(end * sr)))
+        if ee <= ss:
+            return _np.array([], dtype=_np.float32)
+        values, _ = _frame_rms_vec(audio[ss:ee], sr, frame_ms=5.0)
+        return values
+
+    audio_length = len(audio) / sr if audio is not None and sr > 0 else 0.0
+    noise_floor = None
+    active_floor = None
+    all_audio_zero = False
+    if audio is not None and sr > 0 and len(audio):
+        noise_floor = float(_noise_floor(audio, sr))
+        active_floor = max(3.0 * noise_floor, 0.001)
+        all_audio_zero = bool(float(np.max(np.abs(audio))) <= 1e-6)
+
+    # Gather every explicit silence run from the immutable visual list.  This
+    # includes protected runs so report consumers can see why they survived.
+    index = 0
+    while index < len(snapshot):
+        row = snapshot[index]
+        label = str(row["text"]).strip().casefold()
+        if not is_silence(label):
+            index += 1
+            continue
+        run_start_index = index
+        run_end_index = index
+        while (run_end_index + 1 < len(snapshot)
+               and is_silence(str(snapshot[run_end_index + 1]["text"]).strip())):
+            run_end_index += 1
+        left_index = run_start_index - 1
+        right_index = run_end_index + 1
+        gap_start = float(snapshot[run_start_index]["xmin"])
+        gap_end = float(snapshot[run_end_index]["xmax"])
+        gap_duration = gap_end - gap_start
+        left = snapshot[left_index] if left_index >= 0 else None
+        right = snapshot[right_index] if right_index < len(snapshot) else None
+        decision = {
+            "visual_reference_digest": visual_digest,
+            "gap_span": [gap_start, gap_end],
+            "run_start_index": run_start_index,
+            "run_end_index": run_end_index,
+            "gap_label": " ".join(str(snapshot[pos]["text"]).strip()
+                                   for pos in range(run_start_index, run_end_index + 1)),
+            "label": None,
+            "gap_duration": round(gap_duration, 9),
+            "configured_max_sil_sec": round(float(configured_max_sil), 9),
+            "effective_max_sil_sec": round(float(effective_max_sil), 9),
+            "label_matches_duration": False,
+            "left_word": left["text"].strip() if left and _lexical(left) else None,
+            "right_word": right["text"].strip() if right and _lexical(right) else None,
+            "left_index": left_index if left and _lexical(left) else None,
+            "right_index": right_index if right and _lexical(right) else None,
+            "left_old_span": ([left["xmin"], left["xmax"]]
+                              if left and _lexical(left) else None),
+            "right_old_span": ([right["xmin"], right["xmax"]]
+                               if right and _lexical(right) else None),
+            "left_lexical_ordinal": lexical_ordinals.get(left_index),
+            "right_lexical_ordinal": lexical_ordinals.get(right_index),
+            "old_span": {
+                "left": ([left["xmin"], left["xmax"]]
+                          if left and _lexical(left) else None),
+                "right": ([right["xmin"], right["xmax"]]
+                           if right and _lexical(right) else None),
+            },
+            "new_span": None,
+            "energy": {},
+            "winner": None,
+            "winner_share": None,
+            "margin": None,
+            "decision": "preserve",
+            "reason": None,
+            "after_span": None,
+            "operation": None,
+            "policy": None,
+            "direction_source": None,
+            "punctuation_owner": None,
+            "punctuation_evidence": None,
+            "punctuation_gap_restore": False,
+            "phone_reason": None,
+        }
+        run_labels = [_pure_silence_label(snapshot[pos]["text"])
+                      for pos in range(run_start_index, run_end_index + 1)]
+        run_label = run_labels[0] if run_labels and len(set(run_labels)) == 1 else None
+        decision["label"] = run_label
+        # Boundary labels are defined on the serialized axis ticks.  Calling
+        # ``silence_label`` on the raw binary float would classify 0.2 made
+        # from 0.6 - 0.4 as ``<sp0>`` instead of the specified ``<sp1>``.
+        gap_ticks = _duration_ticks(gap_start, gap_end)
+        expected_label = silence_label(gap_ticks / 1_000_000.0)
+        decision["expected_label"] = expected_label
+        decision["label_matches_duration"] = (
+            run_label is not None and run_label == expected_label)
+        owner_reason = _punctuation_owner(gap_start, gap_end)
+        punctuation_evidence = (_punctuation_entry(gap_start, gap_end)
+                                if owner_reason else None)
+        phone_reason = _phone_reason(gap_start, gap_end)
+        decision["punctuation_owner"] = owner_reason
+        decision["punctuation_evidence"] = punctuation_evidence
+        decision["phone_reason"] = phone_reason
+        terminal_tail_candidate = (
+            left is not None and is_punct(str(left["text"]).strip())
+            and run_end_index == len(snapshot) - 1
+            and bool(run_labels) and all(label is not None for label in run_labels)
+            and abs(gap_start - float(left["xmax"])) <= AXIS_EPS
+            and gap_end >= words_tier.xmax - AXIS_EPS)
+        forced_internal_sp1 = (
+            run_label == "<sp1>"
+            and decision["label_matches_duration"]
+            and left is not None and right is not None
+            and _lexical(left) and _lexical(right)
+            and gap_start > words_tier.xmin + AXIS_EPS
+            and gap_end < words_tier.xmax - AXIS_EPS
+            and not is_nvv_token(left["text"])
+            and not is_nvv_token(right["text"])
+            and owner_reason is None)
+        decision["forced_internal_sp1"] = forced_internal_sp1
+        unknown_internal_sp0 = (
+            run_label == "<sp0>"
+            and decision["label_matches_duration"]
+            and left is not None and right is not None
+            and _lexical(left) and _lexical(right)
+            and gap_start > words_tier.xmin + AXIS_EPS
+            and gap_end < words_tier.xmax - AXIS_EPS
+            and not is_nvv_token(left["text"])
+            and not is_nvv_token(right["text"])
+            and owner_reason is None)
+        decision["unknown_internal_sp0"] = unknown_internal_sp0
+        if forced_internal_sp1:
+            forced_gate_reasons: list[str] = []
+            if _duration_ticks(gap_start, gap_end) >= _threshold_ticks(effective_max_sil):
+                forced_gate_reasons.append("long_pause")
+            if not merge_enabled:
+                forced_gate_reasons.append("merge_disabled")
+            if phone_reason:
+                forced_gate_reasons.append(phone_reason)
+            if audio is None or sr <= 0:
+                forced_gate_reasons.append("missing_audio")
+            elif gap_start < 0.0 or gap_end > audio_length + 1e-9:
+                forced_gate_reasons.append("audio_not_covered")
+            elif all_audio_zero:
+                forced_gate_reasons.append("preserve_all_zero_audio")
+            decision["forced_gate_reasons"] = forced_gate_reasons
+        if terminal_tail_candidate:
+            decision["operation"] = "terminal_punctuation_tail_absorption"
+            decision["decision"] = "terminal_punctuation_tail_absorption"
+            decision["reason"] = "terminal_punctuation_tail_absorption"
+            decision["owner_index"] = left_index
+            decision["left_owner"] = left["text"].strip()
+            decision["tail_span"] = [gap_start, gap_end]
+        elif (left is None or right is None or not _lexical(left)
+                or not _lexical(right)
+                or gap_start <= words_tier.xmin + AXIS_EPS
+                or gap_end >= words_tier.xmax - AXIS_EPS):
+            decision["reason"] = "edge"
+        elif run_label is None:
+            decision["reason"] = "mixed_or_noncanonical_silence_labels"
+        elif run_label not in {"<sp0>", "<sp1>"}:
+            decision["reason"] = "unsupported_silence_label"
+        elif not decision["label_matches_duration"]:
+            decision["reason"] = "silence_label_duration_mismatch"
+        elif (_duration_ticks(gap_start, gap_end)
+              >= _threshold_ticks(effective_max_sil)
+              and not forced_internal_sp1):
+            decision["reason"] = "long_pause"
+        elif is_nvv_token(left["text"]) or is_nvv_token(right["text"]):
+            decision["reason"] = "nvv_owner"
+        elif not merge_enabled and not forced_internal_sp1:
+            decision["reason"] = "merge_disabled"
+        else:
+            if owner_reason:
+                decision["reason"] = owner_reason
+            else:
+                if phone_reason and not forced_internal_sp1:
+                    decision["reason"] = phone_reason
+                elif audio is None or sr <= 0:
+                    decision["reason"] = "missing_audio"
+                elif gap_start < 0.0 or gap_end > audio_length + 1e-9:
+                    decision["reason"] = "audio_not_covered"
+                elif all_audio_zero:
+                    decision["reason"] = "preserve_all_zero_audio"
+                else:
+                    gap_rms = _rms_segment(gap_start, gap_end)
+                    left_context = _rms_segment(max(left["xmin"], gap_start - 0.05),
+                                                gap_start)
+                    right_context = _rms_segment(gap_end,
+                                                 min(right["xmax"], gap_end + 0.05))
+                    active = gap_rms >= float(active_floor)
+                    max_run = run = 0
+                    for flag in active:
+                        run = run + 1 if bool(flag) else 0
+                        max_run = max(max_run, run)
+                    left_half = gap_rms[:len(gap_rms) // 2]
+                    right_half = gap_rms[len(gap_rms) // 2:]
+                    excess = np.maximum(gap_rms - float(active_floor), 0.0)
+                    left_mass = float(np.sum(excess[:len(excess) // 2]))
+                    right_mass = float(np.sum(excess[len(excess) // 2:]))
+                    total_mass = left_mass + right_mass
+                    winner = "merged_left" if left_mass >= right_mass else "merged_right"
+                    winner_mass = max(left_mass, right_mass)
+                    loser_mass = min(left_mass, right_mass)
+                    winner_share = winner_mass / total_mass if total_mass > 0 else 0.0
+                    margin = ((winner_mass - loser_mass) / total_mass
+                              if total_mass > 0 else 0.0)
+                    left_gap_median = float(np.median(left_half)) if len(left_half) else 0.0
+                    right_gap_median = float(np.median(right_half)) if len(right_half) else 0.0
+                    left_context_median = (float(np.median(left_context))
+                                           if len(left_context) else 0.0)
+                    right_context_median = (float(np.median(right_context))
+                                            if len(right_context) else 0.0)
+                    left_ratio = left_gap_median / max(left_context_median, 1e-6)
+                    right_ratio = right_gap_median / max(right_context_median, 1e-6)
+                    context_ratio = left_ratio if winner == "merged_left" else right_ratio
+                    decision["energy"] = {
+                        "noise_floor": round(float(noise_floor), 9),
+                        "active_floor": round(float(active_floor), 9),
+                        "frame_ms": 5.0,
+                        "frame_count": int(len(gap_rms)),
+                        "active_frame_count": int(np.sum(active)),
+                        "max_continuous_active_frames": int(max_run),
+                        "left_excess_energy_mass": round(left_mass, 9),
+                        "right_excess_energy_mass": round(right_mass, 9),
+                        "left_gap_median_rms": round(left_gap_median, 9),
+                        "right_gap_median_rms": round(right_gap_median, 9),
+                        "left_context_median_rms": round(left_context_median, 9),
+                        "right_context_median_rms": round(right_context_median, 9),
+                        "left_context_ratio": round(left_ratio, 9),
+                        "right_context_ratio": round(right_ratio, 9),
+                        "winner_context_ratio": round(context_ratio, 9),
+                    }
+                    decision["winner"] = winner
+                    decision["winner_share"] = round(winner_share, 9)
+                    decision["margin"] = round(margin, 9)
+                    if max_run < 3:
+                        decision["reason"] = "preserve_no_continuous_active"
+                    elif total_mass <= 0 or winner_mass < float(active_floor):
+                        decision["reason"] = "preserve_low_energy"
+                    elif winner_share < 0.55 or margin < 0.10:
+                        decision["reason"] = "preserve_ambiguous_energy"
+                    elif context_ratio < energy_threshold:
+                        decision["reason"] = "preserve_context_ratio"
+                    else:
+                        decision["decision"] = winner
+                        decision["reason"] = "energy_owner"
+        if unknown_internal_sp0 and decision["decision"] == "preserve":
+            unknown_reason = str(decision.get("reason") or "")
+            if (unknown_reason.startswith("preserve_")
+                    or unknown_reason in {
+                        "phone_hole", "phone_lineage_ambiguous",
+                        "missing_audio", "audio_not_covered",
+                        "preserve_all_zero_audio"}):
+                decision["energy_reason"] = decision.get("reason")
+                decision["forced_original_reason"] = decision.get("reason")
+                decision["decision"] = "merged_left"
+                decision["reason"] = "unknown_sp0_forward"
+                decision["policy"] = "unknown_sp0_forward"
+                decision["direction_source"] = "forced_left_fallback"
+        if owner_reason and punctuation_evidence is not None:
+            decision["punctuation_gap_restore"] = True
+            decision["operation"] = "punctuation_gap_restore"
+            decision["punctuation_label"] = punctuation_evidence["label"]
+        if forced_internal_sp1:
+            decision["energy_reason"] = (
+                decision["reason"] if decision.get("energy") else None)
+            if decision["reason"] != "energy_owner":
+                decision["forced_original_reason"] = decision["reason"]
+            # Internal sp1 is a structural owner policy: energy is retained
+            # as diagnostics, but never selects the right lexical owner.
+            decision["decision"] = "merged_left"
+            decision["reason"] = "forced_internal_sp1_forward"
+            decision["policy"] = "forced_internal_sp1_forward"
+            decision["direction_source"] = "forced_left"
+        if decision["after_span"] is None:
+            decision["after_span"] = {
+                "left": decision["left_old_span"],
+                "right": decision["right_old_span"],
+            }
+        decisions.append(decision)
+        index = run_end_index + 1
+
+    merges = [item for item in decisions if item["decision"] in {
+        "merged_left", "merged_right"}]
+    terminal_absorptions = [
+        item for item in decisions
+        if item.get("operation") == "terminal_punctuation_tail_absorption"]
+    punctuation_restorations = [
+        item for item in decisions if item.get("punctuation_gap_restore")]
+    if merges or terminal_absorptions or punctuation_restorations:
+        updated = [Interval(row["xmin"], row["xmax"], row["text"])
+                   for row in snapshot]
+        removed: set[int] = set()
+        for item in merges:
+            left_index = int(item["left_index"])
+            right_index = int(item["right_index"])
+            gap_start, gap_end = item["gap_span"]
+            if item["decision"] == "merged_left":
+                old = updated[left_index]
+                updated[left_index] = Interval(old.xmin, max(old.xmax, gap_end), old.text)
+                item["after_span"] = [old.xmin, max(old.xmax, gap_end)]
+            else:
+                old = updated[right_index]
+                updated[right_index] = Interval(min(old.xmin, gap_start), old.xmax, old.text)
+                item["after_span"] = [min(old.xmin, gap_start), old.xmax]
+            item["new_span"] = item["after_span"]
+            for pos in range(left_index + 1, right_index):
+                removed.add(pos)
+            item["operation"] = (
+                "forced_internal_sp1_merge"
+                if item.get("policy") in {
+                    "forced_internal_sp1", "forced_internal_sp1_forward"} else
+                "unknown_sp0_forward_merge"
+                if item.get("policy") == "unknown_sp0_forward" else
+                "energy_short_sp_merge")
+        for item in terminal_absorptions:
+            owner_index = int(item["owner_index"])
+            old = updated[owner_index]
+            tail_end = float(item["tail_span"][1])
+            updated[owner_index] = Interval(old.xmin, max(old.xmax, tail_end), old.text)
+            item["after_span"] = [old.xmin, max(old.xmax, tail_end)]
+            item["new_span"] = item["after_span"]
+            for pos in range(item["run_start_index"], item["run_end_index"] + 1):
+                removed.add(pos)
+        for item in punctuation_restorations:
+            start = int(item["run_start_index"])
+            gap_start, gap_end = item["gap_span"]
+            updated[start] = Interval(
+                float(gap_start), float(gap_end),
+                str(item["punctuation_label"]))
+            item["after_span"] = [float(gap_start), float(gap_end)]
+            item["new_span"] = item["after_span"]
+            for pos in range(start + 1, int(item["run_end_index"]) + 1):
+                removed.add(pos)
+        words_tier.intervals = [iv for pos, iv in enumerate(updated) if pos not in removed]
+        words_tier._word_energy_merge_ledger = list(merges) + list(terminal_absorptions)
+        for item in merges:
+            _record_processed_geometry_operation(
+                words_tier,
+                "forced_internal_sp1_merge"
+                if item.get("policy") in {
+                    "forced_internal_sp1", "forced_internal_sp1_forward"} else
+                "unknown_sp0_forward_merge"
+                if item.get("policy") == "unknown_sp0_forward" else
+                "energy_short_sp_merge",
+                decision=item)
+        for item in terminal_absorptions:
+            _record_processed_geometry_operation(
+                words_tier, "terminal_punctuation_tail_absorption", decision=item)
+        for item in punctuation_restorations:
+            _record_processed_geometry_operation(
+                words_tier, "punctuation_gap_restore", decision=item)
+    if report is not None:
+        report["silence_merges"] = decisions
+        report["terminal_punctuation_tail_absorption"] = terminal_absorptions
+        report["punctuation_gap_restorations"] = punctuation_restorations
+    if not hasattr(words_tier, "_word_energy_merge_ledger"):
+        words_tier._word_energy_merge_ledger = list(merges) + list(terminal_absorptions)
+    return decisions
+
+
+# Descriptive aliases keep the helper discoverable for callers/tests while
+# preserving the private naming convention used by this module.
+_resolve_visual_words_silence_merges = _resolve_visual_short_silence_merges
+resolve_visual_short_silence_merges = _resolve_visual_short_silence_merges
+
+
+def _normalize_final_internal_silence_labels(
+        textgrid: TextGrid, report: dict | None = None) -> list[dict]:
+    """Normalize retained internal pure-silence labels after owner commit.
+
+    The visual resolver must see the original labels: normalizing before that
+    decision would turn a stale exact-200ms ``<sp0>`` into ``<sp1>`` early and
+    could activate the Case 161 forced-left policy.  This pass therefore runs
+    only after all owner mutations, changes labels (never spans), and before
+    the processed-geometry freeze.
+    """
+    words_tier = tier_by_name(textgrid, "words")
+    if words_tier is None:
+        return []
+
+    intervals = words_tier.intervals
+    normalized: list[dict] = []
+    retained: dict[tuple[int, int], dict] = {}
+    for index, interval in enumerate(intervals):
+        # Leading/trailing silence, including the leading <sp1> convention,
+        # is intentionally outside this final internal-only normalization.
+        if index == 0 or index == len(intervals) - 1:
+            continue
+        current = _pure_silence_label(interval.text)
+        if current is None:
+            continue
+        duration_us = _duration_ticks(interval.xmin, interval.xmax)
+        expected = _silence_label_from_ticks(duration_us)
+        status = "unchanged"
+        if current != expected:
+            interval.text = expected
+            status = "relabelled"
+            operation = {
+                "operation": "final_internal_silence_label_normalization",
+                "span": [float(interval.xmin), float(interval.xmax)],
+                "duration_us": duration_us,
+                "from_label": current,
+                "to_label": expected,
+            }
+            _record_processed_geometry_operation(
+                words_tier, operation["operation"],
+                span=operation["span"], duration_us=operation["duration_us"],
+                from_label=operation["from_label"],
+                to_label=operation["to_label"])
+            normalized.append(operation)
+        retained[(_duration_ticks(0.0, interval.xmin),
+                  _duration_ticks(0.0, interval.xmax))] = {
+            "serialized_label": interval.text.strip(),
+            "normalization_status": status,
+            "span": [float(interval.xmin), float(interval.xmax)],
+        }
+
+    # Preserve the original owner decision evidence.  These fields describe
+    # the pre-normalization decision; serialized_label/status describe only
+    # the final retained interval that is about to be frozen.
+    decisions = report.get("silence_merges", []) if isinstance(report, dict) else []
+    if isinstance(decisions, list):
+        for decision in decisions:
+            if not isinstance(decision, dict):
+                continue
+            span = decision.get("gap_span")
+            match = None
+            if isinstance(span, (list, tuple)) and len(span) == 2:
+                start_ticks = _duration_ticks(0.0, span[0])
+                end_ticks = _duration_ticks(0.0, span[1])
+                for item in retained.values():
+                    item_start = _duration_ticks(0.0, item["span"][0])
+                    item_end = _duration_ticks(0.0, item["span"][1])
+                    if (item_start == start_ticks and item_end == end_ticks):
+                        match = item
+                        break
+            if match is None:
+                decision["serialized_label"] = None
+                decision["normalization_status"] = "not_retained_or_non_internal"
+            else:
+                decision["serialized_label"] = match["serialized_label"]
+                decision["normalization_status"] = match["normalization_status"]
+
+    if isinstance(report, dict):
+        report["silence_label_normalization"] = list(normalized)
+    return normalized
 
 
 def _is_alpha_group(s: str) -> bool:
@@ -3539,8 +6908,186 @@ def detect_bgm_suspect(textgrid: TextGrid, wav_path: Path | None, args,
             "suspect_ratio": round(suspect_ratio, 3),
             "total_sil_dur": round(total_sil_dur, 3),
             "suspect_dur": round(suspect_dur, 3),
-            "details": suspect_intervals[:10],
+        "details": suspect_intervals[:10],
         }]
+
+
+def _fallback_bgm_ctc_gap_selection(
+        words_tier: Tier | None,
+        source_words: list[dict] | None,
+        ctc_tokens: list[dict] | None,
+        correspondence: dict | None,
+        audio_axis: tuple[float, float],
+        reference_mode: str | None = "fallback") -> dict:
+    """Select BGM scan spans from exact fallback CTC lexical gaps.
+
+    The final words tier is the only candidate source.  In fallback mode a
+    complete, digest-bound correspondence is required before a final silence
+    can be narrowed to the gap between its exact adjacent CTC owners.  Any
+    missing or unsafe proof deliberately returns the legacy full-silence span
+    for every interval, so this helper cannot turn incomplete evidence into a
+    new filter shortcut.
+    """
+    axis_start, axis_end = audio_axis
+    try:
+        axis_start, axis_end = float(axis_start), float(axis_end)
+    except (TypeError, ValueError):
+        axis_start, axis_end = 0.0, 0.0
+    if not math.isfinite(axis_start) or not math.isfinite(axis_end):
+        axis_start, axis_end = 0.0, 0.0
+    axis_end = max(axis_start, axis_end)
+
+    silences = []
+    if words_tier is not None:
+        silences = [(index, interval) for index, interval in
+                    enumerate(words_tier.intervals)
+                    if is_silence(interval.text)]
+
+    validation = {
+        "schema": FALLBACK_CORRESPONDENCE_SCHEMA,
+        "status": "not_applicable" if reference_mode != "fallback" else "rejected",
+        "reasons": (["reference_mode_not_fallback"]
+                    if reference_mode != "fallback" else ["missing"]),
+        "final_interval_reindexed": False,
+        "final_surface_normalized": False,
+        "digest": None,
+    }
+    can_narrow = False
+    if reference_mode == "fallback":
+        _valid, validation = _validate_fallback_correspondence(
+            correspondence, source_words, ctc_tokens, words_tier)
+        can_narrow = bool(_valid)
+
+    lexical_positions = [
+        index for index, interval in enumerate(words_tier.intervals)
+    ] if words_tier is not None else []
+    lexical_positions = [
+        index for index in lexical_positions
+        if (words_tier.intervals[index].text.strip()
+            and not is_silence(words_tier.intervals[index].text)
+            and not is_punct(words_tier.intervals[index].text))
+    ] if words_tier is not None else []
+    lexical_ordinal = {index: ordinal for ordinal, index in
+                       enumerate(lexical_positions)}
+
+    # Build owner lookup only from the validated ledger and exact CTC
+    # ordinals.  No text or positional fallback is permitted here.
+    ctc_by_ordinal = {}
+    for index, token in enumerate(ctc_tokens or []):
+        if not isinstance(token, dict) or token.get("type", "word") != "word":
+            continue
+        ordinal = token.get("ordinal", index)
+        if type(ordinal) is int and ordinal == index:
+            ctc_by_ordinal[ordinal] = token
+    ctc_by_final: dict[int, dict] = {}
+    if can_narrow and isinstance(correspondence, dict):
+        entries = correspondence.get("entries", [])
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict) or entry.get("status") != "mapped":
+                    continue
+                final_ordinal = entry.get("final_lexical_ordinal")
+                ctc_ordinal = entry.get("ctc_ordinal")
+                if (type(final_ordinal) is int and type(ctc_ordinal) is int
+                        and ctc_ordinal in ctc_by_ordinal
+                        and final_ordinal not in ctc_by_final):
+                    ctc_by_final[final_ordinal] = ctc_by_ordinal[ctc_ordinal]
+        if set(ctc_by_final) != set(range(len(lexical_positions))):
+            can_narrow = False
+            validation = dict(validation)
+            validation["status"] = "rejected"
+            validation["reasons"] = list(validation.get("reasons", []))
+            validation["reasons"].append("owner_mapping_incomplete")
+
+    evaluated_intervals = []
+    for index, interval in silences:
+        original_start = float(interval.xmin)
+        original_end = float(interval.xmax)
+        original_duration = max(0.0, original_end - original_start)
+        left_index = next((item for item in reversed(lexical_positions)
+                           if item < index), None)
+        right_index = next((item for item in lexical_positions if item > index), None)
+        left_ordinal = lexical_ordinal.get(left_index)
+        right_ordinal = lexical_ordinal.get(right_index)
+        left_ctc = ctc_by_final.get(left_ordinal) if can_narrow else None
+        right_ctc = ctc_by_final.get(right_ordinal) if can_narrow else None
+        left_ctc_ordinal = (left_ctc.get("ordinal") if left_ctc is not None
+                            else None)
+        right_ctc_ordinal = (right_ctc.get("ordinal") if right_ctc is not None
+                             else None)
+
+        ctc_gap = None
+        selection_mode = "legacy_full_final_silence"
+        reason = "fallback_correspondence_invalid"
+        if can_narrow and (left_ctc is not None or right_ctc is not None):
+            try:
+                left_end = (float(left_ctc["end_s"])
+                            if left_ctc is not None else None)
+                right_start = (float(right_ctc["start_s"])
+                               if right_ctc is not None else None)
+                gap_start = axis_start if left_end is None else left_end
+                gap_end = axis_end if right_start is None else right_start
+                if (not math.isfinite(gap_start) or not math.isfinite(gap_end)):
+                    raise ValueError("non_finite_ctc_gap")
+                ctc_gap = [round(gap_start, 6), round(gap_end, 6)]
+                selection_mode = "ctc_gap_supported"
+                reason = "exact_adjacent_ctc_gap"
+            except (KeyError, TypeError, ValueError, OverflowError):
+                ctc_gap = None
+                reason = "ctc_gap_evidence_malformed"
+        elif can_narrow:
+            reason = "adjacent_ctc_owner_missing"
+
+        if selection_mode == "ctc_gap_supported":
+            evaluated_start = max(original_start, ctc_gap[0], axis_start)
+            evaluated_end = min(original_end, ctc_gap[1], axis_end)
+            if evaluated_end <= evaluated_start:
+                evaluated_span = None
+                evaluated_duration = 0.0
+                reason = "ctc_gap_does_not_intersect_silence"
+            else:
+                evaluated_span = [round(evaluated_start, 6),
+                                  round(evaluated_end, 6)]
+                evaluated_duration = evaluated_end - evaluated_start
+        else:
+            # Unsafe or incomplete correspondence deliberately keeps the
+            # historical full-final-silence scan.  The audio reader still
+            # clips sample indices at the point of measurement, exactly as
+            # the legacy path did.
+            evaluated_span = [round(original_start, 6), round(original_end, 6)]
+            evaluated_duration = original_duration
+
+        evaluated_intervals.append({
+            "index": index,
+            "original_silence_span": [round(original_start, 6),
+                                       round(original_end, 6)],
+            "ctc_gap": ctc_gap,
+            "evaluated_intersection": evaluated_span,
+            "left_owner_ordinal": left_ordinal,
+            "right_owner_ordinal": right_ordinal,
+            "left_final_lexical_ordinal": left_ordinal,
+            "right_final_lexical_ordinal": right_ordinal,
+            "left_ctc_ordinal": left_ctc_ordinal,
+            "right_ctc_ordinal": right_ctc_ordinal,
+            "excluded_duration": round(
+                max(0.0, original_duration - evaluated_duration), 6),
+            "evaluated_duration": round(evaluated_duration, 6),
+            "selection_mode": selection_mode,
+            "reason": reason,
+        })
+
+    return {
+        "schema": "fallback-bgm-ctc-gap-selection-v1",
+        "selection_mode": ("ctc_gap_supported" if can_narrow
+                            else "legacy_full_final_silence"),
+        "audio_axis": [round(axis_start, 6), round(axis_end, 6)],
+        "validation": {
+            "status": validation.get("status"),
+            "digest": validation.get("digest"),
+            "reasons": list(validation.get("reasons", [])),
+        },
+        "evaluated_intervals": evaluated_intervals,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3565,26 +7112,10 @@ def detect_issues(textgrid: TextGrid, args, wav_path: Path | None = None,
     if words is None or phones is None:
         return [{"rule": "missing_tier"}]
 
-    noise_floor = 1e-6
-    has_audio = audio is not None or (wav_path and wav_path.exists())
-    if has_audio:
-        if audio is None:
-            audio, sr = load_audio(wav_path)
-        try:
-            sil_energies = []
-            for p_iv in phones.intervals:
-                if not is_silence(p_iv.text) and p_iv.text != 'spn':
-                    continue
-                ss = max(0, int(p_iv.xmin * sr))
-                es = min(len(audio), int(p_iv.xmax * sr))
-                if es - ss > 0:
-                    seg = [abs(v) for v in audio[ss:es]]
-                    if seg:
-                        sil_energies.append(sum(seg) / len(seg))
-            if sil_energies:
-                noise_floor = sorted(sil_energies)[max(0, int(len(sil_energies) * 0.1))]
-        except Exception:
-            pass
+    if audio is None and wav_path is not None and wav_path.exists():
+        audio, sr = load_audio(wav_path)
+    word_energy_audit = _word_energy_audit(
+        words, args, audio, sr, textgrid=textgrid)
 
     for idx, w in enumerate(words.intervals):
         if not w.text.strip() or is_silence(w.text):
@@ -3610,26 +7141,6 @@ def detect_issues(textgrid: TextGrid, args, wav_path: Path | None = None,
         _max_dur = 8.0 if (_is_en_nvv) else 3.0
         if w.duration > _max_dur:
             issues.append({"rule": "word_too_long", "text": w.text, "duration": round(w.duration, 4)})
-        # Word energy at silence level -> likely misaligned into a silence gap.
-        # Skip when the word is adjacent to an English / NVV token — MFA
-        # cannot model those, so their boundaries bleed into neighbours.
-        _prev_w = words.intervals[idx - 1] if idx > 0 else None
-        _next_w = words.intervals[idx + 1] if idx + 1 < len(words.intervals) else None
-        _near_en_nvv = (
-            (_prev_w and (is_english_token(_prev_w.text) or is_nvv_token(_prev_w.text)))
-            or (_next_w and (is_english_token(_next_w.text) or is_nvv_token(_next_w.text)))
-        )
-        _word_in_silence_enabled = getattr(args, "enable_word_in_silence_filter", None)
-        if (_word_in_silence_enabled is None
-                and args.filter_word_energy_ratio > 0):
-            _word_in_silence_enabled = True
-        if (not _is_en_nvv and not is_punct(w.text) and not _near_en_nvv
-                and _word_in_silence_enabled is True
-                and args.filter_word_energy_ratio > 0 and noise_floor > 1e-8):
-            w_energy = _word_rms(audio, sr, w.xmin, w.xmax) if (wav_path and wav_path.exists()) else 999
-            if 0 < w_energy < noise_floor * args.filter_word_energy_ratio:
-                issues.append({"rule": "word_in_silence", "text": w.text,
-                               "energy": round(w_energy, 6), "noise_floor": round(noise_floor, 6)})
         if w.duration >= args.filter_min_word_sec and cov < args.filter_min_phone_coverage:
             issues.append({"rule": "low_phone_coverage", "text": w.text, "coverage": round(cov, 3)})
         if sg > args.filter_edge_gap_sec or eg > args.filter_edge_gap_sec:
@@ -3643,6 +7154,17 @@ def detect_issues(textgrid: TextGrid, args, wav_path: Path | None = None,
                 and prev_w.duration >= args.filter_flank_silence_sec
                 and next_w.duration >= args.filter_flank_silence_sec):
             issues.append({"rule": "short_word_between_silences", "text": w.text})
+    if _word_energy_enabled(args):
+        for item in word_energy_audit.get("items", []):
+            if item.get("resulting_reason"):
+                issues.append({
+                    "rule": item["resulting_reason"],
+                    "text": item.get("word"),
+                    "energy": round(item["rms"]["premerge_rms"], 6),
+                    "noise_floor": round(word_energy_audit["noise_model"]["noise_floor"], 6),
+                    "threshold": round(word_energy_audit["noise_model"]["threshold"], 6),
+                    "classification": item.get("classification"),
+                })
     # ── Phone-level checks ──
     # Build time ranges for English / NVV word intervals so phone checks
     # can skip them — MFA cannot model these words and produces artifact
@@ -3704,6 +7226,49 @@ def _build_original_text_index(raw_text_dir: Path | None) -> dict[str, Path]:
     return index
 
 
+def _build_wav_index(wav_dir: Path | None) -> dict[str, Path]:
+    """Build a deterministic one-shot basename index for WAV lookup."""
+    if not wav_dir or not wav_dir.exists():
+        return {}
+    try:
+        candidates = sorted(
+            (path for path in wav_dir.rglob("*.wav") if path.is_file()),
+            key=lambda path: (len(path.relative_to(wav_dir).parts),
+                              path.relative_to(wav_dir).as_posix()),
+        )
+    except OSError:
+        return {}
+    index: dict[str, Path] = {}
+    for path in candidates:
+        index.setdefault(path.stem, path)
+    return index
+
+
+def _find_wav(stem: str, wav_dir: Path | None,
+              wav_index: dict[str, Path] | None = None) -> Path:
+    """Resolve a WAV using an optional index, with safe recursive fallback."""
+    if not wav_dir:
+        return Path(f"{stem}.wav")
+    if wav_index is not None:
+        indexed = wav_index.get(stem)
+        if indexed is not None and indexed.is_file():
+            return indexed
+
+    # Preserve the legacy precedence: an exact top-level path wins before a
+    # recursive candidate.  This also handles an indexed path disappearing.
+    top_level = wav_dir / f"{stem}.wav"
+    if top_level.is_file():
+        return top_level
+    try:
+        candidates = sorted(
+            (path for path in wav_dir.rglob(f"{stem}.wav") if path.is_file()),
+            key=lambda path: path.relative_to(wav_dir).as_posix(),
+        )
+    except OSError:
+        return top_level
+    return candidates[0] if candidates else top_level
+
+
 def find_original_text(stem: str, raw_text_dir: Path | None,
                        text_index: dict[str, Path] | None = None) -> str:
     """Find the original Chinese text for a given output stem (searches recursively)."""
@@ -3757,22 +7322,187 @@ def find_original_text(stem: str, raw_text_dir: Path | None,
     return ""
 
 
-def _inject_punctuation(words_tier: Tier, pp_tier: Tier | None,
-                         punct_entries: list[dict]) -> tuple[Tier, Tier | None]:
-    """Inject punctuation intervals from CTC anchors into words tier.
+def find_original_text_path(stem: str, raw_text_dir: Path | None,
+                            text_index: dict[str, Path] | None = None) -> Path | None:
+    """Return the authority source path without normalizing its bytes."""
+    if not raw_text_dir or not raw_text_dir.exists():
+        return None
+    names = [f"{stem}.txt", f"{stem}_ref.txt"]
+    names.extend(f"{stem}{suffix}.txt"
+                 for suffix in ("_qwen3-api", "_qwen3", "_firered"))
+    match = re.search(r"_(firered|qwen3|qwen3-api)$", stem)
+    if match:
+        base = stem[:match.start()]
+        names.extend([f"{base}.txt", f"{base}_ref.txt"])
+        names.extend(f"{base}{suffix}.txt"
+                     for suffix in ("_qwen3-api", "_qwen3", "_firered"))
+    if text_index is not None:
+        for name in names:
+            path = text_index.get(name)
+            if path is not None and path.is_file():
+                return path
+        return None
+    for name in names:
+        candidates = sorted(path for path in raw_text_dir.rglob(name)
+                            if path.is_file())
+        if candidates:
+            return candidates[0]
+    return None
 
-    Punctuation has no acoustic realization but has precise CTC anchor
-    timestamps.  Each entry is inserted at its CTC time, splitting or
-    trimming adjacent intervals as needed.  Corresponding silence is
-    inserted in pinyin_phones.
+
+def _inject_punctuation(words_tier: Tier, pp_tier: Tier | None,
+                         punct_entries: list[dict],
+                         reference_text: str = "",
+                         reference_authoritative: bool = False
+                         ) -> tuple[Tier, Tier | None]:
+    """Inject only reference-confirmed punctuation in a local word gap.
+
+    CTC punctuation is evidence about timing, not lexical authority.  With
+    no authoritative reference sequence this function is intentionally a
+    no-op: CTC-only punctuation, including terminal punctuation, must not
+    consume any lexical or tail time.  Confirmed punctuation is bound to the
+    reference lexical boundary first; its CTC interval is then clipped to
+    that local owner range.  An anchor can never extend over unrelated audio.
     """
     from dataclasses import replace as _replace
 
-    # Build combined interval list: original words + punctuation
+    if not punct_entries or not reference_authoritative or not reference_text:
+        return words_tier, pp_tier
+
+    allowed = '，。…！？、；：,.!?;:～'
+    reference_puncts: list[tuple[str, int]] = []
+    reference_lexical_count = 0
+    for unit in _extract_word_chars(reference_text):
+        if is_punct(unit) and unit.strip() in allowed:
+            reference_puncts.append((unit.strip(), reference_lexical_count))
+        elif is_word_like(unit):
+            reference_lexical_count += 1
+    lexical = [iv for iv in words_tier.intervals
+               if iv.text.strip() and not is_silence(iv.text)
+               and not is_punct(iv.text)]
+    if reference_lexical_count != len(lexical):
+        # Exact semantic binding is unavailable (for example an English
+        # surface is still split), so defer to the later authority restore.
+        return words_tier, pp_tier
+
+    # Match CTC punctuation to the authoritative semantic sequence in time
+    # order.  This permits a missing CTC mark but rejects extra/reordered
+    # marks; no timestamp-only occurrence is accepted.
+    def _punct_entry_time(pair: tuple[int, dict]) -> float:
+        if not isinstance(pair[1], dict):
+            return math.inf
+        try:
+            value = float(pair[1].get("start_s", 0.0))
+        except (TypeError, ValueError):
+            return math.inf
+        return value if math.isfinite(value) else math.inf
+
+    entries_by_time = sorted(enumerate(punct_entries), key=_punct_entry_time)
+    matched: list[tuple[dict, int]] = []
+    reference_cursor = 0
+    for _, entry in entries_by_time:
+        if not isinstance(entry, dict):
+            continue
+        char = str(entry.get("word", "")).strip()
+        if char not in allowed:
+            continue
+        match = None
+        for ref_index in range(reference_cursor, len(reference_puncts)):
+            if reference_puncts[ref_index][0] == char:
+                match = ref_index
+                break
+        if match is None:
+            continue
+        reference_cursor = match + 1
+        boundary = reference_puncts[match][1]
+        prev = lexical[boundary - 1] if boundary > 0 else None
+        nxt = lexical[boundary] if boundary < len(lexical) else None
+        try:
+            anchor_start = float(entry["start_s"])
+            anchor_end = float(entry["end_s"])
+        except (KeyError, TypeError, ValueError):
+            # Semantic authority alone is not timing ownership.  Without a
+            # finite source occurrence, fail closed instead of guessing the
+            # whole local gap.
+            continue
+        left_bound = prev.xmin if prev is not None else words_tier.xmin
+        right_bound = nxt.xmax if nxt is not None else words_tier.xmax
+        if (not math.isfinite(anchor_start) or not math.isfinite(anchor_end)
+                or anchor_end <= anchor_start
+                or anchor_start < left_bound - AXIS_EPS
+                or anchor_end > right_bound + AXIS_EPS):
+            # An authoritative punctuation character with no local source
+            # span is retained as a missing/filtered occurrence; it may not
+            # consume unrelated audio or an edge remainder.
+            continue
+        # A confirmed mark may replace a pause, not voiced lexical audio.
+        # Require an explicit silence interval overlapping its CTC anchor
+        # before allowing the resolver to clip either adjacent word.
+        local_silences = [iv for iv in words_tier.intervals
+                          if is_silence(iv.text) and iv.text.strip()
+                          and iv.xmax > anchor_start + AXIS_EPS
+                          and iv.xmin < anchor_end - AXIS_EPS]
+        if not local_silences:
+            continue
+        support = max(
+            local_silences,
+            key=lambda iv: min(iv.xmax, anchor_end)
+            - max(iv.xmin, anchor_start))
+        anchor_start = max(anchor_start, support.xmin)
+        anchor_end = min(anchor_end, support.xmax)
+        if anchor_end <= anchor_start + AXIS_EPS:
+            continue
+        has_local_silence = any(
+            is_silence(iv.text) and iv.text.strip()
+            and iv.xmax >= anchor_start - AXIS_EPS
+            and iv.xmin <= anchor_end + AXIS_EPS
+            for iv in words_tier.intervals)
+        if not has_local_silence:
+            continue
+        left_end = min(prev.xmax, anchor_start) if prev is not None else anchor_start
+        right_start = max(nxt.xmin, anchor_end) if nxt is not None else anchor_end
+        if ((prev is not None and left_end <= prev.xmin + AXIS_EPS)
+                or (nxt is not None and right_start >= nxt.xmax - AXIS_EPS)):
+            continue
+        nonadjacent_overlap = any(
+            index not in {boundary - 1, boundary}
+            and iv.xmax > anchor_start + AXIS_EPS
+            and iv.xmin < anchor_end - AXIS_EPS
+            for index, iv in enumerate(lexical))
+        if nonadjacent_overlap:
+            continue
+        bound = dict(entry)
+        bound["start_s"] = anchor_start
+        bound["end_s"] = anchor_end
+        # Keep the semantic boundary alongside the timing anchor.  The
+        # resolver must know which of the two adjacent lexical owners may be
+        # clipped when a later CTC/MFA adjustment has made the anchor fall
+        # inside a word.
+        bound["_reference_boundary"] = boundary
+        matched.append((bound, boundary))
+
+    # Only the bound, reference-confirmed occurrences enter the historical
+    # interval resolver below.
+    punct_entries = [entry for entry, _ in matched]
+    if not punct_entries:
+        return words_tier, pp_tier
+
+    # Build combined interval list: original words + punctuation.  A CTC
+    # punctuation interval that is exactly the same owner as an explicit
+    # silence is provisional evidence, not permission to replace the silence.
+    # Reference reconciliation can later restore the mark if it is actually
+    # authoritative; retaining the silence here is what preserves a CTC-only
+    # terminal mark's edge remainder.
+    explicit_silences = [iv for iv in words_tier.intervals
+                         if is_silence(iv.text) and iv.text.strip()]
     combined = []
     for iv in words_tier.intervals:
         combined.append((iv.xmin, iv.xmax, iv.text, "word"))
     for p in punct_entries:
+        if any(abs(float(p["start_s"]) - silence.xmin) <= AXIS_EPS
+               and abs(float(p["end_s"]) - silence.xmax) <= AXIS_EPS
+               for silence in explicit_silences):
+            continue
         combined.append((p["start_s"], p["end_s"], p["word"], "punct"))
 
     combined.sort(key=lambda x: x[0])
@@ -3784,6 +7514,18 @@ def _inject_punctuation(words_tier: Tier, pp_tier: Tier | None,
         s, e, text, kind = c
         if e > s:
             resolved.append((s, e, text, kind))
+
+    def _punct_boundary(start: float, end: float, text: str) -> int | None:
+        """Return the reference boundary for a resolved punctuation anchor."""
+        for entry in punct_entries:
+            if (entry.get("word", "") == text
+                    and abs(float(entry.get("start_s", -math.inf)) - start)
+                    <= AXIS_EPS
+                    and abs(float(entry.get("end_s", -math.inf)) - end)
+                    <= AXIS_EPS):
+                boundary = entry.get("_reference_boundary")
+                return int(boundary) if boundary is not None else None
+        return None
 
     # 构建 phone 边界查找: word_text -> [(phone_start, phone_end), ...]
     phone_map: dict[str, list[tuple[float, float]]] = {}
@@ -3821,8 +7563,39 @@ def _inject_punctuation(words_tier: Tier, pp_tier: Tier | None,
                 continue
             if ws < pe and we > ps:  # overlap exists
                 if ws <= ps and we >= pe:
-                    # word contains punct → delete punct
-                    resolved[pi] = (0, 0, "", pkind)
+                    # A reference-confirmed punctuation anchor has priority
+                    # over an extended lexical owner.  The old code deleted
+                    # the punctuation here, which is exactly how a mark that
+                    # existed before MFA/CTC boundary compensation was
+                    # permanently lost.  Clip only the immediate owner on
+                    # the side dictated by the reference boundary.
+                    boundary = _punct_boundary(ps, pe, ptext)
+                    prev_owner = (lexical[boundary - 1]
+                                  if boundary is not None and boundary > 0
+                                  else None)
+                    next_owner = (lexical[boundary]
+                                  if boundary is not None
+                                  and boundary < len(lexical) else None)
+                    is_prev_owner = (
+                        prev_owner is not None
+                        and wtext == prev_owner.text
+                        and abs(ws - prev_owner.xmin) <= AXIS_EPS)
+                    is_next_owner = (
+                        next_owner is not None
+                        and wtext == next_owner.text
+                        and abs(we - next_owner.xmax) <= AXIS_EPS)
+                    if is_prev_owner and ps > ws + AXIS_EPS:
+                        resolved[wi] = (ws, ps, wtext, wkind)
+                    elif is_next_owner and pe < we - AXIS_EPS:
+                        resolved[wi] = (pe, we, wtext, wkind)
+                    else:
+                        # A confirmed anchor should not be discarded merely
+                        # because a duplicate/fragmented lexical interval
+                        # prevents an exact owner identity match.  Leave the
+                        # word untouched; the authoritative restore pass will
+                        # perform the same local clipping with the reference
+                        # lexical sequence.
+                        pass
                     break
                 elif ws <= ps:
                     # word overlaps left side of punct → trim punct start
@@ -3879,89 +7652,15 @@ def _inject_punctuation(words_tier: Tier, pp_tier: Tier | None,
     # 去掉零时长
     merged = [(s, e, t, k) for s, e, t, k in merged if e > s + 0.001]
 
-    # 微小静音间隙合并到后续标点或 NVV (<sp> -> 吸收进标点/NVV)
-    for gi in range(len(merged)):
-        gs, ge, gtext, gkind = merged[gi]
-        if not (gkind in ("word", "gap") and is_silence(gtext)):
-            continue
-        # 找后面紧接的标点或 NVV
-        for pi in range(len(merged)):
-            target = merged[pi]
-            is_target = (target[3] == "punct" or is_nvv_token(target[2]))
-            if is_target and abs(target[0] - ge) < 0.01:
-                # NVV 前间隙无条件合并 (NVV 天然含静音, 但句首不合并)
-                # 标点前间隙合并 ≤500ms
-                gap_dur = ge - gs
-                if gs < 0.01:
-                    pass  # 句首间隙不合并
-                elif is_nvv_token(target[2]) or gap_dur <= 0.5:
-                    merged[pi] = (gs, target[1], target[2], target[3])
-                    merged[gi] = (0, 0, "", "word")
-                break
+    # Internal-sp ownership is deliberately not guessed in this constructor.
+    # The owner-aware passes run after punctuation injection: an accepted
+    # punctuation anchor absorbs only its colocated silence, while an
+    # unowned internal <spN> remains visible and is vetoed by the final QC.
 
-    merged = [(s, e, t, k) for s, e, t, k in merged if e > s + 0.001]
-
-    # 标点右边界延伸到下个词的 start (消除标点与词之间的微间隙)
-    for pi in range(len(merged)):
-        ps, pe, ptext, pkind = merged[pi]
-        if pkind != "punct":
-            continue
-        for wi in range(len(merged)):
-            ws, we, wtext, wkind = merged[wi]
-            if wkind == "word" and not is_silence(wtext) and ws >= pe:
-                gap = ws - pe
-                if 0 < gap < 0.5:
-                    merged[pi] = (ps, ws, ptext, pkind)
-                break
-
-    # 标点延展后清理被覆盖的间隙
-    for gi in range(len(merged)):
-        gs, ge, gtext, gkind = merged[gi]
-        if not (gkind in ("word", "gap") and is_silence(gtext)):
-            continue
-        for pi in range(len(merged)):
-            ps, pe, ptext, pkind = merged[pi]
-            if pkind != "punct":
-                continue
-            if gs < pe and ge > ps:
-                if gs < ps:
-                    merged[gi] = (gs, ps, gtext, gkind)
-                else:
-                    merged[gi] = (pe, ge, gtext, gkind)
-
-    merged = [(s, e, t, k) for s, e, t, k in merged if e > s + 0.001]
-
-    # 残余微小 <sp> 合并到前一词 (词间微间隙吸收)
-    for gi in range(len(merged)):
-        gs, ge, gtext, gkind = merged[gi]
-        if not (gkind in ("word", "gap") and is_silence(gtext)):
-            continue
-        if ge - gs > 0.5:
-            continue
-        # 句首间隙不合并 (保留 <sp1> 标记)
-        if gs < 0.01:
-            continue
-        # 优先合并到后一词 (延伸后词 start), 不成再合并到前一词
-        merged_to_next = False
-        for wi in range(len(merged)):
-            ws, we, wtext, wkind = merged[wi]
-            if wkind == "word" and not is_silence(wtext) and abs(ws - ge) < 0.01:
-                merged[wi] = (gs, we, wtext, wkind)
-                merged[gi] = (0, 0, "", "word")
-                merged_to_next = True
-                break
-        if merged_to_next:
-            continue
-        for wi in range(len(merged)):
-            ws, we, wtext, wkind = merged[wi]
-            if wkind == "word" and not is_silence(wtext) and abs(we - gs) < 0.01:
-                merged[wi] = (ws, ge, wtext, wkind)
-                merged[gi] = (0, 0, "", "word")
-                break
-
-    merged = [(s, e, t, k) for s, e, t, k in merged if e > s + 0.001]
-
-    # 最后标点: 吸收前后静音, 延伸到音频结束
+    # 最后标点保留其 CTC/local-gap end.  The old implementation extended
+    # every final mark to ``words_tier.xmax`` and therefore converted an
+    # explicit tail silence into punctuation (and enlarged the preceding
+    # lexical owner after a later reference restore).
     last_punct = None
     for m in reversed(merged):
         if m[3] == "punct":
@@ -3970,27 +7669,24 @@ def _inject_punctuation(words_tier: Tier, pp_tier: Tier | None,
     if last_punct:
         punct_start = last_punct[0]
         punct_text = last_punct[2]
-        # 反向找前一个非 silence 词, 标点从词的 end 开始
-        for m in reversed(merged):
-            if m[3] == "word" and not is_silence(m[2]):
-                punct_start = m[1]
-                break
-        # 确保最后标点至少 30ms: 当末词 xmax == words_tier.xmax 时
-        # (如音频恰好在词边界结束), 标点不会变成零时长被丢弃.
-        punct_end = max(punct_start + 0.030, words_tier.xmax)
-        # 重建: 保留非静音 + 最后标点(延伸)
-        new_merged = []
-        for m in merged:
-            if m is last_punct:
-                new_merged.append((punct_start, punct_end, punct_text, "punct"))
-            elif m[1] <= punct_start + 0.001:
-                new_merged.append(m)
-        merged = new_merged
+        if last_punct[1] > punct_start:
+            # Keep all owners through the local punctuation end.  Any
+            # remaining edge is retained as canonical silence below.
+            new_merged = []
+            for m in merged:
+                if m is last_punct:
+                    new_merged.append((punct_start, last_punct[1], punct_text,
+                                       "punct"))
+                else:
+                    new_merged.append(m)
+            merged = new_merged
 
     # Build new words tier (skip zero-duration intervals, ensure sorted)
     merged.sort(key=lambda x: x[0])
     new_words = [Interval(iv[0], iv[1], iv[2]) for iv in merged if iv[1] > iv[0]]
-    new_words_tier = Tier(words_tier.name, words_tier.xmin, words_tier.xmax, new_words)
+    new_words_tier = _copy_tier_metadata(
+        words_tier, Tier(words_tier.name, words_tier.xmin, words_tier.xmax, new_words))
+    new_words_tier = _reconcile_publication_geometry(new_words_tier)
 
     # Build new pinyin_phones tier (word -> phone, punct -> punct char)
     if pp_tier is not None:
@@ -4100,6 +7796,9 @@ def _extend_word_into_ellipsis(words_tier: Tier, pp_tier: Tier | None,
         iv_curr = intervals[i]
         iv_next = intervals[i + 1]
 
+        if _ctc_authoritative_ordinal(words_tier, i) is not None:
+            continue
+
         if is_nvv_token(iv_curr.text) or is_punct(iv_curr.text):
             continue
         if iv_curr.text.strip() in SILENCE_LABELS:
@@ -4186,7 +7885,8 @@ def _extend_word_into_ellipsis(words_tier: Tier, pp_tier: Tier | None,
         intervals[i + 1] = Interval(new_word_end, ellipsis_end, '…')
 
     intervals = [iv for iv in intervals if iv.xmax > iv.xmin + 0.001]
-    new_words = Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals)
+    new_words = _copy_tier_metadata(
+        words_tier, Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals))
 
     if pp_tier is not None:
         pp_ivs = list(pp_tier.intervals)
@@ -4233,6 +7933,8 @@ def _merge_nvv_ellipsis(words_tier: Tier, pp_tier: Tier | None,
     for i in range(n - 1):
         iv_curr = intervals[i]
         iv_next = intervals[i + 1]
+        if _ctc_authoritative_ordinal(words_tier, i) is not None:
+            continue
         if not is_nvv_token(iv_curr.text):
             continue
         if iv_next.text.strip() != '…':
@@ -4271,7 +7973,8 @@ def _merge_nvv_ellipsis(words_tier: Tier, pp_tier: Tier | None,
 
     # 去零时长
     intervals = [iv for iv in intervals if iv.xmax > iv.xmin + 0.001]
-    new_words = Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals)
+    new_words = _copy_tier_metadata(
+        words_tier, Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals))
 
     # pinyin_phones: NVV 延伸到新边界
     if pp_tier is not None:
@@ -4321,6 +8024,16 @@ def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
     for i in range(n - 1, -1, -1):
         iv = intervals[i]
         if is_silence(iv.text) or not iv.text.strip():
+            continue
+        # Explicit visual silence is reserved for the final owner resolver;
+        # boundary refinement may not resize or consume that interval.
+        if ((i > 0 and is_silence(intervals[i - 1].text))
+                or (i + 1 < n and is_silence(intervals[i + 1].text))):
+            continue
+        if _ctc_authoritative_ordinal(words_tier, i) is not None:
+            # A valid CTC anchor is the word-level authority.  Energy may
+            # diagnose the interval later, but it must not move this word
+            # outside the accepted CTC span.
             continue
         # Skip English/NVV: MFA cannot model their phones, so energy checks
         # are unreliable.  CTC boundaries (from _snap_to_ctc) are authoritative.
@@ -4404,6 +8117,8 @@ def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
         iv = intervals[i]
         if is_silence(iv.text) or not iv.text.strip():
             continue
+        if _ctc_authoritative_ordinal(words_tier, i) is not None:
+            continue
         if is_english_token(iv.text) or is_nvv_token(iv.text):
             continue
         prev_iv = intervals[i - 1]
@@ -4448,6 +8163,8 @@ def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
     for i in range(1, n):
         iv = intervals[i]
         if is_silence(iv.text) or not iv.text.strip():
+            continue
+        if _ctc_authoritative_ordinal(words_tier, i) is not None:
             continue
         if is_english_token(iv.text) or is_nvv_token(iv.text):
             continue
@@ -4531,6 +8248,8 @@ def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
         iv = intervals[i]
         if is_silence(iv.text) or not iv.text.strip():
             continue
+        if _ctc_authoritative_ordinal(words_tier, i) is not None:
+            continue
         if is_english_token(iv.text) or is_nvv_token(iv.text):
             continue
         if i + 1 >= n:
@@ -4538,16 +8257,16 @@ def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
         next_iv = intervals[i + 1]
         if next_iv.xmax <= next_iv.xmin:
             continue
-        # Extend into: NVV always; silence gaps when no punctuation follows;
-        # regular words when leading portion is dead silence.
-        # Only skip real punctuation (not silence tokens like <eps>/<spN>).
-        # Silence gaps adjacent to words without punctuation are absorbable.
+        # Explicit words-tier silence is reserved for the final visual
+        # resolver; this stage may not consume or resize it.
+        if is_silence(next_iv.text):
+            continue
         if is_punct(next_iv.text) and not is_silence(next_iv.text):
             continue
 
         extend_into_word = False
         if not is_nvv_token(next_iv.text):
-            # Silence or word: check if there's dead silence worth absorbing
+            # Regular word: check if the leading portion is dead silence.
             check_s = int(iv.xmax * sr)
             check_e = int(min(iv.xmax + 0.300, next_iv.xmax) * sr)
             if check_e - check_s < int(0.080 * sr):
@@ -4732,6 +8451,9 @@ def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
         next_iv = intervals[i + 1]
         if not is_silence(next_iv.text):
             continue
+        # NVV is a protected semantic owner; its explicit following silence
+        # is still left for the final visual snapshot, not consumed here.
+        continue
         if next_iv.xmax <= next_iv.xmin:
             continue
 
@@ -4851,7 +8573,8 @@ def _refine_boundaries_by_energy(words_tier: Tier, audio, sr: int,
             intervals.insert(i + 1, Interval(new_end_s, iv.xmax, gap_label))
 
     intervals = [iv for iv in intervals if iv.xmax > iv.xmin + 0.001]
-    return Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals)
+    return _copy_tier_metadata(
+        words_tier, Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals))
 
 
 
@@ -4861,13 +8584,13 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
                   punct_entries: list[dict] | None = None,
                   audio=None, sr: int = 16000,
                   _punct_boundary_hits: list | None = None) -> tuple[Tier, Tier | None]:
-    """Snap MFA word boundaries to CTC anchors only when they differ too much.
+    """Resolve word spans with CTC as the cross-word anchor.
 
-    If |MFA - CTC| <= snap_threshold: trust MFA, keep MFA boundaries.
-    If |MFA - CTC| >  snap_threshold: MFA likely misaligned, snap to CTC.
-    When MFA and CTC disagree within the threshold, energy analysis on
-    the disputed region decides: energy above noise → MFA wins (speech
-    continues), energy at noise level → CTC wins (silence after CTC end).
+    MFA remains useful for deciding whether a close CTC span contains speech,
+    and its phone timing is retained as the within-word proportional source.
+    It must not move a word through the neighbouring CTC anchor: adjacent
+    conflicts are resolved at the CTC boundary (or the midpoint of
+    overlapping CTC spans), with any remaining gap represented explicitly.
 
     When keeping MFA boundaries, silence gaps use CTC gap positions to
     correctly place punctuation between words.
@@ -4883,6 +8606,8 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
     # When counts differ (common with NVV/English tokens), use
     # Needleman-Wunsch to find matching pairs instead of skipping.
     ctc_aligned: list[dict | None] = list(ctc_tokens)  # 1:1 with mfa_words after alignment
+    ctc_word_lexical_ordinal = {
+        id(token): ordinal for ordinal, token in enumerate(ctc_tokens)}
 
     if len(mfa_words) != len(ctc_tokens):
         # Needleman-Wunsch alignment on token text
@@ -4901,6 +8626,7 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
 
     new_word_ivs = []        # (xmin, xmax, text, source)
     new_phone_ivs = []       # (xmin, xmax, text)
+    ctc_authority: list[dict] = []
 
     # Pass 0: detect NVV/English overlap with previous word's CTC.
     # When an NVV's CTC start falls before the previous word's CTC end,
@@ -4931,6 +8657,18 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
             # Unmatched token — keep MFA boundaries unchanged
             word_start = mfa_iv.xmin
             word_end = mfa_iv.xmax
+            ctc_authority.append({
+                "lexical_ordinal": len(ctc_authority),
+                "text": mfa_iv.text.strip(),
+                "boundary_source": "mfa",
+                "ctc_lexical_ordinal": None,
+                "ctc_span": None,
+                "mfa_span": [float(mfa_iv.xmin), float(mfa_iv.xmax)],
+                "resolved_span": [float(word_start), float(word_end)],
+                "initial_resolved_span": [float(word_start), float(word_end)],
+                "published_span": None,
+                "operations": [],
+            })
             for p_iv in (pp_tier.intervals if pp_tier else []):
                 if p_iv.xmax > mfa_iv.xmin and p_iv.xmin < mfa_iv.xmax:
                     new_phone_ivs.append((p_iv.xmin, p_iv.xmax, p_iv.text))
@@ -5096,6 +8834,41 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
             word_start = ctc_start
             word_end = ctc_end
 
+        # Reconcile the selected MFA spans against the neighbouring CTC
+        # boundary even when they do not literally overlap.  A previous MFA
+        # end can be later than the CTC end while the current MFA start is
+        # exactly that late end; checking only ``word_start < prev_end`` would
+        # miss this case and leave the CTC word squeezed or shifted right.
+        if (ctc is not None and prev_ctc_end > prev_ctc_start + AXIS_EPS
+                and len(new_word_ivs) >= 1
+                and new_word_ivs[-1][3] == "word"):
+            previous_entry = new_word_ivs[-1]
+            if prev_ctc_end <= ctc_start + AXIS_EPS:
+                ctc_prev_end = prev_ctc_end
+                ctc_current_start = ctc_start
+            else:
+                ctc_boundary = (prev_ctc_end + ctc_start) / 2.0
+                ctc_prev_end = ctc_boundary
+                ctc_current_start = ctc_boundary
+            needs_ctc_boundary = (
+                previous_entry[1] > ctc_prev_end + AXIS_EPS
+                or word_start > ctc_current_start + AXIS_EPS
+                or (prev_ctc_end > ctc_start + AXIS_EPS
+                    and word_start < ctc_current_start - AXIS_EPS))
+            if needs_ctc_boundary and ctc_prev_end > previous_entry[0] + AXIS_EPS:
+                new_word_ivs[-1] = (
+                    previous_entry[0], ctc_prev_end,
+                    previous_entry[2], previous_entry[3])
+                prev_end = ctc_prev_end
+                if ctc_authority:
+                    ctc_authority[-1]["resolved_span"][1] = float(ctc_prev_end)
+                word_start = ctc_current_start
+                # Once the neighbouring boundary has required CTC
+                # compensation, do not let the current MFA tail re-expand
+                # through the same CTC-owned word span.
+                if word_end > ctc_end + AXIS_EPS:
+                    word_end = ctc_end
+
         # 防止词间重叠: start 不能在前一词 end 之前
         # NVV: 缩短前词尾让路（NVV 无 MFA 声学模型，CTC 是唯一依据）
         # English/Chinese normally push forward (MFA boundaries have acoustic
@@ -5109,30 +8882,62 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
         # handles larger overlaps: NVV pushes into prev word, English
         # and Chinese snap to the prev word's end.
         if word_start < prev_end:
-            prev_was_silence_extended = (
-                prev_end > prev_ctc_end + 0.10  # >100ms silence extension
-                and not is_nvv_token(mfa_iv.text)
-                and not is_english_token(mfa_iv.text)
-            )
-            if is_nvv_token(mfa_iv.text) or prev_was_silence_extended:
-                if len(new_word_ivs) >= 1 and new_word_ivs[-1][3] == "word":
-                    prev_entry = new_word_ivs[-1]
-                    new_prev_end = max(word_start - 0.005, prev_entry[0] + 0.010)
-                    if new_prev_end > prev_entry[0]:
-                        new_word_ivs[-1] = (prev_entry[0], new_prev_end, prev_entry[2], prev_entry[3])
-                        prev_end = new_prev_end
+            # CTC is the word-level anchor.  The old fallback simply assigned
+            # ``word_start = prev_end`` whenever MFA and CTC overlapped.  If
+            # the previous word retained an MFA end, that silently moved the
+            # current CTC word to the right and could squeeze it to a few
+            # milliseconds (for example wan3/fan4).  Resolve the pair at the
+            # CTC boundary instead: an ordered pair preserves its CTC gap,
+            # while overlapping CTC spans are split at their midpoint.
+            ctc_pair_resolved = False
+            if (ctc is not None and prev_ctc_end > prev_ctc_start + AXIS_EPS
+                    and len(new_word_ivs) >= 1
+                    and new_word_ivs[-1][3] == "word"):
+                if prev_ctc_end <= ctc_start + AXIS_EPS:
+                    ctc_prev_end = prev_ctc_end
+                    ctc_current_start = ctc_start
+                else:
+                    ctc_boundary = (prev_ctc_end + ctc_start) / 2.0
+                    ctc_prev_end = ctc_boundary
+                    ctc_current_start = ctc_boundary
+                previous_entry = new_word_ivs[-1]
+                if ctc_prev_end > previous_entry[0] + AXIS_EPS:
+                    new_word_ivs[-1] = (
+                        previous_entry[0], ctc_prev_end,
+                        previous_entry[2], previous_entry[3])
+                    prev_end = ctc_prev_end
+                    if ctc_authority:
+                        ctc_authority[-1]["resolved_span"][1] = float(ctc_prev_end)
+                word_start = max(word_start, ctc_current_start)
+                ctc_pair_resolved = True
+
+            if not ctc_pair_resolved:
+                prev_was_silence_extended = (
+                    prev_end > prev_ctc_end + 0.10  # >100ms silence extension
+                    and not is_nvv_token(mfa_iv.text)
+                    and not is_english_token(mfa_iv.text)
+                )
+                if is_nvv_token(mfa_iv.text) or prev_was_silence_extended:
+                    if len(new_word_ivs) >= 1 and new_word_ivs[-1][3] == "word":
+                        prev_entry = new_word_ivs[-1]
+                        new_prev_end = max(word_start - 0.005, prev_entry[0] + 0.010)
+                        if new_prev_end > prev_entry[0]:
+                            new_word_ivs[-1] = (prev_entry[0], new_prev_end, prev_entry[2], prev_entry[3])
+                            prev_end = new_prev_end
+                            if ctc_authority:
+                                ctc_authority[-1]["resolved_span"][1] = float(new_prev_end)
+                        else:
+                            word_start = prev_end
                     else:
                         word_start = prev_end
                 else:
                     word_start = prev_end
-            else:
-                word_start = prev_end
 
         # Guard against inverted intervals: when overlap fix pushes word_start
         # past word_end (prev word CTC-snapped longer than current word's MFA
         # end), extend word_end to preserve the word with at least its MFA
         # duration or a 30 ms floor.
-        if word_end < word_start:
+        if word_end <= word_start:
             word_end = word_start + max(mfa_dur, 0.030)
 
         # ── Gap absorption (ORDER CRITICAL — do not reorder) ──
@@ -5189,6 +8994,24 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
 
         # Word
         new_word_ivs.append((word_start, word_end, mfa_iv.text, "word"))
+
+        # Keep the boundary decision alive after this function returns.  The
+        # interval geometry is later rebuilt several times; without this
+        # provenance, energy/punctuation/normalisation passes cannot tell a
+        # CTC-authoritative word from an MFA-authoritative one.
+        ctc_authority.append({
+            "lexical_ordinal": len(ctc_authority),
+            "text": mfa_iv.text.strip(),
+            "boundary_source": "mfa" if use_mfa else "ctc",
+            "ctc_lexical_ordinal": ctc_word_lexical_ordinal.get(id(ctc)),
+            "ctc_span": [float(ctc_start), float(ctc_end)],
+            "raw_ctc_span": [float(ctc_start), float(ctc_end_raw)],
+            "mfa_span": [float(mfa_start), float(mfa_end)],
+            "resolved_span": [float(word_start), float(word_end)],
+            "initial_resolved_span": [float(word_start), float(word_end)],
+            "published_span": None,
+            "operations": [],
+        })
 
         # Phones: NVV 被扩展时同步扩展首音素; snap 到 CTC 时等比映射; 否则保留 MFA
         if pp_tier is not None:
@@ -5270,22 +9093,15 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
             merged_pp.append(item)
     new_phone_ivs = merged_pp
 
-    # Eliminate tiny gaps between consecutive word intervals.
-    # Regr. Case 39: MFA frame precision is 10 ms; gaps up to 30 ms
-    # (3 frames) are alignment residuals, not real silences.  Absorb
-    # them into the preceding word so the words tier is always
-    # contiguous — downstream tiers (hanzi, pinyin_phones) depend on
-    # this invariant.
-    # Also eliminate tiny overlaps (≤ 3 ms) by splitting at the midpoint —
-    # these are boundary artifacts from CTC/MFA precision mismatch.
+    # Preserve positive word gaps here.  ``_snap_to_ctc`` has no source
+    # ownership proof, so a 10--30 ms residual must reach the explicit
+    # evidence decision in ``_sync_derived_tiers`` (or strict QC).  Only
+    # tiny overlaps are structurally repaired at this stage.
     for k in range(len(new_word_ivs) - 1, 0, -1):
         cur = new_word_ivs[k]
         prev = new_word_ivs[k - 1]
         gap = cur[0] - prev[1]
-        if 0 < gap <= 0.030 and prev[3] == "word":
-            # Tiny gap — absorb into previous word
-            new_word_ivs[k - 1] = (prev[0], cur[0], prev[2], prev[3])
-        elif gap < 0 and gap >= -0.005 and prev[3] == "word":
+        if gap < 0 and gap >= -0.005 and prev[3] == "word":
             # Tiny overlap — split at midpoint (only word-word pairs)
             mid = (prev[1] + cur[0]) / 2.0
             new_word_ivs[k - 1] = (prev[0], mid, prev[2], prev[3])
@@ -5294,6 +9110,44 @@ def _snap_to_ctc(words_tier: Tier, pp_tier: Tier | None,
     # Build new tiers
     new_words_tier = Tier(words_tier.name, words_tier.xmin, words_tier.xmax,
                           [Interval(s, e, t) for s, e, t, _ in new_word_ivs])
+    if hasattr(words_tier, "_fallback_unknown_projection"):
+        new_words_tier._fallback_unknown_projection = (
+            words_tier._fallback_unknown_projection)
+    # The contiguity passes above may adjust a word after its initial
+    # decision was recorded.  Make the accepted post-snap geometry the
+    # authority snapshot; otherwise the final barrier would resurrect the
+    # pre-contiguity span and undo this CTC compensation.
+    _final_lexical = [iv for iv in new_words_tier.intervals
+                      if iv.text.strip() and not is_silence(iv.text)
+                      and not is_punct(iv.text)]
+    if len(_final_lexical) == len(ctc_authority):
+        for _entry, _iv in zip(ctc_authority, _final_lexical):
+            _entry["resolved_span"] = [float(_iv.xmin), float(_iv.xmax)]
+            # Neighbour compensation can force an originally MFA-selected
+            # word back onto its CTC span.  Keep provenance truthful: a final
+            # interval with no MFA overlap but positive CTC overlap is now a
+            # CTC-owned decision, so later audits and barriers must treat it
+            # as such instead of rejecting the already-correct CTC geometry.
+            if _entry.get("boundary_source") == "mfa":
+                mfa_span = _entry.get("mfa_span")
+                ctc_span = _entry.get("ctc_span")
+                if (isinstance(mfa_span, (list, tuple)) and len(mfa_span) == 2
+                        and isinstance(ctc_span, (list, tuple)) and len(ctc_span) == 2):
+                    mfa_overlap = min(_iv.xmax, float(mfa_span[1])) - max(
+                        _iv.xmin, float(mfa_span[0]))
+                    ctc_overlap = min(_iv.xmax, float(ctc_span[1])) - max(
+                        _iv.xmin, float(ctc_span[0]))
+                    ctc_compensated = (
+                        ctc_overlap > AXIS_EPS
+                        and (abs(_iv.xmin - float(mfa_span[0])) > AXIS_EPS
+                             or abs(_iv.xmax - float(mfa_span[1])) > AXIS_EPS))
+                    if ctc_compensated and (
+                            mfa_overlap <= AXIS_EPS
+                            or _iv.xmin < float(mfa_span[0]) - AXIS_EPS
+                            or _iv.xmax < float(mfa_span[1]) - AXIS_EPS):
+                        _entry["boundary_source"] = "ctc"
+                        _entry["arbitration"] = "ctc_neighbor_compensation"
+    new_words_tier._ctc_word_authority = ctc_authority
 
     new_pp_tier = None
     if pp_tier is not None and new_phone_ivs:
@@ -5412,10 +9266,1296 @@ def _strict_en_fail(required_words: int, reason: str, *, ledger_sha256: str = ""
                               ledger_sha256, reason), [])
 
 
+def _source_unknown_context(words_tier: Tier) -> list[dict]:
+    """Snapshot source words needed by the narrow initial-Mira proof."""
+    return [{"ordinal": ordinal, "start": float(iv.xmin),
+             "end": float(iv.xmax), "text": iv.text.strip()}
+            for ordinal, iv in enumerate(words_tier.intervals)]
+
+
+def _fallback_lexical_items(source_words: list[dict] | None,
+                            ctc_tokens: list[dict] | None,
+                            final_words: Tier | None) -> tuple[list[dict], list[dict], list[dict], list[str]]:
+    """Normalize the three fallback lexical streams for correspondence.
+
+    This deliberately keeps raw source ordinals and final lexical ordinals in
+    every item.  The fallback transcript is not included: it can describe a
+    useful display surface, but it is never evidence for ownership.
+    """
+    errors: list[str] = []
+    source: list[dict] = []
+    for index, item in enumerate(source_words or []):
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            errors.append(f"source_malformed:{index}")
+            continue
+        text = item["text"].strip()
+        if not text or is_silence(text) or is_punct(text):
+            continue
+        try:
+            ordinal = int(item.get("ordinal", index))
+            start, end = float(item["start"]), float(item["end"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"source_malformed:{index}")
+            continue
+        if ordinal != index or not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            errors.append(f"source_malformed:{index}")
+            continue
+        source.append({"raw_ordinal": ordinal, "lexical_ordinal": len(source),
+                       "text": text, "identity": _lexical_identity(text),
+                       "start": start, "end": end})
+
+    ctc: list[dict] = []
+    for index, item in enumerate(ctc_tokens or []):
+        if not isinstance(item, dict):
+            errors.append(f"ctc_malformed:{index}")
+            continue
+        item_type = item.get("type", "word")
+        if item_type != "word":
+            continue
+        if not isinstance(item.get("word"), str) or not item["word"].strip():
+            errors.append(f"ctc_malformed:{index}")
+            continue
+        try:
+            ordinal = int(item.get("ordinal", index))
+            start, end = float(item["start_s"]), float(item["end_s"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"ctc_malformed:{index}")
+            continue
+        if (ordinal != index or not math.isfinite(start) or not math.isfinite(end)
+                or end <= start):
+            errors.append(f"ctc_malformed:{index}")
+            continue
+        text = item["word"].strip()
+        ctc.append({"list_ordinal": index, "ordinal": ordinal,
+                    "lexical_ordinal": len(ctc), "text": text,
+                    "identity": _lexical_identity(text, ctc_item=item),
+                    "start": start, "end": end})
+
+    final: list[dict] = []
+    if final_words is None:
+        errors.append("final_missing")
+    else:
+        for index, interval in enumerate(final_words.intervals):
+            text = (interval.text or "").strip()
+            if not text or is_silence(text) or is_punct(text):
+                continue
+            if not math.isfinite(interval.xmin) or not math.isfinite(interval.xmax) \
+                    or interval.xmax <= interval.xmin:
+                errors.append(f"final_malformed:{index}")
+                continue
+            final.append({"interval_ordinal": index,
+                          "lexical_ordinal": len(final), "text": text,
+                          "identity": _lexical_identity(text),
+                          "start": float(interval.xmin),
+                          "end": float(interval.xmax)})
+    return source, ctc, final, errors
+
+
+def _fallback_exact_source_ctc_projection(
+        source: list[dict], ctc: list[dict]) -> dict:
+    """Project source lexical owners onto CTC words exactly once, in order.
+
+    A known source word may be explicitly omitted, but an unknown placeholder
+    may only consume a known NVV/English CTC word.  The dynamic program keeps
+    both choices for known words and counts complete monotone solutions; a
+    projection is usable only when that count is exactly one.  Time spans are
+    carried as evidence after the lexical solution and never participate in
+    selecting an owner.
+    """
+    @lru_cache(maxsize=None)
+    def _solve(source_index: int, ctc_index: int) -> tuple[int, tuple[int | None, ...] | None]:
+        if source_index == len(source):
+            return ((1, ()) if ctc_index == len(ctc) else (0, None))
+
+        source_item = source[source_index]
+        unknown = is_unknown_token(source_item["text"])
+        choices: list[tuple[int, tuple[int | None, ...] | None]] = []
+        if ctc_index < len(ctc):
+            ctc_item = ctc[ctc_index]
+            compatible = (
+                (ctc_item["identity"] == source_item["identity"])
+                if not unknown else
+                (_canonical_nvv_identity(ctc_item["text"]) is not None
+                 or is_english_token(ctc_item["text"])))
+            if compatible:
+                count, path = _solve(source_index + 1, ctc_index + 1)
+                if count:
+                    choices.append((count, (ctc_index,) + path))
+        if not unknown:
+            count, path = _solve(source_index + 1, ctc_index)
+            if count:
+                choices.append((count, (None,) + path))
+
+        total = min(2, sum(count for count, _ in choices))
+        if total != 1:
+            return total, None
+        return 1, next(path for count, path in choices if count == 1)
+
+    solution_count, path = _solve(0, 0)
+    projection = {
+        "schema": "fallback-source-ctc-projection-v1",
+        "status": "rejected" if solution_count != 1 else (
+            "omitted" if any(item is None for item in path or ()) else "mapped"),
+        "safe": solution_count == 1,
+        "solution_count": solution_count,
+        "source_count": len(source),
+        "ctc_count": len(ctc),
+        "entries": [],
+        "first_mismatch": None,
+    }
+
+    if solution_count != 1:
+        projection["first_mismatch"] = {
+            "reason": ("non_unique_projection" if solution_count > 1
+                       else "no_complete_projection"),
+        }
+        if solution_count == 0:
+            # Add a useful fail-closed diagnostic without using timing to
+            # repair the failed lexical projection.
+            for source_index, source_item in enumerate(source):
+                if is_unknown_token(source_item["text"]):
+                    remaining = ctc[source_index:] if source_index < len(ctc) else []
+                    if not any(_canonical_nvv_identity(item["text"]) is not None
+                               or is_english_token(item["text"])
+                               for item in remaining):
+                        projection["first_mismatch"] = {
+                            "reason": "unknown_target_not_known_nvv_or_english",
+                            "source_ordinal": source_item["raw_ordinal"],
+                        }
+                        break
+        path = tuple(None for _ in source)
+
+    for source_item, ctc_index in zip(source, path):
+        ctc_item = ctc[ctc_index] if ctc_index is not None else None
+        entry = {
+            "source_ordinal": source_item["raw_ordinal"],
+            "source_lexical_ordinal": source_item["lexical_ordinal"],
+            "source_text": source_item["text"],
+            "source_identity": source_item["identity"],
+            "source_span": [source_item["start"], source_item["end"]],
+            "ctc_ordinal": ctc_item["ordinal"] if ctc_item else None,
+            "ctc_lexical_ordinal": ctc_item["lexical_ordinal"] if ctc_item else None,
+            "ctc_text": ctc_item["text"] if ctc_item else None,
+            "ctc_identity": ctc_item["identity"] if ctc_item else None,
+            "ctc_span": ([ctc_item["start"], ctc_item["end"]]
+                         if ctc_item else None),
+            "status": "mapped" if ctc_item is not None and solution_count == 1
+                      else "omitted" if ctc_item is None and not is_unknown_token(source_item["text"])
+                      else "mismatch",
+            "reason": ("exact_ordered_correspondence" if ctc_item is not None
+                       and solution_count == 1 else "source_omitted"
+                       if ctc_item is None and not is_unknown_token(source_item["text"])
+                       else projection["first_mismatch"]["reason"]),
+        }
+        if entry["status"] == "omitted":
+            entry["omission_evidence"] = {
+                "source_identity": source_item["identity"],
+                "reason": "known_source_absent_from_unique_projection",
+            }
+        projection["entries"].append(entry)
+
+    projection["digest"] = _evidence_digest(projection)
+    return projection
+
+
+def _fallback_lexical_correspondence_ledger(
+        source_words: list[dict] | None,
+        ctc_tokens: list[dict] | None,
+        final_words: Tier | None) -> dict:
+    """Build the complete fail-closed source→CTC→final lexical ledger.
+
+    Known lexical source omissions are represented explicitly and do not
+    consume a later CTC/final owner.  Every other deviation is retained in
+    the ledger and makes it unsafe: reorder, substitution, final-only/CTC-only
+    evidence, malformed evidence, and ambiguous ownership are never repaired
+    by position.
+    """
+    source, ctc, final, malformed = _fallback_lexical_items(
+        source_words, ctc_tokens, final_words)
+    entries: list[dict] = []
+    omissions: list[dict] = []
+    first_mismatch: dict | None = None
+
+    def reject(reason: str, **details: object) -> None:
+        nonlocal first_mismatch
+        if first_mismatch is None:
+            first_mismatch = {"reason": reason, **details}
+
+    status = "mapped"
+    safe = not malformed
+    if malformed:
+        status = "rejected"
+        reject("malformed_evidence", details=list(malformed))
+
+    # CTC and final are both post-MFA evidence.  They must be an exact ordered
+    # stream before source omissions or unknown recovery can be considered.
+    if len(ctc) != len(final):
+        status = "rejected"
+        safe = False
+        reject("final_only" if len(final) > len(ctc) else "ctc_only",
+               ctc_index=min(len(ctc), len(final)),
+               ctc_remaining=max(0, len(ctc) - len(final)),
+               final_remaining=max(0, len(final) - len(ctc)))
+    elif any(left["identity"] != right["identity"]
+             for left, right in zip(ctc, final)):
+        status = "rejected"
+        safe = False
+        for index, (left, right) in enumerate(zip(ctc, final)):
+            if left["identity"] != right["identity"]:
+                reject("substitution", ctc_ordinal=left["ordinal"],
+                       final_lexical_ordinal=right["lexical_ordinal"],
+                       ctc_text=left["text"], final_text=right["text"])
+                break
+    for left, right in zip(final, final[1:]):
+        if left["end"] > right["start"] + AXIS_EPS:
+            status = "rejected"
+            safe = False
+            reject("non_unique_ownership",
+                   final_lexical_ordinal=right["lexical_ordinal"],
+                   overlapping_with=left["lexical_ordinal"])
+            break
+
+    stream_exact = (len(ctc) == len(final)
+                    and not any(left["identity"] != right["identity"]
+                                for left, right in zip(ctc, final)))
+    projection = _fallback_exact_source_ctc_projection(source, ctc)
+    ctc_cursor = len(ctc) if stream_exact else 0
+    if stream_exact:
+        for projection_entry in projection["entries"]:
+            entry = dict(projection_entry)
+            ctc_ordinal = entry.get("ctc_lexical_ordinal")
+            final_item = (final[ctc_ordinal] if isinstance(ctc_ordinal, int)
+                          and ctc_ordinal < len(final) else None)
+            entry.update({
+                "final_lexical_ordinal": final_item["lexical_ordinal"] if final_item else None,
+                "final_interval_ordinal": final_item["interval_ordinal"] if final_item else None,
+                "final_text": final_item["text"] if final_item else None,
+                "final_span": ([final_item["start"], final_item["end"]]
+                               if final_item else None),
+                "resolved_text": final_item["text"] if final_item else None,
+            })
+            if entry["status"] == "omitted":
+                omissions.append(entry.copy())
+            entries.append(entry)
+        if not projection["safe"]:
+            status = "rejected"
+            safe = False
+            reject(projection["first_mismatch"]["reason"],
+                   **{key: value for key, value in projection["first_mismatch"].items()
+                      if key != "reason"})
+    else:
+        # Keep detailed mismatch entries for the independent CTC/final gate;
+        # source projection is not allowed to redeem a partial or substituted
+        # final stream.
+        ctc_cursor = 0
+        for source_item in source:
+            ctc_item = ctc[ctc_cursor] if ctc_cursor < len(ctc) else None
+            final_item = final[ctc_cursor] if ctc_cursor < len(final) else None
+            entry = {
+                "source_ordinal": source_item["raw_ordinal"],
+                "source_lexical_ordinal": source_item["lexical_ordinal"],
+                "source_text": source_item["text"],
+                "ctc_ordinal": ctc_item["ordinal"] if ctc_item else None,
+                "ctc_lexical_ordinal": ctc_item["lexical_ordinal"] if ctc_item else None,
+                "ctc_text": ctc_item["text"] if ctc_item else None,
+                "final_lexical_ordinal": final_item["lexical_ordinal"] if final_item else None,
+                "final_interval_ordinal": final_item["interval_ordinal"] if final_item else None,
+                "final_text": final_item["text"] if final_item else None,
+                "resolved_text": None,
+                "status": "rejected",
+                "reason": None,
+            }
+            if ctc_item is not None and final_item is not None:
+                same_evidence = ctc_item["identity"] == final_item["identity"]
+                if (source_item["identity"] == ctc_item["identity"]
+                        and same_evidence):
+                    entry.update(status="mapped", resolved_text=final_item["text"],
+                                 reason="exact_ordered_correspondence")
+                    ctc_cursor += 1
+                elif (is_unknown_token(source_item["text"])
+                      and same_evidence
+                      and (_canonical_nvv_identity(ctc_item["text"]) is not None
+                           or is_english_token(ctc_item["text"]))):
+                    entry.update(status="mapped", resolved_text=final_item["text"],
+                                 reason="known_nvv_or_english_unknown_recovery")
+                    ctc_cursor += 1
+                else:
+                    safe = False
+                    entry.update(status="mismatch", reason="unknown_correspondence"
+                                 if is_unknown_token(source_item["text"])
+                                 else "mismatch")
+                    reject(entry["reason"], source_ordinal=source_item["raw_ordinal"],
+                           ctc_ordinal=ctc_item["ordinal"], ctc_text=ctc_item["text"],
+                           final_text=final_item["text"])
+                    ctc_cursor += 1
+            else:
+                safe = False if is_unknown_token(source_item["text"]) else safe
+                entry.update(status="mismatch" if is_unknown_token(source_item["text"])
+                             else "omitted",
+                             reason="unknown_unproved" if is_unknown_token(source_item["text"])
+                             else "source_omitted")
+                if entry["status"] == "omitted":
+                    omissions.append(entry.copy())
+                if is_unknown_token(source_item["text"]):
+                    reject("unknown_unproved", source_ordinal=source_item["raw_ordinal"])
+            entries.append(entry)
+
+    if ctc_cursor < len(ctc):
+        status = "rejected"
+        safe = False
+        reject("ctc_only", ctc_ordinal=ctc[ctc_cursor]["ordinal"],
+               ctc_text=ctc[ctc_cursor]["text"])
+        for item in ctc[ctc_cursor:]:
+            entries.append({"source_ordinal": None,
+                            "source_lexical_ordinal": None,
+                            "source_text": None,
+                            "ctc_ordinal": item["ordinal"],
+                            "ctc_lexical_ordinal": item["lexical_ordinal"],
+                            "ctc_text": item["text"],
+                            "final_lexical_ordinal": item["lexical_ordinal"] if item["lexical_ordinal"] < len(final) else None,
+                            "final_interval_ordinal": final[item["lexical_ordinal"]]["interval_ordinal"] if item["lexical_ordinal"] < len(final) else None,
+                            "final_text": final[item["lexical_ordinal"]]["text"] if item["lexical_ordinal"] < len(final) else None,
+                            "resolved_text": None, "status": "rejected",
+                            "reason": "ctc_only"})
+
+    if len(final) > len(ctc):
+        status = "rejected"
+        safe = False
+        for item in final[len(ctc):]:
+            entries.append({"source_ordinal": None,
+                            "source_lexical_ordinal": None,
+                            "source_text": None,
+                            "ctc_ordinal": None,
+                            "ctc_lexical_ordinal": None,
+                            "ctc_text": None,
+                            "final_lexical_ordinal": item["lexical_ordinal"],
+                            "final_interval_ordinal": item["interval_ordinal"],
+                            "final_text": item["text"],
+                            "resolved_text": None, "status": "rejected",
+                            "reason": "final_only"})
+
+    # A repeated final owner can only be accepted when its CTC ordinal is the
+    # unique correspondence key.  Duplicate candidates at a single key are
+    # structurally impossible in the normalized stream; malformed duplicate
+    # ordinals are rejected above rather than silently selecting one.
+    source_to_final = {
+        str(entry["source_ordinal"]): entry["final_lexical_ordinal"]
+        for entry in entries if entry.get("status") == "mapped"
+        and entry.get("source_ordinal") is not None
+        and entry.get("final_lexical_ordinal") is not None}
+    ctc_to_final = {
+        str(entry["ctc_ordinal"]): entry["final_lexical_ordinal"]
+        for entry in entries if entry.get("status") == "mapped"
+        and entry.get("ctc_ordinal") is not None
+        and entry.get("final_lexical_ordinal") is not None}
+    if len(source_to_final) != len([e for e in entries if e.get("status") == "mapped"
+                                    and e.get("source_ordinal") is not None]):
+        status = "rejected"
+        safe = False
+        reject("non_unique_ownership")
+    if first_mismatch is not None:
+        safe = False
+        status = "rejected"
+    payload = {
+        "schema": FALLBACK_CORRESPONDENCE_SCHEMA,
+        "status": status,
+        "source_count": len(source),
+        "ctc_count": len(ctc),
+        "final_count": len(final),
+        "entries": entries,
+        "omissions": omissions,
+        "first_mismatch": first_mismatch,
+        "mapping": {"source_to_final": source_to_final,
+                    "ctc_to_final": ctc_to_final},
+        "safe": bool(safe and not first_mismatch),
+    }
+    payload["digest"] = _evidence_digest(payload)
+    return payload
+
+
+_FALLBACK_QUALIFIED_PAUSE_LABELS = frozenset(
+    {"<sp0>", "<sp1>", "<sp2>", "<sp3>"})
+
+
+def _validate_fallback_correspondence(
+        correspondence: dict | None,
+        source_words: list[dict] | None,
+        ctc_tokens: list[dict] | None,
+        final_words: Tier | None) -> tuple[bool, dict]:
+    """Validate the exact fallback ledger before it can redeem pause QC.
+
+    ``safe`` is producer output, not an authority decision.  Recompute the
+    ledger from the immutable source/CTC/final streams and bind the supplied
+    payload to its digest, counts, mappings, entries, and first-mismatch state.
+    Any missing or malformed field fails closed.
+    """
+    errors: list[str] = []
+    final_interval_reindexed = False
+    final_surface_normalized = False
+    expected: dict | None = None
+    if not isinstance(correspondence, dict):
+        errors.append("missing")
+    else:
+        if correspondence.get("schema") != FALLBACK_CORRESPONDENCE_SCHEMA:
+            errors.append("schema_mismatch")
+        if correspondence.get("safe") is not True:
+            errors.append("safe_false")
+        if correspondence.get("first_mismatch") is not None:
+            errors.append("first_mismatch_present")
+        digest = correspondence.get("digest")
+        if not isinstance(digest, str) or not digest:
+            errors.append("digest_missing")
+        elif digest != _evidence_digest(
+                {key: value for key, value in correspondence.items()
+                 if key != "digest"}):
+            errors.append("digest_mismatch")
+
+        try:
+            expected = _fallback_lexical_correspondence_ledger(
+                source_words, ctc_tokens, final_words)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            errors.append("recompute_failed")
+        if expected is not None:
+            if expected.get("safe") is not True:
+                errors.append("recomputed_unsafe")
+            for key in ("status", "source_count", "ctc_count", "final_count",
+                        "omissions", "first_mismatch", "mapping", "safe"):
+                if correspondence.get(key) != expected.get(key):
+                    errors.append(f"{key}_mismatch")
+            supplied_entries = correspondence.get("entries")
+            expected_entries = expected.get("entries")
+            if (not isinstance(supplied_entries, list)
+                    or not isinstance(expected_entries, list)
+                    or len(supplied_entries) != len(expected_entries)):
+                errors.append("entries_mismatch")
+            else:
+                for supplied, actual in zip(supplied_entries, expected_entries):
+                    if not isinstance(supplied, dict) or not isinstance(actual, dict):
+                        errors.append("entries_mismatch")
+                        break
+                    # Final serialization can insert a display-only leading
+                    # `<sp1>`.  Its physical interval reindex is diagnostic;
+                    # all lexical identities, ordinals and mappings remain
+                    # mandatory and are compared below.
+                    supplied_owner = {
+                        key: value for key, value in supplied.items()
+                        if key not in {"final_interval_ordinal", "final_text",
+                                       "resolved_text"}}
+                    actual_owner = {
+                        key: value for key, value in actual.items()
+                        if key not in {"final_interval_ordinal", "final_text",
+                                       "resolved_text"}}
+                    if supplied_owner != actual_owner:
+                        errors.append("entries_mismatch")
+                        break
+                    for surface_key in ("final_text", "resolved_text"):
+                        supplied_surface = supplied.get(surface_key)
+                        actual_surface = actual.get(surface_key)
+                        if supplied_surface == actual_surface:
+                            continue
+                        if (_lexical_identity(supplied_surface or "")
+                                != _lexical_identity(actual_surface or "")):
+                            errors.append("entries_mismatch")
+                            break
+                        final_surface_normalized = True
+                    if errors and errors[-1] == "entries_mismatch":
+                        break
+                    if (supplied.get("final_interval_ordinal")
+                            != actual.get("final_interval_ordinal")):
+                        final_interval_reindexed = True
+    return (not errors, {
+        "schema": FALLBACK_CORRESPONDENCE_SCHEMA,
+        "status": "verified" if not errors else "rejected",
+        "reasons": errors,
+        "final_interval_reindexed": final_interval_reindexed,
+        "final_surface_normalized": final_surface_normalized,
+        "digest": correspondence.get("digest")
+        if isinstance(correspondence, dict) else None,
+    })
+
+
+def _fallback_pause_qualification(
+        words_tier: Tier | None,
+        reference_mode: str | None,
+        correspondence: dict | None,
+        source_words: list[dict] | None,
+        ctc_tokens: list[dict] | None) -> dict:
+    """Qualify each retained internal pause against its exact lexical gap.
+
+    A valid ledger is necessary but not sufficient: the pause label must be
+    canonical and both neighboring final lexical owners must be present in
+    the ledger's exact CTC→final mapping.  Long ``<sp3>`` pauses additionally
+    require the mapped neighboring CTC anchors to expose the same blank span;
+    this distinguishes a real acoustic/CTC pause from missing ownership.
+    Thus one bad pause remains a veto even when another pause qualifies.
+    """
+    valid_ledger, validation = _validate_fallback_correspondence(
+        correspondence, source_words, ctc_tokens, words_tier)
+    lexical_positions = [
+        index for index, interval in enumerate(words_tier.intervals)
+    ] if words_tier is not None else []
+    lexical_positions = [
+        index for index in lexical_positions
+        if (words_tier.intervals[index].text.strip()
+            and not is_silence(words_tier.intervals[index].text)
+            and not is_punct(words_tier.intervals[index].text))
+    ] if words_tier is not None else []
+    lexical_ordinal = {index: ordinal for ordinal, index in
+                       enumerate(lexical_positions)}
+    mapped_final: set[int] = set()
+    ctc_by_final: dict[int, dict] = {}
+    if valid_ledger and isinstance(correspondence, dict):
+        mapping = correspondence.get("mapping", {})
+        ctc_to_final = mapping.get("ctc_to_final", {}) if isinstance(mapping, dict) else {}
+        if isinstance(ctc_to_final, dict):
+            mapped_final = {
+                value for value in ctc_to_final.values()
+                if type(value) is int
+            }
+            lexical_ctc = [
+                item for item in (ctc_tokens or [])
+                if isinstance(item, dict)
+                and str(item.get("word", item.get("text", ""))).strip()
+                and not is_silence(str(item.get("word", item.get("text", ""))))
+                and not is_punct(str(item.get("word", item.get("text", ""))))
+            ]
+            for ctc_ordinal, final_ordinal in ctc_to_final.items():
+                try:
+                    ctc_index = int(ctc_ordinal)
+                except (TypeError, ValueError):
+                    continue
+                if (type(final_ordinal) is int
+                        and 0 <= ctc_index < len(lexical_ctc)):
+                    ctc_by_final[final_ordinal] = lexical_ctc[ctc_index]
+
+    pauses: list[dict] = []
+    if words_tier is not None:
+        for index, interval in enumerate(words_tier.intervals):
+            if not _is_substantive_interior_silence(words_tier.intervals, index):
+                continue
+            left = next((item for item in reversed(lexical_positions)
+                         if item < index), None)
+            right = next((item for item in lexical_positions if item > index), None)
+            left_ordinal = lexical_ordinal.get(left)
+            right_ordinal = lexical_ordinal.get(right)
+            label = interval.text.strip()
+            reasons: list[str] = []
+            if reference_mode != "fallback":
+                reasons.append("reference_mode_not_fallback")
+            if not valid_ledger:
+                reasons.append("fallback_correspondence_invalid")
+            if label not in _FALLBACK_QUALIFIED_PAUSE_LABELS:
+                reasons.append("pause_label_not_qualified")
+            if (left_ordinal is None or right_ordinal is None
+                    or left_ordinal not in mapped_final
+                    or right_ordinal not in mapped_final):
+                reasons.append("pause_owner_mapping_missing")
+            ctc_gap_evidence = None
+            if label == "<sp3>" and not reasons:
+                left_ctc = ctc_by_final.get(left_ordinal)
+                right_ctc = ctc_by_final.get(right_ordinal)
+                try:
+                    ctc_gap_start = float(
+                        left_ctc["end_s"] if "end_s" in left_ctc
+                        else float(left_ctc["end_ms"]) / 1000.0)
+                    ctc_gap_end = float(
+                        right_ctc["start_s"] if "start_s" in right_ctc
+                        else float(right_ctc["start_ms"]) / 1000.0)
+                    pause_duration = max(interval.xmax - interval.xmin, 1e-9)
+                    overlap = max(0.0, min(interval.xmax, ctc_gap_end)
+                                  - max(interval.xmin, ctc_gap_start))
+                    coverage = overlap / pause_duration
+                    ctc_gap_evidence = {
+                        "start_s": round(ctc_gap_start, 6),
+                        "end_s": round(ctc_gap_end, 6),
+                        "overlap_s": round(overlap, 6),
+                        "pause_coverage": round(coverage, 6),
+                    }
+                    if (ctc_gap_end <= ctc_gap_start
+                            or coverage < 0.90):
+                        reasons.append("sp3_ctc_gap_not_supported")
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    reasons.append("sp3_ctc_gap_evidence_missing")
+            pauses.append({
+                "index": index,
+                "label": label,
+                "start_s": round(interval.xmin, 6),
+                "end_s": round(interval.xmax, 6),
+                "duration_us": _duration_ticks(interval.xmin, interval.xmax),
+                "left_lexical_ordinal": left_ordinal,
+                "right_lexical_ordinal": right_ordinal,
+                "ctc_gap_evidence": ctc_gap_evidence,
+                "qualified": not reasons,
+                "qualification_reasons": reasons,
+            })
+    qualified = [item["index"] for item in pauses if item["qualified"]]
+    unqualified = [item["index"] for item in pauses if not item["qualified"]]
+    unexpected_candidates = [
+        item for item in pauses
+        if item["label"] in {"<sp0>", "<sp1>", "<sp2>", "<sp3>"}
+    ]
+    reason_qualification = {
+        "mid_sp": bool(pauses) and not unqualified,
+        "strict_interior_sp": bool(pauses) and not unqualified,
+        "unexpected_silence": bool(unexpected_candidates) and all(
+            item["qualified"] for item in unexpected_candidates),
+        "sp3": bool([item for item in pauses if item["label"] == "<sp3>"])
+        and all(item["qualified"] for item in pauses
+                if item["label"] == "<sp3>"),
+    }
+    return {
+        "schema": "fallback-pause-qualification-v1",
+        "reference_mode": reference_mode,
+        "ledger": validation,
+        "pause_count": len(pauses),
+        "qualified_indices": qualified,
+        "unqualified_indices": unqualified,
+        "all_qualified": bool(pauses) and not unqualified,
+        "reason_qualification": reason_qualification,
+        "details": pauses,
+    }
+
+
+def _apply_fallback_pause_veto_qualification(
+        filter_reasons: list[str], pause_gate: dict) -> list[str]:
+    """Redeem only the three fallback pause diagnostics when all qualify."""
+    if not isinstance(pause_gate, dict):
+        return list(filter_reasons)
+    qualified_reasons = pause_gate.get("reason_qualification", {})
+    redeemable = {
+        reason for reason in {"mid_sp", "strict_interior_sp",
+                               "unexpected_silence", "sp3"}
+        if qualified_reasons.get(reason) is True
+    }
+    return [reason for reason in filter_reasons if reason not in redeemable]
+
+
+# Descriptive aliases keep the contract discoverable to callers/tests while
+# retaining one implementation and one digest definition.
+_build_fallback_correspondence_ledger = _fallback_lexical_correspondence_ledger
+_build_lexical_correspondence_ledger = _fallback_lexical_correspondence_ledger
+
+
+def _apply_fallback_correspondence_to_lineage(lineage: dict,
+                                              correspondence: dict) -> None:
+    """Bind source phone owners to final ordinals without positional shifts."""
+    if not isinstance(lineage, dict) or not isinstance(correspondence, dict):
+        return
+    by_source = {int(key): value for key, value in
+                 correspondence.get("mapping", {}).get("source_to_final", {}).items()
+                 if str(key).lstrip("-").isdigit() and isinstance(value, int)}
+    for source_key, rows in lineage.get("owners", {}).items():
+        try:
+            source_ordinal = int(source_key)
+        except (TypeError, ValueError):
+            continue
+        final_ordinal = by_source.get(source_ordinal)
+        for row in rows if isinstance(rows, list) else []:
+            row["final_lexical_ordinal"] = final_ordinal
+            if final_ordinal is None and row.get("lexical_ordinal") is not None:
+                row["omitted_source_owner"] = True
+
+
+def _bind_source_phone_lineage(words_tier: Tier,
+                               phones_tier: Tier | None,
+                               correspondence: dict | None = None) -> dict:
+    """Bind original MFA phones to one source word by ordered containment.
+
+    This snapshot must be taken before any boundary mutation.  A lexical
+    phone that crosses two source owners remains a hard structural failure.
+    Ambiguous silence phones are retained as partial diagnostics: they have
+    no lexical owner to preserve, and the rebuild stage will only materialize
+    portions that remain inside final silence/punctuation owners.
+    """
+    result = {"schema": "source-phone-lineage-v1", "status": "verified",
+              "owners": {}, "reasons": [],
+              "source_intervals": [
+                  {"ordinal": ordinal, "start": float(iv.xmin),
+                   "end": float(iv.xmax), "text": iv.text.strip()}
+                  for ordinal, iv in enumerate(words_tier.intervals)
+              ]}
+    if phones_tier is None:
+        result["status"] = "missing"
+        result["reasons"] = ["source_phones_missing"]
+        return result
+    source = list(words_tier.intervals)
+    lexical_ordinals: dict[int, int] = {}
+    lexical_count = 0
+    for ordinal, word in enumerate(source):
+        if (word.text.strip() and not is_silence(word.text)
+                and not is_punct(word.text)):
+            lexical_ordinals[ordinal] = lexical_count
+            lexical_count += 1
+    for phone_ordinal, phone in enumerate(phones_tier.intervals):
+        if not phone.text.strip():
+            continue
+        owners = [ordinal for ordinal, word in enumerate(source)
+                  if phone.xmin >= word.xmin - AXIS_EPS
+                  and phone.xmax <= word.xmax + AXIS_EPS]
+        if len(owners) != 1:
+            if not is_silence(phone.text):
+                result["status"] = "rejected"
+            elif result["status"] == "verified":
+                result["status"] = "partial"
+            result["reasons"].append({
+                "phone_ordinal": phone_ordinal,
+                "label": phone.text,
+                "span": [phone.xmin, phone.xmax],
+                "owner_count": len(owners),
+                "reason": "phone_lineage_ambiguous",
+            })
+            continue
+        owner = owners[0]
+        result["owners"].setdefault(str(owner), []).append({
+            "phone_ordinal": phone_ordinal,
+            "lexical_ordinal": lexical_ordinals.get(owner),
+            "source_lexical_ordinal": lexical_ordinals.get(owner),
+            "label": phone.text,
+            "start": float(phone.xmin),
+            "end": float(phone.xmax),
+        })
+    if result["status"] in {"verified", "partial"}:
+        for rows in result["owners"].values():
+            ordinals = [row["phone_ordinal"] for row in rows]
+            if ordinals != sorted(ordinals):
+                result["status"] = "rejected"
+                result["reasons"].append("phone_lineage_order_invalid")
+                break
+    if isinstance(correspondence, dict):
+        _apply_fallback_correspondence_to_lineage(result, correspondence)
+    return result
+
+
+def _rebuild_phones_from_lineage(words_tier: Tier,
+                                 phones_tier: Tier,
+                                 lineage: dict) -> Tier | None:
+    """Affine-remap each source owner's original phone sequence."""
+    if (not isinstance(lineage, dict)
+            or lineage.get("status") not in {"verified", "partial"}):
+        return None
+    final_lexical = [iv for iv in words_tier.intervals
+                     if iv.text.strip() and not is_silence(iv.text)
+                     and not is_punct(iv.text)]
+    source_intervals = lineage.get("source_intervals")
+    if not isinstance(source_intervals, list):
+        return None
+    rebuilt: list[Interval] = []
+    for owner_key, rows in lineage.get("owners", {}).items():
+        try:
+            owner_ordinal = int(owner_key)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(rows, list) or not rows:
+            continue
+        source = next((item for item in source_intervals
+                       if item.get("ordinal") == owner_ordinal), None)
+        # Fallback correspondence may omit a source owner.  In that case the
+        # row is intentionally skipped; using the old source lexical ordinal
+        # here would shift every later phone/English owner left by one.
+        lexical_ordinal = rows[0].get("final_lexical_ordinal",
+                                     rows[0].get("lexical_ordinal"))
+        if rows[0].get("omitted_source_owner"):
+            continue
+        if source is None or lexical_ordinal is None:
+            # Non-lexical source phones retain their original label and order,
+            # but their display ownership can be split by publication
+            # geometry.  A source silence/punctuation row must be fully
+            # covered by final non-lexical owners; strongest-overlap repair
+            # would silently assign its crossing part to a lexical word.
+            if source is None:
+                return None
+            source_start, source_end = float(source["start"]), float(source["end"])
+            if source_end <= source_start:
+                return None
+            final_display = [iv for iv in words_tier.intervals
+                             if iv.xmax > iv.xmin + AXIS_EPS]
+            for row in rows:
+                row_start, row_end = float(row["start"]), float(row["end"])
+                if row_end <= row_start:
+                    return None
+                # A source silence can straddle a word and a pause/punctuation
+                # after CTC compensation.  Never assign that part to the
+                # lexical word by overlap strength; retain only display-owned
+                # nonlexical pieces.  If no such piece remains, the source
+                # silence is intentionally omitted from the derived tier.
+                for owner in final_display:
+                    if (not is_silence(owner.text)
+                            and not is_punct(owner.text)):
+                        continue
+                    piece_start = max(row_start, owner.xmin)
+                    piece_end = min(row_end, owner.xmax)
+                    if piece_end > piece_start + AXIS_EPS:
+                        rebuilt.append(Interval(
+                            piece_start, piece_end, str(row["label"])))
+            continue
+        if not isinstance(lexical_ordinal, int) or lexical_ordinal >= len(final_lexical):
+            return None
+        target = final_lexical[lexical_ordinal]
+        source_start, source_end = float(source["start"]), float(source["end"])
+        source_duration = source_end - source_start
+        if source_duration <= 0:
+            return None
+        target_duration = target.xmax - target.xmin
+        if target_duration <= 0:
+            return None
+        for row in rows:
+            ratio_start = (float(row["start"]) - source_start) / source_duration
+            ratio_end = (float(row["end"]) - source_start) / source_duration
+            start = target.xmin + ratio_start * target_duration
+            end = target.xmin + ratio_end * target_duration
+            if end <= start:
+                return None
+            rebuilt.append(Interval(start, end, str(row["label"])))
+    rebuilt.sort(key=lambda iv: (iv.xmin, iv.xmax))
+    # A non-lexical source phone may become several display-owned pieces, or
+    # disappear when its final visual silence owner was merged into a lexical
+    # word.  Lexical source rows must remain represented; non-lexical rows do
+    # not, because retaining them would reintroduce a stale silence phone.
+    expected_lexical = sum(
+        len(rows) for rows in lineage.get("owners", {}).values()
+        if rows and rows[0].get("final_lexical_ordinal") is not None
+        and not rows[0].get("omitted_source_owner"))
+    if len(rebuilt) < expected_lexical:
+        return None
+    return Tier(phones_tier.name, phones_tier.xmin, phones_tier.xmax, rebuilt)
+
+
+def _lexical_ordinal(source_words: list[dict], ordinal: int) -> int:
+    """Return an unknown's ordinal among non-silence/non-punctuation words."""
+    return sum(1 for item in source_words[:ordinal]
+               if item["text"] and not is_silence(item["text"])
+               and not is_punct(item["text"]))
+
+
+def _semantic_sequence_digest(sequence: list[tuple[str, str]]) -> str:
+    return _evidence_digest([[kind, value] for kind, value in sequence])
+
+
+def _build_mfa_unknown_recovery_proof(
+        stem: str,
+        source_words: list[dict],
+        ctc_tokens: list[dict],
+        reference_text: str,
+        final_words: Tier | None,
+        final_hanzi: Tier | None,
+        strict_report: dict | None,
+        strict_pairs: list[tuple[Interval, dict]]) -> dict | None:
+    """Build proof for exactly the observed source ``<eps>,<unk>,<eps>`` case.
+
+    Every returned field is bound to a concrete source interval, CTC token,
+    reference semantic ordinal, ledger record, and finalized semantic
+    sequence.  A report marker alone can never create this proof.
+    """
+    unknowns = [(index, item) for index, item in enumerate(source_words)
+                if is_unknown_token(item["text"])]
+    if len(unknowns) != 1 or not ctc_tokens or final_words is None:
+        return None
+    source_ordinal, source = unknowns[0]
+    if (_lexical_ordinal(source_words, source_ordinal) != 0
+            or source_ordinal == 0
+            or source_words[source_ordinal - 1]["text"] != "<eps>"
+            or source_ordinal + 1 >= len(source_words)
+            or source_words[source_ordinal + 1]["text"] != "<eps>"):
+        return None
+    token = ctc_tokens[0]
+    if (not isinstance(token, dict)
+            or token.get("word", "").strip().casefold() != "mira"
+            or token.get("type", "word") != "word"):
+        return None
+    try:
+        token_start, token_end = float(token["start_s"]), float(token["end_s"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (not math.isfinite(token_start) or not math.isfinite(token_end)
+            or token_end <= token_start):
+        return None
+    source_sequence = [_lexical_identity(item["text"]) for item in source_words
+                       if item["text"] and not is_silence(item["text"])
+                       and not is_punct(item["text"])]
+    source_unknown_position = next(
+        (index for index, value in enumerate(source_sequence)
+         if value == "<unknown>"), None)
+    if source_unknown_position is None:
+        return None
+    source_sequence[source_unknown_position] = "mira"
+    ctc_sequence = [_lexical_identity(item.get("word", ""), ctc_item=item)
+                    for item in ctc_tokens
+                    if isinstance(item, dict) and item.get("type", "word") == "word"]
+    if source_sequence != ctc_sequence:
+        return None
+
+    reference_semantics = project_authority_semantics(reference_text)
+    reference_matches = [item for item in reference_semantics
+                         if item.get("kind") == "english"
+                         and item.get("alignment_token", "").casefold() == "mira"
+                         and item.get("reference_ordinal") == 0]
+    if len(reference_matches) != 1:
+        return None
+    reference_item = reference_matches[0]
+    reference_ordinal = int(reference_item["reference_ordinal"])
+    reference_token = str(reference_item["surface"]).casefold()
+    reference_sequence = _strict_semantic_tokens(reference_text)
+    final_lexical = [iv for iv in final_words.intervals
+                     if iv.text.strip() and not is_silence(iv.text)
+                     and not is_punct(iv.text)]
+    # The final words tier is ordered by the processed CTC/authority stream.
+    # Bind the owner by lexical ordinal, not by raw MFA/CTC time overlap: the
+    # latter is exactly what fails for the five observed leading-offset cases.
+    owners = [iv for index, iv in enumerate(final_lexical)
+              if index == 0 and _lexical_identity(iv.text) == "mira"]
+    if len(owners) != 1:
+        return None
+    owner = owners[0]
+    pair_matches = [(word, record) for word, record in strict_pairs
+                    if word is owner
+                    and str(record.get("ctc_text", "")).casefold() == "mira"]
+    if len(pair_matches) != 1 or not isinstance(strict_report, dict):
+        return None
+    record = pair_matches[0][1]
+    ledger_sha = strict_report.get("ledger_sha256", "")
+    if (strict_report.get("status") != "verified"
+            or not isinstance(ledger_sha, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", ledger_sha)
+            or record.get("provenance") != "english_mfa_textgrid"):
+        return None
+    final_sequence = (_strict_semantic_tokens(" ".join(iv.text for iv in final_hanzi.intervals
+                                                    if iv.text))
+                      if final_hanzi is not None else [])
+    if final_sequence != reference_sequence:
+        return None
+    source_interval = {"ordinal": source["ordinal"], "start": source["start"],
+                       "end": source["end"], "text": source["text"]}
+    ctc_value = {"ordinal": 0, "word": token.get("word", ""),
+                 "start_s": token_start, "end_s": token_end,
+                 "type": token.get("type", "word")}
+    owner_value = {"text": owner.text.strip(), "start": float(owner.xmin),
+                   "end": float(owner.xmax)}
+    return {
+        "schema": _UNKNOWN_REPAIR_PROOF_SCHEMA,
+        "scenario": "initial_mira",
+        "stem": stem,
+        "source": {"interval": source_interval,
+                    "interval_sha256": _evidence_digest(source_interval),
+                    "lexical_ordinal": 0,
+                    "neighbors": ["<eps>", "<eps>"]},
+        "ctc": {"token": ctc_value, "token_sha256": _evidence_digest(ctc_value)},
+        "ordered_correspondence": {
+            "source_tokens": source_sequence,
+            "ctc_tokens": ctc_sequence,
+            "sha256": _evidence_digest(source_sequence),
+        },
+        "reference": {"ordinal": reference_ordinal, "token": reference_token},
+        "binding": {
+            "source_lexical_ordinal": source_unknown_position,
+            "ctc_lexical_ordinal": 0,
+            "reference_ordinal": reference_ordinal,
+            "temporal_overlap_s": max(
+                0.0, min(source["end"], token_end)
+                - max(source["start"], token_start)),
+            "temporal_overlap_required": False,
+        },
+        "english_ledger": {
+            "ledger_sha256": ledger_sha,
+            "word_id": record.get("word_id"),
+            "ctc_ordinal": record.get("ctc_ordinal"),
+            "ctc_text": record.get("ctc_text"),
+            "word_sha256": _evidence_digest(record),
+        },
+        "final": {"owner": owner_value,
+                  "semantic_sequence_sha256": _semantic_sequence_digest(final_sequence),
+                  "semantic_token_count": len(final_sequence)},
+    }
+
+
+def _dual_evidence_boundary_solution(
+        source_words: list[dict], ctc_tokens: list[dict],
+        left: Interval, right: Interval,
+        *, allow_overlap: bool) -> dict | None:
+    """Return the unique CTC boundary for one local Chinese word pair.
+
+    The source and CTC sequences must independently agree on order and word
+    identity.  Candidate matching is local to the final pair and therefore
+    repeated words elsewhere cannot silently become owners.  English/NVV,
+    punctuation, and silence are intentionally excluded by the caller.
+    """
+    left_text, right_text = left.text.strip().casefold(), right.text.strip().casefold()
+    if not left_text or not right_text:
+        return None
+    local_start = min(left.xmin, right.xmin) - 0.5
+    local_end = max(left.xmax, right.xmax) + 0.5
+    source_left = [item for item in source_words
+                   if item["text"].casefold() == left_text
+                   and item["end"] > local_start and item["start"] < local_end]
+    source_right = [item for item in source_words
+                    if item["text"].casefold() == right_text
+                    and item["end"] > local_start and item["start"] < local_end]
+    ctc_words = [(index, item) for index, item in enumerate(ctc_tokens)
+                 if isinstance(item, dict) and item.get("type", "word") == "word"
+                 and item.get("word", "").strip()
+                 and float(item.get("end_s", -1)) > local_start
+                 and float(item.get("start_s", -1)) < local_end]
+    ctc_left = [(index, item) for index, item in ctc_words
+                if str(item["word"]).strip().casefold() == left_text]
+    ctc_right = [(index, item) for index, item in ctc_words
+                 if str(item["word"]).strip().casefold() == right_text]
+    solutions: list[dict] = []
+    for source_l in source_left:
+        for source_r in source_right:
+            if (source_l["ordinal"] >= source_r["ordinal"]
+                    or source_l["end"] > source_r["start"]
+                    or source_l["end"] - source_l["start"] < _EVIDENCE_REPAIR_FLOOR_S - 1e-9
+                    or source_r["end"] - source_r["start"] < _EVIDENCE_REPAIR_FLOOR_S - 1e-9):
+                continue
+            for ctc_l_index, ctc_l in ctc_left:
+                for ctc_r_index, ctc_r in ctc_right:
+                    if ctc_l_index >= ctc_r_index:
+                        continue
+                    try:
+                        ctc_l_start, ctc_l_end = float(ctc_l["start_s"]), float(ctc_l["end_s"])
+                        ctc_r_start, ctc_r_end = float(ctc_r["start_s"]), float(ctc_r["end_s"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if (ctc_l_end - ctc_l_start < _EVIDENCE_REPAIR_FLOOR_S - 1e-9
+                            or ctc_r_end - ctc_r_start < _EVIDENCE_REPAIR_FLOOR_S - 1e-9
+                            or ctc_l_end > ctc_r_start + 1e-6
+                            or abs(ctc_l_end - ctc_r_start) > 1e-3):
+                        continue
+                    final_overlap = left.xmax - right.xmin
+                    final_gap = right.xmin - left.xmax
+                    final_short = (left.xmax - left.xmin < _EVIDENCE_REPAIR_FLOOR_S
+                                   or right.xmax - right.xmin < _EVIDENCE_REPAIR_FLOOR_S)
+                    if final_overlap > 0.005 and not allow_overlap:
+                        continue
+                    if final_overlap <= 0.005 and final_gap <= 0.020 and not final_short:
+                        continue
+                    # CTC supplies the local boundary.  When a preceding
+                    # punctuation/authority interval makes that anchor leave
+                    # a word below the immutable 30 ms floor, the only
+                    # admissible adjustment is the deterministic floor clamp;
+                    # midpoint heuristics are never used.
+                    lower = left.xmin + _EVIDENCE_REPAIR_FLOOR_S
+                    upper = right.xmax - _EVIDENCE_REPAIR_FLOOR_S
+                    boundary = min(max(ctc_l_end, lower), upper)
+                    if boundary < lower or boundary > upper:
+                        continue
+                    solutions.append({
+                        "source": [source_l, source_r],
+                        "ctc": [{"ordinal": ctc_l_index, **ctc_l},
+                                 {"ordinal": ctc_r_index, **ctc_r}],
+                        "boundary_s": boundary,
+                        "ctc_boundary_s": ctc_l_end,
+                        "reason": ("overlap" if final_overlap > 0.005
+                                   else "short_word" if final_short else "words_tier_gap"),
+                    })
+    if len(solutions) != 1:
+        return None
+    return solutions[0]
+
+
+def _apply_evidence_constrained_repairs(
+        stem: str, source_words: list[dict], ctc_tokens: list[dict],
+        textgrid: TextGrid) -> list[dict]:
+    """Apply only unique source/CTC repairs; return structured evidence."""
+    words = tier_by_name(textgrid, "words")
+    if words is None:
+        return []
+    stem_id = stem[:6]
+    pp = tier_by_name(textgrid, "pinyin_phones")
+    hanzi = tier_by_name(textgrid, "hanzi")
+    repairs: list[dict] = []
+    for index in range(len(words.intervals) - 1):
+        left, right = words.intervals[index:index + 2]
+        labels = [left.text.strip(), right.text.strip()]
+        if any(not is_pinyin_syllable(label) for label in labels):
+            continue
+        overlap_allowed = stem_id in _OVERLAP_EVIDENCE_STEMS
+        solution = _dual_evidence_boundary_solution(
+            source_words, ctc_tokens, left, right, allow_overlap=overlap_allowed)
+        if solution is None:
+            continue
+        old_left, old_right = left.xmax, right.xmin
+        boundary = solution["boundary_s"]
+        if not (left.xmin + _EVIDENCE_REPAIR_FLOOR_S <= boundary
+                <= right.xmax - _EVIDENCE_REPAIR_FLOOR_S):
+            continue
+        left.xmax = boundary
+        right.xmin = boundary
+        if hanzi is not None and index + 1 < len(hanzi.intervals):
+            # Finalization keeps hanzi and words positionally aligned.
+            hanzi.intervals[index].xmax = boundary
+            hanzi.intervals[index + 1].xmin = boundary
+        if pp is not None:
+            # Never clip or move verified English phones.  Chinese phones
+            # remain owned by the repaired word and are clipped only if they
+            # crossed the new boundary.
+            for phone in pp.intervals:
+                if phone.text.strip().startswith(EN_PHONE_PREFIX):
+                    continue
+                if phone.xmax > left.xmin and phone.xmin < right.xmax:
+                    if phone.xmin < boundary < phone.xmax:
+                        if phone.xmin < left.xmax:
+                            phone.xmax = left.xmax
+                        elif phone.xmax > right.xmin:
+                            phone.xmin = right.xmin
+        repairs.append({
+            "schema": _EVIDENCE_REPAIR_SCHEMA,
+            "kind": solution["reason"],
+            "stem": stem,
+            "word_indices": [index, index + 1],
+            "source_words": solution["source"],
+            "ctc_tokens": [{key: value for key, value in token.items()
+                            if key in {"ordinal", "word", "start_s", "end_s", "type"}}
+                           for token in solution["ctc"]],
+            "boundary_s": boundary,
+            "previous_boundary": {"left_end": old_left, "right_start": old_right},
+            "proof": "source_mfa_ctc_unique_monotone_boundary",
+        })
+    return repairs
+
+
 def _strict_en_lexical_words(words_tier: Tier | None) -> list[Interval]:
     if words_tier is None:
         return []
     return [iv for iv in words_tier.intervals if is_english_token(iv.text.strip())]
+
+
+def _restore_fallback_unknown_surfaces(
+        words_tier: Tier, ctc_tokens: list[dict]) -> Tier:
+    """Restore explicit MFA unknowns from one exact ordered projection.
+
+    The lexical projection is solved before any interval is changed.  A
+    known source item may be omitted, while each unknown must consume the next
+    known NVV/English CTC item.  Ambiguous, partial, malformed, reordered, or
+    substituted evidence returns an unchanged tier with a rejected proof.
+    """
+    source_words = _source_unknown_context(words_tier)
+    source, ctc, _final, malformed = _fallback_lexical_items(
+        source_words, ctc_tokens,
+        Tier("words", words_tier.xmin, words_tier.xmax, []))
+    projection = _fallback_exact_source_ctc_projection(source, ctc)
+    if malformed:
+        projection["safe"] = False
+        projection["status"] = "rejected"
+        projection["first_mismatch"] = {
+            "reason": "malformed_evidence", "details": list(malformed)}
+        projection["digest"] = _evidence_digest(projection)
+
+    # Recovery is transactional: no surface, merge, or geometry operation is
+    # performed until the complete source→CTC solution is unique and safe.
+    if not projection.get("safe"):
+        unchanged = _copy_tier_metadata(
+            words_tier, Tier(words_tier.name, words_tier.xmin, words_tier.xmax,
+                             list(words_tier.intervals)))
+        unchanged._fallback_unknown_projection = projection
+        return unchanged
+
+    intervals = list(words_tier.intervals)
+    recovered: list[dict] = []
+    for entry in projection["entries"]:
+        if (entry.get("status") != "mapped"
+                or not is_unknown_token(entry.get("source_text", ""))):
+            continue
+        source_ordinal = entry.get("source_ordinal")
+        if not isinstance(source_ordinal, int) or not (0 <= source_ordinal < len(intervals)):
+            projection["safe"] = False
+            projection["status"] = "rejected"
+            projection["first_mismatch"] = {
+                "reason": "source_ordinal_invalid",
+                "source_ordinal": source_ordinal,
+            }
+            break
+        ctc_text = str(entry.get("ctc_text", "")).strip().strip("<>")
+        if (_canonical_nvv_identity(ctc_text) is None
+                and not is_english_token(ctc_text)):
+            projection["safe"] = False
+            projection["status"] = "rejected"
+            projection["first_mismatch"] = {
+                "reason": "unknown_target_not_known_nvv_or_english",
+                "source_ordinal": source_ordinal,
+            }
+            break
+        intervals[source_ordinal] = Interval(
+            intervals[source_ordinal].xmin, intervals[source_ordinal].xmax, ctc_text)
+        entry["reason"] = "known_nvv_or_english_unknown_recovery"
+        entry["recovery_evidence"] = {
+            "source_ordinal": source_ordinal,
+            "source_identity": entry.get("source_identity"),
+            "ctc_ordinal": entry.get("ctc_ordinal"),
+            "ctc_identity": entry.get("ctc_identity"),
+            "ctc_span": entry.get("ctc_span"),
+        }
+        recovered.append(entry["recovery_evidence"])
+
+    if not projection.get("safe"):
+        unchanged = _copy_tier_metadata(
+            words_tier, Tier(words_tier.name, words_tier.xmin, words_tier.xmax,
+                             list(words_tier.intervals)))
+        projection["digest"] = _evidence_digest(projection)
+        unchanged._fallback_unknown_projection = projection
+        return unchanged
+
+    projection["recovered"] = recovered
+    projection["digest"] = _evidence_digest(projection)
+    restored = _copy_tier_metadata(
+        words_tier, Tier(words_tier.name, words_tier.xmin, words_tier.xmax,
+                         intervals))
+    restored._fallback_unknown_projection = projection
+    return restored
+
+
+def _fallback_redeemed_unknown_entries(
+        correspondence: dict | None,
+        english_provenance: dict | None = None) -> list[dict]:
+    """Return source unknowns backed by exact NVV or strict-English owners.
+
+    The source→CTC→final correspondence already proves unique ordered
+    ownership.  NVV identities are self-authenticating lexical tags; English
+    targets additionally require the strict English phone ledger to be fully
+    verified.  Chinese/pinyin targets and partial English provenance never
+    redeem a source ``<unk>``.
+    """
+    if not isinstance(correspondence, dict) or not correspondence.get("safe"):
+        return []
+    english_verified = (
+        isinstance(english_provenance, dict)
+        and english_provenance.get("status") == "verified"
+    )
+    recovered: list[dict] = []
+    for original in correspondence.get("entries", []):
+        if (not isinstance(original, dict)
+                or original.get("status") != "mapped"
+                or not is_unknown_token(original.get("source_text", ""))):
+            continue
+        resolved = str(original.get("resolved_text", "")).strip()
+        if _canonical_nvv_identity(resolved) is not None:
+            target_kind = "known_nvv"
+        elif is_english_token(resolved) and english_verified:
+            target_kind = "strict_english"
+        else:
+            continue
+        entry = dict(original)
+        entry["recovery_target_kind"] = target_kind
+        entry["recovery_provenance"] = (
+            "exact_correspondence"
+            if target_kind == "known_nvv"
+            else "exact_correspondence+strict_english_ledger"
+        )
+        recovered.append(entry)
+    return recovered
+
+
+def _strict_en_join_key(text: str, *, hyphenated: bool = False) -> str:
+    """Return the exact ledger-join key for one English spelling.
+
+    Hyphenated reference words may be emitted by the Chinese tokenizer as
+    contiguous alpha fragments (``kp`` + ``op`` for ``K-Pop``).  Only the
+    reference hyphen is ignored for that one explicit join; all other text
+    remains case-folded and order-sensitive.
+    """
+    value = str(text).strip().casefold()
+    if hyphenated:
+        return re.sub(r"[^a-z0-9]", "", value)
+    return value
 
 
 def _strict_en_phone_is_valid(phone: dict, mfa_word: dict) -> bool:
@@ -5433,9 +10573,60 @@ def _strict_en_phone_is_valid(phone: dict, mfa_word: dict) -> bool:
             and start >= word_start - 0.003 and end <= word_end + 0.003)
 
 
+def _strict_en_pronunciation_reason(record: dict, ledger: dict) -> str | None:
+    """Validate producer pronunciation policy at the English consumer.
+
+    SOS is a run-local dictionary override.  A consumer must bind the policy,
+    exact source sequence, dictionary path/hash, and phone ordinals already
+    checked by the surrounding ledger validator; it may not infer SOS from
+    labels alone.  APP is retained as a negative canary for a fabricated
+    second ``P``.
+    """
+    token = str(record.get("alignment_token", "")).casefold()
+    labels = tuple(str(phone.get("label", "")).strip()
+                   for phone in record.get("phones", [])
+                   if isinstance(phone, dict))
+    if token == "app":
+        return (None if labels == APP_EXPECTED_PRONUNCIATION
+                else "app_expected_pronunciation_mismatch")
+    if token != "sos":
+        return None
+    policy = record.get("pronunciation_policy")
+    dictionary = ledger.get("dictionary_provenance")
+    if (record.get("pronunciation_policy_id") != SOS_PRONUNCIATION_POLICY_ID
+            or not isinstance(policy, dict)
+            or policy.get("policy_id") != SOS_PRONUNCIATION_POLICY_ID
+            or tuple(policy.get("expected_pronunciation", ())) != SOS_EXPECTED_PRONUNCIATION
+            or tuple(policy.get("actual_source_sequence", ())) != labels
+            or labels != SOS_EXPECTED_PRONUNCIATION
+            or policy.get("dictionary_provenance") != dictionary
+            or record.get("dictionary_provenance") != dictionary):
+        return "sos_pronunciation_policy_mismatch"
+    if (not isinstance(dictionary, dict)
+            or not isinstance(dictionary.get("path"), str)
+            or not isinstance(dictionary.get("sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", dictionary["sha256"])):
+        return "sos_dictionary_provenance_invalid"
+    try:
+        dictionary_path = Path(dictionary["path"])
+        if (dictionary_path.is_symlink() or not dictionary_path.is_file()
+                or _strict_en_sha256(dictionary_path) != dictionary["sha256"]):
+            return "sos_dictionary_hash_mismatch"
+    except (OSError, ValueError, TypeError):
+        return "sos_dictionary_provenance_unreadable"
+    return None
+
+
 def load_strict_en_provenance(stem: str, words_tier: Tier | None,
-                              en_phones_dir: Path | None) -> tuple[dict, list[tuple[Interval, dict]]]:
-    """Load a strict-en-mfa-v1 ledger and bind it by ordered word instance.
+                              en_phones_dir: Path | None, *,
+                              hanzi_tier: Tier | None = None,
+                              reference_text: str | None = None,
+                              ctc_tokens: list[dict] | None = None,
+                              correspondence: dict | None = None,
+                              processed_ctc_words_tier: Tier | None = None,
+                              processed_ctc_textgrid_path: Path | None = None,
+                              ) -> tuple[dict, list[tuple[Interval, dict]]]:
+    """Load a strict-en-mfa-v2 ledger and bind one owner to one unit.
 
     The old JSON list is deliberately not accepted here.  In particular, no
     text/time lookup is used: repeated words and English separated by Chinese
@@ -5452,8 +10643,13 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
         return _strict_en_fail(required, "strict_en_manifest_missing_or_corrupt")
     if (not isinstance(manifest, dict) or manifest.get("schema") != STRICT_EN_MFA_SCHEMA
             or manifest.get("strict_provenance") is not True
-            or manifest.get("status") not in {"success", "no_english"}):
-        return _strict_en_fail(required, "strict_en_manifest_invalid")
+            or manifest.get("canonical_units") != CANONICAL_UNITS_SCHEMA
+            or manifest.get("status") not in {"success", "partial", "no_english"}):
+        reason = ("strict_en_manifest_legacy_schema"
+                  if isinstance(manifest, dict)
+                  and manifest.get("schema") == HISTORICAL_STRICT_EN_MFA_SCHEMA
+                  else "strict_en_manifest_invalid")
+        return _strict_en_fail(required, reason)
     expected_segments = manifest.get("expected_segments")
     produced_segments = manifest.get("produced_segments")
     rejected_segments = manifest.get("rejected_segments")
@@ -5463,17 +10659,24 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
             or not all(isinstance(item, str) for item in produced_segments)):
         return _strict_en_fail(required, "strict_en_manifest_partition_invalid")
     rejected_ids = [item.get("id") for item in rejected_segments if isinstance(item, dict)]
-    if (len(rejected_ids) != len(rejected_segments) or not all(isinstance(item, str) for item in rejected_ids)
+    if (len(rejected_ids) != len(rejected_segments)
+            or not all(isinstance(item, str) for item in rejected_ids)
+            or any(not isinstance(item, dict)
+                   or not isinstance(item.get("reason"), str)
+                   or not item.get("reason")
+                   for item in rejected_segments)
             or len(expected_segments) != len(set(expected_segments))
             or len(produced_segments) != len(set(produced_segments))
             or len(rejected_ids) != len(set(rejected_ids))
             or set(expected_segments) != set(produced_segments) | set(rejected_ids)
             or set(produced_segments) & set(rejected_ids)
+            or (manifest.get("status") == "success" and rejected_ids)
+            or (manifest.get("status") == "partial" and not rejected_ids)
             or (manifest.get("status") == "no_english" and expected_segments)):
         return _strict_en_fail(required, "strict_en_manifest_partition_invalid")
     if not english_words:
         return _strict_en_report("not_required"), []
-    if manifest.get("status") != "success":
+    if manifest.get("status") not in {"success", "partial"}:
         return _strict_en_fail(required, "strict_en_manifest_has_no_english")
 
     prefix = f"{stem}:s"
@@ -5485,7 +10688,7 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
                          if isinstance(item, dict) and isinstance(item.get("id"), str)
                          and item["id"].startswith(prefix)}
     if (not expected_for_stem or expected_for_stem != produced_for_stem | rejected_for_stem
-            or produced_for_stem & rejected_for_stem or rejected_for_stem):
+            or produced_for_stem & rejected_for_stem):
         return _strict_en_fail(required, "strict_en_manifest_segment_rejected_or_incomplete")
 
     entries = manifest.get("stem_ledgers")
@@ -5504,8 +10707,26 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
         return _strict_en_fail(required, "strict_en_ledger_missing_or_corrupt")
     if not isinstance(expected_hash, str) or not expected_hash or actual_hash != expected_hash:
         return _strict_en_fail(required, "strict_en_ledger_hash_mismatch", ledger_sha256=actual_hash)
-    if not isinstance(ledger, dict) or ledger.get("schema") != STRICT_EN_MFA_SCHEMA or ledger.get("stem") != stem:
-        return _strict_en_fail(required, "strict_en_ledger_schema_or_stem_mismatch", ledger_sha256=actual_hash)
+    if (not isinstance(ledger, dict) or ledger.get("schema") != STRICT_EN_MFA_SCHEMA
+            or ledger.get("stem") != stem
+            or ledger.get("canonical_units") != CANONICAL_UNITS_SCHEMA):
+        reason = ("strict_en_ledger_legacy_schema"
+                  if isinstance(ledger, dict)
+                  and ledger.get("schema") == HISTORICAL_STRICT_EN_MFA_SCHEMA
+                  else "strict_en_ledger_schema_or_stem_mismatch")
+        return _strict_en_fail(required, reason, ledger_sha256=actual_hash)
+    if processed_ctc_textgrid_path is not None:
+        try:
+            ctc_textgrid_sha256 = ledger["ctc_textgrid_sha256"]
+            if (not isinstance(ctc_textgrid_sha256, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", ctc_textgrid_sha256)
+                    or _strict_en_sha256(processed_ctc_textgrid_path)
+                    != ctc_textgrid_sha256):
+                raise ValueError("processed CTC TextGrid hash mismatch")
+        except (KeyError, OSError, TypeError, ValueError):
+            return _strict_en_fail(
+                required, "strict_en_ctc_textgrid_hash_mismatch",
+                ledger_sha256=actual_hash)
 
     records: list[dict] = []
     seen_segment_ids: set[str] = set()
@@ -5546,16 +10767,159 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
         return _strict_en_fail(required, "strict_en_ledger_segment_partition_invalid",
                                ledger_sha256=actual_hash)
 
+    # Validate the immutable record envelope before any projection/grouping.
+    # This prevents a malformed, duplicated, reordered, or extra record from
+    # disappearing when several fragments are represented by one final word.
+    record_ids: set[str] = set()
+    prior_ctc_ordinal = -1
+    for record in records:
+        if not isinstance(record, dict):
+            return _strict_en_fail(required, "strict_en_word_invalid", ledger_sha256=actual_hash)
+        word_id = record.get("word_id")
+        try:
+            ctc_ordinal = int(record["ctc_ordinal"])
+        except (KeyError, TypeError, ValueError):
+            return _strict_en_fail(required, "strict_en_word_identity_or_evidence_invalid",
+                                   ledger_sha256=actual_hash)
+        if (not isinstance(word_id, str) or not word_id or word_id in record_ids
+                or ctc_ordinal <= prior_ctc_ordinal
+                or record.get("status") != "verified"
+                or record.get("provenance") != "english_mfa_textgrid"
+                or record.get("canonical_binding") != CANONICAL_UNITS_SCHEMA
+                or not isinstance(record.get("unit_id"), str)
+                or not isinstance(record.get("alignment_token"), str)
+                or not isinstance(record.get("source_ctc_ordinals"), list)
+                or not isinstance(record.get("canonical_span"), list)
+                or len(record["canonical_span"]) != 2
+                or not isinstance(record.get("mfa_word"), dict)
+                or not isinstance(record.get("phones"), list)
+                or not record["phones"]):
+            return _strict_en_fail(required, "strict_en_word_identity_or_evidence_invalid",
+                                   ledger_sha256=actual_hash, failed_word_ids=[str(word_id or "")])
+        if any(not isinstance(phone, dict) for phone in record["phones"]):
+            return _strict_en_fail(required, "strict_en_phone_invalid",
+                                   ledger_sha256=actual_hash,
+                                   failed_word_ids=[str(word_id)])
+        mfa_word = record["mfa_word"]
+        try:
+            mfa_start, mfa_end = float(mfa_word["start"]), float(mfa_word["end"])
+        except (KeyError, TypeError, ValueError):
+            return _strict_en_fail(required, "strict_en_mfa_word_invalid",
+                                   ledger_sha256=actual_hash,
+                                   failed_word_ids=[str(word_id)])
+        if (not isinstance(mfa_word.get("ordinal"), int)
+                or mfa_word["ordinal"] < 0
+                or not math.isfinite(mfa_start) or not math.isfinite(mfa_end)
+                or mfa_end <= mfa_start):
+            return _strict_en_fail(required, "strict_en_mfa_word_invalid",
+                                   ledger_sha256=actual_hash,
+                                   failed_word_ids=[str(word_id)])
+        source_ordinals = record["source_ctc_ordinals"]
+        canonical_span = record["canonical_span"]
+        if ((canonical_span[0] is None) != (canonical_span[1] is None)
+                or (canonical_span[0] is not None and (
+                    not isinstance(canonical_span[0], (int, float))
+                    or isinstance(canonical_span[0], bool)
+                    or not isinstance(canonical_span[1], (int, float))
+                    or isinstance(canonical_span[1], bool)
+                    or not all(math.isfinite(float(value)) for value in canonical_span)
+                    or canonical_span[1] < canonical_span[0]))):
+            return _strict_en_fail(required, "strict_en_unit_span_invalid",
+                                   ledger_sha256=actual_hash,
+                                   failed_word_ids=[str(word_id)])
+        if (not source_ordinals
+                or any(type(value) is not int or value < 0 for value in source_ordinals)
+                or source_ordinals != list(range(source_ordinals[0], source_ordinals[-1] + 1))
+                or ctc_ordinal != source_ordinals[0]):
+            # A missing source ordinal is always invalid.  A non-contiguous
+            # span is valid only when the exact processed token independently
+            # carries the producer's explicit dropped-hyphen marker.
+            try:
+                if (not source_ordinals
+                        or any(type(value) is not int or value < 0
+                               for value in source_ordinals)
+                        or any(left >= right for left, right in
+                               zip(source_ordinals, source_ordinals[1:]))):
+                    raise EnglishUnitError("strict_english_source_ordinals_invalid")
+                token = resolve_processed_english_token(
+                    ctc_tokens, source_ordinals)
+                validate_processed_english_token_binding(record, token)
+            except (EnglishUnitError, TypeError, ValueError):
+                return _strict_en_fail(required, "strict_en_unit_span_invalid",
+                                       ledger_sha256=actual_hash,
+                                       failed_word_ids=[str(word_id)])
+        prior_phone_end = -math.inf
+        for phone_ordinal, phone in enumerate(record["phones"]):
+            if (phone.get("ordinal") != phone_ordinal
+                    or not _strict_en_phone_is_valid(phone, mfa_word)):
+                return _strict_en_fail(required, "strict_en_phone_invalid",
+                                       ledger_sha256=actual_hash,
+                                       failed_word_ids=[str(word_id)])
+            phone_start, phone_end = float(phone["start"]), float(phone["end"])
+            if phone_start < prior_phone_end:
+                return _strict_en_fail(required, "strict_en_phone_unordered",
+                                       ledger_sha256=actual_hash,
+                                       failed_word_ids=[str(word_id)])
+            prior_phone_end = phone_end
+        first_phone = record["phones"][0]
+        last_phone = record["phones"][-1]
+        if (abs(float(first_phone["start"]) - mfa_start) > AXIS_EPS
+                or abs(float(last_phone["end"]) - mfa_end) > AXIS_EPS
+                or any(float(right["start"]) - float(left["end"]) > AXIS_EPS
+                       for left, right in zip(record["phones"], record["phones"][1:]))):
+            return _strict_en_fail(required, "strict_en_phone_span_mismatch",
+                                   ledger_sha256=actual_hash,
+                                   failed_word_ids=[str(word_id)])
+        pronunciation_reason = _strict_en_pronunciation_reason(record, ledger)
+        if pronunciation_reason:
+            return _strict_en_fail(required, pronunciation_reason,
+                                   ledger_sha256=actual_hash,
+                                   failed_word_ids=[str(word_id)])
+        record_ids.add(word_id)
+        prior_ctc_ordinal = ctc_ordinal
+
     # The authoritative transcript may keep a contiguous English spelling as
     # one word (e.g. ``Sila``), while CTC/MFA tokenization can split the same
     # acoustic span into verified records (``S`` + ``il`` + ``a``).  Reconcile
     # only exact, ordered concatenations; never drop a record or synthesize a
     # phone.  This preserves every MFA phone as provenance for the final word.
+    if reference_text:
+        try:
+            authority_units = parse_english_units(reference_text)
+        except (EnglishUnitError, TypeError, ValueError):
+            authority_units = ()
+        if len(authority_units) != required and required > len(authority_units):
+            return _strict_en_fail(required, "strict_en_authoritative_compound_split",
+                                   ledger_sha256=actual_hash)
+    else:
+        authority_units = ()
+
     if len(records) != required:
+        # v2 canonical units are already merged by the producer.  A final
+        # split cannot be repaired by text concatenation: it would create two
+        # visible owners for one immutable unit and could enlarge ownership
+        # over punctuation or a gap.
+        return _strict_en_fail(
+            required, "strict_en_authoritative_compound_split"
+            if any("-" in str(record.get("ctc_text", ""))
+                   or record.get("unit_id") in {
+                       other.get("unit_id") for other in records
+                       if isinstance(other, dict) and other is not record}
+                   for record in records if isinstance(record, dict))
+            else "strict_en_word_count_mismatch",
+            ledger_sha256=actual_hash,
+            failed_word_ids=[str(item.get("word_id", "")) for item in records
+                             if isinstance(item, dict)])
+    if reference_text and len(authority_units) != required:
+        return _strict_en_fail(required, "strict_en_authority_unit_count_mismatch",
+                               ledger_sha256=actual_hash)
+    if not reference_text:
         grouped_records: list[dict] = []
         record_cursor = 0
         for final_word in english_words:
             target = final_word.text.strip().casefold()
+            hyphenated = "-" in target
+            target_key = _strict_en_join_key(target, hyphenated=hyphenated)
             joined = ""
             matched_end = None
             for candidate_end in range(record_cursor + 1, len(records) + 1):
@@ -5563,10 +10927,11 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
                 if not isinstance(candidate, dict):
                     break
                 joined += str(candidate.get("ctc_text", "")).strip()
-                if joined.casefold() == target:
+                joined_key = _strict_en_join_key(joined, hyphenated=hyphenated)
+                if joined_key == target_key:
                     matched_end = candidate_end
                     break
-                if not target.startswith(joined.casefold()):
+                if not target_key.startswith(joined_key):
                     break
             if matched_end is None:
                 return _strict_en_fail(
@@ -5592,6 +10957,8 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
                 combined = dict(first)
                 combined["ctc_text"] = final_word.text.strip()
                 combined["ctc_ordinal"] = last.get("ctc_ordinal")
+                combined["source_records"] = [dict(item) for item in chunk]
+                combined["source_word_ids"] = [item.get("word_id") for item in chunk]
                 combined["mfa_word"] = {
                     "ordinal": first_word.get("ordinal"),
                     "text": final_word.text.strip(),
@@ -5620,6 +10987,78 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
                 failed_word_ids=[str(item.get("word_id", "")) for item in records[record_cursor:]
                                  if isinstance(item, dict)])
         records = grouped_records
+    ordered_english_words = english_words
+    if isinstance(correspondence, dict):
+        if not correspondence.get("safe"):
+            return _strict_en_fail(required, "fallback_correspondence_rejected",
+                                   ledger_sha256=actual_hash)
+        # ``source_ctc_ordinals`` are raw interval ordinals in the *processed
+        # CTC* TextGrid consumed by the English producer.  They are neither
+        # the raw interval ordinals of the MFA source words tier
+        # (``source_to_final``) nor compact lexical ordinals
+        # (``ctc_to_final``).  Energy adjustment may insert blank intervals,
+        # so the three axes can differ even for a one-word English unit.
+        # Project the producer's raw processed-CTC owner onto the compact CTC
+        # axis first, then consume the correspondence ledger's CTC mapping.
+        if processed_ctc_words_tier is None:
+            return _strict_en_fail(
+                required, "fallback_processed_ctc_owner_axis_missing",
+                ledger_sha256=actual_hash)
+        processed_ctc_to_lexical: dict[int, int] = {}
+        lexical_ordinal = 0
+        for interval_ordinal, interval in enumerate(
+                processed_ctc_words_tier.intervals):
+            text = interval.text.strip()
+            if not text or is_silence(text) or is_punct(text):
+                continue
+            processed_ctc_to_lexical[interval_ordinal] = lexical_ordinal
+            lexical_ordinal += 1
+        ctc_to_final = correspondence.get("mapping", {}).get(
+            "ctc_to_final", {})
+        if (not isinstance(ctc_to_final, dict)
+                or lexical_ordinal != len(ctc_tokens or ())):
+            return _strict_en_fail(
+                required, "fallback_processed_ctc_owner_axis_invalid",
+                ledger_sha256=actual_hash)
+        final_lexical = [iv for iv in (words_tier.intervals if words_tier else [])
+                         if iv.text.strip() and not is_silence(iv.text)
+                         and not is_punct(iv.text)]
+        bound: list[Interval] = []
+        for record in records:
+            try:
+                source_ordinals = record["source_ctc_ordinals"]
+                if (not isinstance(source_ordinals, list) or not source_ordinals
+                        or any(type(value) is not int or value < 0
+                               for value in source_ordinals)):
+                    raise ValueError("invalid source CTC ordinals")
+                owner_ordinals = {
+                    int(ctc_to_final[str(processed_ctc_to_lexical[value])])
+                    for value in source_ordinals
+                }
+            except (KeyError, TypeError, ValueError):
+                return _strict_en_fail(required,
+                                       "fallback_correspondence_owner_missing",
+                                       ledger_sha256=actual_hash)
+            if len(owner_ordinals) != 1:
+                return _strict_en_fail(
+                    required, "fallback_correspondence_non_unique_owner",
+                    ledger_sha256=actual_hash)
+            final_ordinal = next(iter(owner_ordinals))
+            if final_ordinal < 0 or final_ordinal >= len(final_lexical):
+                return _strict_en_fail(required,
+                                       "fallback_correspondence_owner_missing",
+                                       ledger_sha256=actual_hash)
+            owner = final_lexical[final_ordinal]
+            if not is_english_token(owner.text.strip()):
+                return _strict_en_fail(required,
+                                       "fallback_correspondence_owner_mismatch",
+                                       ledger_sha256=actual_hash)
+            bound.append(owner)
+        if len({id(owner) for owner in bound}) != len(bound):
+            return _strict_en_fail(required, "fallback_correspondence_non_unique_owner",
+                                   ledger_sha256=actual_hash)
+        ordered_english_words = bound
+
     pairs: list[tuple[Interval, dict]] = []
     previous_ctc_ordinal = -1
     seen_word_ids: set[str] = set()
@@ -5628,7 +11067,7 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
     # stem containing more than one English segment even when the ledger and
     # source TextGrids are valid.
     seen_mfa_phone_ordinals: set[tuple[str, int]] = set()
-    for final_word, record in zip(english_words, records):
+    for final_word, record in zip(ordered_english_words, records):
         if not isinstance(record, dict):
             return _strict_en_fail(required, "strict_en_word_invalid", ledger_sha256=actual_hash)
         word_id = record.get("word_id")
@@ -5641,7 +11080,8 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
         if (record.get("status") != "verified" or record.get("provenance") != "english_mfa_textgrid"
                 or not isinstance(word_id, str) or not word_id or word_id in seen_word_ids
                 or ordinal <= previous_ctc_ordinal
-                or str(record.get("ctc_text", "")).casefold() != final_word.text.strip().casefold()
+            or re.sub(r"[^a-z0-9]", "", str(record.get("alignment_token", "")).casefold())
+               != re.sub(r"[^a-z0-9]", "", final_word.text.strip().casefold())
                 or not isinstance(mfa_word, dict) or not isinstance(phones, list) or not phones):
             return _strict_en_fail(required, "strict_en_word_identity_or_evidence_invalid",
                                    ledger_sha256=actual_hash, failed_word_ids=[str(word_id or "")])
@@ -5650,7 +11090,8 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
         try:
             if (not isinstance(mfa_word.get("ordinal"), int)
                     or mfa_word["ordinal"] < 0
-                    or str(mfa_word.get("text", "")).casefold() != final_word.text.strip().casefold()):
+                    or re.sub(r"[^a-z0-9]", "", str(mfa_word.get("text", "")).casefold())
+                       != re.sub(r"[^a-z0-9]", "", str(record.get("alignment_token", "")).casefold())):
                 raise ValueError("mfa_word_identity")
         except Exception:
             return _strict_en_fail(required, "strict_en_mfa_word_invalid", ledger_sha256=actual_hash,
@@ -5672,6 +11113,23 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
                 return _strict_en_fail(required, "strict_en_mfa_phone_ordinal_invalid",
                                        ledger_sha256=actual_hash, failed_word_ids=[word_id])
             seen_mfa_phone_ordinals.add(phone_key)
+        if authority_units:
+            unit = authority_units[len(pairs)]
+            if (record.get("unit_id") != unit.unit_id
+                    or record.get("alignment_token") != unit.alignment_token
+                    or final_word.text.strip() != unit.surface_text):
+                return _strict_en_fail(required, "strict_en_unit_owner_mismatch",
+                                       ledger_sha256=actual_hash,
+                                       failed_word_ids=[word_id])
+        if hanzi_tier is not None:
+            owners = [iv for iv in hanzi_tier.intervals
+                      if is_english_token(iv.text.strip())
+                      and abs(iv.xmin - final_word.xmin) <= AXIS_EPS
+                      and abs(iv.xmax - final_word.xmax) <= AXIS_EPS]
+            if len(owners) != 1:
+                return _strict_en_fail(required, "strict_en_hanzi_owner_mismatch",
+                                       ledger_sha256=actual_hash,
+                                       failed_word_ids=[word_id])
         pairs.append((final_word, record))
     return _strict_en_report("verified", required, required, [], actual_hash), pairs
 
@@ -6007,12 +11465,19 @@ def _apply_en_stress(words_tier: Tier, pp_intervals: list[Interval]) -> None:
             )
 
 
+def _strict_en_provenance_enabled(args) -> bool:
+    """Require strict English ledgers independently of global strict-ok QC."""
+    return bool(getattr(args, "strict_ok", False)
+                or getattr(args, "strict_en_provenance", False))
+
+
 def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                 output_dir: Path, filtered_dir: Path, args,
                 ipa_to_pinyin: dict[str, str],
                 pinyin_dict: dict[str, list[str]],
                 pinyin_case: dict[str, str] | None = None,
-                raw_text_index: dict[str, Path] | None = None) -> dict:
+                raw_text_index: dict[str, Path] | None = None,
+                wav_index: dict[str, Path] | None = None) -> dict:
     """Post-process a single MFA-aligned TextGrid into 5-tier output.
 
     PROCESSING ORDER IS CRITICAL.  The function is organised in 5 phases:
@@ -6033,7 +11498,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
 
     # Load English MFA phone data.
     # Auto-detect en_phones dir from workspace if not explicitly provided.
-    strict_en_mode = bool(getattr(args, "strict_ok", False))
+    strict_en_mode = _strict_en_provenance_enabled(args)
     en_phones_dir = getattr(args, 'en_phones_dir', None)
     if en_phones_dir is None:
         auto_dir = output_dir.parent / "en_phones"
@@ -6044,9 +11509,23 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # is loaded only after the final words tier is settled.
     en_data = None if strict_en_mode else load_en_phones(stem, en_phones_dir)
     report: dict = {"stem": stem, "status": "ok", "warnings": []}
+    ctc_lifecycle = _load_ctc_lifecycle(txt_dir, stem)
+    if ctc_lifecycle is None:
+        report["ctc_lifecycle"] = {
+            "schema": "ctc-processed-input-lifecycle-v1",
+            "status": "legacy_single_directory_fixture",
+        }
+    else:
+        report["ctc_lifecycle"] = ctc_lifecycle
     txt_path = txt_dir / f"{stem}.txt"
-    if not txt_path.exists():
-        txt_path = txt_dir / f"{stem}.lab"
+    lab_path = txt_dir / f"{stem}.lab"
+    reference_mode_policy = getattr(args, "reference_mode", "auto")
+    # Bind lab_fallback to the actual .lab artifact when the optional .txt is
+    # empty.  A non-empty .txt remains the normal pinyin source.
+    if (not txt_path.exists() or
+            (not txt_path.read_text(encoding="utf-8").strip()
+             and lab_path.is_file() and lab_path.read_text(encoding="utf-8").strip())):
+        txt_path = lab_path
     if not txt_path.exists():
         raise FileNotFoundError(f"Missing txt/lab: {txt_dir}/{stem}")
     tg = parse_textgrid(tg_path)
@@ -6054,9 +11533,15 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         raise ValueError(f"Need at least 2 tiers in {tg_path}")
     words_tier = tg.tiers[0]
     phones_tier = tg.tiers[1]
+    source_words_snapshot = _source_unknown_context(words_tier)
+    source_phone_lineage = _bind_source_phone_lineage(words_tier, phones_tier)
     mfa_unknown_before_snap = [
         iv.text.strip() for iv in words_tier.intervals
         if is_unknown_token(iv.text)
+    ]
+    mfa_unknown_intervals = [
+        (float(iv.xmin), float(iv.xmax), iv.text.strip())
+        for iv in words_tier.intervals if is_unknown_token(iv.text)
     ]
 
     # Fix MFA's forced lowercase: use dictionary's canonical form
@@ -6071,10 +11556,51 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # Tier 1: original/reference Chinese text.  This flag is intentionally
     # captured before ASR fallback: CTC may provide boundaries and language
     # hints, but it must not replace a supplied reference transcript.
-    raw_text = find_original_text(stem, args.raw_text_dir, raw_text_index)
-    reference_text_authoritative = bool(raw_text)
+    # An explicit fallback policy does not even inspect raw_text_dir, so a
+    # mixed directory or stale reference sidecar cannot upgrade one stem to
+    # authority while the rest of the batch remains ASR-only.
+    reference_text_original_raw = ("" if reference_mode_policy == "fallback" else
+                                   find_original_text(stem, args.raw_text_dir, raw_text_index))
+    reference_source_path = (find_original_text_path(
+        stem, args.raw_text_dir, raw_text_index)
+        if reference_text_original_raw else None)
+    reference_text_original = reference_text_original_raw
+    raw_text = reference_text_original
+    reference_text_authoritative = bool(reference_text_original_raw)
+    if reference_mode_policy == "authority" and not reference_text_authoritative:
+        raise FileNotFoundError(
+            f"reference-mode=authority requires reference text for {stem}")
     reference_source = "original_or_ref" if reference_text_authoritative else ""
-    if not raw_text:
+    if reference_text_authoritative:
+        # Keep the loaded reference immutable for provenance.  Only the
+        # authority projection receives numeral normalization; CTC labs,
+        # tokens, and the pinyin source remain untouched.
+        try:
+            import cn2an as _cn2an
+            _numeral_transform = _cn2an.transform
+        except ImportError:
+            _numeral_transform = None
+        reference_text_original, _numeral_report = (
+            normalize_authority_reference_numerals(
+                reference_text_original_raw, _numeral_transform,
+                return_report=True))
+        raw_reference_bytes = (reference_source_path.read_bytes()
+                               if reference_source_path is not None
+                               else reference_text_original_raw.encode("utf-8"))
+        _numeral_report["raw_sha256"] = hashlib.sha256(
+            raw_reference_bytes).hexdigest()
+        if reference_source_path is not None:
+            _numeral_report["raw_path"] = str(reference_source_path.resolve())
+        _numeral_report["normalized_sha256"] = hashlib.sha256(
+            reference_text_original.encode("utf-8")).hexdigest()
+        report["reference_text_original_raw"] = reference_text_original_raw
+        report["reference_text_normalized"] = reference_text_original
+        report["reference_text_raw_sha256"] = _numeral_report["raw_sha256"]
+        report["reference_numeral_normalization"] = _numeral_report
+        # Canonicalize only the in-memory authority string.  The original
+        # source remains byte-for-byte untouched on disk.
+        raw_text = _canonicalize_reference_hyphens(reference_text_original)
+    if not reference_text_authoritative:
         # Try NVASR Chinese ASR output
         cn_path = txt_dir / f"{stem}_text_cn.txt"
         if cn_path.exists():
@@ -6084,10 +11610,31 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         # Fallback: use the pinyin txt content
         raw_text = txt_path.read_text(encoding="utf-8").strip()
         reference_source = "lab_fallback"
-    reference_text_original = raw_text
+    if not reference_text_authoritative:
+        reference_text_original = raw_text
+    report["reference_mode"] = (
+        "authority" if reference_text_authoritative else "fallback")
+    report["reference_source"] = reference_source
+    report["reference_text_authoritative"] = reference_text_authoritative
+    if not reference_text_authoritative:
+        report["reference_numeral_normalization"] = {
+            "schema": REFERENCE_NUMERAL_NORMALIZATION_SCHEMA,
+            "status": "not_applicable",
+        }
+    if not reference_text_authoritative:
+        fallback_path = (cn_path if reference_source == "asr_fallback" else txt_path)
+        report["fallback_transcript"] = {
+            "source": reference_source,
+            "path": str(fallback_path.resolve()),
+            "sha256": hashlib.sha256(fallback_path.read_bytes()).hexdigest(),
+        }
 
     # Tier 2: pinyin with punctuation (from corpus txt)
     pinyin_text = txt_path.read_text(encoding="utf-8").strip()
+    if reference_text_authoritative:
+        # CTC/lab text is normalized with the same lexical policy so a lab
+        # containing ``v-tuber`` aligns identically to ``v tu ber``.
+        pinyin_text = _canonicalize_reference_hyphens(pinyin_text)
     pinyin_text_original = pinyin_text
 
     # Fix <unk>/[bracketed] from MFA: self-referential NVV / English tokens
@@ -6100,62 +11647,22 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     if tokens_path.exists():
         for line in tokens_path.read_text(encoding="utf-8").strip().split("\n"):
             if line:
-                ctc_token_list.append(json.loads(line))
+                token = json.loads(line)
+                if (reference_text_authoritative and isinstance(token, dict)
+                        and isinstance(token.get("word"), str)):
+                    token = dict(token)
+                    token["word"] = _canonicalize_reference_hyphens(token["word"])
+                ctc_token_list.append(token)
 
-    # For each MFA word that is <unk>/[bracketed], or is a pinyin syllable
-    # (e.g. rui4) where the CTC anchor says it should be English (e.g. ria),
-    # restore the correct word text from CTC anchors by time overlap.
+    # Restore only explicit MFA unknown placeholders.  A no-reference CTC
+    # English anchor is not authority to relabel a neighbouring pinyin word.
     if ctc_token_list and not reference_text_authoritative:
-        for iv in words_tier.intervals:
-            if is_silence(iv.text) or iv.text.strip() in ("", "<eps>"):
-                continue
-            is_bracket = iv.text.strip() in ("<unk>", "[bracketed]")
-            is_pinyin = is_pinyin_syllable(iv.text.strip())
-            if not is_bracket and not is_pinyin:
-                continue
-            best_ctc = None
-            best_overlap = 0.0
-            for ct in ctc_token_list:
-                overlap = min(iv.xmax, ct["end_s"]) - max(iv.xmin, ct["start_s"])
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best_ctc = ct
-            if best_ctc:
-                ctc_word = best_ctc["word"].strip().strip("<>")
-                if is_bracket and (is_nvv_token(ctc_word) or is_english_token(ctc_word)):
-                    iv.text = ctc_word
-                elif is_pinyin and is_english_token(ctc_word):
-                    # MFA split an English word into pinyin fragments
-                    iv.text = ctc_word
-
-    # Merge consecutive intervals that belong to the same CTC English token.
-    # When MFA splits e.g. "ria" into "rui4"+"ya4", both fragments fall
-    # within the CTC token's time range and should be merged.
-    # Guard: both words must be English tokens (not Chinese pinyin like "yi1")
-    # to avoid swallowing real Chinese words that happen to overlap the
-    # English token boundary.
-    if ctc_token_list and not reference_text_authoritative:
-        merged_intervals = []
-        for iv in words_tier.intervals:
-            if (merged_intervals
-                    and is_english_token(merged_intervals[-1].text.strip())
-                    and (is_english_token(iv.text.strip())
-                         or is_pinyin_syllable(iv.text.strip()))):
-                prev = merged_intervals[-1]
-                for ct in ctc_token_list:
-                    ct_word = ct["word"].strip().strip("<>")
-                    if not is_english_token(ct_word):
-                        continue
-                    prev_ov = min(prev.xmax, ct["end_s"]) - max(prev.xmin, ct["start_s"])
-                    cur_ov = min(iv.xmax, ct["end_s"]) - max(iv.xmin, ct["start_s"])
-                    if prev_ov > 0 and cur_ov > 0 and prev.text.strip().lower() == ct_word.lower():
-                        merged_intervals[-1] = Interval(prev.xmin, iv.xmax, prev.text)
-                        break
-                else:
-                    merged_intervals.append(Interval(iv.xmin, iv.xmax, iv.text))
-            else:
-                merged_intervals.append(Interval(iv.xmin, iv.xmax, iv.text))
-        words_tier = Tier(words_tier.name, words_tier.xmin, words_tier.xmax, merged_intervals)
+        words_tier = _restore_fallback_unknown_surfaces(
+            words_tier, ctc_token_list)
+        fallback_unknown_projection = getattr(
+            words_tier, "_fallback_unknown_projection", None)
+        if isinstance(fallback_unknown_projection, dict):
+            report["fallback_unknown_projection"] = fallback_unknown_projection
 
     raw_tier = Tier("raw_text", tg.xmin, tg.xmax,
                     [Interval(tg.xmin, tg.xmax, raw_text)])
@@ -6167,13 +11674,10 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # Build 5 tiers
     tiers = [raw_tier, pinyin_tier, words_tier, phones_tier, pinyin_phones_tier]
     new_tg = TextGrid(tg.xmin, tg.xmax, tiers)
+    new_tg._phone_lineage = source_phone_lineage
 
-    # Find WAV recursively (may be in subdirectory)
-    wav_path = wav_dir / f"{stem}.wav"
-    if not wav_path.exists():
-        candidates = list(wav_dir.rglob(f"{stem}.wav"))
-        if candidates:
-            wav_path = candidates[0]
+    # Find WAV once from the batch index (may be in a subdirectory).
+    wav_path = _find_wav(stem, wav_dir, wav_index)
     # Load WAV once for all audio-dependent steps
     wav_audio = wav_sr = None
     if wav_path.exists():
@@ -6188,11 +11692,11 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # they operate on raw MFA phone/word boundaries.
     # ═══════════════════════════════════════════════════════════════
 
+    # Short inter-word silence is owned only by the final visual resolver.
+    # Keep the legacy option/API for compatibility, but do not let Phase 1
+    # mutate words or phones before the final authority snapshot exists.
     merge_report = []
-    if args.merge_silence:
-        new_tg, merge_report = merge_short_silences(
-            new_tg, wav_path if wav_path.exists() else None, args, wav_audio, wav_sr)
-        report["silence_merges"] = merge_report
+    report["silence_merges"] = merge_report
 
     if args.fix_short_word:
         new_tg, fixes = fix_short_words(new_tg, wav_path if wav_path.exists() else None, args,
@@ -6236,6 +11740,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                      for iv in tier.intervals]
         new_tiers.append(Tier(tier.name, tier.xmin, tier.xmax, relabeled))
     new_tg = TextGrid(new_tg.xmin, new_tg.xmax, new_tiers)
+    new_tg._phone_lineage = source_phone_lineage
 
     # Tier 6: corrected Chinese text (punctuation ↔ silence cross-check)
     if args.enable_text_correction:
@@ -6257,7 +11762,10 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # _finalise_textgrid is a throwaway (replaced in Phase 5).
     # Passing warnings would duplicate every mismatch message.
     if args.enable_text_correction:
-        new_tg = _finalise_textgrid(new_tg, raw_text, pinyin_text, args)
+        new_tg = _finalise_textgrid(
+            new_tg, raw_text, pinyin_text, args,
+            reference_authoritative=reference_text_authoritative)
+        new_tg._phone_lineage = source_phone_lineage
 
     # ═══════════════════════════════════════════════════════════════
     # Phase 3 — Boundary adjustments (ORDER CRITICAL — DO NOT REORDER).
@@ -6304,6 +11812,11 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                     new_tg.tiers[i] = words_tier
                 elif t.name == "pinyin_phones" and pp_tier is not None:
                     new_tg.tiers[i] = pp_tier
+            new_tg._ctc_word_authority = getattr(
+                words_tier, "_ctc_word_authority", None)
+            _ensure_processed_geometry_state(words_tier)
+            new_tg._processed_geometry_ledger = list(
+                _processed_geometry_ledger(words_tier))
 
     # --- B. Energy-based boundary refinement ---
     if wav_audio is not None:
@@ -6335,7 +11848,9 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     pp_tier = tier_by_name(new_tg, "pinyin_phones")
     if punct_entries and words_tier:
             words_tier, pp_tier = _inject_punctuation(
-                words_tier, pp_tier, punct_entries)
+                words_tier, pp_tier, punct_entries,
+                reference_text=reference_text_original,
+                reference_authoritative=reference_text_authoritative)
             for i, t in enumerate(new_tg.tiers):
                 if t.name == "words":
                     new_tg.tiers[i] = words_tier
@@ -6438,11 +11953,12 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                         break
 
     # --- D. Handle unexpected silences ---
+    # Keep the historical pinyin cross-check as pre-final diagnostics only.
+    # The authoritative filter reason is recomputed after all punctuation and
+    # ownership geometry mutations below.
     sil_filter_reasons = []
     if args.handle_unexpected_sil:
-        sil_filter_reasons = handle_unexpected_silences(new_tg, pinyin_text)
-        if sil_filter_reasons:
-            report["unexpected_silence"] = sil_filter_reasons
+        handle_unexpected_silences(new_tg, pinyin_text)
 
     # --- D2. NVV absorbs trailing punctuation + silence chain ---
     # MFA cannot model NVV acoustically; the audio between an NVV and
@@ -6473,7 +11989,12 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             _sync_derived_tiers(new_tg, ipa_to_pinyin, pinyin_dict,
                                 raw_text=raw_text,
                                 en_mfa_windows=en_mfa_windows,
-                                report_warnings=report.get("warnings", []))
+                                report_warnings=report.get("warnings", []),
+                                reference_authoritative=reference_text_authoritative,
+                                gap_ownership_evidence=_build_gap_ownership_evidence(
+                                    _wt, source_words_snapshot, ctc_token_list,
+                                    reference_text_original,
+                                    reference_text_authoritative))
 
     # ── Phase 4 后比对: 哪些标点在 Phase 4 中被吞了 ──
     _swallowed_puncts: list[dict] = []
@@ -6495,7 +12016,12 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
 
     # ── SYNC: D2/D3/D4 modified words tier in-place → rebuild derived tiers ──
     _sync_derived_tiers(new_tg, ipa_to_pinyin, pinyin_dict,
-                         raw_text, en_mfa_windows, report.get("warnings", []))
+                         raw_text, en_mfa_windows, report.get("warnings", []),
+                         reference_text_authoritative,
+                         _build_gap_ownership_evidence(
+                             tier_by_name(new_tg, "words"), source_words_snapshot,
+                             ctc_token_list, reference_text_original,
+                             reference_text_authoritative))
 
     # --- E. NVV + ellipsis unconditional merge ---
     words_tier = tier_by_name(new_tg, "words")
@@ -6503,6 +12029,8 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     if words_tier:
         intervals = list(words_tier.intervals)
         for i in range(len(intervals) - 1):
+            if _ctc_authoritative_ordinal(words_tier, i) is not None:
+                continue
             if is_nvv_token(intervals[i].text) and intervals[i + 1].text.strip() == '…':
                 gap = intervals[i + 1].xmin - intervals[i].xmax
                 if gap < 0.02:
@@ -6510,7 +12038,8 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                                             intervals[i].text)
                     intervals[i + 1] = Interval(0, 0, '')
         intervals = [iv for iv in intervals if iv.xmax > iv.xmin + 0.001]
-        words_tier = Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals)
+        words_tier = _copy_tier_metadata(
+            words_tier, Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals))
         for i, t in enumerate(new_tg.tiers):
             if t.name == "words":
                 new_tg.tiers[i] = words_tier
@@ -6562,7 +12091,12 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
 
     # ── Final Phase 4 sync: ensure all derived tiers are current ──
     _sync_derived_tiers(new_tg, ipa_to_pinyin, pinyin_dict,
-                         raw_text, en_mfa_windows, report.get("warnings", []))
+                         raw_text, en_mfa_windows, report.get("warnings", []),
+                         reference_text_authoritative,
+                         _build_gap_ownership_evidence(
+                             tier_by_name(new_tg, "words"), source_words_snapshot,
+                             ctc_token_list, reference_text_original,
+                             reference_text_authoritative))
 
     # ═══════════════════════════════════════════════════════════════
     # Phase 5 — Final text sync & QC.
@@ -6581,16 +12115,45 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         words_tier = tier_by_name(new_tg, "words")
         if words_tier and ctc_data:
             intervals = list(words_tier.intervals)
+            fallback_projection = getattr(
+                words_tier, "_fallback_unknown_projection", None)
+            ordinal_ctc = {}
+            ctc_word_data = [item for item in ctc_data
+                             if isinstance(item, dict)
+                             and item.get("type", "word") == "word"]
+            if isinstance(fallback_projection, dict) \
+                    and fallback_projection.get("safe"):
+                ordinal_ctc = {
+                    entry.get("ctc_lexical_ordinal"): ctc_word_data[
+                        entry["ctc_lexical_ordinal"]]
+                    for entry in fallback_projection.get("entries", [])
+                    if entry.get("status") == "mapped"
+                    and isinstance(entry.get("ctc_lexical_ordinal"), int)
+                    and 0 <= entry["ctc_lexical_ordinal"] < len(ctc_word_data)}
+            elif fallback_projection is None:
+                # Authority-mode compatibility uses the ordinal established
+                # by _snap_to_ctc itself.  It is still lexical evidence, not
+                # a second time-overlap owner search.
+                for authority in getattr(words_tier, "_ctc_word_authority", []):
+                    ctc_ordinal = authority.get("ctc_lexical_ordinal")
+                    lexical = authority.get("lexical_ordinal")
+                    if (isinstance(lexical, int)
+                            and isinstance(ctc_ordinal, int)
+                            and 0 <= ctc_ordinal < len(ctc_word_data)):
+                        ordinal_ctc[lexical] = ctc_word_data[ctc_ordinal]
+            lexical_ordinal = 0
             for i, iv in enumerate(intervals):
+                if (not iv.text.strip() or is_silence(iv.text)
+                        or is_punct(iv.text)):
+                    continue
+                current_lexical_ordinal = lexical_ordinal
+                lexical_ordinal += 1
                 if not is_nvv_token(iv.text.strip()):
                     continue
-                best_ctc = None
-                best_overlap = 0.0
-                for ct in ctc_data:
-                    overlap = min(iv.xmax, ct["end_s"]) - max(iv.xmin, ct["start_s"])
-                    if overlap > best_overlap:
-                        best_overlap = overlap
-                        best_ctc = ct
+                # Presence of fallback projection metadata is an authority
+                # decision: safe projections use the exact CTC ordinal, while
+                # rejected projections never fall back to a guessed owner.
+                best_ctc = ordinal_ctc.get(current_lexical_ordinal)
                 if best_ctc and best_ctc["end_s"] > iv.xmax + 0.01:
                     new_end = best_ctc["end_s"]
                     # Set the next non-silence word to start at NVV's CTC end
@@ -6602,14 +12165,15 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                             nj.xmin = new_end
                         break
                     iv.xmax = new_end
-            words_tier = Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals)
+            words_tier = _copy_tier_metadata(
+                words_tier, Tier(words_tier.name, words_tier.xmin, words_tier.xmax, intervals))
             for i, t in enumerate(new_tg.tiers):
                 if t.name == "words":
                     new_tg.tiers[i] = words_tier
                     break
 
     # 检测被吞掉的标点: CTC punct 条目在 words tier 中时间匹配不到 -> 从文本删除
-    if punct_entries:
+    if punct_entries and not reference_text_authoritative:
         words_tier = tier_by_name(new_tg, "words")
         if words_tier:
             # 收集 words tier 中所有标点 interval (按时间索引)
@@ -6674,20 +12238,15 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         #    normalize_english_tokens.py when _text_cn.txt (ASR) differs from
         #    the reference.  raw_text from the original .txt is ground truth.
         #    Regression Case 62.
-        _normalize_word_spellings(final_words_tier, raw_text)
+        _normalize_word_spellings(
+            final_words_tier,
+            reference_text_original if reference_text_authoritative else raw_text,
+            authority_strict=reference_text_authoritative)
 
-        # Reference punctuation is lexical authority.  CTC punctuation may
-        # be missing, swallowed by a broad pause, or spuriously appended at
-        # the end; repair the words tier before rebuilding all derived tiers.
+        # Reference punctuation is committed once, after all mutable
+        # boundary/energy stages.  Its derived tiers are rebuilt at the final
+        # authority commit below.
         if reference_text_authoritative:
-            _restore_reference_punctuation(
-                final_words_tier, reference_text_original, punct_entries)
-            _sync_derived_tiers(
-                new_tg, ipa_to_pinyin, pinyin_dict,
-                raw_text=reference_text_original,
-                en_mfa_windows=en_mfa_windows,
-                report_warnings=report.get("warnings", []))
-            final_words_tier = tier_by_name(new_tg, "words")
             raw_text = reference_text_original
             pinyin_text = pinyin_text_original
         # Phase 5 spelling/punctuation authority can itself change interval
@@ -6701,11 +12260,16 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                 new_tg, ipa_to_pinyin, pinyin_dict,
                 raw_text=(reference_text_original if reference_text_authoritative else raw_text),
                 en_mfa_windows=en_mfa_windows,
-                report_warnings=report.get("warnings", []))
+                report_warnings=report.get("warnings", []),
+                reference_authoritative=reference_text_authoritative,
+                gap_ownership_evidence=_build_gap_ownership_evidence(
+                    final_words_tier, source_words_snapshot, ctc_token_list,
+                    reference_text_original, reference_text_authoritative))
             final_words_tier = tier_by_name(new_tg, "words")
         # 2. Rebuild hanzi from normalised words.
-        hanzi_tier = _build_hanzi_tier(final_words_tier, raw_text,
-                                        report.get("warnings", []))
+        hanzi_tier = _build_hanzi_tier(
+            final_words_tier, raw_text, report.get("warnings", []),
+            reference_authoritative=reference_text_authoritative)
         if hanzi_tier:
             found = False
             for i, t in enumerate(new_tg.tiers):
@@ -6906,7 +12470,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                     raw_tier.intervals[0].text = "".join(raw_tokens)
 
     # 最终恢复: CTC 长停顿注入 … 覆盖了原标点, 用 CTC punct 替换回去
-    if punct_entries:
+    if punct_entries and not reference_text_authoritative:
         words_tier = tier_by_name(new_tg, "words")
         if words_tier:
             for p in punct_entries:
@@ -6930,7 +12494,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # 匹配策略 (Case 24 修复): 按CTC序列顺序匹配, 而非时间重叠.
     # 标点在CTC序列中的前后邻词决定了其顺序位置;
     # 在words tier中找到同一个前词→<spN>→后词的三元组, 即为恢复目标.
-    if _swallowed_puncts:
+    if _swallowed_puncts and not reference_text_authoritative:
         _words_t = tier_by_name(new_tg, "words")
         if _words_t:
             # Build CTC timeline: all items (tokens + puncts) sorted by start time
@@ -7000,7 +12564,8 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                     _new_hanzi = _build_hanzi_tier(
                         _words_t,
                         raw_text if raw_text else "",
-                        report.get("warnings", []))
+                        report.get("warnings", []),
+                        reference_authoritative=reference_text_authoritative)
                     if _new_hanzi:
                         for _i, _t in enumerate(new_tg.tiers):
                             if _t.name == "hanzi":
@@ -7028,17 +12593,28 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                 report.setdefault("restored_punct", 0)
                 report["restored_punct"] = _restored
 
-    # ── 末尾标点强制保留 ───────────────────────────────────────────
-    # CTC 最后一个标点如果被前词 (通常是 NVV) 吸收, 从前词末尾截取至少
-    # 60ms 还给标点。保证每个音频的句末标点不丢失。
+    # ── 末尾标点恢复（仅替换显式尾部静音） ─────────────────────────
+    # CTC 最后一个标点如果被前词吸收，只能从同一 CTC anchor 覆盖的显式
+    # 尾部静音中恢复。没有显式静音时，不能从 voiced lexical word 裁剪
+    # 音频/音素来强行保留标点；标点缺失由 publication projection 记为
+    # missing_allowed，不是过滤理由。
     # Regression Case 25 follow-up: terminal punct recovery.
-    if punct_entries:
+    if punct_entries and not reference_text_authoritative:
         _words_t = tier_by_name(new_tg, "words")
         if _words_t:
             # Find the last (rightmost) CTC punct
             _last_punct = max(punct_entries, key=lambda p: p["end_s"])
             _last_punct_word = _last_punct["word"]
             _last_punct_end = _last_punct["end_s"]
+            try:
+                _last_punct_start = float(_last_punct["start_s"])
+            except (KeyError, TypeError, ValueError):
+                _last_punct_start = -math.inf
+            _has_explicit_tail_silence = any(
+                is_silence(iv.text) and iv.text.strip()
+                and iv.xmax > _last_punct_start + AXIS_EPS
+                and iv.xmin < _last_punct_end - AXIS_EPS
+                for iv in _words_t.intervals)
 
             # Check if this punct already exists as the last item in words tier
             _word_ivs = list(_words_t.intervals)
@@ -7051,7 +12627,8 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             _punct_at_end = (_last_word_iv is not None
                              and _last_word_iv.text.strip() == _last_punct_word)
 
-            if not _punct_at_end and _last_word_iv is not None:
+            if not _punct_at_end and _last_word_iv is not None \
+                    and _has_explicit_tail_silence:
                 _last_idx = len(_word_ivs) - 1
                 for _i in range(len(_word_ivs) - 1, -1, -1):
                     if _word_ivs[_i] is _last_word_iv:
@@ -7072,8 +12649,9 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                                              xmin=_punct_start,
                                              xmax=_punct_start + _carve_s,
                                              text=_last_punct_word))
-                    _words_t = Tier(_words_t.name, _words_t.xmin,
-                                    _words_t.xmax, _new_ivs)
+                    _words_t = _copy_tier_metadata(
+                        _words_t, Tier(_words_t.name, _words_t.xmin,
+                                       _words_t.xmax, _new_ivs))
                     for _i, _t in enumerate(new_tg.tiers):
                         if _t.name == "words":
                             new_tg.tiers[_i] = _words_t
@@ -7106,31 +12684,74 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                                 new_tg.tiers[_i] = _t_new
                                 break
 
-    # Final authoritative reconciliation: terminal-punctuation recovery above
-    # may have reintroduced a CTC-only mark.  Reapply the reference contract
-    # immediately before strict English injection and publication.
+    # Evidence-constrained recovery is the last non-authority boundary repair.
+    # It must run before the single reference owner commit so that the commit
+    # below is stable and every later operation is derived-only.
+    evidence_repairs = _apply_evidence_constrained_repairs(
+        stem, source_words_snapshot, ctc_token_list, new_tg)
+    if evidence_repairs:
+        report["evidence_repairs"] = evidence_repairs
     if reference_text_authoritative:
+        # This pass is still a words-tier mutation, so it belongs before the
+        # single authority commit.  It absorbs only punctuation-owned silence.
+        absorb_silence_into_punct(new_tg)
+
+    # Final authoritative reconciliation: commit the reference punctuation
+    # owner once, immediately before derived-tier publication.
+    if reference_text_authoritative:
+        reference_output_text = _canonicalize_reference_hyphens(
+            reference_text_original)
         _final_words = tier_by_name(new_tg, "words")
         if _final_words is not None:
             _restore_reference_punctuation(
-                _final_words, reference_text_original, punct_entries)
-            _sync_derived_tiers(
-                new_tg, ipa_to_pinyin, pinyin_dict,
-                raw_text=reference_text_original,
-                en_mfa_windows=en_mfa_windows,
-                report_warnings=report.get("warnings", []))
-            _derived_pp = tier_by_name(new_tg, "pinyin_phones")
-            _derived_words = tier_by_name(new_tg, "words")
-            if _derived_pp is not None and _derived_words is not None:
-                _clip_pinyin_phones_to_words(_derived_pp, _derived_words)
+                _final_words, reference_output_text, punct_entries)
+            # One exact compound transaction owns all reference English
+            # fragments.  It runs after punctuation restore and before the
+            # final derived-tier rebuild/freeze; failed validation leaves the
+            # split geometry untouched for the strict auditors to reject.
+            _merge_authority_alpha_digit_fragments(
+                _final_words, reference_output_text, ctc_token_list,
+                report=report)
+            # Derived-only rebuild: unlike _sync_derived_tiers this does not
+            # reopen gap ownership or canonicalize the frozen owner list.
+            _final_hanzi = _build_hanzi_tier(
+                _final_words, reference_output_text,
+                report.get("warnings", []), reference_authoritative=True)
+            if _final_hanzi is not None:
+                for _index, _tier in enumerate(new_tg.tiers):
+                    if _tier.name == "hanzi":
+                        new_tg.tiers[_index] = _final_hanzi
+                        break
+            _final_phones = tier_by_name(new_tg, "phones")
+            if _final_phones is not None and pinyin_dict is not None:
+                _final_pp = build_pinyin_phones_tier(
+                    _final_phones, ipa_to_pinyin, _final_words,
+                    pinyin_dict, en_mfa_windows=en_mfa_windows)
+                if _final_pp is not None:
+                    for _index, _tier in enumerate(new_tg.tiers):
+                        if _tier.name == "pinyin_phones":
+                            new_tg.tiers[_index] = _final_pp
+                            break
         _raw_authoritative = tier_by_name(new_tg, "raw_text")
         if _raw_authoritative and _raw_authoritative.intervals:
             _raw_authoritative.intervals[0].text = (
-                "<sp1>" + reference_text_original.replace("<sp1>", ""))
+                "<sp1>" + reference_output_text.replace("<sp1>", ""))
         _pinyin_authoritative = tier_by_name(new_tg, "pinyin")
         if _pinyin_authoritative and _pinyin_authoritative.intervals:
             _pinyin_authoritative.intervals[0].text = _reference_pinyin_text(
-                reference_text_original, pinyin_text_original)
+                reference_output_text, pinyin_text_original)
+
+    # Final visual silence owner commit.  The resolver snapshots the current
+    # words list after punctuation restore/absorption, computes every decision
+    # against that immutable list, and rebuilds words once.  Phones and all
+    # derived tiers are synchronized only by the freeze/lineage barrier below.
+    _resolve_visual_short_silence_merges(
+        new_tg, wav_audio, wav_sr or 16000, args, report=report,
+        ctc_tokens=ctc_token_list, reference_punct_entries=punct_entries)
+    # Owner arbitration is complete.  Only now normalize labels on retained
+    # internal pure-silence intervals, immediately before geometry freeze;
+    # this cannot reopen or alter the already-committed owner decision.
+    _normalize_final_internal_silence_labels(new_tg, report=report)
 
     # ── Final de-overlap: pinyin_phones tier (must be after ALL
     #     Phase 5 phone modifications including _apply_en_stress) ──
@@ -7145,12 +12766,135 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # English phones.  None of those transformations are admissible for a
     # strict result: the final pinyin_phones tier must be the exact ledger
     # sequence and affine timings, with only the ``en:`` namespace added.
+    if reference_text_authoritative:
+        restored_units = _restore_reference_surfaces(
+            tier_by_name(new_tg, "words"), tier_by_name(new_tg, "hanzi"),
+            reference_text_original)
+        if restored_units:
+            report["english_surface_units_restored"] = restored_units
+
+    # Final geometry barrier.  All earlier stages may inspect or reconcile
+    # CTC/MFA evidence, but the *current processed words* are now the only
+    # publication authority.  In particular, never reassert ``resolved_span``
+    # or a raw CTC span here: doing so resurrects the pre-processed boundary
+    # after ``handle_unexpected_silences`` merged an internal <sp0>.
+    _final_words_before_ctc = tier_by_name(new_tg, "words")
+    _final_words_after_ctc = _final_words_before_ctc
+    _ctc_reasserted = 0
+    if _ctc_reasserted and _final_words_after_ctc is not None:
+        # Reference-confirmed punctuation is the one intentional local
+        # exception: it may carve the immediate CTC lexical owners, but no
+        # generic MFA/energy pass is allowed to do so.
+        if reference_text_authoritative:
+            # The authority commit above is the single owner mutation.  This
+            # barrier is intentionally derived-only; do not re-run restore.
+            pass
+        report["boundary_decision_reassertions"] = _ctc_reasserted
+        for _index, _tier in enumerate(new_tg.tiers):
+            if _tier.name == "words":
+                new_tg.tiers[_index] = _final_words_after_ctc
+                break
+        _final_words_before_ctc = _final_words_after_ctc
+        _lineage = getattr(new_tg, "_phone_lineage", None)
+        _final_phones = tier_by_name(new_tg, "phones")
+        if _final_phones is not None and isinstance(_lineage, dict):
+            _rebuilt_final_phones = _rebuild_phones_from_lineage(
+                _final_words_after_ctc, _final_phones, _lineage)
+            if _rebuilt_final_phones is not None:
+                for _index, _tier in enumerate(new_tg.tiers):
+                    if _tier.name == "phones":
+                        new_tg.tiers[_index] = _rebuilt_final_phones
+                        _final_phones = _rebuilt_final_phones
+                        break
+                if _lineage.get("status") in {"verified", "partial"}:
+                    if hasattr(new_tg, "_phone_lineage_invalid"):
+                        delattr(new_tg, "_phone_lineage_invalid")
+                    if hasattr(_final_phones, "_phone_lineage_invalid"):
+                        delattr(_final_phones, "_phone_lineage_invalid")
+        if _final_phones is not None:
+            _final_hanzi = _build_hanzi_tier(
+                _final_words_after_ctc,
+                reference_text_original if reference_text_authoritative else raw_text,
+                report.get("warnings", []),
+                reference_authoritative=reference_text_authoritative)
+            if _final_hanzi is not None:
+                for _index, _tier in enumerate(new_tg.tiers):
+                    if _tier.name == "hanzi":
+                        new_tg.tiers[_index] = _final_hanzi
+                        break
+            if pinyin_dict is not None:
+                _final_pp = build_pinyin_phones_tier(
+                    _final_phones, ipa_to_pinyin, _final_words_after_ctc,
+                    pinyin_dict, en_mfa_windows=en_mfa_windows)
+                if _final_pp is not None:
+                    for _index, _tier in enumerate(new_tg.tiers):
+                        if _tier.name == "pinyin_phones":
+                            new_tg.tiers[_index] = _final_pp
+                            break
+
+    # Fallback lexical correspondence is the only source of a no-reference
+    # lexical owner mapping.  Build it after the final words mutation and
+    # before freezing so phone/English lineage can consume the same immutable
+    # source→CTC→final ordinals.  Authority runs deliberately retain their
+    # existing proof path and do not consult fallback evidence.
+    fallback_correspondence = None
+    if not reference_text_authoritative:
+        fallback_correspondence = _fallback_lexical_correspondence_ledger(
+            source_words_snapshot, ctc_token_list, tier_by_name(new_tg, "words"))
+        report["fallback_correspondence"] = fallback_correspondence
+        if fallback_correspondence.get("safe"):
+            _apply_fallback_correspondence_to_lineage(
+                source_phone_lineage, fallback_correspondence)
+            new_tg._phone_lineage = source_phone_lineage
+
+    # Freeze only after the final authority/silence mutation above.  All
+    # derived tiers below are rebuilt from this frozen interval list; no later
+    # sync is allowed to reopen CTC/MFA arbitration.
+    _frozen_words, _freeze_reasons = _freeze_processed_geometry(new_tg)
+    if _freeze_reasons:
+        report["processed_geometry_contract"] = {
+            "status": "rejected", "reasons": _freeze_reasons}
+    if _frozen_words is not None:
+        _rebuild_derived_from_frozen_words(
+            new_tg, ipa_to_pinyin, pinyin_dict,
+            reference_text_original if reference_text_authoritative else raw_text,
+            en_mfa_windows=en_mfa_windows,
+            warnings=report.get("warnings", []),
+            reference_authoritative=reference_text_authoritative)
     strict_en_rejected = False
+    unknown_source_redeemed = False
+    unknown_recovery_proof = None
     if strict_en_mode:
         final_words_tier = tier_by_name(new_tg, "words")
+        processed_ctc_textgrid_path = txt_dir / f"{stem}.TextGrid"
+        if not processed_ctc_textgrid_path.is_file():
+            processed_ctc_textgrid_path = txt_dir / stem / f"{stem}.TextGrid"
+        processed_ctc_words_tier = None
+        if processed_ctc_textgrid_path.is_file():
+            try:
+                processed_ctc_words_tier = tier_by_name(
+                    parse_textgrid(processed_ctc_textgrid_path), "words")
+            except (OSError, UnicodeError, ValueError):
+                processed_ctc_words_tier = None
         strict_en, strict_pairs = load_strict_en_provenance(
-            stem, final_words_tier, en_phones_dir)
+            stem, final_words_tier, en_phones_dir,
+            hanzi_tier=tier_by_name(new_tg, "hanzi"),
+            reference_text=(reference_text_original if reference_text_authoritative else None),
+            ctc_tokens=ctc_token_list,
+            correspondence=(fallback_correspondence
+                            if not reference_text_authoritative else None),
+            processed_ctc_words_tier=processed_ctc_words_tier,
+            processed_ctc_textgrid_path=(processed_ctc_textgrid_path
+                                         if processed_ctc_textgrid_path.is_file()
+                                         else None))
         report["english_provenance"] = strict_en
+        unknown_recovery_proof = _build_mfa_unknown_recovery_proof(
+            stem, source_words_snapshot, ctc_token_list, reference_text_original,
+            final_words_tier, tier_by_name(new_tg, "hanzi"), strict_en, strict_pairs)
+        unknown_source_redeemed = bool(
+            reference_text_authoritative and unknown_recovery_proof is not None)
+        if unknown_source_redeemed:
+            report["mfa_unknown_source_redeemed"] = unknown_recovery_proof
         if strict_en["status"] == "verified":
             try:
                 strict_pp = inject_strict_en_phones(
@@ -7162,6 +12906,9 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                         new_tg.tiers[_index] = strict_pp
                         break
             except Exception as exc:
+                unknown_source_redeemed = False
+                unknown_recovery_proof = None
+                report.pop("mfa_unknown_source_redeemed", None)
                 strict_en_rejected = True
                 report["english_provenance"] = _strict_en_report(
                     "rejected", strict_en["required_words"], 0,
@@ -7174,6 +12921,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                         if _tier.name == "pinyin_phones":
                             new_tg.tiers[_index] = stripped
                             break
+
         elif strict_en["status"] == "rejected":
             strict_en_rejected = True
             # A filtered TextGrid must not contain a fabricated English phone
@@ -7186,6 +12934,27 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                         new_tg.tiers[_index] = stripped
                         break
 
+    # In no-reference mode, only a complete safe correspondence may redeem a
+    # source <unk>.  The fallback transcript is intentionally absent from this
+    # decision.  Each recovered item is already bound to the exact CTC/final
+    # ordinal by the ledger, including multiple NVV items.
+    fallback_unknown_recovered = []
+    if (not reference_text_authoritative
+            and isinstance(fallback_correspondence, dict)
+            and fallback_correspondence.get("safe")):
+        fallback_unknown_recovered = _fallback_redeemed_unknown_entries(
+            fallback_correspondence,
+            report.get("english_provenance"))
+        if fallback_unknown_recovered:
+            report["mfa_unknown_source_redeemed"] = {
+                "schema": "fallback-unknown-recovery-v2",
+                "entries": fallback_unknown_recovered,
+                "ledger_digest": fallback_correspondence.get("digest"),
+            }
+            unknown_source_redeemed = len(fallback_unknown_recovered) == len(
+                [item for item in source_words_snapshot
+                 if is_unknown_token(item.get("text", ""))])
+
     # Strict English injection is intentionally last for English intervals;
     # clean any remaining Chinese/punctuation overlap without touching the
     # immutable ``en:`` phone geometry.
@@ -7196,16 +12965,82 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             report["pp_deoverlap_fixed"] = int(
                 report.get("pp_deoverlap_fixed", 0)) + _post_fixed
 
+    # A final owner-aware pass repairs only clear MFA boundary leakage.  It
+    # runs after strict English injection so the immutable English ledger is
+    # never rewritten by a generic midpoint split.  Ambiguous phones remain
+    # visible in the report and are vetoed by the publication contract.
+    _publication_phones_tier = tier_by_name(new_tg, "phones")
+    _final_words_for_phone_owner = tier_by_name(new_tg, "words")
+    if _final_words_for_phone_owner is not None:
+        _source_phone_fixed, _source_phone_ambiguous = (
+            _resolve_phone_owner_overlaps(
+                _publication_phones_tier, _final_words_for_phone_owner))
+        _pp_phone_fixed, _pp_phone_ambiguous = (
+            _resolve_phone_owner_overlaps(
+                _post_strict_pp, _final_words_for_phone_owner))
+        if _source_phone_fixed or _pp_phone_fixed:
+            report["phone_owner_repairs"] = {
+                "phones": _source_phone_fixed,
+                "pinyin_phones": _pp_phone_fixed,
+            }
+        if _source_phone_ambiguous or _pp_phone_ambiguous:
+            report["phone_owner_ambiguity"] = {
+                "phones": _source_phone_ambiguous[:20],
+                "pinyin_phones": _pp_phone_ambiguous[:20],
+            }
+
+    # The one final word-energy audit runs after visual ownership commit,
+    # freeze/lineage rebuild, and strict English/phone ownership.  It is
+    # diagnostic-first: a silence merge is evaluated on the immutable lexical
+    # core and never on its display-expanded span.
+    _word_energy_report = _word_energy_audit(
+        tier_by_name(new_tg, "words"), args, wav_audio, wav_sr or 16000,
+        textgrid=new_tg, ctc_tokens=ctc_token_list)
+    report["word_energy_audit"] = _word_energy_report
+    if (getattr(args, "filter_suspicious", True)
+            and _word_energy_enabled(args)):
+        for _energy_item in _word_energy_report.get("items", []):
+            _energy_reason = _energy_item.get("resulting_reason")
+            if _energy_reason in {
+                    "word_in_silence",
+                    "word_energy_boundary_mismatch",
+                    "word_energy_evidence_unresolved"}:
+                align_issues.append({
+                    "rule": _energy_reason,
+                    "text": _energy_item.get("word"),
+                    "lexical_ordinal": _energy_item.get("lexical_ordinal"),
+                    "energy": round(_energy_item["rms"]["premerge_rms"], 9),
+                    "noise_floor": round(
+                        _word_energy_report["noise_model"]["noise_floor"], 9),
+                    "threshold": round(
+                        _word_energy_report["noise_model"]["threshold"], 9),
+                    "classification": _energy_item.get("classification"),
+                })
+
     # ================================================================
     # 最终筛选: 所有处理完成后再统一判断 (用最终的边界和静音结构)
     # ================================================================
     filter_reasons = []
+    if (getattr(args, "filter_suspicious", True)
+            and _word_energy_enabled(args)):
+        for _energy_reason in {
+                item.get("resulting_reason")
+                for item in _word_energy_report.get("items", [])}:
+            if _energy_reason in {
+                    "word_in_silence",
+                    "word_energy_boundary_mismatch",
+                    "word_energy_evidence_unresolved"}:
+                filter_reasons.append(_energy_reason)
     axis_reasons = list(getattr(args, "_axis_stem_reasons", {}).get(stem, ()))
     if axis_reasons:
         filter_reasons.extend(axis_reasons)
         report["axis_reasons"] = axis_reasons
     if strict_en_rejected:
         filter_reasons.append("english_provenance_rejected")
+    if (not reference_text_authoritative
+            and isinstance(fallback_correspondence, dict)
+            and not fallback_correspondence.get("safe")):
+        filter_reasons.append("fallback_correspondence_rejected")
 
     # Hard lexical integrity is independent of optional acoustic filtering.
     # NVV, punctuation and sentence-initial <sp1> are intentionally excluded
@@ -7213,16 +13048,21 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # Retain this pre-finalization snapshot only for the downstream CJK/pinyin
     # diagnostic below.  It is not publication evidence: `_finalize_textgrid`
     # still normalizes labels such as a leading `<sp2>` to `<sp1>`.
+    _fallback_recovered_count = len(locals().get("fallback_unknown_recovered", []))
+    unknown_source_count = (0 if unknown_source_redeemed else
+                            max(0, len(mfa_unknown_before_snap)
+                                - _fallback_recovered_count))
     _prewrite_coverage, _ = assess_reference_coverage(
         reference_text_original,
         tier_by_name(new_tg, "words"),
         tier_by_name(new_tg, "hanzi"),
         reference_source=reference_source,
-        unknown_source_count=len(mfa_unknown_before_snap),
+        unknown_source_count=unknown_source_count,
+        reference_authoritative=reference_text_authoritative,
     )
-    if mfa_unknown_before_snap:
+    if mfa_unknown_before_snap and not unknown_source_redeemed:
         report["mfa_unknown_source"] = {
-            "count": len(mfa_unknown_before_snap),
+            "count": unknown_source_count,
             "examples": mfa_unknown_before_snap[:20],
         }
 
@@ -7273,7 +13113,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     words_tier = tier_by_name(new_tg, "words")
     pp_tier = tier_by_name(new_tg, "pinyin_phones")
     _tier_mismatches, _tier_total = _tier_desync_counts(_hanzi_t, words_tier)
-    if _tier_total > 0 and _tier_mismatches / _tier_total > 0.10:
+    if _tier_mismatches > 0:
         filter_reasons.append("tier_desync")
         report["tier_desync"] = f"hanzi↔words mismatches: {_tier_mismatches}/{_tier_total}"
 
@@ -7293,30 +13133,29 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                           for _ws, _we in _word_ranges)
             if not _inside:
                 _misaligned_phones += 1
-        if _total_phones > 0 and _misaligned_phones / _total_phones > 0.15:
+        if _misaligned_phones > 0:
             filter_reasons.append("misaligned_phones")
             report["misaligned_phones"] = f"{_misaligned_phones}/{_total_phones}"
 
-    # sp3 / mid_sp: 检查最终 words 层的静音结构
-    # 首尾静音 (<spN> 在开头/结尾) 是正常的音频裁剪结果, 不算异常。
-    # 只有中间 (非首非尾) 的长静音才是问题。
+    # sp3 / mid_sp: 检查最终 words 层的静音结构。  Edge-ness is
+    # semantic: punctuation and other non-lexical labels do not own a gap,
+    # so a tail pause before terminal punctuation is still a normal edge.
     if words_tier:
-        n_ivs = len(words_tier.intervals)
         _sp3_details: list[dict] = []
         for i, iv in enumerate(words_tier.intervals):
             if iv.text.strip() == "<sp3>":
                 _sp3_details.append({"index": i, "start_s": round(iv.xmin, 6),
                                      "end_s": round(iv.xmax, 6),
                                      "duration_us": _duration_ticks(iv.xmin, iv.xmax)})
-                if i == 0 or i == n_ivs - 1:
-                    continue  # leading / trailing silence is normal
-                filter_reasons.append("sp3")
+                if _is_substantive_interior_silence(
+                        words_tier.intervals, i):
+                    filter_reasons.append("sp3")
         _mid_sp_details: list[dict] = []
         for i, iv in enumerate(words_tier.intervals):
-            if i == 0 or i == n_ivs - 1:
-                continue  # leading / trailing silence is normal
-            if is_silence(iv.text) and iv.text.strip():
-                _mid_sp_details.append({"index": i, "label": iv.text.strip(),
+                if (is_silence(iv.text) and iv.text.strip()
+                        and _is_substantive_interior_silence(
+                            words_tier.intervals, i)):
+                    _mid_sp_details.append({"index": i, "label": iv.text.strip(),
                                         "start_s": round(iv.xmin, 6),
                                         "end_s": round(iv.xmax, 6),
                                         "duration_us": _duration_ticks(iv.xmin, iv.xmax),
@@ -7325,17 +13164,12 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         if _sp3_details:
             report["sp3"] = {"count": len(_sp3_details), "details": _sp3_details[:10]}
         if _mid_sp_details:
-            filter_reasons.append("mid_sp")
             report["mid_sp"] = {"count": len(_mid_sp_details),
                                 "details": _mid_sp_details[:10]}
 
     # suspicious_alignment (from phone-level QC in Phase 5)
     if align_issues:
         filter_reasons.append("suspicious_alignment")
-
-    # unexpected_silence
-    if sil_filter_reasons:
-        filter_reasons.extend(sil_filter_reasons)
 
     # BGM + word_in_silence: 用处理后的最终边界检测
     if wav_audio is not None and words_tier is not None:
@@ -7356,16 +13190,44 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             suspect_intervals = []
             total_sil_dur = 0.0
             suspect_dur = 0.0
-            for iv in words_tier.intervals:
+            _fallback_bgm = (
+                not reference_text_authoritative
+                and reference_mode_policy == "fallback")
+            if _fallback_bgm:
+                _bgm_selection = _fallback_bgm_ctc_gap_selection(
+                    words_tier, source_words_snapshot, ctc_token_list,
+                    fallback_correspondence,
+                    (0.0, len(wav_audio) / float(wav_sr or 16000)),
+                    reference_mode=reference_mode_policy)
+                report["bgm_ctc_gap_selection"] = _bgm_selection
+                _bgm_intervals = {
+                    item["index"]: item
+                    for item in _bgm_selection["evaluated_intervals"]}
+            else:
+                _bgm_selection = None
+                _bgm_intervals = {}
+            for _word_index, iv in enumerate(words_tier.intervals):
                 if not is_silence(iv.text):
                     if iv.text.strip():
                         e = _word_rms(wav_audio, wav_sr, iv.xmin, iv.xmax)
                         if e > 0:
                             speech_energies.append(e)
                     continue
-                if iv.xmax - iv.xmin < args.bgm_min_sil_dur:
+                _selection = _bgm_intervals.get(_word_index)
+                if _selection is not None:
+                    _evaluated = _selection.get("evaluated_intersection")
+                    if not _evaluated:
+                        continue
+                    _scan_start, _scan_end = _evaluated
+                    _scan_duration = max(0.0, _scan_end - _scan_start)
+                else:
+                    _scan_start, _scan_end = iv.xmin, iv.xmax
+                    _scan_duration = max(0.0, _scan_end - _scan_start)
+                # The minimum-duration gate applies after CTC-gap
+                # intersection.  All other BGM thresholds remain unchanged.
+                if _scan_duration < args.bgm_min_sil_dur:
                     continue
-                total_sil_dur += iv.xmax - iv.xmin
+                total_sil_dur += _scan_duration
                 # ── Frame-level energy check within silence interval ──
                 # _word_rms() averages over the entire interval, which can
                 # hide short bursts of loud content inside long silences.
@@ -7374,8 +13236,8 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                 # Regression Case 25 follow-up.
                 _frame_ms = 50.0
                 _frame_samp = max(1, int(_frame_ms / 1000.0 * wav_sr))
-                _s0 = int(iv.xmin * wav_sr)
-                _s1 = int(iv.xmax * wav_sr)
+                _s0 = int(_scan_start * wav_sr)
+                _s1 = int(_scan_end * wav_sr)
                 _n_frames = max(0, (_s1 - _s0 - _frame_samp) // max(1, _frame_samp // 2) + 1)
                 if _n_frames <= 0:
                     _n_frames = 1
@@ -7395,12 +13257,23 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                 # Flag if >= 20% of frames are above threshold (sustained
                 # high energy, not just a transient click)
                 if _high_ratio >= 0.20:
-                    suspect_intervals.append({"xmin": round(iv.xmin, 3), "xmax": round(iv.xmax, 3),
-                                              "duration": round(iv.xmax - iv.xmin, 3),
-                                              "energy": round(_max_frame_e, 6),
-                                              "high_ratio": round(_high_ratio, 3),
-                                              "noise_floor": round(nf_bgm, 6)})
-                    suspect_dur += (iv.xmax - iv.xmin) * _high_ratio
+                    _suspect = {"xmin": round(_scan_start, 3),
+                                "xmax": round(_scan_end, 3),
+                                "duration": round(_scan_duration, 3),
+                                "energy": round(_max_frame_e, 6),
+                                "high_ratio": round(_high_ratio, 3),
+                                "noise_floor": round(nf_bgm, 6)}
+                    if _selection is not None:
+                        for _evidence_key in (
+                                "original_silence_span", "ctc_gap",
+                                "evaluated_intersection",
+                                "left_owner_ordinal", "right_owner_ordinal",
+                                "left_ctc_ordinal", "right_ctc_ordinal",
+                                "excluded_duration"):
+                            _suspect[_evidence_key] = _selection.get(
+                                _evidence_key)
+                    suspect_intervals.append(_suspect)
+                    suspect_dur += _scan_duration * _high_ratio
             if suspect_intervals:
                 avg_speech = sum(speech_energies) / len(speech_energies) if speech_energies else 0
                 suspect_ratio = suspect_dur / total_sil_dur if total_sil_dur > 0 else 0
@@ -7415,45 +13288,6 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                                        "details": suspect_intervals})
                     if bgm_issues:
                         report["bgm_issues"] = bgm_issues
-        # word_in_silence
-        # ``strict_ok`` force-enables the surrounding QC pass, but must not
-        # resurrect the independently disabled word-in-silence detector.  The
-        # explicit switch is tri-state for backwards compatibility with
-        # callers that predate it: when absent, a positive ratio retains the
-        # historical behaviour; when present, only ``True`` enables it.
-        _word_in_silence_enabled = getattr(args, "enable_word_in_silence_filter", None)
-        if (_word_in_silence_enabled is None
-                and args.filter_word_energy_ratio > 0):
-            _word_in_silence_enabled = True
-        if (args.filter_suspicious and _word_in_silence_enabled is True
-                and args.filter_word_energy_ratio > 0):
-            all_rms, _ = _frame_rms_vec(wav_audio, wav_sr, frame_ms=10.0)
-            k = max(1, int(len(all_rms) * 0.15))
-            nf = float(np.partition(all_rms, k)[k]) if len(all_rms) > 0 else 1e-6
-            threshold = max(nf * args.filter_word_energy_ratio, nf * 10.0)
-            # Build English/NVV adjacency set
-            en_nvv_neighbors: set[int] = set()
-            for idx, iv in enumerate(words_tier.intervals):
-                if not iv.text.strip() or is_silence(iv.text):
-                    continue
-                if is_english_token(iv.text) or is_nvv_token(iv.text):
-                    if idx > 0:
-                        en_nvv_neighbors.add(idx - 1)
-                    en_nvv_neighbors.add(idx + 1)
-            for idx, iv in enumerate(words_tier.intervals):
-                if is_silence(iv.text) or not iv.text.strip():
-                    continue
-                if is_punct(iv.text):
-                    continue
-                if is_english_token(iv.text) or is_nvv_token(iv.text):
-                    continue  # MFA can't model acoustically, CTC boundaries authoritative
-                if idx in en_nvv_neighbors:
-                    continue  # adjacent to English/NVV — boundaries unreliable
-                w_energy = _word_rms(wav_audio, wav_sr, iv.xmin, iv.xmax)
-                if 0 < w_energy < threshold:
-                    align_issues.append({"rule": "word_in_silence", "text": iv.text,
-                                         "energy": round(w_energy, 6),
-                                         "noise_floor": round(nf, 6)})
         # Phone-level QC — runs on POST-adjustment boundaries.
         if args.filter_suspicious:
             words_tier = tier_by_name(new_tg, "words")
@@ -7584,16 +13418,39 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         # (b) CJK character coverage — compare raw_text CJK sequence
         #     against hanzi tier CJK sequence.  Missing or out-of-order
         #     CJK chars indicate the alignment dropped or misassigned them.
-        # Compare against the immutable source reference, never against the
+        # Compare against the immutable lexical source, never against the
         # rendered raw tier (which may have been rebuilt or punctuation-edited).
-        raw_cjk = _prewrite_coverage["reference_cjk"]
+        # For reference mode this is the authority transcript; for fallback
+        # mode it remains an independent ASR-source/hanzi structural check.
+        raw_cjk = _prewrite_coverage.get(
+            "source_cjk", _prewrite_coverage["reference_cjk"])
         hanzi_cjk = "".join(iv.text.strip() for iv in hanzi_tier_final.intervals
                            if iv.text.strip()
                            and ("一" <= iv.text.strip() <= "鿿"
                                 or "㐀" <= iv.text.strip() <= "䶿"))
+        _fallback_alignment = None
+        if not reference_text_authoritative:
+            _fallback_alignment = _fallback_cjk_alignment(
+                reference_text_original, tier_by_name(new_tg, "words"))
+            report["fallback_lexical_alignment"] = {
+                key: value for key, value in _fallback_alignment.items()
+                if key != "actual_to_source"
+            }
         if raw_cjk != hanzi_cjk:
-            if "cjk_mismatch" not in filter_reasons:
-                filter_reasons.append("cjk_mismatch")
+            # A fallback transcript is not lexical authority.  When every
+            # realised pinyin token has a high-confidence monotonic source
+            # match, source-only ASR insertions/deletions must not shift the
+            # entire hanzi/pinyin projection or veto an otherwise coherent
+            # acoustic alignment.  Authoritative reference mode retains the
+            # exact historical CJK contract.
+            _fallback_safe = bool(
+                _fallback_alignment and _fallback_alignment.get("safe"))
+            if reference_text_authoritative or not _fallback_safe:
+                if "cjk_mismatch" not in filter_reasons:
+                    filter_reasons.append("cjk_mismatch")
+            else:
+                report.setdefault("fallback_lexical_alignment", {})[
+                    "cjk_mismatch_recovered"] = True
             report.setdefault("cjk_details", {})["raw_count"] = len(raw_cjk)
             report["cjk_details"]["hanzi_count"] = len(hanzi_cjk)
             report["cjk_details"]["delta"] = len(raw_cjk) - len(hanzi_cjk)
@@ -7710,7 +13567,8 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
                 #     If not, CTC anchors have rearranged the character order
                 #     which is a hard error — no ratio, no threshold. ──
                 _orig_txt = raw_text  # fallback: may be CTC-normalized
-                if getattr(args, 'original_txt_dir', None):
+                if (reference_text_authoritative
+                        and getattr(args, 'original_txt_dir', None)):
                     _orig_path = Path(args.original_txt_dir) / f"{stem}.txt"
                     if _orig_path.exists():
                         _orig_txt = _orig_path.read_text(encoding="utf-8").strip()
@@ -8108,8 +13966,112 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # 统一设置过滤状态和输出路径
     # Finalize before the final classification.  Strict reviewers must inspect
     # exactly the labels that are written, never an earlier pre-finalized view.
+    # ``phones`` is an internal source tier in the published five-tier
+    # artifact, but it remains mandatory evidence for the final owner gate.
+    # Capture it before the legacy output-shape reduction; never publish a
+    # result whose source phones cross or escape a words owner.
+    _publication_phones_tier = tier_by_name(new_tg, "phones")
     new_tg.tiers = [t for t in new_tg.tiers if t.name != "phones"]
     _finalize_textgrid(new_tg)
+
+    # Final publication veto: a substantive interior silence must remain
+    # visible for diagnosis and cannot be emitted as a strict candidate.  Do
+    # this after finalization so leading ``<spN>`` canonicalization cannot
+    # turn a provisional edge marker into a false interior hit.
+    _final_words = tier_by_name(new_tg, "words")
+    _fallback_pause_gate = _fallback_pause_qualification(
+        _final_words, reference_mode_policy, fallback_correspondence,
+        source_words_snapshot, ctc_token_list)
+    if _fallback_pause_gate["pause_count"]:
+        report["fallback_pause_qualification"] = _fallback_pause_gate
+        _final_pause_details = _fallback_pause_gate["details"]
+        report["mid_sp"] = {
+            "count": len(_final_pause_details),
+            "details": _final_pause_details[:10],
+        }
+        if not _fallback_pause_gate["reason_qualification"].get(
+                "mid_sp", False):
+            filter_reasons.append("mid_sp")
+    else:
+        report.pop("mid_sp", None)
+    if args.handle_unexpected_sil:
+        sil_filter_reasons = _final_unexpected_silence_reasons(_final_words)
+        if sil_filter_reasons:
+            report["unexpected_silence"] = list(sil_filter_reasons)
+            report["unexpected_silence_evidence"] = {
+                "count": len(_fallback_pause_gate["details"]),
+                "details": _fallback_pause_gate["details"][:10],
+            }
+        else:
+            # Do not carry a pre-final pinyin/geometry observation into the
+            # published classification after punctuation ownership absorbed
+            # or moved that silence.
+            report.pop("unexpected_silence", None)
+            report.pop("unexpected_silence_evidence", None)
+        if (sil_filter_reasons
+                and not _fallback_pause_gate["reason_qualification"].get(
+                    "unexpected_silence", False)):
+            filter_reasons.extend(sil_filter_reasons)
+    _processed_digest = _processed_geometry_digest(_final_words)
+    _processed_ledger = list(_processed_geometry_ledger(_final_words))
+    report["processed_geometry_digest"] = _processed_digest
+    report["processed_operation_ledger"] = _processed_ledger
+    report["processed_geometry"] = {
+        "schema": "processed-words-geometry-v1",
+        "frozen": bool(getattr(_final_words, "_processed_geometry_frozen", False)),
+        "digest": _processed_digest,
+        "ledger": _processed_ledger,
+    }
+    _interior_sp_details = []
+    if _final_words is not None:
+        for _index, _interval in enumerate(_final_words.intervals):
+            if _is_substantive_interior_silence(
+                    _final_words.intervals, _index):
+                _interior_sp_details.append({
+                    "index": _index,
+                    "label": _interval.text.strip(),
+                    "start_s": round(_interval.xmin, 6),
+                    "end_s": round(_interval.xmax, 6),
+                    "duration_us": _duration_ticks(_interval.xmin, _interval.xmax),
+                })
+    if _interior_sp_details:
+        report["strict_interior_sp"] = {
+            "count": len(_interior_sp_details),
+            "details": _interior_sp_details[:10],
+        }
+        if not _fallback_pause_gate["reason_qualification"].get(
+                "strict_interior_sp", False):
+            if getattr(args, "filter_suspicious", True):
+                filter_reasons.append("strict_interior_sp")
+
+    _publication_contract_reasons, _publication_contract_details = (
+        _publication_contract_audit(
+            tier_by_name(new_tg, "words"),
+            tier_by_name(new_tg, "hanzi"),
+            tier_by_name(new_tg, "pinyin_phones"),
+            _publication_phones_tier,
+            reference_text_original,
+            source_words_snapshot,
+            ctc_token_list,
+            reference_text_authoritative,
+            report.get("english_provenance"),
+            unknown_recovery_proof=unknown_recovery_proof,
+            fallback_correspondence=fallback_correspondence,
+            reference_mode=reference_mode_policy))
+    report["publication_contract"] = {
+        "schema": "publication-owner-contract-v1",
+        "status": "rejected" if _publication_contract_reasons else "verified",
+        "reasons": _publication_contract_reasons,
+        "details": _publication_contract_details,
+    }
+    for _pause_evidence_name in (
+            "mid_sp", "strict_interior_sp", "unexpected_silence",
+            "unexpected_silence_evidence"):
+        if _pause_evidence_name in report:
+            _publication_contract_details[_pause_evidence_name] = report[
+                _pause_evidence_name]
+    filter_reasons.extend(_freeze_reasons)
+    filter_reasons.extend(_publication_contract_reasons)
 
     # Hard lexical publication evidence must describe exactly the finalized
     # labels that are about to be written.  In particular, `_finalize_textgrid`
@@ -8121,7 +14083,8 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
         tier_by_name(new_tg, "words"),
         tier_by_name(new_tg, "hanzi"),
         reference_source=reference_source,
-        unknown_source_count=len(mfa_unknown_before_snap),
+        unknown_source_count=unknown_source_count,
+        reference_authoritative=reference_text_authoritative,
     )
     report["reference_coverage"] = _coverage
     report["hard_integrity_reasons"] = _coverage_reasons
@@ -8130,7 +14093,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             "count": len(report["warnings"]),
             "messages": list(report["warnings"][:20]),
         }
-    if not _coverage.get("exact_semantic_sequence", True):
+    if _coverage.get("exact_semantic_sequence") is False:
         _semantic_ref = _strict_semantic_tokens(reference_text_original)
         _semantic_obs = _strict_semantic_tokens(" ".join(
             iv.text for iv in (tier_by_name(new_tg, "hanzi").intervals
@@ -8159,6 +14122,8 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # as not evaluated.
     if getattr(args, "strict_ok", False) and report.get("warnings"):
         filter_reasons.append("warnings")
+    filter_reasons = _apply_fallback_pause_veto_qualification(
+        filter_reasons, _fallback_pause_gate)
     filter_reasons = list(dict.fromkeys(filter_reasons))
     if filter_reasons:
         report["status"] = "filtered_" + "_".join(filter_reasons)
@@ -8188,21 +14153,21 @@ _W = None
 
 
 def _worker_init(_ipa, _py_dict, _py_case, _a, _txt_d, _wav_d, _out_d,
-                 _filt_d, _raw_text_index):
+                 _filt_d, _raw_text_index, _wav_index=None):
     import os as _os
     for ev in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
                 "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         _os.environ[ev] = "1"
     global _W
     _W = (_ipa, _py_dict, _py_case, _a, _txt_d, _wav_d, _out_d, _filt_d,
-          _raw_text_index)
+          _raw_text_index, _wav_index)
 
 
 def _worker_fn(tgp):
     (_ipa, _py_dict, _py_case, _a, _txt_d, _wav_d, _out_d, _filt_d,
-     _raw_text_index) = _W
+     _raw_text_index, _wav_index) = _W
     return process_one(tgp, _txt_d, _wav_d, _out_d, _filt_d, _a,
-                       _ipa, _py_dict, _py_case, _raw_text_index)
+                       _ipa, _py_dict, _py_case, _raw_text_index, _wav_index)
 
 
 def main() -> int:
@@ -8218,6 +14183,9 @@ def main() -> int:
     parser.add_argument("--tts-authoritative-audio-root", type=Path, default=None)
     parser.add_argument("--raw-text-dir", type=Path, default=None,
                         help="Directory with original Chinese text files")
+    parser.add_argument("--reference-mode", choices=("auto", "authority", "fallback"),
+                        default="auto",
+                        help="Transcript authority policy; fallback ignores raw reference files.")
     parser.add_argument("--original-txt-dir", type=Path, default=None,
                         help="Directory with original {stem}.txt reference texts (for text_order check)")
     parser.add_argument("--pinyin-dict", type=Path, default=PROJECT_ROOT / "dict" / "fullpinyin_enword.dict")
@@ -8230,9 +14198,9 @@ def main() -> int:
                         help="Parallel workers for postprocessing (0=auto: cpu_count, 1=serial).")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--merge-silence", action=argparse.BooleanOptionalAction, default=True,
-                        help="Merge short sil intervals into previous phone based on energy.")
+                        help="Resolve final visual-word <sp0>/<sp1> gaps by bidirectional energy ownership.")
     parser.add_argument("--merge-max-sil-sec", type=float, default=0.2,
-                        help="Max silence duration to consider for merging (default: 0.2s).")
+                        help="Final visual-word bidirectional energy-owner bound; hard-capped at 0.5s. Configure above 0.2s to admit ordinary <sp1> (default: 0.2s).")
     parser.add_argument("--merge-energy-threshold", type=float, default=0.5,
                         help="Merge when sil_nonzero_mean > prev_nonzero_mean * threshold (default: 0.5).")
     parser.add_argument("--fix-short-word", action=argparse.BooleanOptionalAction, default=True)
@@ -8283,7 +14251,7 @@ def main() -> int:
     parser.add_argument("--filter-min-word-dur-sec", type=float, default=0.02,
                         help="Absolute minimum word duration (below = misaligned).")
     parser.add_argument("--filter-word-energy-ratio", type=float, default=2.0,
-                        help="Flag word if energy < noise_floor * N.")
+                        help="Flag lexical word core if 10ms-frame RMS < noise_floor * N; no extra floor.")
     parser.add_argument("--enable-word-in-silence-filter",
                         action=argparse.BooleanOptionalAction, default=None,
                         help="Explicitly enable the word-in-silence detector. "
@@ -8296,10 +14264,12 @@ def main() -> int:
                         help="Continue when mandatory-integrity failures were isolated in filtered/.")
     parser.add_argument("--strict-ok", action="store_true",
                         help="Treat every executed QC positive and warning as filterable.")
+    parser.add_argument("--strict-en-provenance", action="store_true",
+                        help="Require strict-en-mfa-v2 ledgers without enabling global strict-ok QC.")
     parser.add_argument("--enable-text-correction", action=argparse.BooleanOptionalAction, default=True,
                         help="Cross-check punctuation against silence gaps and emit corrected_text tier.")
     parser.add_argument("--handle-unexpected-sil", action=argparse.BooleanOptionalAction, default=True,
-                        help="Merge <sp0> gaps without punct; flag <sp1-3> gaps for filtering.")
+                        help="Diagnose unowned silence; final visual-word energy ownership is resolved once.")
     args = parser.parse_args()
 
     axis_errors, axis_stem_reasons = _load_axis_contract(args)
@@ -8320,6 +14290,7 @@ def main() -> int:
     # serial/parallel workers.  This avoids one recursive directory walk per
     # TextGrid while preserving deterministic first-match precedence.
     raw_text_index = _build_original_text_index(args.raw_text_dir)
+    wav_index = _build_wav_index(args.wav_dir)
 
     # Load dictionaries and build IPA->pinyin mapping
     print("Loading dictionaries...")
@@ -8366,7 +14337,7 @@ def main() -> int:
                 reports.append(process_one(tgp, args.txt_dir, args.wav_dir,
                                            args.output_dir, args.filtered_dir, args,
                                            ipa_to_pinyin, pinyin_dict, pinyin_case,
-                                           raw_text_index))
+                                           raw_text_index, wav_index))
             except Exception as exc:
                 reports.append({"stem": tgp.stem, "status": "error", "error": str(exc)})
                 if args.copy_errors:
@@ -8393,7 +14364,8 @@ def main() -> int:
             # ThreadPool: set globals once, then all threads see them
             _worker_init(ipa_to_pinyin, pinyin_dict, pinyin_case,
                          args, args.txt_dir, args.wav_dir,
-                         args.output_dir, args.filtered_dir, raw_text_index)
+                         args.output_dir, args.filtered_dir, raw_text_index,
+                         wav_index)
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
                 futures = {pool.submit(_worker_fn, tgp): tgp for tgp in tg_paths}
                 for fut in as_completed(futures):
@@ -8412,7 +14384,7 @@ def main() -> int:
                                      initargs=(ipa_to_pinyin, pinyin_dict, pinyin_case,
                                                args, args.txt_dir, args.wav_dir,
                                                args.output_dir, args.filtered_dir,
-                                               raw_text_index)) as pool:
+                                               raw_text_index, wav_index)) as pool:
                 futures = {pool.submit(_worker_fn, tgp): tgp for tgp in tg_paths}
                 for fut in as_completed(futures):
                     tgp = futures[fut]

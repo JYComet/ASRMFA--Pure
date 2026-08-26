@@ -46,7 +46,16 @@ from pipeline_utils import (
     is_english_token, is_nvv_token, is_silence, SILENCE_LABELS,
     find_mfa_python, get_mfa_env,
     is_english_phone as is_arpabet_phone,
-    report_en_ipa_mappings,
+    report_en_ipa_mappings, load_ctc_token_entries,
+    CTC_PROCESSED_BOUNDARY_SOURCES,
+)
+from english_units import (
+    EnglishUnit,
+    EnglishUnitError,
+    canonicalize_english_token,
+    is_english_fragment_token,
+    merge_authority_fragment_group,
+    parse_english_units,
 )
 
 # English MFA phone inventory — vowels, consonants, and stress markers
@@ -67,7 +76,16 @@ _ENGLISH_CONSONANTS = {
 }
 _ENGLISH_SILENCE = {'sil', 'sp', 'spn', '<eps>'}
 
-STRICT_SCHEMA = "strict-en-mfa-v1"
+STRICT_SCHEMA = "strict-en-mfa-v2"
+HISTORICAL_STRICT_SCHEMA = "strict-en-mfa-v1"
+CANONICAL_UNITS_SCHEMA = "canonical-english-units-v1"
+SOS_PRONUNCIATION_POLICY_ID = "sos-exact-override-v1"
+SOS_ALIGNMENT_TOKEN = "sos"
+SOS_SURFACE_TEXT = "SOS"
+SOS_EXPECTED_PRONUNCIATION = ("EH2", "S", "OW2", "EH1", "S")
+SOS_BASE_PRONUNCIATION = ("EH2", "OW2", "EH1", "S")
+APP_ALIGNMENT_TOKEN = "app"
+APP_EXPECTED_PRONUNCIATION = ("AE1", "P")
 STRICT_COUNT_KEYS = (
     "english_stems", "english_segments", "english_words",
     "verified_words", "rejected_words",
@@ -79,6 +97,382 @@ STRICT_BOUNDARY_TOLERANCE_S = 0.003
 
 class StrictG2PError(RuntimeError):
     """Raised when strict provenance cannot construct a complete dictionary."""
+
+
+def _dictionary_entries(text: str, token: str) -> list[tuple[str, ...]]:
+    """Return pronunciations for one exact CMUdict token.
+
+    CMU pronunciation variants (``WORD(1)``) are grouped with their base
+    token, while words that merely contain the token are never considered.
+    """
+    entries: list[tuple[str, ...]] = []
+    wanted = token.casefold()
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        key = parts[0].split("(", 1)[0].casefold()
+        if key == wanted:
+            entries.append(tuple(parts[1:]))
+    return entries
+
+
+def _replace_exact_dictionary_entry(text: str, token: str,
+                                    pronunciation: tuple[str, ...]) -> str:
+    """Replace all exact variants of *token* in a run-local dictionary."""
+    wanted = token.casefold()
+    lines = []
+    for line in text.splitlines():
+        parts = line.split()
+        if parts and parts[0].split("(", 1)[0].casefold() == wanted:
+            continue
+        lines.append(line.rstrip())
+    lines.append(f"{token.upper()} {' '.join(pronunciation)}")
+    return "\n".join(lines) + "\n"
+
+
+def _validate_exact_dictionary_word(text: str, token: str,
+                                    expected: tuple[str, ...], *,
+                                    error_code: str) -> None:
+    entries = _dictionary_entries(text, token)
+    if len(entries) != 1 or entries[0] != expected:
+        raise StrictG2PError(error_code)
+
+
+def _validate_dictionary_provenance(provenance: dict, *,
+                                    expected_sos: bool = True) -> None:
+    """Validate the existing dictionary path/hash before SOS is published."""
+    if not isinstance(provenance, dict):
+        raise ValueError("sos_dictionary_provenance_missing")
+    path_text = provenance.get("path")
+    expected_hash = provenance.get("sha256")
+    if not isinstance(path_text, str) or not path_text:
+        raise ValueError("sos_dictionary_provenance_missing")
+    if not isinstance(expected_hash, str) or not expected_hash:
+        raise ValueError("sos_dictionary_hash_missing")
+    path = Path(path_text)
+    try:
+        actual_hash = _provenance_sha256(path)
+    except Exception as exc:
+        raise ValueError("sos_dictionary_provenance_unreadable") from exc
+    if actual_hash != expected_hash:
+        raise ValueError("sos_dictionary_hash_mismatch")
+    if expected_sos:
+        try:
+            dictionary_text = _read_dict(path)
+        except Exception as exc:
+            raise ValueError("sos_dictionary_provenance_unreadable") from exc
+        if _dictionary_entries(dictionary_text, SOS_ALIGNMENT_TOKEN) != [SOS_EXPECTED_PRONUNCIATION]:
+            raise ValueError("sos_dictionary_override_missing_or_tampered")
+
+
+def validate_sos_pronunciation_record(
+    actual_source_sequence: list[str] | tuple[str, ...],
+    policy: dict,
+    dictionary_provenance: dict,
+) -> dict:
+    """Validate and return one exact SOS override provenance record."""
+    actual = tuple(actual_source_sequence)
+    if actual != SOS_EXPECTED_PRONUNCIATION:
+        raise ValueError("sos_expected_pronunciation_mismatch")
+    if not isinstance(policy, dict):
+        raise ValueError("sos_pronunciation_policy_missing")
+    if policy.get("policy_id") != SOS_PRONUNCIATION_POLICY_ID:
+        raise ValueError("sos_pronunciation_policy_id_mismatch")
+    if tuple(policy.get("expected_pronunciation", ())) != SOS_EXPECTED_PRONUNCIATION:
+        raise ValueError("sos_expected_pronunciation_mismatch")
+    if tuple(policy.get("actual_source_sequence", ())) != actual:
+        raise ValueError("sos_actual_source_sequence_mismatch")
+    if policy.get("dictionary_provenance") != dictionary_provenance:
+        raise ValueError("sos_dictionary_provenance_mismatch")
+    _validate_dictionary_provenance(dictionary_provenance)
+    return {
+        "policy_id": SOS_PRONUNCIATION_POLICY_ID,
+        "expected_pronunciation": list(SOS_EXPECTED_PRONUNCIATION),
+        "actual_source_sequence": list(actual),
+        "dictionary_provenance": dict(dictionary_provenance),
+    }
+
+
+def _sos_policy_record(actual_source_sequence: list[str] | tuple[str, ...],
+                       dictionary_provenance: dict) -> dict:
+    """Construct a validated SOS policy record for a strict ledger word."""
+    policy = {
+        "policy_id": SOS_PRONUNCIATION_POLICY_ID,
+        "expected_pronunciation": list(SOS_EXPECTED_PRONUNCIATION),
+        "actual_source_sequence": list(actual_source_sequence),
+        "dictionary_provenance": dict(dictionary_provenance),
+    }
+    return validate_sos_pronunciation_record(
+        actual_source_sequence, policy, dictionary_provenance)
+
+
+def _unit_dict(unit: EnglishUnit, *, reference_span=None) -> dict:
+    """Serialize one immutable Wave 1 unit and its binding metadata."""
+    data = unit.to_dict()
+    data["canonical_binding"] = CANONICAL_UNITS_SCHEMA
+    if reference_span is not None:
+        data["reference_span"] = list(reference_span)
+    return data
+
+
+def _validated_unit(word: dict) -> EnglishUnit:
+    """Validate the canonical unit attached to a corpus/ledger word.
+
+    The producer never reconstructs a unit from a display word.  This is the
+    tamper boundary: a changed surface, token, ID, span, or source ordinal is
+    rejected before dictionary, corpus, MFA, or ledger work.
+    """
+    raw = word.get("canonical_unit")
+    if not isinstance(raw, dict) or raw.get("canonical_binding") != CANONICAL_UNITS_SCHEMA:
+        raise EnglishUnitError("canonical_unit_binding_missing")
+    try:
+        surface = raw["surface_text"]
+        # ``parse_english_units`` parses an isolated surface, so its local
+        # ordinal necessarily starts at zero.  It is semantic evidence only:
+        # validate surface/token/match_key from that parse, while identity is
+        # bound to the raw reference ordinal carried by the producer record.
+        parsed_units = parse_english_units(surface)
+        ordinal = raw["reference_ordinal"]
+        if (not isinstance(ordinal, int) or isinstance(ordinal, bool)
+                or ordinal < 0 or len(parsed_units) != 1):
+            raise EnglishUnitError("canonical_unit_identity_invalid")
+        parsed = parsed_units[0]
+        expected_unit_id = f"en-u{ordinal:04d}"
+        if (raw.get("unit_id") != expected_unit_id
+                or raw.get("alignment_token") != parsed.alignment_token
+                or raw.get("match_key") != parsed.match_key):
+            raise EnglishUnitError("canonical_unit_identity_tampered")
+        source = raw.get("source_ctc_ordinals")
+        if (not isinstance(source, list)
+                or any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+                       for value in source)
+                or tuple(source) != tuple(sorted(set(source)))):
+            raise EnglishUnitError("canonical_unit_source_ordinals_invalid")
+        span = raw.get("canonical_span")
+        if not isinstance(span, list) or len(span) != 2:
+            raise EnglishUnitError("canonical_unit_span_invalid")
+        start, end = span
+        if ((start is None) != (end is None)
+                or (start is not None and (
+                    not isinstance(start, (int, float)) or isinstance(start, bool)
+                    or not isinstance(end, (int, float)) or isinstance(end, bool)
+                    or end < start))):
+            raise EnglishUnitError("canonical_unit_span_invalid")
+        if (word.get("unit_id") != expected_unit_id
+                or word.get("alignment_token") != parsed.alignment_token):
+            raise EnglishUnitError("canonical_word_identity_tampered")
+        if tuple(word.get("source_ctc_ordinals", ())) != tuple(source):
+            raise EnglishUnitError("canonical_word_source_ordinals_tampered")
+        if word.get("canonical_span") != span:
+            raise EnglishUnitError("canonical_word_span_tampered")
+        if word.get("text") != parsed.surface_text:
+            raise EnglishUnitError("canonical_word_surface_tampered")
+        return EnglishUnit(
+            surface_text=parsed.surface_text,
+            alignment_token=parsed.alignment_token,
+            match_key=parsed.match_key,
+            unit_id=expected_unit_id,
+            reference_ordinal=ordinal,
+            source_ctc_ordinals=tuple(source),
+            merge_kind=raw.get("merge_kind", parsed.merge_kind),
+            canonical_start=start,
+            canonical_end=end,
+        )
+    except (KeyError, TypeError, ValueError, EnglishUnitError) as exc:
+        if isinstance(exc, EnglishUnitError):
+            raise
+        raise EnglishUnitError("canonical_unit_malformed") from exc
+
+
+def _reference_text_for_stem(ctc_dir: Path, stem: str, reference_dir: Path | None = None) -> str | None:
+    """Read the optional CTC reference sidecar without broad file guessing."""
+    roots = [reference_dir] if reference_dir is not None else [ctc_dir]
+    candidates = [root / f"{stem}_ref.txt" for root in roots]
+    candidates += [root / f"{stem}.ref.txt" for root in roots]
+    for path in candidates:
+        if path.is_file():
+            return path.read_text(encoding="utf-8").strip()
+    return None
+
+
+def _source_english_fragments(intervals: list[dict]) -> list[dict]:
+    """Return English source intervals, retaining full words-tier ordinals."""
+    result = []
+    for index, interval in enumerate(intervals):
+        text = str(interval.get("text", "")).strip()
+        if not text or text in SILENCE_LABELS or text == "<eps>":
+            continue
+        if not is_english_fragment_token(text):
+            continue
+        result.append({"text": text, "ordinal": int(interval.get("ordinal", index)),
+                       "start": float(interval["xmin"]), "end": float(interval["xmax"])})
+    return result
+
+
+def _processed_geometry_reason(word: dict, *, require: bool = False) -> str | None:
+    """Return a stable fail-closed reason for the processed/canonical axes."""
+    if "processed_ctc_span" not in word:
+        return "processed_geometry_missing" if require else None
+    canonical_span = word.get("canonical_span")
+    processed_span = word.get("processed_ctc_span")
+    if (not isinstance(canonical_span, (list, tuple))
+            or len(canonical_span) != 2
+            or not all(isinstance(value, (int, float))
+                       and not isinstance(value, bool)
+                       and math.isfinite(float(value))
+                       for value in canonical_span)
+            or float(canonical_span[1]) <= float(canonical_span[0])):
+        return "processed_geometry_canonical_invalid"
+    if (not isinstance(processed_span, (list, tuple))
+            or len(processed_span) != 2):
+        return "processed_geometry_missing"
+    if (not all(isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                for value in processed_span)):
+        return "processed_geometry_non_numeric"
+    processed_start, processed_end = map(float, processed_span)
+    canonical_start, canonical_end = map(float, canonical_span)
+    if processed_end <= processed_start:
+        return "processed_geometry_non_positive"
+    if abs(processed_start - canonical_start) > STRICT_BOUNDARY_TOLERANCE_S + 1e-9:
+        return "processed_geometry_start_mismatch"
+    if processed_end + STRICT_BOUNDARY_TOLERANCE_S < canonical_end:
+        return "processed_geometry_end_before_canonical_end"
+    return None
+
+
+def _canonicalize_source_units(intervals: list[dict], reference_text: str | None) -> tuple[dict, ...]:
+    """Bind CTC English fragments to exact canonical authority units.
+
+    A missing reference is supported by making each valid source token its
+    own direct authority unit.  When a reference exists, every lexical source
+    token must be consumed by exactly one ordered authority unit; partial,
+    extra, split, and reordered inputs raise instead of being guessed.
+    """
+    fragments = _source_english_fragments(intervals)
+    if not fragments:
+        return ()
+    if not reference_text:
+        units = []
+        for fragment in fragments:
+            authority = parse_english_units(fragment["text"])
+            if len(authority) != 1:
+                raise EnglishUnitError("source_unit_not_canonical")
+            units.append({"unit": merge_authority_fragment_group(authority[0], [fragment]),
+                          "reference_span": authority[0].canonical_span,
+                          "fragments": [fragment]})
+        return tuple(units)
+
+    authorities = parse_english_units(reference_text)
+    if not authorities:
+        raise EnglishUnitError("reference_has_no_english_units")
+    groups = []
+    cursor = 0
+    for authority in authorities:
+        if cursor >= len(fragments):
+            raise EnglishUnitError("source_unit_missing")
+        matched = None
+        for end in range(cursor + 1, len(fragments) + 1):
+            group = fragments[cursor:end]
+            try:
+                merged = merge_authority_fragment_group(authority, group)
+            except EnglishUnitError:
+                continue
+            matched = (merged, group, end)
+            break
+        if matched is None:
+            raise EnglishUnitError("source_unit_not_exact")
+        merged, group, cursor = matched
+        groups.append((merged, group, authority.canonical_span))
+    if cursor != len(fragments):
+        raise EnglishUnitError("source_unit_extra")
+    return tuple(
+        {"unit": merged, "reference_span": reference_span, "fragments": group}
+        for merged, group, reference_span in groups
+    )
+
+
+def _canonical_units_from_tokens(
+        intervals: list[dict], token_rows: list[dict],
+        reference_text: str | None) -> tuple[dict, ...] | None:
+    """Bind canonical English identity and geometry to the token authority.
+
+    A token sidecar containing canonical metadata is authoritative.  The
+    TextGrid is accepted only as a geometry mirror; it cannot recreate a
+    missing or inconsistent processed span from its shorter raw interval.
+    ``None`` means the sidecar is legacy/non-authority and the historical
+    TextGrid path remains in effect.
+    """
+    lexical_intervals = [item for item in intervals
+                         if str(item.get("text", "")).strip()]
+    canonical_rows = [row for row in token_rows
+                      if isinstance(row.get("canonical_unit"), dict)]
+    if not canonical_rows:
+        return None
+    if len(lexical_intervals) != len(token_rows):
+        raise EnglishUnitError("canonical_token_textgrid_owner_mismatch")
+
+    reference_identity = (
+        hashlib.sha256(reference_text.encode("utf-8")).hexdigest()
+        if isinstance(reference_text, str) else None)
+    result = []
+    for interval, token in zip(lexical_intervals, token_rows):
+        unit = token.get("canonical_unit")
+        if not isinstance(unit, dict):
+            continue
+        if "processed_ctc_span" in unit or "processed_ctc_boundary_source" in unit:
+            raise EnglishUnitError("canonical_processed_geometry_owner_conflict")
+        surface = token.get("surface_text")
+        if not isinstance(surface, str) or not surface:
+            raise EnglishUnitError("canonical_token_surface_missing")
+        if str(interval.get("text", "")).strip() != str(token.get("word", "")).strip():
+            raise EnglishUnitError("canonical_token_textgrid_text_mismatch")
+        raw_span = token.get("canonical_span")
+        unit_span = unit.get("canonical_span")
+        processed_span = token.get("processed_ctc_span")
+        if (not isinstance(raw_span, list) or len(raw_span) != 2
+                or raw_span != unit_span):
+            raise EnglishUnitError("canonical_token_raw_span_mismatch")
+        geometry_reason = _processed_geometry_reason(
+            {"canonical_span": raw_span, "processed_ctc_span": processed_span},
+            require=True)
+        if geometry_reason is not None:
+            raise EnglishUnitError(geometry_reason)
+        source = token.get("processed_ctc_boundary_source")
+        if not isinstance(source, str) or source not in CTC_PROCESSED_BOUNDARY_SOURCES:
+            raise EnglishUnitError("processed_ctc_boundary_source_missing")
+        encoded = json.dumps(unit, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8")
+        if token.get("canonical_unit_sha256") != hashlib.sha256(encoded).hexdigest():
+            raise EnglishUnitError("canonical_token_hash_mismatch")
+        if reference_identity is not None and token.get("reference_identity") != reference_identity:
+            raise EnglishUnitError("canonical_token_reference_owner_mismatch")
+
+        word = {
+            "text": surface,
+            "alignment_token": unit.get("alignment_token"),
+            "unit_id": unit.get("unit_id"),
+            "source_ctc_ordinals": token.get("source_ctc_ordinals"),
+            "canonical_span": list(raw_span),
+            "canonical_unit": dict(unit),
+            "processed_ctc_span": list(processed_span),
+            "processed_ctc_boundary_source": source,
+            "start": float(processed_span[0]),
+            "end": float(processed_span[1]),
+            "ordinal": int(interval.get("ordinal", 0)),
+        }
+        _validated_unit(word)
+        if (abs(float(interval["xmin"]) - word["start"]) > STRICT_BOUNDARY_TOLERANCE_S
+                or abs(float(interval["xmax"]) - word["end"]) > STRICT_BOUNDARY_TOLERANCE_S):
+            raise EnglishUnitError("canonical_token_textgrid_geometry_mismatch")
+        result.append({"unit": _validated_unit(word), "reference_span": unit.get("reference_span"),
+                       "fragments": [{"ordinal": word["ordinal"],
+                                      "start": word["start"], "end": word["end"],
+                                      "text": token.get("word", "")}],
+                       "token_word": word})
+    return tuple(result)
 
 
 def _sha256(path: Path) -> str:
@@ -174,6 +568,7 @@ def _strict_mfa_record(outcome: dict, acoustic_model: Path, dictionary: Path) ->
             record["dictionary_sha256"] = ""
             record["exception"] = (record["exception"] + "; " if record["exception"] else "") + \
                                   f"dictionary hashing failed: {exc}"
+    record.setdefault("dictionary", str(dictionary))
     return record
 
 
@@ -195,13 +590,27 @@ def _strict_tiers(path: Path) -> tuple[list[dict], list[dict]]:
 
 def _strict_rejected_words(sid: str, segment: dict, reason: str) -> list[dict]:
     """Keep stable CTC-derived IDs even when source evidence is unusable."""
-    return [{"word_id": f"{sid}:w{word['ordinal']}", "ctc_ordinal": word["ordinal"],
-             "ctc_text": word["text"], "start": word["start"], "end": word["end"],
-             "status": "rejected", "reason": reason, "mfa_word": None,
-             "phones": [], "provenance": None}
-            for word in segment["words"]]
-
-
+    records = []
+    for position, word in enumerate(segment["words"]):
+        source_ordinals = list(word.get("source_ctc_ordinals", [word.get("ordinal", position)]))
+        unit_id = word.get("unit_id")
+        records.append({
+            "word_id": f"{sid}:w{position}",
+            "unit_id": unit_id,
+            "ctc_ordinal": source_ordinals[0] if source_ordinals else word.get("ordinal", position),
+            "source_ctc_ordinals": source_ordinals,
+            "ctc_text": word.get("text", ""),
+            "alignment_token": word.get("alignment_token"),
+            "canonical_span": word.get("canonical_span"),
+            "canonical_binding": CANONICAL_UNITS_SCHEMA,
+            "start": word.get("start"), "end": word.get("end"),
+            "processed_ctc_span": word.get("processed_ctc_span"),
+            "processed_ctc_boundary_source": word.get(
+                "processed_ctc_boundary_source"),
+            "status": "rejected", "reason": reason, "mfa_word": None,
+            "phones": [], "provenance": None,
+        })
+    return records
 def _strict_source_words(words: list[dict]) -> list[dict]:
     """Return lexical MFA words after proving their temporal ordering."""
     lexical = [word for word in words if word["text"] and not is_silence(word["text"])]
@@ -221,14 +630,25 @@ def _strict_phone_silence(text: str) -> bool:
     return is_silence(text) or text in _ENGLISH_SILENCE
 
 
-def _strict_verified_words(sid: str, segment: dict, words: list[dict], phones: list[dict]) -> list[dict]:
+def _strict_verified_words(sid: str, segment: dict, words: list[dict], phones: list[dict],
+                           dictionary_provenance: dict | None = None) -> list[dict]:
     """Validate the complete source hierarchy and construct verified evidence."""
     source_words = _strict_source_words(words)
     ctc_words = segment["words"]
     if len(source_words) != len(ctc_words):
         raise ValueError("word_count_mismatch")
-    for ctc_word, source_word in zip(ctc_words, source_words):
-        if source_word["text"].casefold() != ctc_word["text"].casefold():
+    canonical_units = []
+    for ctc_word in ctc_words:
+        canonical_units.append(_validated_unit(ctc_word))
+        geometry_reason = _processed_geometry_reason(ctc_word)
+        if geometry_reason is not None:
+            raise ValueError(geometry_reason)
+    for ctc_word, source_word, unit in zip(ctc_words, source_words, canonical_units):
+        try:
+            source_token = canonicalize_english_token(source_word["text"])
+        except EnglishUnitError as exc:
+            raise ValueError("mfa_word_not_canonical") from exc
+        if source_token != unit.alignment_token:
             raise ValueError("word_text_order_mismatch")
 
     lexical_phones = [phone for phone in phones if not _strict_phone_silence(phone["text"])]
@@ -251,7 +671,7 @@ def _strict_verified_words(sid: str, segment: dict, words: list[dict], phones: l
         owned[owners[0]].append(phone)
 
     evidence: list[dict] = []
-    for ctc_word, source_word, word_phones in zip(ctc_words, source_words, owned):
+    for ctc_word, source_word, word_phones, unit in zip(ctc_words, source_words, owned, canonical_units):
         if not word_phones:
             raise ValueError("phone_empty")
         if abs(word_phones[0]["start"] - source_word["start"]) > STRICT_BOUNDARY_TOLERANCE_S:
@@ -261,15 +681,38 @@ def _strict_verified_words(sid: str, segment: dict, words: list[dict], phones: l
         for previous, current in zip(word_phones, word_phones[1:]):
             if current["start"] - previous["end"] > STRICT_BOUNDARY_TOLERANCE_S:
                 raise ValueError("phone_gap")
-        item = {"word_id": f"{sid}:w{ctc_word['ordinal']}", "ctc_ordinal": ctc_word["ordinal"],
-                "ctc_text": ctc_word["text"], "start": ctc_word["start"], "end": ctc_word["end"],
+        dictionary = dictionary_provenance or {}
+        actual_source_sequence = tuple(phone["text"] for phone in word_phones)
+        if unit.alignment_token == APP_ALIGNMENT_TOKEN and actual_source_sequence != APP_EXPECTED_PRONUNCIATION:
+            raise ValueError("app_expected_pronunciation_mismatch")
+        pronunciation_policy = None
+        if unit.alignment_token == SOS_ALIGNMENT_TOKEN:
+            pronunciation_policy = _sos_policy_record(
+                actual_source_sequence, dictionary)
+        item = {"word_id": f"{sid}:w{ctc_word['ordinal']}",
+                "unit_id": unit.unit_id,
+                "ctc_ordinal": ctc_word["source_ctc_ordinals"][0],
+                "source_ctc_ordinals": list(unit.source_ctc_ordinals),
+                "ctc_text": ctc_word["text"],
+                "alignment_token": unit.alignment_token,
+                "canonical_span": list(unit.canonical_span),
+                "canonical_binding": CANONICAL_UNITS_SCHEMA,
+                "start": ctc_word["start"], "end": ctc_word["end"],
+                "processed_ctc_span": ctc_word.get("processed_ctc_span",
+                                                     [ctc_word["start"], ctc_word["end"]]),
+                "processed_ctc_boundary_source": ctc_word.get(
+                    "processed_ctc_boundary_source", "legacy_ctc"),
                 "status": "verified", "reason": "",
                 "mfa_word": {"ordinal": source_word["ordinal"], "text": source_word["text"],
                              "start": source_word["start"], "end": source_word["end"]},
                 "phones": [{"ordinal": position, "label": phone["text"], "start": phone["start"],
                             "end": phone["end"], "mfa_phone_ordinal": phone["ordinal"]}
                            for position, phone in enumerate(word_phones)],
-                "provenance": "english_mfa_textgrid"}
+                "provenance": "english_mfa_textgrid",
+                "dictionary_provenance": dictionary}
+        if pronunciation_policy is not None:
+            item["pronunciation_policy"] = pronunciation_policy
+            item["pronunciation_policy_id"] = SOS_PRONUNCIATION_POLICY_ID
         evidence.append(item)
     return evidence
 
@@ -289,11 +732,18 @@ def _strict_source_path(aligned_root: Path, seg_name: str) -> Path:
 
 def _strict_manifest_consistent(expected: list[str], produced: list[str], rejected: list[dict],
                                 ledgers: list[dict], counts: dict) -> bool:
-    """Check the global denominator before a producer may claim success."""
+    """Check the global denominator before a producer may claim success/partial."""
     rejected_ids = [item.get("id") for item in rejected]
-    if len(expected) != len(set(expected)) or len(produced) != len(set(produced)):
+    if (len(expected) != len(set(expected))
+            or len(produced) != len(set(produced))
+            or len(rejected_ids) != len(set(rejected_ids))
+            or any(not isinstance(item, dict)
+                   or not isinstance(item.get("id"), str)
+                   or not isinstance(item.get("reason"), str)
+                   or not item.get("reason")
+                   for item in rejected)):
         return False
-    if len(rejected_ids) != len(set(rejected_ids)) or set(produced) & set(rejected_ids):
+    if set(produced) & set(rejected_ids):
         return False
     if set(expected) != set(produced) | set(rejected_ids):
         return False
@@ -316,7 +766,9 @@ def write_strict_manifest(output_dir: Path, status: str, *, mfa: dict,
                           expected_segments: list[str], produced_segments: list[str],
                           rejected_segments: list[dict], stem_ledgers: list[dict],
                           counts: dict, reason: str = "") -> Path:
-    payload = {"schema": STRICT_SCHEMA, "status": status, "strict_provenance": True,
+    payload = {"schema": STRICT_SCHEMA, "historical_schema": HISTORICAL_STRICT_SCHEMA,
+               "canonical_units": CANONICAL_UNITS_SCHEMA,
+               "status": status, "strict_provenance": True,
                "mfa": mfa, "expected_segments": expected_segments,
                "produced_segments": produced_segments, "rejected_segments": rejected_segments,
                "stem_ledgers": stem_ledgers, "counts": _strict_counts(counts), "reason": reason}
@@ -326,12 +778,55 @@ def write_strict_manifest(output_dir: Path, status: str, *, mfa: dict,
 
 
 def _strict_manifest_succeeded(path: Path) -> bool:
-    """Accept only the producer's complete, known-success strict manifest."""
+    """Accept a complete strict manifest, including explicit partial output."""
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return False
-    return payload.get("schema") == STRICT_SCHEMA and payload.get("status") == "success"
+    if (payload.get("schema") != STRICT_SCHEMA
+            or payload.get("status") not in {"success", "partial"}
+            or payload.get("strict_provenance") is not True):
+        return False
+    expected = payload.get("expected_segments")
+    produced = payload.get("produced_segments")
+    rejected = payload.get("rejected_segments")
+    ledgers = payload.get("stem_ledgers")
+    counts = payload.get("counts")
+    if (not isinstance(expected, list) or not isinstance(produced, list)
+            or not isinstance(rejected, list) or not isinstance(ledgers, list)
+            or not isinstance(counts, dict)):
+        return False
+    rejected_ids = [item.get("id") for item in rejected
+                    if isinstance(item, dict)]
+    if (len(rejected_ids) != len(rejected)
+            or any(not isinstance(item.get("reason"), str) or not item["reason"]
+                   for item in rejected if isinstance(item, dict))
+            or len(expected) != len(set(expected))
+            or len(produced) != len(set(produced))
+            or len(rejected_ids) != len(set(rejected_ids))
+            or set(produced) & set(rejected_ids)
+            or set(expected) != set(produced) | set(rejected_ids)):
+        return False
+    expected_stems = {item.split(":s", 1)[0] for item in expected
+                      if isinstance(item, str) and ":s" in item}
+    if (len(ledgers) != len(expected_stems)
+            or {item.get("stem") for item in ledgers if isinstance(item, dict)} != expected_stems):
+        return False
+    for item in ledgers:
+        try:
+            ledger_path = Path(item["path"])
+            if (not ledger_path.is_file()
+                    or _sha256(ledger_path) != item.get("sha256")):
+                return False
+        except Exception:
+            return False
+    if payload.get("status") == "success" and rejected_ids:
+        return False
+    if payload.get("status") == "partial" and not rejected_ids:
+        return False
+    return (counts.get("english_segments") == len(expected)
+            and counts.get("verified_words", 0) + counts.get("rejected_words", 0)
+            == counts.get("english_words", -1))
 
 
 def produce_strict_ledgers(en_segments: dict[str, list[dict]], ctc_dir: Path,
@@ -354,12 +849,19 @@ def produce_strict_ledgers(en_segments: dict[str, list[dict]], ctc_dir: Path,
         except Exception as exc:
             ctc_error = f"ctc_textgrid_hash_failed: {exc}"
         ledger = {"schema": STRICT_SCHEMA, "stem": stem,
+                  "canonical_units": CANONICAL_UNITS_SCHEMA,
                   "ctc_textgrid_sha256": ctc_hash,
+                  "dictionary_provenance": {
+                      "path": str(mfa.get("dictionary", "")),
+                      "sha256": str(mfa.get("dictionary_sha256", "")),
+                  },
+                  "pronunciation_policies": [],
                   "segments": []}
         for seg in segments:
             ordinal = int(seg.get("segment_ordinal", seg.get("seg_idx", 0)))
             sid = f"{stem}:s{ordinal}"; discovered_expected.append(sid)
             record = {"segment_id": sid, "segment_ordinal": ordinal, "status": "verified",
+                      "canonical_units": CANONICAL_UNITS_SCHEMA,
                       "reason": "", "mfa_textgrid": None, "words": []}
             words_total += len(seg["words"])
             if ctc_error:
@@ -376,7 +878,11 @@ def produce_strict_ledgers(en_segments: dict[str, list[dict]], ctc_dir: Path,
                     except Exception as exc:
                         raise ValueError(f"source_textgrid_hash_failed: {exc}") from exc
                     mw, mp = _strict_tiers(resolved)
-                    record["words"] = _strict_verified_words(sid, seg, mw, mp)
+                    record["words"] = _strict_verified_words(
+                        sid, seg, mw, mp, ledger["dictionary_provenance"])
+                    ledger["pronunciation_policies"].extend(
+                        word["pronunciation_policy"] for word in record["words"]
+                        if "pronunciation_policy" in word)
                     record["mfa_textgrid"] = {"path": str(resolved), "sha256": source_hash}
                     verified += len(record["words"])
                 except Exception as exc:
@@ -402,9 +908,14 @@ def produce_strict_ledgers(en_segments: dict[str, list[dict]], ctc_dir: Path,
     counts.update({"verified_words": verified, "rejected_words": rejected_words})
     consistent = (expected == discovered_expected and counts["english_words"] == words_total
                   and _strict_manifest_consistent(expected, produced, rejected, ledgers, counts))
-    return write_strict_manifest(output_dir, "success" if consistent else "failed", mfa=mfa, expected_segments=expected,
+    status = ("success" if consistent and not rejected
+              else "partial" if consistent else "failed")
+    reason = ("" if status == "success"
+              else "partial_segments_rejected" if status == "partial"
+              else "strict_manifest_inconsistent")
+    return write_strict_manifest(output_dir, status, mfa=mfa, expected_segments=expected,
         produced_segments=produced, rejected_segments=rejected, stem_ledgers=ledgers,
-        counts=counts, reason="" if consistent else "strict_manifest_inconsistent")
+        counts=counts, reason=reason)
 
 
 def _read_dict(path: Path) -> str:
@@ -455,7 +966,8 @@ def parse_textgrid_simple(path: Path) -> list[dict]:
         elif in_interval and line.startswith("text = "):
             text = line.split("=", 1)[1].strip().strip('"')
             if current_name == "words" and pending_xmin is not None and pending_xmax is not None:
-                intervals.append({"xmin": pending_xmin, "xmax": pending_xmax, "text": text})
+                intervals.append({"ordinal": len(intervals), "xmin": pending_xmin,
+                                  "xmax": pending_xmax, "text": text})
             pending_xmin = pending_xmax = None
             in_interval = False
 
@@ -463,7 +975,8 @@ def parse_textgrid_simple(path: Path) -> list[dict]:
 
 
 def find_english_segments(ctc_dir: Path, stems: list[str],
-                          max_gap_s: float = 0.35) -> dict[str, list[dict]]:
+                          max_gap_s: float = 0.35,
+                          reference_dir: Path | None = None) -> dict[str, list[dict]]:
     """Scan CTC TextGrids and .lab files; return English-word segments per stem.
 
     *max_gap_s* controls how far apart consecutive English words can be
@@ -485,21 +998,67 @@ def find_english_segments(ctc_dir: Path, stems: list[str],
         if not intervals:
             continue
 
-        # Preserve the complete words-tier ordinal.  English spans may only
-        # merge when adjacent ordinal entries are English; a Chinese/NVV/punct
-        # interval is a hard separator regardless of acoustic gap.
+        # Preserve the complete words-tier ordinal.  The optional reference
+        # sidecar is the authority for compounds; absent a sidecar, each
+        # strict source token is a direct canonical unit.
+        reference_text = _reference_text_for_stem(ctc_dir, stem, reference_dir)
         en_words = []
-        for ordinal, iv in enumerate(intervals):
-            text = iv["text"].strip()
-            if not text or text in SILENCE_LABELS or text in ("", "<eps>"):
+        try:
+            token_path = ctc_dir / f"{stem}_tokens.jsonl"
+            token_rows = load_ctc_token_entries(token_path) if token_path.exists() else None
+            canonical_groups = (
+                _canonical_units_from_tokens(intervals, token_rows, reference_text)
+                if token_rows is not None else None)
+            if canonical_groups is None:
+                canonical_groups = _canonicalize_source_units(intervals, reference_text)
+        except EnglishUnitError as exc:
+            # Keep the English denominator while preventing a malformed or
+            # split source unit from reaching MFA or fabricating phones.
+            source = _source_english_fragments(intervals)
+            if not source:
                 continue
-            if is_english_token(text):
-                en_words.append({"text": text, "start": iv["xmin"], "end": iv["xmax"], "ordinal": ordinal})
+            rejected_words = [{"text": item["text"], "start": item["start"],
+                               "end": item["end"], "ordinal": item["ordinal"]}
+                              for item in source]
+            result[stem] = [{"seg_idx": 0, "segment_ordinal": 0,
+                             "words": rejected_words,
+                             "seg_start": rejected_words[0]["start"],
+                             "seg_end": rejected_words[-1]["end"],
+                             "canonical_reject_reason": exc.code}]
+            continue
+
+        for group in canonical_groups:
+            unit = group["unit"]
+            fragments = group["fragments"]
+            token_word = group.get("token_word")
+            if token_word is not None:
+                start, end = token_word["start"], token_word["end"]
+            else:
+                start, end = unit.canonical_span
+            if start is None or end is None:
+                raise ValueError("canonical_unit_timing_missing")
+            word = {
+                "text": unit.surface_text,
+                "alignment_token": unit.alignment_token,
+                "unit_id": unit.unit_id,
+                "source_ctc_ordinals": list(unit.source_ctc_ordinals),
+                "canonical_span": list(unit.canonical_span),
+                "canonical_unit": _unit_dict(unit, reference_span=group["reference_span"]),
+                "start": start,
+                "end": end,
+                "ordinal": fragments[0]["ordinal"],
+            }
+            if token_word is not None:
+                word["processed_ctc_span"] = token_word["processed_ctc_span"]
+                word["processed_ctc_boundary_source"] = token_word[
+                    "processed_ctc_boundary_source"]
+            en_words.append(word)
 
         if not en_words:
             continue
 
-        # Merge consecutive English words into segments
+        # Merge consecutive canonical units into segments.  A non-English
+        # words-tier interval remains a hard separator.
         segments = []
         seg_words = [en_words[0]]
         seg_start = en_words[0]["start"]
@@ -507,7 +1066,9 @@ def find_english_segments(ctc_dir: Path, stems: list[str],
 
         for w in en_words[1:]:
             gap = w["start"] - seg_end
-            if w["ordinal"] == seg_words[-1]["ordinal"] + 1 and gap < max_gap_s:
+            previous_ordinals = seg_words[-1]["source_ctc_ordinals"]
+            if (w["ordinal"] == previous_ordinals[-1] + 1
+                    and gap < max_gap_s):
                 seg_words.append(w)
                 seg_end = w["end"]
             else:
@@ -530,6 +1091,7 @@ def find_english_segments(ctc_dir: Path, stems: list[str],
         # Assign segment indices
         for idx, seg in enumerate(segments):
             seg["seg_idx"] = idx
+            seg["segment_ordinal"] = idx
 
         result[stem] = segments
 
@@ -588,12 +1150,47 @@ def _build_corpus_stem(stem: str, segments: list[dict],
     valid_segments = []
 
     for seg in segments:
+        if seg.get("canonical_reject_reason"):
+            seg["skipped"] = True
+            seg["reject_reason"] = str(seg["canonical_reject_reason"])
+            seg["offset"] = seg["seg_start"]
+            valid_segments.append(seg)
+            continue
+        try:
+            for word in seg["words"]:
+                _validated_unit(word)
+        except EnglishUnitError as exc:
+            seg["skipped"] = True
+            seg["reject_reason"] = exc.code
+            seg["offset"] = seg["seg_start"]
+            valid_segments.append(seg)
+            continue
         seg_start_raw = seg["seg_start"]
         seg_end_raw = seg["seg_end"]
-        seg_dur = seg_end_raw - seg_start_raw
+        raw_duration_s = seg_end_raw - seg_start_raw
 
-        # Skip segments that are too short for MFA
-        if seg_dur < min_dur_s:
+        # Add padding
+        seg_start_padded = max(0.0, seg_start_raw - padding_s)
+        seg_end_padded = min(total_dur, seg_end_raw + padding_s)
+        padded_duration_s = seg_end_padded - seg_start_padded
+        seg["raw_duration_s"] = raw_duration_s
+        seg["padded_duration_s"] = padded_duration_s
+        seg["padding_s"] = {
+            "requested": padding_s,
+            "left": seg_start_raw - seg_start_padded,
+            "right": seg_end_padded - seg_end_raw,
+        }
+
+        # Eligibility is measured on the exact sample interval MFA will see.
+        # Comparing binary floats made a serialized 150 ms clip occasionally
+        # evaluate just below 0.150 and become a false short-segment reject.
+        # The CTC/TextGrid axis is decimal seconds.  Convert it to the nearest
+        # sample instead of flooring two independent binary-float products;
+        # otherwise an exact threshold clip can lose one sample at one edge.
+        start_sample = int(round(seg_start_padded * sr))
+        end_sample = int(round(seg_end_padded * sr))
+        minimum_samples = int(math.ceil(min_dur_s * sr - 1e-9))
+        if end_sample - start_sample < minimum_samples:
             seg["skipped"] = True
             if strict:
                 seg["reject_reason"] = "segment_too_short"
@@ -601,14 +1198,7 @@ def _build_corpus_stem(stem: str, segments: list[dict],
             valid_segments.append(seg)
             continue
 
-        # Add padding
-        seg_start_padded = max(0.0, seg_start_raw - padding_s)
-        seg_end_padded = min(total_dur, seg_end_raw + padding_s)
-
-        start_sample = int(seg_start_padded * sr)
-        end_sample = int(seg_end_padded * sr)
-
-        if end_sample <= start_sample + int(0.05 * sr):
+        if end_sample <= start_sample:
             seg["skipped"] = True
             if strict:
                 seg["reject_reason"] = "segment_too_short"
@@ -627,7 +1217,9 @@ def _build_corpus_stem(stem: str, segments: list[dict],
         _wavfile2.write(str(seg_wav), sr, seg_audio_int16)
 
         # .lab: English word sequence
-        lab_text = " ".join(w["text"] for w in seg["words"])
+        # MFA receives only the canonical, hyphenless alignment tokens.  The
+        # surface spelling remains in the attached unit for provenance.
+        lab_text = " ".join(w["alignment_token"] for w in seg["words"])
         seg_lab.write_text(lab_text + "\n", encoding="utf-8")
 
         seg["skipped"] = False
@@ -735,9 +1327,13 @@ def build_en_dict(en_segments: dict[str, list[dict]],
     for stem, segments in en_segments.items():
         for seg in segments:
             for w in seg["words"]:
-                word = w["text"].strip().lower()
-                if word and word.isalpha():
-                    all_words.add(word)
+                try:
+                    unit = _validated_unit(w)
+                except EnglishUnitError as exc:
+                    if strict:
+                        raise StrictG2PError(f"canonical unit rejected: {exc.code}") from exc
+                    continue
+                all_words.add(unit.alignment_token)
 
     if not all_words:
         return base_dict
@@ -753,20 +1349,40 @@ def build_en_dict(en_segments: dict[str, list[dict]],
                 parts = line.split(None, 1)
                 if parts:
                     word = parts[0].split("(")[0].lower()
-                    base_words.add(word)
+                    try:
+                        base_words.add(canonicalize_english_token(word))
+                    except EnglishUnitError:
+                        # Dictionary inventory may contain non-English rows;
+                        # they are not eligible for canonical English lookup.
+                        continue
 
     oov_words = sorted(all_words - base_words)
-    # Always start with a clean (comment-free) copy of the base dictionary
+    # Always start with a clean (comment-free) copy of the base dictionary.
+    # SOS is deliberately in-vocabulary, so it must be replaced before the
+    # OOV decision rather than sent through G2P or copied from CMUdict.
+    dictionary_text = base_dict_text
+    if SOS_ALIGNMENT_TOKEN in all_words:
+        dictionary_text = _replace_exact_dictionary_entry(
+            dictionary_text, SOS_ALIGNMENT_TOKEN, SOS_EXPECTED_PRONUNCIATION)
+    if APP_ALIGNMENT_TOKEN in all_words:
+        _validate_exact_dictionary_word(
+            dictionary_text, APP_ALIGNMENT_TOKEN, APP_EXPECTED_PRONUNCIATION,
+            error_code="app_pronunciation_missing_or_tampered")
+
     combined = temp_dir / "en_combined.dict"
     if not oov_words:
-        with open(combined, 'w', encoding='utf-8') as outf:
-            outf.write(base_dict_text)
+        combined.parent.mkdir(parents=True, exist_ok=True)
+        combined.write_text(dictionary_text, encoding="utf-8")
+        if SOS_ALIGNMENT_TOKEN in all_words:
+            _validate_exact_dictionary_word(
+                dictionary_text, SOS_ALIGNMENT_TOKEN, SOS_EXPECTED_PRONUNCIATION,
+                error_code="sos_dictionary_override_missing_or_tampered")
         return combined
 
     def merge_dictionary(g2p_text: str = "") -> Path:
         with combined.open("w", encoding="utf-8") as outf:
-            if base_dict_text:
-                outf.write(base_dict_text)
+            if dictionary_text:
+                outf.write(dictionary_text)
                 if g2p_text:
                     outf.write("\n")
             outf.write(g2p_text)
@@ -795,7 +1411,17 @@ def build_en_dict(en_segments: dict[str, list[dict]],
             missing = sorted(set(oov_words) - entries)
             raise StrictG2PError("strict G2P cache is empty or does not cover all OOV words"
                                  f" (missing: {', '.join(missing[:20])})")
-        return merge_dictionary(cached_text)
+        result = merge_dictionary(cached_text)
+        final_text = result.read_text(encoding="utf-8")
+        if SOS_ALIGNMENT_TOKEN in all_words:
+            _validate_exact_dictionary_word(
+                final_text, SOS_ALIGNMENT_TOKEN, SOS_EXPECTED_PRONUNCIATION,
+                error_code="sos_dictionary_override_missing_or_tampered")
+        if APP_ALIGNMENT_TOKEN in all_words:
+            _validate_exact_dictionary_word(
+                final_text, APP_ALIGNMENT_TOKEN, APP_EXPECTED_PRONUNCIATION,
+                error_code="app_pronunciation_missing_or_tampered")
+        return result
 
     # Run G2P for OOV words
     oov_file = temp_dir / "en_oov_words.txt"
@@ -864,14 +1490,24 @@ def build_en_dict(en_segments: dict[str, list[dict]],
                              f" (missing: {', '.join(missing[:20])})")
 
     # Merge base dict + G2P output
-    merge_dictionary(g2p_text)
+    result = merge_dictionary(g2p_text)
+
+    final_text = result.read_text(encoding="utf-8")
+    if SOS_ALIGNMENT_TOKEN in all_words:
+        _validate_exact_dictionary_word(
+            final_text, SOS_ALIGNMENT_TOKEN, SOS_EXPECTED_PRONUNCIATION,
+            error_code="sos_dictionary_override_missing_or_tampered")
+    if APP_ALIGNMENT_TOKEN in all_words:
+        _validate_exact_dictionary_word(
+            final_text, APP_ALIGNMENT_TOKEN, APP_EXPECTED_PRONUNCIATION,
+            error_code="app_pronunciation_missing_or_tampered")
 
     # Save to cache for future runs
     import shutil
     shutil.copy(g2p_output, cached_dict)
 
     print(f"  Combined dictionary: {combined} ({len(all_words)} words)")
-    return combined
+    return result
 
 
 def run_en_mfa(corpus_dir: Path, dict_path: Path, acoustic_model: str,
@@ -906,8 +1542,20 @@ def run_en_mfa(corpus_dir: Path, dict_path: Path, acoustic_model: str,
 
     print(f"  Running English MFA align ({len(list(corpus_dir.glob('*.wav')))} segments)...")
     command = [str(mfa_python), "-m", "montreal_forced_aligner.command_line.mfa"] + mfa_args
+    mfa_root = temp_dir / "mfa_root"
+    numba_cache = temp_dir / "numba_cache"
+    mfa_root.mkdir(parents=True, exist_ok=True)
+    numba_cache.mkdir(parents=True, exist_ok=True)
+    mfa_env = get_mfa_env(mfa_python, models_dir)
+    # The parent pipeline may itself inherit a shared MFA_ROOT_DIR.  Override
+    # it here: MFA writes command_history.yaml and Numba cache files, and
+    # concurrent English runs must never race in models/mfa or site-packages.
+    mfa_env["MFA_ROOT_DIR"] = str(mfa_root)
+    mfa_env["NUMBA_CACHE_DIR"] = str(numba_cache)
     result = {"return_code": None, "timed_out": False, "timeout_seconds": timeout,
-              "command": command, "acoustic_model": acoustic_arg, "exception": ""}
+              "command": command, "acoustic_model": acoustic_arg, "exception": "",
+              "environment": {"MFA_ROOT_DIR": str(mfa_root),
+                              "NUMBA_CACHE_DIR": str(numba_cache)}}
     log_path = temp_dir / "english_mfa.log"
     if strict:
         result["log_path"] = str(log_path)
@@ -921,7 +1569,7 @@ def run_en_mfa(corpus_dir: Path, dict_path: Path, acoustic_model: str,
                 log.write(f"exception: {result['exception']}\n")
 
     try:
-        run_kwargs = {"env": get_mfa_env(mfa_python, models_dir), "timeout": timeout}
+        run_kwargs = {"env": mfa_env, "timeout": timeout}
         if strict:
             with log_path.open("w", encoding="utf-8") as log:
                 log.write("command: " + " ".join(command) + "\n\n[output]\n")
@@ -950,6 +1598,94 @@ def run_en_mfa(corpus_dir: Path, dict_path: Path, acoustic_model: str,
     return result
 
 
+def retry_missing_en_segments(
+        en_segments: dict[str, list[dict]], corpus_dir: Path,
+        aligned_dir: Path, dict_path: Path, acoustic_model: str,
+        temp_dir: Path, mfa_python: Path, models_dir: Path, *,
+        beam: int = 100, retry_beam: int = 1000,
+        timeout: int = 600, limit: int = 16) -> list[dict]:
+    """Retry bounded utterance-level decoder misses in isolated MFA roots.
+
+    MFA can return process success while omitting one or more utterances.  A
+    missing TextGrid is not provenance, so each retry receives only the exact
+    original clip/lab and publishes back only after strict tier validation.
+    """
+    missing: list[str] = []
+    aligned_root = aligned_dir.resolve()
+    for stem, segments in sorted(en_segments.items()):
+        for segment in segments:
+            if segment.get("skipped"):
+                continue
+            seg_name = str(segment.get(
+                "seg_name", f"{stem}_seg{int(segment.get('seg_idx', 0))}"))
+            try:
+                _strict_source_path(aligned_root, seg_name)
+            except ValueError:
+                missing.append(seg_name)
+
+    if not missing:
+        return []
+
+    retry_root = temp_dir / "en_singleton_retry"
+    if retry_root.is_symlink():
+        raise ValueError("singleton retry root must not be a symlink")
+    if retry_root.exists():
+        shutil.rmtree(retry_root)
+    retry_root.mkdir(parents=True, exist_ok=False)
+    records: list[dict] = []
+    for ordinal, seg_name in enumerate(missing):
+        record = {"segment_name": seg_name, "status": "not_run"}
+        if ordinal >= max(0, int(limit)):
+            record.update({"status": "retry_limit_exceeded",
+                           "reason": "singleton_retry_limit_exceeded"})
+            records.append(record)
+            continue
+        wav = corpus_dir / f"{seg_name}.wav"
+        lab = corpus_dir / f"{seg_name}.lab"
+        try:
+            if (wav.is_symlink() or lab.is_symlink()
+                    or not wav.is_file() or not lab.is_file()):
+                raise ValueError("singleton retry corpus artifact missing or aliased")
+            unit_root = retry_root / f"r{ordinal:04d}_{hashlib.sha256(seg_name.encode()).hexdigest()[:12]}"
+            retry_corpus = unit_root / "corpus"
+            retry_aligned = unit_root / "aligned"
+            retry_work = unit_root / "work"
+            retry_corpus.mkdir(parents=True, exist_ok=False)
+            shutil.copyfile(wav, retry_corpus / wav.name)
+            shutil.copyfile(lab, retry_corpus / lab.name)
+            record["inputs"] = {
+                "wav_sha256": _sha256(wav), "lab_sha256": _sha256(lab)}
+            result = run_en_mfa(
+                retry_corpus, dict_path, acoustic_model,
+                retry_aligned, retry_work, mfa_python, models_dir, 1,
+                beam=beam, retry_beam=retry_beam, fine_tune=False,
+                timeout=timeout, strict=True)
+            record["mfa"] = result
+            if result.get("return_code") != 0:
+                record.update({"status": "mfa_failed",
+                               "reason": "singleton_retry_mfa_failed"})
+                records.append(record)
+                continue
+            source = _strict_source_path(retry_aligned.resolve(), seg_name)
+            _strict_tiers(source)
+            destination = aligned_dir / f"{seg_name}.TextGrid"
+            staging = aligned_dir / f".{seg_name}.singleton-retry.tmp"
+            if staging.exists() or staging.is_symlink():
+                raise ValueError("singleton retry staging collision")
+            shutil.copyfile(source, staging)
+            if _sha256(source) != _sha256(staging):
+                raise ValueError("singleton retry publication hash mismatch")
+            os.replace(staging, destination)
+            record.update({"status": "recovered",
+                           "textgrid_sha256": _sha256(destination)})
+        except Exception as exc:
+            record.update({"status": "validation_failed", "reason": str(exc)})
+        records.append(record)
+    recovered = sum(record["status"] == "recovered" for record in records)
+    print(f"  Singleton English MFA retry: {recovered}/{len(missing)} recovered")
+    return records
+
+
 def parse_en_textgrid(tg_path: Path) -> dict:
     """Parse English MFA TextGrid into a simple structure.
 
@@ -957,22 +1693,22 @@ def parse_en_textgrid(tg_path: Path) -> dict:
     Assumes tier 0 = words, tier 1 = phones.
     """
     lines = tg_path.read_text(encoding="utf-8").splitlines()
-    tiers_data: list[list[dict]] = []  # each tier = list of {xmin, xmax, text}
-    current_tier: list[dict] = []
+    tiers: dict[str, list[dict]] = {}
+    current_name = None
+    current_tier: list[dict] | None = None
     in_interval = False
     pending_xmin = pending_xmax = None
-    in_items = False
 
     for raw in lines:
         line = raw.strip()
-        if line == "item []:":
-            in_items = True
-        elif in_items and line.startswith("item ["):
-            if current_tier:
-                tiers_data.append(current_tier)
-                current_tier = []
+        if line.startswith("item ["):
+            current_name = None
+            current_tier = None
             in_interval = False
-        elif in_items and line.startswith("intervals ["):
+        elif line.startswith("name = ") and current_tier is None:
+            current_name = line.split("=", 1)[1].strip().strip('"')
+            current_tier = tiers.setdefault(current_name, [])
+        elif line.startswith("intervals [") and current_tier is not None:
             in_interval = True
             pending_xmin = pending_xmax = None
         elif in_interval and line.startswith("xmin = "):
@@ -981,19 +1717,16 @@ def parse_en_textgrid(tg_path: Path) -> dict:
             pending_xmax = float(line.split("=", 1)[1].strip())
         elif in_interval and line.startswith("text = "):
             text = line.split("=", 1)[1].strip().strip('"')
-            if pending_xmin is not None and pending_xmax is not None:
-                current_tier.append({"xmin": pending_xmin, "xmax": pending_xmax, "text": text})
+            if pending_xmin is not None and pending_xmax is not None and current_tier is not None:
+                current_tier.append({"ordinal": len(current_tier), "xmin": pending_xmin,
+                                     "xmax": pending_xmax, "text": text})
             pending_xmin = pending_xmax = None
             in_interval = False
 
-    if current_tier:
-        tiers_data.append(current_tier)
-
-    if len(tiers_data) < 2:
+    words_tier = tiers.get("words", [])
+    phones_tier = tiers.get("phones", [])
+    if not words_tier or not phones_tier:
         return {"words": []}
-
-    words_tier = tiers_data[0]
-    phones_tier = tiers_data[1]
 
     # Build word list with nested phones
     words = []
@@ -1015,6 +1748,7 @@ def parse_en_textgrid(tg_path: Path) -> dict:
                 p_text = p["text"].strip()
                 if p_text and p_text not in ("sil", "sp", "spn", "<eps>"):
                     word_phones.append({
+                        "ordinal": p["ordinal"],
                         "phone": p_text,
                         "start": max(p["xmin"], w_start),
                         "end": min(p["xmax"], w_end),
@@ -1049,20 +1783,49 @@ def collect_en_phones(en_segments: dict[str, list[dict]],
     for stem, segments in en_segments.items():
         en_data = []
 
+        def _word_record(unit: EnglishUnit, word: dict, *, seg_idx: int,
+                         offset: float = 0.0, phones: list | None = None,
+                         status: str | None = None, reason: str = "") -> dict:
+            processed = word.get("processed_ctc_span")
+            record = {
+                "seg_idx": seg_idx,
+                "offset": round(offset, 4),
+                "word_text": unit.surface_text,
+                "alignment_token": unit.alignment_token,
+                "unit_id": unit.unit_id,
+                "source_ctc_ordinals": list(unit.source_ctc_ordinals),
+                "canonical_span": list(unit.canonical_span),
+                "word_start": word.get("start"),
+                "word_end": word.get("end"),
+                "phones": phones if phones is not None else [],
+            }
+            if isinstance(processed, (list, tuple)) and len(processed) == 2:
+                record["processed_ctc_span"] = list(processed)
+                record["processed_ctc_boundary_source"] = word.get(
+                    "processed_ctc_boundary_source")
+            if status is not None:
+                record["status"] = status
+                record["reason"] = reason
+            return record
+
         for seg in segments:
             seg_idx = seg["seg_idx"]
 
             if seg.get("skipped"):
                 # G2P fallback: equal-duration split for CTC word interval
                 for w in seg["words"]:
-                    en_data.append({
-                        "seg_idx": seg_idx,
-                        "offset": 0.0,
-                        "word_text": w["text"],
-                        "word_start": w["start"],
-                        "word_end": w["end"],
-                        "phones": [],  # empty -> postprocessing uses equal split
-                    })
+                    try:
+                        unit = _validated_unit(w)
+                    except EnglishUnitError:
+                        continue
+                    if "processed_ctc_span" in w:
+                        en_data.append(_word_record(
+                            unit, w, seg_idx=seg_idx, status="rejected",
+                            reason=str(seg.get("canonical_reject_reason",
+                                               seg.get("reject_reason",
+                                                      "mfa_segment_unavailable")))))
+                    else:
+                        en_data.append(_word_record(unit, w, seg_idx=seg_idx))
                 continue
 
             seg_name = seg.get("seg_name", f"{stem}_seg{seg_idx}")
@@ -1075,14 +1838,16 @@ def collect_en_phones(en_segments: dict[str, list[dict]],
                 else:
                     # MFA didn't produce output — fall back
                     for w in seg["words"]:
-                        en_data.append({
-                            "seg_idx": seg_idx,
-                            "offset": 0.0,
-                            "word_text": w["text"],
-                            "word_start": w["start"],
-                            "word_end": w["end"],
-                            "phones": [],
-                        })
+                        try:
+                            unit = _validated_unit(w)
+                        except EnglishUnitError:
+                            continue
+                        if "processed_ctc_span" in w:
+                            en_data.append(_word_record(
+                                unit, w, seg_idx=seg_idx, status="rejected",
+                                reason="mfa_textgrid_missing"))
+                        else:
+                            en_data.append(_word_record(unit, w, seg_idx=seg_idx))
                     continue
 
             parsed = parse_en_textgrid(tg_path)
@@ -1096,16 +1861,20 @@ def collect_en_phones(en_segments: dict[str, list[dict]],
             # (same text, same order)
             mfa_idx = 0
             for ctc_w in ctc_words:
-                ctc_text_lower = ctc_w["text"].strip().lower()
-                # Find matching MFA word
+                try:
+                    unit = _validated_unit(ctc_w)
+                except EnglishUnitError:
+                    continue
                 matched = None
-                while mfa_idx < len(mfa_words):
+                if mfa_idx < len(mfa_words):
                     mw = mfa_words[mfa_idx]
-                    mfa_idx += 1
-                    if mw["text"].strip().lower().rstrip('012') == ctc_text_lower.rstrip('012'):
+                    try:
+                        matched_token = canonicalize_english_token(mw["text"].strip())
+                    except EnglishUnitError:
+                        matched_token = ""
+                    if matched_token == unit.alignment_token:
                         matched = mw
-                        break
-                    # If MFA word doesn't match, check next (may have been merged/skipped)
+                        mfa_idx += 1
 
                 if matched:
                     # Map MFA phone times (relative to segment) to absolute times
@@ -1121,26 +1890,24 @@ def collect_en_phones(en_segments: dict[str, list[dict]],
                             "end": round(offset + p["end"], 4),
                         })
 
-                    en_data.append({
-                        "seg_idx": seg_idx,
-                        "offset": round(offset, 4),
-                        "word_text": ctc_w["text"],
-                        "word_start": ctc_w["start"],  # CTC word boundary (original time)
-                        "word_end": ctc_w["end"],
-                        "en_word_start": round(offset + matched["start"], 4),  # English MFA word boundary
+                    item = _word_record(unit, ctc_w, seg_idx=seg_idx,
+                                        offset=offset, phones=phones_abs)
+                    item.update({
+                        "en_word_start": round(offset + matched["start"], 4),
                         "en_word_end": round(offset + matched["end"], 4),
-                        "phones": phones_abs,
                     })
+                    en_data.append(item)
                 else:
-                    # No match found — fall back
-                    en_data.append({
-                        "seg_idx": seg_idx,
-                        "offset": round(offset, 4),
-                        "word_text": ctc_w["text"],
-                        "word_start": ctc_w["start"],
-                        "word_end": ctc_w["end"],
-                        "phones": [],
-                    })
+                    # A canonical mismatch is a rejection, never a short
+                    # TextGrid/equal-duration phone fallback.
+                    if "processed_ctc_span" in ctc_w:
+                        en_data.append(_word_record(
+                            unit, ctc_w, seg_idx=seg_idx, offset=offset,
+                            status="rejected", reason="mfa_word_mismatch"))
+                    else:
+                        en_data.append(_word_record(unit, ctc_w,
+                                                    seg_idx=seg_idx,
+                                                    offset=offset))
 
         if en_data:
             out_path = output_dir / f"{stem}_en_phones.json"
@@ -1180,7 +1947,7 @@ def main():
                         help="Temporary directory for MFA working files")
     parser.add_argument("--num-jobs", type=int, default=4,
                         help="Number of parallel MFA jobs")
-    parser.add_argument("--padding-ms", type=float, default=50.0,
+    parser.add_argument("--padding-ms", type=float, default=75.0,
                         help="Padding around English segments (ms)")
     parser.add_argument("--min-segment-dur-ms", type=float, default=150.0,
                         help="Minimum segment duration for MFA (ms)")
@@ -1190,6 +1957,12 @@ def main():
                         help="MFA Viterbi beam width for English alignment")
     parser.add_argument("--retry-beam", type=int, default=40,
                         help="MFA retry beam width for English alignment")
+    parser.add_argument("--singleton-retry-beam", type=int, default=100,
+                        help="Beam for isolated retries of omitted utterances")
+    parser.add_argument("--singleton-retry-retry-beam", type=int, default=1000,
+                        help="Retry beam for isolated omitted utterances")
+    parser.add_argument("--singleton-retry-timeout", type=int, default=600)
+    parser.add_argument("--singleton-retry-limit", type=int, default=16)
     parser.add_argument("--fine-tune", action="store_true",
                         help="Enable MFA extra fine-tuning pass (default: disabled)")
     parser.add_argument("--corpus-workers", type=int, default=0,
@@ -1281,6 +2054,13 @@ def main():
     en_aligned_dir = temp_dir / "en_aligned"
     en_work_dir = temp_dir / "en_mfa_work"
     if args.strict_provenance:
+        # A strict run owns these exact child directories.  Clear them before
+        # rebuilding the corpus so an old MFA export cannot satisfy the new
+        # segment ledger (the historical fixed /tmp/mfa_temp layout caused
+        # source_tg_missing_or_ambiguous to be reported for current data).
+        for stale_dir in (en_corpus_dir, en_aligned_dir, en_work_dir, temp_dir / "log"):
+            if stale_dir.exists():
+                shutil.rmtree(stale_dir)
         # These are evidence artifacts, including in pre-MFA failures.
         for artifact_dir in (en_corpus_dir, en_aligned_dir, en_work_dir, temp_dir / "log"):
             artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -1393,6 +2173,15 @@ def main():
             print("ERROR: strict English MFA failed; no fallback artifacts were generated")
             return 1
         print("  WARNING: English MFA had issues — will use fallback for affected segments")
+
+    if args.strict_provenance and outcome["return_code"] == 0:
+        outcome["singleton_retries"] = retry_missing_en_segments(
+            en_segments, en_corpus_dir, en_aligned_dir, dict_path,
+            args.acoustic_model, temp_dir, mfa_python, models_dir,
+            beam=args.singleton_retry_beam,
+            retry_beam=args.singleton_retry_retry_beam,
+            timeout=args.singleton_retry_timeout,
+            limit=args.singleton_retry_limit)
 
     # Step 5: Collect results
     if args.strict_provenance:

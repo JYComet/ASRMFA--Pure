@@ -295,13 +295,16 @@ MFA 对齐后，将 MFA 词边界与 CTC 锚点对比，混合取优:
 
 ### 4. 标点注入 (`_inject_punctuation`)
 
-标点没有声学实现 (MFA 会转为 `<eps>`)，但有 CTC 时间戳。注入过程以**词优先**为原则:
+标点没有声学实现 (MFA 会转为 `<eps>`)，但有 CTC 时间戳。CTC 时间戳本身不是词汇
+authority；只有 authoritative reference semantic sequence 确认的 occurrence 才能
+绑定相邻 lexical owners 的 local gap。无 authority 时 CTC-only 标点只有在它与显式
+local silence gap 相交且未穿过 lexical owner 时才写回，否则直接移除并保留
+edge/interior silence:
 
 - 词-标点重叠 → 裁剪标点，保护词 (不破坏音素完整性)
-- 微小间隙 → 合并到标点/NVV (<=500ms)
-- 残余间隙 → 优先分配给后一词的 start
+- 标点 interval → clip 到已确认 occurrence 的 local gap，不向下一个词或 axis 尾部延伸
+- 无 local owner gap 或 malformed/missing authority evidence → fail-closed，不猜测时间
 - NVV 前方间隙 <=200ms → 吸收进 NVV (NVV 天然含周围静音，但有标点时跳过)
-- 标点右边界 → 延伸到下个词 start
 
 ### 5. 标点-静音交叉校验 (`build_corrected_text`)
 
@@ -421,7 +424,7 @@ mfa:
 # ── Step 8: 后处理 ──
 postprocess:
   merge_silence: true
-  min_sil_merge_sec: 0.2        # 短于此时长的静音可能被合并
+  min_sil_merge_sec: 0.2        # 最终 visual words 双向能量 owner 上限；0.5 为硬上限
   fix_short_word: true
   short_word_max_sec: 0.25      # 短词检测阈值
   flank_silence_sec: 0.4        # 短词两侧所需静音
@@ -445,6 +448,103 @@ postprocess:
   enable_text_correction: true       # 标点↔静音交叉校验
   handle_unexpected_sil: false       # 合并无标点短停顿
 ```
+
+`min_sil_merge_sec`（或 CLI 的 `--merge-max-sil-sec`）控制最终 `words` tier 的一次性
+双向 energy-owner pass：上限为 `min(configured, 0.5)`，并使用严格的
+`duration < effective_max`。默认 `0.2` 保持历史行为；要让普通 `<sp1>` 进入同一能量
+判定需配置到 `0.5`（`0.2 <= duration < 0.5`，恰好 `0.5` 保留）。有效内部
+`lexical–<sp1>–lexical` 另遵循 `forced_internal_sp1_forward` policy；首部/edge、NVV、标点
+owner、`<sp2>/<sp3>` 以及不完整的结构证据不会因配置而吞并。`<sp2>` 保持 preserve，
+由 `mid_sp`/`strict_interior_sp` gate 过滤。决策会记录 label、原始
+duration、effective max 和 preserve/merge reason；phones、hanzi、pinyin_phones 只从
+冻结后的 words 单向重建。所有 visual silence owner 决策提交完成后、processed geometry
+freeze 之前，最终保留的内部纯静音 interval 再按 serialized integer microsecond ticks
+规范化标签：`<200ms` 为 `<sp0>`、`[200,500ms)` 为 `<sp1>`、`[500,1500ms)` 为
+`<sp2>`、`>=1500ms` 为 `<sp3>`。这一步只改标签，不改区间、owner、tier 数量或过滤
+原因，也不重新开启 owner arbitration；leading `<sp1>` convention 保持不变。原始
+owner decision 的 `label`、`expected_label` 和 mismatch reason 保留，最终写入标签与
+normalization status 另行记录在 report/processed geometry operation ledger 中。
+
+### English/reference canonical contract
+
+有参考文本时，reference 原始顺序是唯一 semantic projection：CJK、English、NVV、标点
+和 other 分开处理，`<spN>` 不参与语义。English 保留 `surface` 与独立 `unit_id`；
+`target1`/`target2` 可以共享 dictionary-facing `alignment_token=target`，但不能互相
+消费。`jin1`、`rui4` 等拼音不会被当作 English，K-Pop 规范化只改变 semantic/dictionary
+key，不改变显示 surface。
+
+CTC/MFA 的 `target`、`1` 等碎片必须在 authority commit 前按文件顺序组成一个连续、完整
+的 owner；真实 `tokens.jsonl` 没有 ordinal 时使用稳定文件顺序补全，不使用 substring
+猜测，也不跨 CJK/NVV/标点/另一 English unit。producer 会先加有效 padding，再以 padded
+clip duration 判断 `min_segment_dur_ms`；缺失 MFA、空 phones 或跨度不完整仍 fail-closed，
+不会回退到 CMU/G2P/equal split。strict/publication audit 验证同一多对一 projection，
+缺失标点保持 `missing_allowed`，但 extra、错序、跨边界或 partial fragment 继续过滤。
+
+authority/reference mode 在上述 semantic projection 之前执行一次
+`reference-numeral-normalization-v1`。原始 reference 文本保持独立的
+`reference_text_original_raw`/SHA-256 provenance；只有内存中的 normalized surface 进入
+English、pinyin、hanzi 和 strict/audit projection。小写、独立的 `target1`/`target2`
+分别变为 `target一`/`target二`，CTC 中末尾 ASCII fragment `1`/`2` 绑定为中文 numeral，
+最终显示/拼音为 `target yi1`/`target er4`，不再把完整 `target1`/`target2` 当作一个
+English unit。pinyin tone token（如 `rui4`）、NVV、uppercase identifier 和普通 English
+numeric identifier（如 `OK2`、`ABC1`）不会转换；raw CTC lab/tokens 与 pinyin tone digits
+也不会被改写。归一化字段会记录 schema、engine、mapping 及 raw/normalized hash。
+
+最终 visual words 的短静音 owner pass 按结构和 owner 类型处理
+`lexical–<spN>–lexical` 内部 gap。标签语义固定为：
+`<sp0>` `<0.2s`、`<sp1>` `[0.2s, 0.5s)`、`<sp2>` `[0.5s, 1.5s)`、`<sp3>`
+`>=1.5s`；候选总时长必须与 `silence_label(duration)` 一致，并严格小于
+`min(min_sil_merge_sec, 0.5)`. 默认 `0.2` 保持历史行为，只处理 `<sp0>`；如需
+让普通 `<sp1>` 进入双向 5ms RMS energy-owner pass，通常把上限配置为 `0.5`
+（恰好 `0.5s` 的普通 gap 仍保留）。普通 `<sp0>` 先遵循原有配置与能量 gate；有效的
+内部 `lexical–<sp1>–lexical` 则使用 `forced_internal_sp1_forward` policy，
+不因 `merge_silence`、max 配置、phone hole/lineage ambiguity、缺音频或低能量而保留：
+双向能量只保留为诊断，提交方向始终确定性并入左词。首部静音、NVV、edge、sp2/sp3、
+标点/reference/CTC punctuation owner 均不属于该强制候选；lexical CTC overlap 不
+单独 veto。最终 visual snapshot 中已有标点若是最后非静音 owner，且后面直到
+`words_tier.xmax` 只有连续纯静音，则执行 `terminal_punctuation_tail_absorption`；
+没有显式局部静音时不会仅按 reference/CTC-only anchor 合成缺失标点；有局部显式静音
+owner 时会写回对应 punctuation interval。所有 preserve/merge/fallback 原因写入决策
+报告。
+
+对内部 lexical–`<sp0>`–lexical gap，若没有明确且局部的 punctuation owner，能量归属
+不可靠（包括 low/ambiguous、phone hole、缺音频或全零）时使用
+`policy=unknown_sp0_forward` 确定性并入左词。局部 punctuation evidence 与显式静音
+gap 同时存在时，resolver 会把该 gap 写回对应 punctuation interval；宽泛 punctuation
+span 若穿过 gap 两侧已有 lexical owner，不得保护该 gap。没有显式静音 gap 时仍不合成
+标点。
+
+### Pre-CTC subset denominator
+
+在 `mode: nvrasr_fallback` 或 `full` 且没有既有 `expected_stems` 时，
+`ctc_prealign.limit > 0` 是整个 pre-CTC 路由的选择边界：pipeline 先对物理 WAV 的
+去重 stem 排序，选择前 N 条并写入 `workspace/pre_ctc_stems.txt`。pad_silence、resample、
+CTC prealign、MFA 和 postprocess 都必须消费该 manifest；CTC 不再通过第二次 `--limit`
+扫描恢复全量。最终 accounting receipt 同时记录 physical source universe、selected
+eligible denominator、排除原因 `pre_ctc_limit` 以及 selection schema。已有
+`expected_stems` 或既有 manifest 则保持其冻结分母；不会覆盖或扩大选择集。
+
+### Word-energy evidence contract
+
+`filter_word_energy_ratio` 使用单一的 `word-energy-evidence-v1` 审计：词能量和噪声底
+都按完整 10ms frame RMS 计算，阈值严格为 `noise_floor * ratio`，不再附加隐藏的
+`10x` 下限。噪声池优先取最终 visual words 中显式纯静音 owner 的完整 frames；没有
+可用静音 frames 时才回退到全音频 10ms RMS 的 15th percentile。报告保留
+`source/frame_count/noise_floor/ratio/threshold`，并逐 lexical ordinal 记录 final、
+premerge lexical core、source-phone、CTC spans、RMS/active-run、merge operation、
+lineage 与分类。
+
+分类包括 `energetic`、`silence_merge_dilution`（只诊断，扩张后的 display span 不会
+稀释词本体判定）、`true_low_energy`（产生 `word_in_silence`）、
+`word_energy_boundary_mismatch` 和 `word_energy_evidence_unresolved`。缺失/歧义 lineage、
+无 source owner 或没有有效 CTC evidence 时，source phone 的 active overhang、phone
+hole/audio hole 才会升级为 hard reason；有效 CTC `ctc_span` 是词边界锚点，相关越界
+与 hole 仍写入 diagnostics 但不直接过滤。派生 phones 不会被当作独立声学证据。English/NVV
+本身为 `not_applicable`，但中文 owner 可通过静音跨到最近 English/NVV owner；标点会
+截断这种邻接关系。显式 `--no-enable-word-in-silence-filter` 优先于 strict mode，
+关闭时仍保留诊断报告但不新增能量过滤原因。能量审计只在 visual silence commit、
+freeze/lineage rebuild、strict English/phone owner 之后执行一次，publication audit
+随后继续独立执行。
 
 ## CLI 参考
 
@@ -529,6 +629,120 @@ python scripts/verify_mapping.py
 python scripts/add_english_to_dict.py --root <ctc_output_dir> --dict dict/mfa_ipa.dict
 python scripts/add_english_to_dict.py --root <path> --dict <path> --dry-run  # 预览模式
 ```
+
+## Testing
+
+运行仓库测试（禁用字节码和 pytest 缓存）：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider tests
+```
+
+默认 `pytest` 可能遍历模型资产；仓库配置将测试根限定为 `tests/`，因此
+`--collect-only` 也只收集测试目录。`tests/run_*` 是专项 fixture/旧 runner；仅已确认重复的 runner 会移除。
+
+### English v2 provenance and replay
+
+当前 English producer/consumer 契约是 `strict-en-mfa-v2`，且 manifest、ledger、
+segment/word evidence 必须绑定 `canonical-english-units-v1`。`strict-en-mfa-v1`
+只作为历史产物识别，不能被当作本次运行成功，也不会被原地改写；filtered recovery
+和 strict replay 必须在 run-local workspace 重新定位已验证的 v2 文件。English MFA
+词典角色同样绑定到本次 run-local dictionary 的 SHA-256，禁止用旧生产目录中的词典
+冒充当前 provenance。
+
+无参考（no-reference/fallback）路径没有 English lexical evidence 时仍可通过空的
+v2 English manifest；一旦输出包含 English 词，就必须提供完整 canonical binding 和
+逐词 ledger/source TextGrid evidence。
+
+最终 display publication 还要求 `words`/`hanzi` 在同一音频轴上形成完整、正时长、无重叠
+的 owner partition；axis 对齐残差按 `AXIS_EPS` 处理。小于 30 ms 只是候选上限；只有
+source words、CTC lexical spans 与（如有）reference semantic sequence 共同证明是
+mechanical frame residual 时才吸收，证据缺失或存在 source silence/标点时保留为
+canonical `<spN>` 并由 strict audit 过滤。参考标点只拥有相邻 lexical owners
+之间的 local gap，不能把末尾 English/CJK 词延伸到 axis 末端。`strict-en-mfa-v2` consumer
+会独立验证 SOS 的 `sos-exact-override-v1`、精确五音序列、run-local dictionary SHA-256
+和 phone ordinals；APP 的 `AE1 P` 是负向 canary。历史 v1、缺失、重排或篡改记录均
+fail-closed。无 ownership proof 的 gap 不会因数值阈值被静默 publish；interior silence
+保留为可审计的 `<spN>`，只有 edge silence 可以关闭 publication axis。上述当前行为由
+synthetic/focused tests 验证，历史批次只作为 forensic evidence。
+
+### Authority `ok` 100-stem canary
+
+`configs/hecheng_ria_ok100_authority.selection.json` 是固定的 100 条 authority
+选择清单：先在历史只读 `ctc_pretg/{stem}_ref.txt` 中用
+`(?<![A-Za-z])ok(?![A-Za-z])` 做大小写不敏感的 ASCII 独立 token 匹配，再从完整
+audio/CTC/reference bundle 候选中按固定 seed
+`authority-ok100-20260818-v1` 的 `sha256(seed + NUL + stem), stem` 顺序取前 100。
+清单中的 `candidate_count`、seed、排序规则和历史 manifest SHA 是可追溯元数据；
+配置 `configs/hecheng_ria_ok100_authority.yaml` 的 stems 必须与清单逐项相同，且
+`reference_mode: authority`。CTC receipt 绑定的 audio root 是
+`/mnt/nvme3/mfa_workspace_54k_fresh/padded_audio`；历史目录只提供 CTC/reference
+forensic evidence，不能用其中的 `audio_16k` 替代。workspace/output/filtered 使用
+`/mnt/nvme3/mfa_workspace_54k_ok100_authority_validation_v9` 下的新隔离路径；配置的
+`require_fresh_workspace: true` 会在 workspace 已存在时 fail-closed，不覆盖旧验证或生产目录。
+
+显式 `ctc_ready.stems`/`stem_range` 在 link 完成后冻结为同一个
+`ctx.expected_stems`/accounting denominator，并传给 resample、receipt、MFA axis、
+postprocess 和 strict-ok。resample 从完整 `data_dir` 只读取这些精确 stem；源目录可
+有额外 WAV，但 workspace `audio_16k` 输出必须严格等于冻结子集。未筛选的普通路径仍
+保留完整 source namespace 校验。
+
+先做不启动 MFA/GPU 的准备扫描：
+
+```bash
+python scripts/run_pipeline.py --config configs/hecheng_ria_ok100_authority.yaml --scan-only
+```
+
+fresh run 完成后逐条审计：
+
+```bash
+PYTHONPATH=. python scripts/audit_authority_ok100.py \
+  --selection configs/hecheng_ria_ok100_authority.selection.json \
+  --run-root /mnt/nvme3/mfa_workspace_54k_ok100_authority_validation_v9/strict_ok_runs/<run_id> \
+  --evidence-root /mnt/nvme3/mfa_workspace_54k_ok100_authority_validation_v9 \
+  --audio-root /mnt/nvme3/mfa_workspace_54k_fresh/padded_audio \
+  --report /tmp/hecheng_ria_ok100_authority.audit.json
+```
+
+审计器会重新检查每条 reference 的独立 `ok` token、audio/CTC/reference bundle、
+MFA aligned evidence、words/hanzi/phone ownership、CTC lexical spans、标点 local
+gap、interior SP 以及 English provenance；缺失或不一致只允许进入 `filtered`，并保留
+结构化 reason。`output` 与 `filtered` 必须对 100 条恰好守恒，任何“发布但证据不一致”
+都会使审计失败。历史 54k 路径仅用于选择清单和 forensic 对照，不是当前 fresh
+publication 结果；本项目不以此命令宣称已重跑生产 MFA/GPU/NVASR。
+
+权威 English 单位仍区分 surface identity 与 MFA dictionary key；普通 English reference
+中的 `target1`、`target2` 可各自保留为有序 `en-uXXXX` surface unit，并共享可查字典的
+`alignment_token=target`。但经过 authority numeral normalization 的
+`target一`/`target二` 会把 numeral suffix 作为独立 CJK semantic owner；CTC 的 `1`/`2`
+只按 ordered fragment evidence 映射为 `yi1`/`er4`，不能回退成 `target1` English unit。
+有限拼音词表中的 `jin1`、`rui4` 等始终不是 English 单位。缺少 reference、CTC lexical
+span 或完整 phone provenance 时保持 fail-closed，不会用模糊拼接补齐。
+
+### CTC raw/work/processed 三段契约
+
+CTC 输入分为三个不可混淆的阶段：`ctc_pretg/` 是 producer-owned 的 immutable
+raw namespace，必须由 `.ctc_raw_manifest.json` 绑定每个 stem 的六类 artifact、producer
+receipt、文件 SHA-256 和 manifest identity；`ctc_pretg_adj/` 是可变的 processed/work
+副本，只能由物理 copy 产生，并由 `.ctc_work_receipt.json` 记录 raw manifest path、
+raw digest、raw identity、work identity 和 transform/operation lineage。raw 与 work
+即使内容相同也不能共享 inode 或 symlink；raw artifact、manifest 或 work receipt 的
+digest/identity 不一致时，独立 audit 对整个候选集 fail-closed。
+
+postprocess report 必须同时保存 `ctc_lifecycle.raw_manifest` 和
+`ctc_lifecycle.work_receipt` 的 path/SHA-256/identity，以及
+`processed_geometry_digest`、`processed_geometry.frozen` 和
+`processed_operation_ledger`。最终 `words` tier 当前写出的 interval geometry 是唯一
+publication authority；audit 会把它重新解析并与 report 的 lexical published-span
+proof 和 geometry digest 逐项绑定。`resolved_span`、raw CTC span 以及早期 MFA span
+只能作为历史证据，不能被重新当作 publication authority。最终 words/hanzi 必须仍是
+完整、无重叠的 processed frozen geometry；不确定的 owner、gap、punctuation 或 phone
+lineage 只能进入 `filtered`。
+
+因此，`ctc_pretg=immutable raw`、`ctc_pretg_adj=mutable processed/work`，而最终
+`words=processed frozen geometry` 是严格的阶段边界，不是目录命名约定。旧的单目录
+fixture 若没有任何 raw/work marker 仍保留兼容读取；一旦出现任一 marker，audit 要求
+整条 raw → work → processed lineage 完整存在。
 
 ## 环境说明
 

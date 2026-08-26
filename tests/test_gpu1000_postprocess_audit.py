@@ -10,6 +10,7 @@ import wave
 from pathlib import Path
 
 from scripts import audit_strict_ok as audit
+from scripts import ctc_prealign as ctc
 from scripts import postprocess_textgrids as post
 
 
@@ -109,6 +110,8 @@ def test_v2_missing_status_is_explicit_and_conserved(tmp_path):
     assert post._load_axis_contract(args) == ([], {"aligned": [], "missing": ["missing_mfa_alignment"]})
     assert audit._axis_contract_reasons(args, {"aligned", "missing"}) == (
         [], {"aligned": [], "missing": ["missing_mfa_alignment"]})
+    assert audit._axis_contract_reasons(args, {"aligned"}) == (
+        [], {"aligned": [], "missing": ["missing_mfa_alignment"]})
 
 
 def test_transform_tampering_or_missing_evidence_fails_closed(tmp_path):
@@ -184,9 +187,56 @@ def test_reference_semantic_integrity_catches_english_position_swap(tmp_path):
     ])
     coverage, reasons = post.assess_reference_coverage(
         "第N天，Noa上", words, hanzi, reference_source="fixture")
+    assert coverage["reference_validation_applied"] is True
     assert coverage["exact_cjk_sequence"] is True
     assert coverage["exact_semantic_sequence"] is False
     assert reasons == ["reference_semantic_sequence_mismatch"]
+
+
+def test_asr_fallback_skips_reference_semantic_validation(monkeypatch):
+    words = post.Tier("words", 0.0, 1.0, [
+        post.Interval(0.0, 0.2, "di4"), post.Interval(0.2, 0.4, "tian1"),
+        post.Interval(0.4, 0.6, "Noa"), post.Interval(0.6, 0.8, "shang4"),
+    ])
+    hanzi = post.Tier("hanzi", 0.0, 1.0, [
+        post.Interval(0.0, 0.2, "第"), post.Interval(0.2, 0.4, "Noa"),
+        post.Interval(0.4, 0.6, "天"), post.Interval(0.6, 0.7, "，"),
+        post.Interval(0.7, 0.8, "Noa"), post.Interval(0.8, 1.0, "上"),
+    ])
+
+    def unexpected_reference_tokenization(_text):
+        raise AssertionError("fallback must not enter semantic token validation")
+
+    monkeypatch.setattr(post, "_strict_semantic_tokens",
+                        unexpected_reference_tokenization)
+    coverage, reasons = post.assess_reference_coverage(
+        "第N天，Noa上", words, hanzi, reference_source="asr_fallback")
+
+    assert coverage["reference_validation_applied"] is False
+    assert coverage["exact_cjk_sequence"] is None
+    assert coverage["exact_semantic_sequence"] is None
+    assert coverage["source_cjk"] == "第天上"
+    assert coverage["reference_cjk"] == ""
+    assert reasons == []
+
+
+def test_asr_fallback_keeps_nonreference_integrity_checks():
+    # Reference checks are skipped, but the ordinary tier identity check still
+    # rejects a malformed fallback rendering.
+    hanzi = post.Tier("hanzi", 0.0, 1.0, [
+        post.Interval(0.0, 0.3, "你"), post.Interval(0.3, 0.6, "好"),
+    ])
+    malformed_words = post.Tier("words", 0.0, 1.0, [
+        post.Interval(0.0, 0.3, "ni3"), post.Interval(0.3, 0.6, "bad"),
+    ])
+    coverage, reasons = post.assess_reference_coverage(
+        "你好", malformed_words, hanzi, reference_source="asr_fallback")
+    mismatches, total = post._tier_desync_counts(hanzi, malformed_words)
+
+    assert coverage["reference_validation_applied"] is False
+    assert reasons == []
+    assert mismatches > 0
+    assert mismatches / total > 0.10
 
 
 def test_final_semantic_veto_ignores_provisional_silence_labels(tmp_path):
@@ -239,3 +289,190 @@ def test_reference_semantic_integrity_matches_strict_spaced_english_tokens(tmp_p
         "最后all in了", words, hanzi, reference_source="fixture")
     assert coverage["exact_semantic_sequence"] is True
     assert reasons == []
+
+
+def test_reference_only_hyphen_projection_is_exact_and_conserves_fragments():
+    words = post.Tier("words", 0.0, 1.0, [
+        post.Interval(0.0, 0.2, "ni3"),
+        post.Interval(0.2, 0.4, "kp"),
+        post.Interval(0.4, 0.6, "op"),
+        post.Interval(0.6, 1.0, "hao3"),
+    ])
+    warnings = []
+    hanzi = post._build_hanzi_tier(
+        words, "你K-Pop好", warnings, reference_authoritative=True)
+
+    assert [iv.text for iv in words.intervals] == ["ni3", "kp", "op", "hao3"]
+    assert [iv.text for iv in hanzi.intervals] == ["你", "K-Pop", "", "好"]
+    assert warnings == []
+
+
+def test_reference_hyphenless_canonicalization_preserves_nvv_punctuation_and_sp1():
+    source = "<sp1>你好，v-tuber<QUESTION-YI>！open-ai。"
+    assert post._canonicalize_reference_hyphens(source) == (
+        "<sp1>你好，vtuber<QUESTION-YI>！openai。")
+    assert source == "<sp1>你好，v-tuber<QUESTION-YI>！open-ai。"
+
+
+def test_reference_and_ctc_hyphenless_forms_align_to_same_lexical_units():
+    reference = post._canonicalize_reference_hyphens("v-tuber/open-ai")
+    ctc = post._canonicalize_reference_hyphens("v tu ber open ai")
+    assert reference == "vtuber/openai"
+    assert ctc == "v tu ber open ai"
+
+    words = post.Tier("words", 0.0, 0.5, [
+        post.Interval(0.0, 0.3, "vtuber"),
+        post.Interval(0.3, 0.5, "openai"),
+    ])
+    post._normalize_word_spellings(words, reference)
+    assert [iv.text for iv in words.intervals] == ["vtuber", "openai"]
+    warnings = []
+    post._build_hanzi_tier(words, reference, warnings,
+                            reference_authoritative=True)
+    assert "reference_hyphen_fragment_mismatch" not in warnings
+
+
+def test_strict_audit_uses_hyphenless_reference_without_mutating_source():
+    source = "<sp1>你好，v-tuber<QUESTION-YI>！open-ai。"
+    canonical = audit._canonicalize_reference_hyphens(source)
+    assert canonical == "<sp1>你好，vtuber<QUESTION-YI>！openai。"
+    assert source == "<sp1>你好，v-tuber<QUESTION-YI>！open-ai。"
+    assert audit._semantic_tokens(canonical) == audit._semantic_tokens(
+        "<sp1>你好，vtuber<QUESTION-YI>！openai。")
+    assert audit._semantic_tokens(canonical) != audit._semantic_tokens(source)
+
+
+def test_no_reference_hyphen_behavior_is_unchanged():
+    words = post.Tier("words", 0.0, 0.4, [
+        post.Interval(0.0, 0.2, "v-tuber"),
+        post.Interval(0.2, 0.4, "open-ai"),
+    ])
+    original = [iv.text for iv in words.intervals]
+    post._normalize_word_spellings(words, "")
+    assert [iv.text for iv in words.intervals] == original
+
+
+def test_reference_normalization_merges_hyphen_fragments_from_authority():
+    # The ASR/CTC spelling is fragmented, while the authoritative reference
+    # carries the lexical hyphens.  The existing NW orphan merge must receive
+    # the authority spelling to keep strict-English word identity aligned.
+    words = post.Tier("words", 0.0, 1.2, [
+        post.Interval(0.0, 0.1, "ni3"), post.Interval(0.1, 0.2, "hao3"),
+        post.Interval(0.2, 0.3, "v"), post.Interval(0.3, 0.4, "tu"),
+        post.Interval(0.4, 0.5, "ber"), post.Interval(0.5, 0.6, "Mi"),
+        post.Interval(0.6, 0.7, "ra"), post.Interval(0.7, 0.8, "he2"),
+        post.Interval(0.8, 0.9, "open"), post.Interval(0.9, 1.0, "ai"),
+        post.Interval(1.0, 1.1, "shi4"), post.Interval(1.1, 1.2, "jie4"),
+    ])
+    post._normalize_word_spellings(
+        words, post._canonicalize_reference_hyphens("你好v-tuber Mira和open-ai世界"))
+    assert [iv.text for iv in words.intervals] == [
+        "ni3", "hao3", "vtuber", "Mira", "he2", "openai", "shi4", "jie4"]
+
+
+def test_reference_only_hyphen_projection_rejects_partial_reordered_and_extra():
+    for fragments in (("kp", "bad"), ("op", "kp"), ("kp", "op", "x")):
+        words = post.Tier("words", 0.0, 1.0, [
+            post.Interval(0.0, 0.2, "ni3"),
+            *[post.Interval(0.2 + i * 0.2, 0.4 + i * 0.2, fragment)
+              for i, fragment in enumerate(fragments)],
+            post.Interval(0.2 + len(fragments) * 0.2, 1.0, "hao3"),
+        ])
+        warnings = []
+        hanzi = post._build_hanzi_tier(
+            words, "你K-Pop好", warnings, reference_authoritative=True)
+        assert "reference_hyphen_fragment_mismatch" in warnings
+        assert [iv.text for iv in hanzi.intervals] != ["你", "K-Pop", "", "好"]
+        assert [iv.text for iv in words.intervals] == [
+            "ni3", *fragments, "hao3"]
+
+
+def test_strict_english_hyphen_unit_keeps_one_owner_and_phones(tmp_path):
+    stem = "hyphen"
+    evidence = tmp_path / "source.TextGrid"
+    evidence.write_text("strict source fixture\n", encoding="utf-8")
+    evidence_sha = hashlib.sha256(evidence.read_bytes()).hexdigest()
+
+    def record(ordinal, text, start, phone, phone_ordinal):
+        return {
+            "word_id": f"{stem}:s0:w{ordinal}", "ctc_text": text,
+            "ctc_ordinal": ordinal, "status": "verified",
+            "provenance": "english_mfa_textgrid",
+            "unit_id": "en-u0000", "alignment_token": "kpop",
+            "source_ctc_ordinals": [7, 9], "canonical_span": [0, 5],
+            "canonical_binding": post.CANONICAL_UNITS_SCHEMA,
+            "mfa_word": {"ordinal": ordinal, "text": text,
+                         "start": start, "end": start + 0.2},
+            "phones": [{"ordinal": 0, "mfa_phone_ordinal": phone_ordinal,
+                        "label": phone, "start": start, "end": start + 0.2}],
+        }
+
+    segments = [{
+        "segment_id": f"{stem}:s0", "segment_ordinal": 0, "status": "verified",
+        "mfa_textgrid": {"path": str(evidence), "sha256": evidence_sha},
+        "words": [record(7, "kpop", 0.0, "K", 0)],
+    }]
+    ledger = tmp_path / f"{stem}_en_phones.json"
+    ledger.write_text(json.dumps({"schema": post.STRICT_EN_MFA_SCHEMA,
+                                  "stem": stem,
+                                  "canonical_units": post.CANONICAL_UNITS_SCHEMA,
+                                  "segments": segments}),
+                      encoding="utf-8")
+    manifest = {
+        "schema": post.STRICT_EN_MFA_SCHEMA, "strict_provenance": True,
+        "canonical_units": post.CANONICAL_UNITS_SCHEMA,
+        "status": "success", "expected_segments": [f"{stem}:s0"],
+        "produced_segments": [f"{stem}:s0"], "rejected_segments": [],
+        "stem_ledgers": [{"stem": stem, "path": str(ledger),
+                           "sha256": hashlib.sha256(ledger.read_bytes()).hexdigest()}],
+    }
+    (tmp_path / "en_alignment_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8")
+
+    words = post.Tier("words", 0.0, 0.4, [
+        post.Interval(0.0, 0.4, "K-Pop"),
+    ])
+    canonical = post.parse_english_units("K-Pop")[0].to_dict()
+    canonical["source_ctc_ordinals"] = [7, 9]
+    processed_token = {
+        "type": "word", "word": "kpop", "surface_text": "K-Pop",
+        "source_ctc_ordinals": [7, 9], "canonical_span": [0, 5],
+        "canonical_unit": canonical, "hyphen_separator_omitted": True,
+        "start_s": 0.0, "end_s": 0.4,
+    }
+    report, pairs = post.load_strict_en_provenance(
+        stem, words, tmp_path, ctc_tokens=[processed_token])
+    assert report["status"] == "verified"
+    assert len(pairs) == 1
+    assert pairs[0][1]["unit_id"] == "en-u0000"
+    assert [phone["mfa_phone_ordinal"] for phone in pairs[0][1]["phones"]] == [0]
+
+
+def test_snap_repairs_equal_word_boundary_with_positive_mfa_duration():
+    words = post.Tier("words", 0.0, 1.0, [
+        post.Interval(0.2, 0.2, "ni3"),
+    ])
+    snapped, _ = post._snap_to_ctc(
+        words, None, [{"word": "ni3", "start_s": 0.2, "end_s": 0.2}])
+    word = next(iv for iv in snapped.intervals if iv.text == "ni3")
+    assert word.xmax > word.xmin
+    assert word.xmax - word.xmin >= 0.030
+
+
+def test_ctc_reference_hyphenless_fragments_merge_to_one_anchor():
+    source = [
+        {"word": "v", "start": 1.00, "end": 1.20},
+        {"word": "tu", "start": 1.20, "end": 1.40},
+        {"word": "ber", "start": 1.40, "end": 1.70},
+        {"word": "QUESTION-YI", "start": 1.70, "end": 1.90},
+        {"word": "open", "start": 2.00, "end": 2.20},
+        {"word": "ai", "start": 2.20, "end": 2.50},
+    ]
+    merged = ctc._merge_reference_english_fragments(source, "v-tuber [Question-yi] open-ai")
+
+    assert [row["word"] for row in merged] == [
+        "vtuber", "QUESTION-YI", "openai"]
+    assert (merged[0]["start"], merged[0]["end"]) == (1.00, 1.70)
+    assert (merged[2]["start"], merged[2]["end"]) == (2.00, 2.50)
+    assert [row["word"] for row in source] == [
+        "v", "tu", "ber", "QUESTION-YI", "open", "ai"]

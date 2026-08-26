@@ -10,6 +10,7 @@
 #       --python /home/user/miniconda3/envs/mfa-dev/bin/python
 
 mode: ctc_ready
+reference_mode: authority
 
 # ── 路径配置 ──────────────────────────────────────────────────
 
@@ -108,7 +109,9 @@ postprocess:
   strict_ok: true
   allow_filtered_integrity_failures: true
   merge_silence: true
-  min_sil_merge_sec: 0.2
+  # Enable the final visual energy-owner resolver for the full <sp1> range
+  # [0.2s, 0.5s); <sp2>/<sp3> remain protected and are never merged.
+  min_sil_merge_sec: 0.5
   fix_short_word: false
   detect_bgm: false
   filter_suspicious: false

@@ -271,8 +271,6 @@ def main():
     # Load pre-built wav index if available
     wav_index: dict[str, str] | None = None
     if args.wav_index:
-        if args.stems_file:
-            parser.error("--wav-index is forbidden with --stems-file")
         wav_index = json.loads(Path(args.wav_index).read_text(encoding='utf-8'))
         print(f"Loaded wav index: {len(wav_index)} stems")
 

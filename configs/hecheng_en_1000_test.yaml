@@ -20,6 +20,7 @@
 # ═══════════════════════════════════════════════════════════════
 
 mode: nvrasr_fallback
+reference_mode: authority
 
 # ── 路径配置 ──────────────────────────────────────────────────
 
@@ -27,7 +28,7 @@ mode: nvrasr_fallback
 data_dir: /mnt/Raw/新版合成英文数据
 
 # 工作目录 (NVMe)
-workspace: /mnt/nvme3/mfa_workspace_1000test
+workspace: /mnt/nvme3/mfa_workspace_1000test_rerun_20260821_v7
 
 # 最终输出 (NAS)
 output_dir: /mnt/Raw/0805test

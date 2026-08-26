@@ -26,9 +26,9 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import time
-import wave
 from collections import Counter
 from itertools import groupby
 from pathlib import Path
@@ -146,11 +146,43 @@ from pipeline_utils import (
     is_nvv_token, is_english_token, is_pinyin_syllable, is_punct,
     RIA_VARIANTS, replace_ria_variants, normalize_punct_inline,
     _ASCII_TO_CJK_PUNCT,
-    normalize_reference_numerals, validate_ctc_transcript_bundle,
+    normalize_reference_numerals, normalize_authority_reference_numerals,
+    validate_ctc_transcript_bundle,
+    validate_ctc_authority_bundle,
     make_pipeline_accounting_receipt, write_pipeline_accounting_receipt,
     read_pipeline_accounting_receipt, validate_pipeline_accounting_receipt,
-    make_pipeline_run_id,
+    make_pipeline_run_id, cuda_visible_token,
 )
+
+try:
+    from english_units import (
+        EnglishUnitError,
+        merge_authority_fragment_group,
+        parse_english_units,
+    )
+
+except ImportError:  # package-style imports in tests/tools
+    from scripts.english_units import (
+        EnglishUnitError,
+        merge_authority_fragment_group,
+        parse_english_units,
+    )
+
+try:
+    if "ctc_processed_geometry" in sys.modules:
+        import ctc_processed_geometry as _processed_geometry
+    else:
+        from scripts import ctc_processed_geometry as _processed_geometry
+except ImportError:  # direct-script imports outside the repository root
+    import ctc_processed_geometry as _processed_geometry
+
+# Keep package and direct-script imports on the same module object.
+sys.modules["ctc_processed_geometry"] = _processed_geometry
+sys.modules["scripts.ctc_processed_geometry"] = _processed_geometry
+_vad_speech_end = _processed_geometry._vad_speech_end
+resolve_processed_english_spans = _processed_geometry.resolve_processed_english_spans
+
+_resolve_processed_english_spans = resolve_processed_english_spans
 
 
 def _reference_inventory(wav_files: list[Path], data_dir: Path,
@@ -182,8 +214,19 @@ def _reference_inventory(wav_files: list[Path], data_dir: Path,
 
 def _source_inventory(wav_files: list[Path], data_dir: Path,
                       txt_index: dict[str, Path],
-                      allow_missing_reference: bool = False) -> tuple[list[Path], dict[str, str], dict[str, str]]:
+                      allow_missing_reference: bool = False,
+                      reference_mode: str = "auto") -> tuple[list[Path], dict[str, str], dict[str, str]]:
     """Build either a reference-authoritative or free-ASR inventory."""
+    if reference_mode == "fallback":
+        # An explicit no-reference run must not become a mixed batch merely
+        # because a stale/accidental {stem}.txt is present beside one WAV.
+        # ASR remains the sole transcript source for this policy.
+        by_stem: dict[str, Path] = {}
+        for wav in wav_files:
+            if wav.stem in by_stem:
+                raise ValueError(f"duplicate WAV stem in frozen source universe: {wav.stem}")
+            by_stem[wav.stem] = wav
+        return [by_stem[stem] for stem in sorted(by_stem)], {}, {}
     if not allow_missing_reference:
         return _reference_inventory(wav_files, data_dir, txt_index)
     by_stem: dict[str, Path] = {}
@@ -491,6 +534,7 @@ def make_patched_inference(ref_texts: dict[str, str],
                                     "word": flat_token_labels[matched],
                                     "start": round(t_left, 3),
                                     "end": round(t_right, 3),
+                                    "source_ctc_ordinal": matched,
                                 })
                                 matched_target_positions.add(matched)
                                 target_cursor = matched + 1
@@ -562,6 +606,19 @@ def make_patched_inference(ref_texts: dict[str, str],
 # TextGrid 写入 (Praat 格式, MFA 兼容)
 # ═══════════════════════════════════════════════════════════════
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Publish one CTC artifact without exposing a partial file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    try:
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
 def write_textgrid(words_pinyin: list[dict], duration_s: float,
                    out_path: Path, pauses: list[dict] | None = None) -> None:
     """生成双层 TextGrid: words tier + pauses tier.
@@ -590,7 +647,14 @@ def write_textgrid(words_pinyin: list[dict], duration_s: float,
     cursor = 0.0
     for i, w in enumerate(words_pinyin):
         ws = w["start"]
-        we = words_pinyin[i + 1]["start"] if i + 1 < len(words_pinyin) else w["end"]
+        # A canonical authority unit owns only its normalized CTC span.  Do
+        # not let a following punctuation/gap or lexical row enlarge that
+        # interval merely to make the tier visually contiguous.
+        if "canonical_unit" in w:
+            we = w["end"]
+        else:
+            we = (words_pinyin[i + 1]["start"]
+                  if i + 1 < len(words_pinyin) else w["end"])
         if ws > cursor + 0.005:
             intervals.append((cursor, ws, ""))
         intervals.append((ws, we, w["word"]))
@@ -641,7 +705,7 @@ def write_textgrid(words_pinyin: list[dict], duration_s: float,
             lines.append(f"            xmax = {e:.6f}")
             lines.append(f'            text = "{label}"')
 
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _atomic_write_text(out_path, "\n".join(lines) + "\n")
 
 
 def _clamp_words_to_wav_axis(words: list[dict], duration_s: float) -> list[dict]:
@@ -664,40 +728,6 @@ def _clamp_words_to_wav_axis(words: list[dict], duration_s: float) -> list[dict]
 # ═══════════════════════════════════════════════════════════════
 # 主流程: 批量处理
 # ═══════════════════════════════════════════════════════════════
-
-def _vad_speech_end(wav_path: str, search_from_s: float) -> float | None:
-    """用能量 VAD 从 audio 末尾反向搜索语音结束点."""
-    try:
-        import soundfile as sf
-        import numpy as np
-        audio, sr = sf.read(wav_path)
-        if len(audio.shape) > 1:
-            audio = audio[:, 0]
-        frame_ms = 0.01  # 10ms frames
-        frame_len = int(sr * frame_ms)
-        hop = frame_len // 2
-        # 从 search_from_s 开始向后搜索
-        start_sample = int(search_from_s * sr)
-        if start_sample >= len(audio):
-            return None
-        segment = audio[start_sample:]
-        rms = np.array([np.sqrt(np.mean(segment[i:i+frame_len]**2))
-                        for i in range(0, len(segment) - frame_len, hop)])
-        if len(rms) == 0:
-            return None
-        # 阈值: 最大 RMS 的 5%
-        threshold = np.max(rms) * 0.05
-        # 从后向前找最后一个超过阈值的帧
-        last_speech_frame = len(rms) - 1
-        for i in range(len(rms) - 1, -1, -1):
-            if rms[i] > threshold:
-                last_speech_frame = i
-                break
-        end_s = search_from_s + (last_speech_frame * hop) / sr
-        return round(end_s, 3)
-    except Exception:
-        return None
-
 
 def has_japanese(text: str) -> bool:
     """检测文本是否含日语假名 (ひらがな / カタカナ)."""
@@ -735,35 +765,28 @@ def clean_unsupported_punct(text: str) -> str:
 
 
 def _build_txt_index(data_dir: Path) -> dict[str, Path]:
-    """Build {stem: path} index for .txt files — single scan, O(1) lookup."""
+    """Build a deterministic recursive ``{stem: path}`` reference index.
+
+    The fresh corpus contains ``ria新增/ria/*.txt`` below the usual speaker
+    directory depth.  A one-level fallback silently omitted that subtree,
+    causing a frozen 1000-WAV authority selection to become 500 eligible
+    stems at CTC time.  Scan the complete source tree once and keep the first
+    path in stable lexical order; duplicate stems remain an explicit source
+    error in the WAV denominator rather than being resolved nondeterministically.
+    """
     index: dict[str, Path] = {}
-    # Single-level scan first (fast, handles flat directories)
     try:
-        with os.scandir(str(data_dir)) as it:
-            for entry in it:
-                if entry.is_file() and entry.name.endswith(".txt"):
-                    stem = entry.name[:-4]
-                    if stem not in index:
-                        index[stem] = Path(entry.path)
+        entries = sorted(
+            (path for path in data_dir.rglob("*.txt")
+             if path.is_file() and not path.is_symlink()),
+            key=lambda path: path.as_posix(),
+        )
     except OSError:
-        pass
-    # One level of subdirectories if top-level empty
-    if not index:
-        try:
-            with os.scandir(str(data_dir)) as it:
-                for entry in it:
-                    if entry.is_dir():
-                        try:
-                            with os.scandir(entry.path) as it2:
-                                for e2 in it2:
-                                    if e2.is_file() and e2.name.endswith('.txt'):
-                                        stem = e2.name[:-4]
-                                        if stem not in index:
-                                            index[stem] = Path(e2.path)
-                        except OSError:
-                            pass
-        except OSError:
-            pass
+        return index
+    for path in entries:
+        stem = path.stem
+        if stem not in index:
+            index[stem] = path
     return index
 
 
@@ -950,12 +973,22 @@ def _normalize_numerals(ctc_dir: Path) -> int:
     return changed
 
 
-def _validate_all_ctc_bundles(ctc_dir: Path) -> bool:
-    """Validate every successful CTC lab before publishing a v3 marker."""
+def _validate_all_ctc_bundles(
+    ctc_dir: Path, authority_references: dict[str, str] | None = None,
+) -> bool:
+    """Validate every CTC bundle before publishing a normalization marker."""
     lab_paths = sorted(ctc_dir.glob("*.lab"))
     invalid: list[tuple[str, list[str]]] = []
     for lab_path in lab_paths:
-        errors = validate_ctc_transcript_bundle(ctc_dir, lab_path.stem)
+        # This is the producer/raw bundle.  It must validate raw CTC
+        # authority without requiring the processed geometry that is created
+        # later in ctc_pretg_adj.
+        errors = validate_ctc_transcript_bundle(
+            ctc_dir, lab_path.stem, _include_authority=False)
+        if not errors and authority_references and lab_path.stem in authority_references:
+            errors.extend(validate_ctc_authority_bundle(
+                ctc_dir, lab_path.stem, authority_references[lab_path.stem],
+                require_processed=False))
         if errors:
             invalid.append((lab_path.stem, errors))
     if invalid:
@@ -971,10 +1004,15 @@ def _validate_all_ctc_bundles(ctc_dir: Path) -> bool:
 
 def _wav_duration_s(path: Path) -> float:
     """Return the authoritative physical WAV duration, never encoder length."""
-    with wave.open(str(path), "rb") as handle:
-        if handle.getframerate() <= 0:
-            raise ValueError(f"invalid WAV sample rate: {path}")
-        return handle.getnframes() / handle.getframerate()
+    # ``wave`` rejects IEEE-float WAVs (format tag 3), while soundfile is
+    # already a runtime audio reader used by this script and supports both
+    # float and PCM WAV metadata.
+    import soundfile as sf
+
+    info = sf.info(str(path))
+    if info.samplerate <= 0:
+        raise ValueError(f"invalid WAV sample rate: {path}")
+    return info.frames / info.samplerate
 
 
 def _rebuild_final_manifest(ctc_dir: Path, audio_dir: Path,
@@ -1119,6 +1157,146 @@ def _protect_ria(words_pinyin: list[dict]) -> list[dict]:
     return result
 
 
+def _merge_reference_english_fragments(words_pinyin: list[dict], reference: str) -> list[dict]:
+    """Merge reference English units with exact, contiguous CTC fragments.
+
+    ``english_units.py`` owns the spelling and merge contract.  This adapter
+    only maps timed CTC rows into that contract and serializes the resulting
+    canonical metadata.  It intentionally does not search for a later match:
+    the first English row at the current lexical position owns the span, and
+    every source ordinal in the candidate must be contiguous.  Consequently
+    partial, reordered, punctuation-separated, CJK/NVV-crossing, and extra
+    fragment candidates fail closed instead of being repaired heuristically.
+    """
+    if not reference:
+        return list(words_pinyin)
+
+    authorities = parse_english_units(reference)
+    english_indexes = [
+        index for index, row in enumerate(words_pinyin)
+        if is_english_token(str(row.get("word", "")).strip())
+    ]
+    if not authorities:
+        if english_indexes:
+            raise ValueError("authority English candidate has no reference unit")
+        return list(words_pinyin)
+
+    def source_ordinals(row: dict, fallback: int) -> tuple[int, ...]:
+        values = row.get("source_ctc_ordinals")
+        if values is None:
+            value = row.get("source_ctc_ordinal", fallback)
+            values = [value]
+        elif isinstance(values, int):
+            values = [values]
+        if (not isinstance(values, (list, tuple))
+                or any(not isinstance(value, int) or isinstance(value, bool)
+                       or value < 0 for value in values)):
+            raise ValueError("invalid source CTC ordinal metadata")
+        normalized = tuple(values)
+        if not normalized or tuple(sorted(set(normalized))) != normalized:
+            raise ValueError("non-monotonic source CTC ordinal metadata")
+        return normalized
+
+    def row_fragment(row: dict, fallback: int) -> dict:
+        text = str(row.get("word", "")).strip().lstrip("▁")
+        ordinals = source_ordinals(row, fallback)
+        fragment = {"text": text, "ordinal": ordinals[0]}
+        if len(ordinals) != 1:
+            # A pre-merged row is not one CTC fragment and cannot be used as
+            # an authority candidate.  It must be re-emitted from raw rows.
+            raise ValueError("pre-merged source CTC row in authority candidate")
+        if "start" not in row or "end" not in row:
+            raise ValueError("authority CTC candidate is missing timing")
+        fragment.update(start=float(row["start"]), end=float(row["end"]))
+        return fragment
+
+    def content_hash(value: object) -> str:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    reference_identity = hashlib.sha256(reference.encode("utf-8")).hexdigest()
+    result = list(words_pinyin)
+    cursor = 0
+    for authority in authorities:
+        start = next((index for index in english_indexes if index >= cursor), None)
+        if start is None:
+            raise ValueError(f"missing authority English unit {authority.surface_text}")
+
+        # Collect the smallest source-ordered candidate whose lexical ASCII
+        # length reaches the authority token.  Non-English rows are retained
+        # in the candidate so CJK/NVV crossings are rejected by the shared
+        # validator rather than skipped.
+        candidate_rows: list[dict] = []
+        compact_length = 0
+        end = start
+        while end < len(result):
+            row = result[end]
+            candidate_rows.append(row)
+            token = str(row.get("word", "")).strip().lstrip("▁")
+            if is_english_token(token):
+                compact_length += len(token.replace("-", ""))
+            end += 1
+            if compact_length >= len(authority.alignment_token):
+                break
+        if compact_length < len(authority.alignment_token):
+            raise ValueError(f"partial authority English unit {authority.surface_text}")
+
+        fragments = [row_fragment(row, index)
+                     for index, row in enumerate(candidate_rows, start)]
+        try:
+            merged = merge_authority_fragment_group(authority, fragments)
+        except EnglishUnitError as exc:
+            raise ValueError(
+                f"authority English unit {authority.surface_text}: {exc.code}") from exc
+
+        canonical = merged.to_dict()
+        canonical_json_hash = content_hash(canonical)
+        merged_row = dict(candidate_rows[0])
+        canonical_start = merged.canonical_start
+        canonical_end = merged.canonical_end
+        if not isinstance(canonical_start, (int, float)):
+            canonical_start = float(candidate_rows[0]["start"])
+        if not isinstance(canonical_end, (int, float)):
+            canonical_end = float(candidate_rows[-1]["end"])
+        merged_row.update({
+            "word": merged.alignment_token,
+            "surface_text": merged.surface_text,
+            "start": float(canonical_start),
+            "end": float(canonical_end),
+            "source_ctc_ordinals": list(merged.source_ctc_ordinals),
+            "canonical_span": [merged.canonical_start, merged.canonical_end],
+            "canonical_unit": canonical,
+            "canonical_unit_sha256": canonical_json_hash,
+            "reference_identity": reference_identity,
+            "reference_ordinal": merged.reference_ordinal,
+        })
+        if ("-" in authority.surface_text
+                and any(right > left + 1
+                        for left, right in zip(merged.source_ctc_ordinals,
+                                              merged.source_ctc_ordinals[1:]))
+                and all(re.fullmatch(r"[A-Za-z]+(?:[0-9]+)?", str(row.get("word", "")).strip())
+                        for row in candidate_rows)):
+            merged_row["hyphen_separator_omitted"] = True
+        del result[start:end]
+        result.insert(start, merged_row)
+        cursor = start + 1
+        # The index list is based on the original row list.  Recompute it
+        # after each contraction so a second authority unit cannot consume an
+        # old position or silently skip an extra English candidate.
+        english_indexes = [
+            index for index, row in enumerate(result)
+            if is_english_token(str(row.get("word", "")).strip())
+        ]
+    remaining = [
+        row for row in result[cursor:]
+        if is_english_token(str(row.get("word", "")).strip())
+    ]
+    if remaining:
+        raise ValueError("extra authority English fragment")
+    return result
+
+
 def _normalize_ria(ctc_dir: Path) -> int:
     """ASR 后处理安全网: 修复旧 CTC 输出中 ria 的拼音碎片和 CTC 锚点.
 
@@ -1246,6 +1424,108 @@ def _plan_all_gpu_shards(
     return plans
 
 
+def _prepare_dictionary_candidate(
+    dict_path: Path | None,
+    merged_manifest: list[dict],
+    *,
+    no_update: bool,
+) -> tuple[Path | None, list[str]]:
+    """Build and validate a dictionary candidate without touching the live file."""
+    if no_update or not dict_path or not dict_path.is_file():
+        return None, []
+    english_tokens = sorted({
+        word["word"]
+        for entry in merged_manifest
+        for word in entry.get("_words", [])
+        if isinstance(word, dict) and is_english_token(str(word.get("word", "")))
+    })
+    existing: set[str] = set()
+    with open(dict_path, encoding="utf-8-sig") as handle:
+        for line in handle:
+            if line.strip():
+                existing.add(line.split()[0])
+    new_tokens = [token for token in english_tokens if token not in existing]
+    if not new_tokens:
+        return None, []
+
+    candidate = dict_path.with_name(
+        f".{dict_path.name}.candidate-{os.getpid()}"
+    )
+    if candidate.exists() or candidate.is_symlink():
+        raise RuntimeError(f"dictionary candidate already exists: {candidate}")
+    shutil.copy2(str(dict_path), str(candidate))
+    with open(candidate, "a", encoding="utf-8") as handle:
+        for token in new_tokens:
+            handle.write(f"{token} {token}\n")
+    candidate_words = load_mfa_word_set(candidate) or set()
+    if not set(existing).issubset(candidate_words) \
+            or not set(new_tokens).issubset(candidate_words):
+        raise RuntimeError(f"dictionary candidate validation failed: {candidate}")
+    return candidate, new_tokens
+
+
+def _commit_all_gpu_candidate(
+    live_output: Path,
+    candidate_output: Path,
+    old_output_backup: Path,
+    dict_path: Path | None,
+    dict_candidate: Path | None,
+) -> tuple[Path, Path | None]:
+    """Commit output and dictionary as a recoverable pair.
+
+    The two filesystem namespaces cannot be made one OS-level atomic rename.
+    Keep the old output and dictionary as recoverable backups and quarantine
+    the new candidate on any failure, restoring the old pair before raising.
+    """
+    dict_backup = (dict_path.with_name(
+        f".{dict_path.name}.previous-{os.getpid()}"
+    ) if dict_path and dict_candidate else None)
+    if old_output_backup.exists() or old_output_backup.is_symlink():
+        raise RuntimeError(f"output backup already exists: {old_output_backup}")
+    if dict_backup and (dict_backup.exists() or dict_backup.is_symlink()):
+        raise RuntimeError(f"dictionary backup already exists: {dict_backup}")
+
+    output_moved = False
+    output_published = False
+    dictionary_moved = False
+    dictionary_published = False
+    failed_output = candidate_output.with_name(
+        f"{candidate_output.name}.FAILED-{os.getpid()}"
+    )
+    failed_dictionary = (dict_candidate.with_name(
+        f"{dict_candidate.name}.FAILED-{os.getpid()}"
+    ) if dict_candidate else None)
+    try:
+        os.replace(live_output, old_output_backup)
+        output_moved = True
+        os.replace(candidate_output, live_output)
+        output_published = True
+        if dict_candidate and dict_path and dict_backup:
+            os.replace(dict_path, dict_backup)
+            dictionary_moved = True
+            os.replace(dict_candidate, dict_path)
+            dictionary_published = True
+        return old_output_backup, dict_backup
+    except Exception:
+        # Preserve every newly-created artifact; never delete user data.
+        if output_published and live_output.exists():
+            if failed_output.exists() or failed_output.is_symlink():
+                raise RuntimeError(
+                    f"cannot quarantine failed output candidate: {failed_output}"
+                )
+            os.replace(live_output, failed_output)
+        if output_moved and old_output_backup.exists() and not live_output.exists():
+            os.replace(old_output_backup, live_output)
+
+        if dictionary_published and dict_path and failed_dictionary:
+            if dict_path.exists():
+                os.replace(dict_path, failed_dictionary)
+        if dictionary_moved and dict_path and dict_backup \
+                and dict_backup.exists() and not dict_path.exists():
+            os.replace(dict_backup, dict_path)
+        raise
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="CTC Pre-alignment: NVASR → MFA anchor TextGrids (pinyin)")
@@ -1279,9 +1559,24 @@ def main():
                         help="禁用 NVV 标签检测, 仅用 CTC 锚点给参考文本做时间戳.")
     parser.add_argument("--allow-missing-reference", action="store_true",
                         help="无参考文本全管线：所有 WAV 进入 NVASR，自由 ASR 文本作为 MFA 语料.")
+    parser.add_argument("--reference-mode", choices=("auto", "authority", "fallback"),
+                        default="auto",
+                        help="Transcript authority policy; fallback ignores reference TXT files.")
     parser.add_argument("--no-dict-update", action="store_true",
                         help="Do not append discovered English tokens to --dict-path.")
     args = parser.parse_args()
+    if args.reference_mode == "authority" and args.allow_missing_reference:
+        print("ERROR: reference-mode=authority conflicts with --allow-missing-reference",
+              file=sys.stderr)
+        return 2
+    if args.reference_mode == "fallback" and args.no_nvv:
+        print("ERROR: reference-mode=fallback requires NVASR free decode (omit --no-nvv)",
+              file=sys.stderr)
+        return 2
+    # The explicit policy is the source of truth; retain the legacy flag as a
+    # compatible command-line alias for auto mode.
+    if args.reference_mode == "fallback":
+        args.allow_missing_reference = True
     if args.require_fresh_output and args.output_dir.exists():
         print(f"ERROR: --require-fresh-output refuses existing output: {args.output_dir}", file=sys.stderr)
         return 2
@@ -1344,7 +1639,7 @@ def main():
             try:
                 all_wavs, _all_ref_texts, _all_exclusions = _source_inventory(
                     _source_wavs, args.data_dir, _txt_index,
-                    args.allow_missing_reference)
+                    args.allow_missing_reference, args.reference_mode)
             except ValueError as _exc:
                 print(f"ERROR: {_exc}", file=sys.stderr)
                 return 2
@@ -1378,6 +1673,9 @@ def main():
                 _base_argv += ["--audio-dir", str(args.audio_dir)]
             if args.no_nvv:
                 _base_argv += ["--no-nvv"]
+            if args.allow_missing_reference:
+                _base_argv += ["--allow-missing-reference"]
+            _base_argv += ["--reference-mode", args.reference_mode]
             if args.no_dict_update:
                 _base_argv += ["--no-dict-update"]
 
@@ -1433,7 +1731,7 @@ def main():
                     child_argv += ["--dict-path", str(shard_dict)]
 
                 env = os.environ.copy()
-                env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+                env["CUDA_VISIBLE_DEVICES"] = cuda_visible_token(gpu_id, env)
                 print(f"  GPU {gpu_id}: offset={offset} limit={limit} "
                       f"→ {shard_dir}")
                 _proc = _sp.Popen(child_argv, env=env, cwd=str(PROJECT_ROOT))
@@ -1585,11 +1883,16 @@ def main():
                 )
             _merge_output_dir.mkdir(parents=False)
             _merge_lock = args.output_dir / ".merge_lock"
-            if _merge_lock.exists():
+            try:
+                _lock_fd = os.open(
+                    str(_merge_lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+                os.close(_lock_fd)
+            except FileExistsError as exc:
                 raise RuntimeError(
                     f"all-GPU merge lock exists — another merge may be in progress: {_merge_lock}"
-                )
-            _merge_lock.write_text("")  # acquire lock
+                ) from exc
             try:
                 print(f"\n  合并 {len(_procs)} 个 shard 输出...")
                 _merged_entries = 0
@@ -1654,28 +1957,6 @@ def main():
                 )
                 # summary/manifest are published only after final bundle validation.
 
-                # ── Collect English tokens from merged manifest → shared dict ──
-                if not args.no_dict_update and args.dict_path and args.dict_path.exists():
-                    _english_tokens: set[str] = set()
-                    for _entry in _merged:
-                        for _w in _entry.get("_words", []):
-                            _token = _w["word"]
-                            if is_english_token(_token):
-                                _english_tokens.add(_token)
-                    if _english_tokens:
-                        _existing: set[str] = set()
-                        with open(args.dict_path, encoding='utf-8-sig') as _f:
-                            for _line in _f:
-                                _line = _line.strip()
-                                if _line:
-                                    _existing.add(_line.split()[0])
-                        _new_tokens = sorted(t for t in _english_tokens if t not in _existing)
-                        if _new_tokens:
-                            with open(args.dict_path, 'a', encoding='utf-8') as _f:
-                                for t in _new_tokens:
-                                    _f.write(f"{t} {t}\n")
-                            print(f"  Added {len(_new_tokens)} English tokens to dict")
-
                 # Keep the shard evidence under the quarantined partial tree
                 # until the final publish is complete.  This is useful for
                 # diagnosing a failed GPU without mutating the old evidence.
@@ -1687,7 +1968,7 @@ def main():
                 # Tells run_pipeline.py that normalize_* steps were already done
                 # by ctc_prealign. pad_silence only shifts timestamps, doesn't
                 # change token content, so re-normalizing is redundant.
-                if not _validate_all_ctc_bundles(_merge_output_dir):
+                if not _validate_all_ctc_bundles(_merge_output_dir, _all_ref_texts):
                     print("ERROR: refusing to write CTC normalization marker")
                     sys.exit(1)
                 _rebuild_final_manifest(_merge_output_dir, audio_dir,
@@ -1756,18 +2037,27 @@ def main():
                     shards=_shard_rows,
                     extra={"source_frozen": True,
                            "reference_only": not args.allow_missing_reference,
+                           "reference_mode": args.reference_mode,
                            "selected_stems_manifest_sha256": _selected_manifest_digests},
                 )
                 write_pipeline_accounting_receipt(_merge_output_dir, _accounting)
                 _partial_output_dir = args.output_dir.parent / (
                     f"{args.output_dir.name}.partial-{os.getpid()}"
                 )
-                if _partial_output_dir.exists():
-                    raise RuntimeError(
-                        f"partial publish quarantine already exists: {_partial_output_dir}"
-                    )
-                os.replace(args.output_dir, _partial_output_dir)
-                os.replace(_merge_output_dir, args.output_dir)
+                _dict_candidate, _new_dict_tokens = _prepare_dictionary_candidate(
+                    Path(args.dict_path) if args.dict_path else None,
+                    _merged,
+                    no_update=args.no_dict_update,
+                )
+                _commit_all_gpu_candidate(
+                    live_output=args.output_dir,
+                    candidate_output=_merge_output_dir,
+                    old_output_backup=_partial_output_dir,
+                    dict_path=Path(args.dict_path) if args.dict_path else None,
+                    dict_candidate=_dict_candidate,
+                )
+                if _new_dict_tokens:
+                    print(f"  Added {len(_new_dict_tokens)} English tokens to dict")
                 print(f"  Published atomically; partial shard evidence retained at {_partial_output_dir}")
                 # ─────────────────────────────────────────────────────────
             finally:
@@ -1790,13 +2080,31 @@ def main():
     try:
         wav_files, ref_texts, source_exclusions = _source_inventory(
             source_wav_files, args.data_dir, txt_index,
-            args.allow_missing_reference)
+            args.allow_missing_reference, args.reference_mode)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     if source_exclusions:
         print(f"  冻结来源: {len(source_wav_files)} WAV; "
               f"eligible={len(wav_files)}, exclusions={len(source_exclusions)}")
+
+    if args.reference_mode == "authority":
+        # Reference text is the semantic authority.  Normalize Arabic
+        # numerals before CTC words are projected to pinyin; otherwise a
+        # surface such as ``target1`` is parsed as one English unit and the
+        # CTC ``target``/``1`` evidence cannot be reconciled.  This is an
+        # in-memory projection only; source text files and raw CTC evidence
+        # remain immutable and are audited separately downstream.
+        try:
+            import cn2an
+            _numeral_transform = cn2an.transform
+        except ImportError:
+            _numeral_transform = None
+        ref_texts = {
+            stem: normalize_authority_reference_numerals(
+                text, _numeral_transform)
+            for stem, text in ref_texts.items()
+        }
 
     # 建立 stem → WAV 路径映射 (支持子目录布局)
     wav_map: dict[str, Path] = {}
@@ -1964,6 +2272,15 @@ def main():
         # 标点不进 MFA: 没有声学实现, 后处理从 CTC 锚点注入
         words_pinyin = []
         punct_entries = []
+
+        def _source_metadata(row: dict) -> dict:
+            metadata = {}
+            if "source_ctc_ordinals" in row:
+                metadata["source_ctc_ordinals"] = list(row["source_ctc_ordinals"])
+            elif "source_ctc_ordinal" in row:
+                metadata["source_ctc_ordinal"] = row["source_ctc_ordinal"]
+            return metadata
+
         for w in words_aligned:
             token_str = w["word"].strip()
             if not token_str:
@@ -1978,6 +2295,7 @@ def main():
                     "word": mfa_token,
                     "start": w["start"],
                     "end": w["end"],
+                    **_source_metadata(w),
                 })
                 continue
 
@@ -1987,6 +2305,7 @@ def main():
                     "word": token_clean,
                     "start": w["start"],
                     "end": w["end"],
+                    **_source_metadata(w),
                 })
                 continue
 
@@ -2003,6 +2322,7 @@ def main():
                     "word": py_token,
                     "start": w["start"],
                     "end": w["end"],
+                    **_source_metadata(w),
                 })
                 continue
 
@@ -2012,6 +2332,7 @@ def main():
                     "word": token_clean,
                     "start": w["start"],
                     "end": w["end"],
+                    **_source_metadata(w),
                 })
                 continue
 
@@ -2029,6 +2350,13 @@ def main():
                     "end": w["end"],
                 })
 
+        # Canonicalize reference English before any generic CTC token merge.
+        # The shared authority validator must see raw source rows so source
+        # ordinals remain available for punctuation/gap and crossing checks.
+        if stem in ref_texts:
+            words_pinyin = _merge_reference_english_fragments(
+                words_pinyin, ref_texts[stem])
+
         # ── Merge consecutive single-ASCII-letter tokens ──
         # The NVASR tokenizer splits OOV English words into individual
         # letter tokens (e.g. "ria"→"R"+"I"+"A").  Merge them back so
@@ -2040,13 +2368,15 @@ def main():
                 w = words_pinyin[i]
                 token = w["word"]
                 if (len(token) == 1 and token.isascii() and token.isalpha()
-                        and not is_nvv_token(token)):
+                        and not is_nvv_token(token)
+                        and "canonical_unit" not in w):
                     letters = [token]
                     j = i + 1
                     while j < len(words_pinyin):
                         nt = words_pinyin[j]["word"]
                         if (len(nt) == 1 and nt.isascii() and nt.isalpha()
-                                and not is_nvv_token(nt)):
+                                and not is_nvv_token(nt)
+                                and "canonical_unit" not in words_pinyin[j]):
                             letters.append(nt)
                             j += 1
                         else:
@@ -2104,6 +2434,7 @@ def main():
         # Regression Case 31 Fix-4d.
         if not args.no_nvv:
             words_pinyin = _protect_ria(words_pinyin)
+
         words_pinyin = _clamp_words_to_wav_axis(words_pinyin, duration_s)
 
         # 写 TextGrid — 含 pauses tier
@@ -2119,6 +2450,12 @@ def main():
                         "end_ms": e * 60,
                         "duration_ms": dur_ms,
                     })
+
+            # The producer writes immutable raw CTC evidence.  English
+            # processed spans are resolved only after this bundle is copied
+            # into ctc_pretg_adj by the energy/geometry stage; otherwise the
+            # raw CTC root would already contain downstream geometry.
+            words_pinyin = _clamp_words_to_wav_axis(words_pinyin, duration_s)
 
             # ── Strip leading punctuation (part A: remove from punct_entries) ──
             # NVASR sometimes inserts a comma / period right after emotion
@@ -2150,7 +2487,7 @@ def main():
 
             # 写 .lab — MFA 将此作为 transcript, 与 TextGrid words tier 同源
             out_lab = args.output_dir / f"{stem}.lab"
-            out_lab.write_text(lab_tokens + "\n", encoding="utf-8")
+            _atomic_write_text(out_lab, lab_tokens + "\n")
 
             # 写标点锚点文件 (供 postprocess 后注入)
             # end = 下一个 token 的 start, 与词 token 同规则
@@ -2206,11 +2543,11 @@ def main():
                             kept_ellipsis.append(ep)
                     punct_data = non_ellipsis + kept_ellipsis
 
-                punct_path.write_text(json.dumps(punct_data, ensure_ascii=False),
-                                     encoding="utf-8")
+                _atomic_write_text(
+                    punct_path, json.dumps(punct_data, ensure_ascii=False))
             else:
                 # v4 requires a deterministic sidecar for every rerun stem.
-                punct_path.write_text("[]", encoding="utf-8")
+                _atomic_write_text(punct_path, "[]")
 
             # Required sidecars never receive free ASR content in
             # reference-only mode, even transiently before the canonical
@@ -2236,7 +2573,7 @@ def main():
                 if _pos < len(text_asr) and text_asr[_pos] == _lp:
                     text_asr = text_asr[:_pos] + text_asr[_pos + 1:]
             raw_path = args.output_dir / f"{stem}_text_raw.txt"
-            raw_path.write_text(text_asr + "\n", encoding="utf-8")
+            _atomic_write_text(raw_path, text_asr + "\n")
 
             # 中文文本 (raw_text tier 用): 去掉 <|lang|> <|emo|> 标签, NVV→大写
             text_cn = re.sub(r"<\|[^|]+\|>", "", text_asr).strip()
@@ -2263,7 +2600,7 @@ def main():
                 r'\1\2', text_cn)
             text_cn = re.sub(r'…{2,}', '…', text_cn)
             cn_path = args.output_dir / f"{stem}_text_cn.txt"
-            cn_path.write_text(text_cn + "\n", encoding="utf-8")
+            _atomic_write_text(cn_path, text_cn + "\n")
 
             # Reference-only required sidecars are canonical reference content;
             # free ASR text remains diagnostic only.
@@ -2272,18 +2609,19 @@ def main():
                 if canonical is None:
                     raise ValueError(f"reference-only stem has no canonical reference: {stem}")
                 canonical_bytes = canonical.strip() + "\n"
-                raw_path.write_text(canonical_bytes, encoding="utf-8")
-                cn_path.write_text(canonical_bytes, encoding="utf-8")
-                (args.output_dir / f"{stem}_ref.txt").write_text(
-                    canonical_bytes, encoding="utf-8")
+                _atomic_write_text(raw_path, canonical_bytes)
+                _atomic_write_text(cn_path, canonical_bytes)
+                _atomic_write_text(
+                    args.output_dir / f"{stem}_ref.txt", canonical_bytes)
 
             # Preserve the source transcript beside CTC output.  The ASR
             # text above is diagnostic only; downstream normalization and
             # post-processing must be able to recover the authoritative
             # reference even when the original data directory is not passed.
             if stem in ref_texts:
-                (args.output_dir / f"{stem}_ref.txt").write_text(
-                    ref_texts[stem].strip() + "\n", encoding="utf-8")
+                _atomic_write_text(
+                    args.output_dir / f"{stem}_ref.txt",
+                    ref_texts[stem].strip() + "\n")
 
             manifest.append({
                 "audio": str(wav_map[stem]),
@@ -2357,26 +2695,57 @@ def main():
             last_word_vad_end = _vad_speech_end(audio_path, words[-1]["start"])
 
         tokens_path = args.output_dir / f"{stem}_tokens.jsonl"
-        with open(tokens_path, "w", encoding="utf-8") as f:
-            for i, w in enumerate(words):
-                if w is words[-1] and last_word_vad_end is not None:
-                    end_s = last_word_vad_end
-                else:
-                    next_start = None
-                    for t in all_tokens:
-                        if t["start"] > w["start"] + 0.001:
-                            next_start = t["start"]
-                            break
-                    end_s = next_start if next_start is not None else w["end"]
-                line = {
-                    "word": w["word"],
-                    "start_ms": round(w["start"] * 1000, 1),
-                    "end_ms": round(end_s * 1000, 1),
-                    "start_s": w["start"],
-                    "end_s": end_s,
-                    "type": "word",
-                }
-                f.write(json.dumps(line, ensure_ascii=False) + "\n")
+        token_lines: list[str] = []
+        for i, w in enumerate(words):
+            canonical_span = w.get("canonical_span")
+            has_timed_canonical_span = (
+                "canonical_unit" in w
+                and isinstance(canonical_span, (list, tuple))
+                and len(canonical_span) == 2
+                and all(isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        for value in canonical_span))
+            if has_timed_canonical_span:
+                # Raw CTC is an immutable evidence artifact.  Its TextGrid
+                # must never require or consume mutable processed geometry;
+                # that geometry is created later in the copied work root by
+                # adjust_ctc_boundaries.py.  In particular, a 60 ms raw
+                # anchor is evidence, not the final English word duration.
+                start_s = float(w["start"])
+                end_s = float(canonical_span[1])
+            elif (w is words[-1] and last_word_vad_end is not None
+                    and "canonical_unit" not in w):
+                start_s = w["start"]
+                end_s = last_word_vad_end
+            else:
+                start_s = w["start"]
+                next_start = None
+                for t in all_tokens:
+                    if t["start"] > w["start"] + 0.001:
+                        next_start = t["start"]
+                        break
+                end_s = next_start if next_start is not None else w["end"]
+            line = {
+                "word": w["word"],
+                "start_ms": round(start_s * 1000, 1),
+                "end_ms": round(end_s * 1000, 1),
+                "start_s": start_s,
+                "end_s": end_s,
+                "type": "word",
+            }
+            # Authority English rows carry the immutable Wave 1 unit
+            # ledger into the CTC bundle.  Keep the ordinary rows
+            # byte-compatible apart from their timing/source metadata.
+            for key in (
+                    "surface_text", "source_ctc_ordinals", "canonical_span",
+                    "canonical_unit", "canonical_unit_sha256",
+                    "reference_identity", "reference_ordinal",
+                    "hyphen_separator_omitted", "processed_ctc_span",
+                    "processed_ctc_boundary_source"):
+                if key in w:
+                    line[key] = w[key]
+            token_lines.append(json.dumps(line, ensure_ascii=False))
+        _atomic_write_text(tokens_path, "\n".join(token_lines) + "\n")
 
     # ── Build skip summary lines ──
     skip_lines = ""
@@ -2420,7 +2789,7 @@ def main():
             _normalize_ria(args.output_dir)
             _normalize_english(args.output_dir, args.dict_path,
                                update_dict=not args.no_dict_update)
-        if _validate_all_ctc_bundles(args.output_dir):
+        if _validate_all_ctc_bundles(args.output_dir, ref_texts):
             _rebuild_final_manifest(args.output_dir, audio_dir,
                                     wav_files=wav_files)
             # Marker: downstream pipeline steps can skip re-normalization.
@@ -2466,6 +2835,7 @@ def main():
                 shards=[{"shard_id": "single", "stems": _eligible_all}],
                 extra={"source_frozen": True,
                        "reference_only": not args.allow_missing_reference,
+                       "reference_mode": args.reference_mode,
                        "processed_stems": sorted(Path(p).stem for p in paths)},
             )
             write_pipeline_accounting_receipt(args.output_dir, _accounting)

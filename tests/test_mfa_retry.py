@@ -88,7 +88,8 @@ def _fixture_parent(tmp_path: Path, stems: list[str]) -> Path:
 def test_mfa_retry_packet_is_exact_and_bound(tmp_path: Path):
     stems = ["s0", "s1"]
     parent = _fixture_parent(tmp_path, stems)
-    packet = prepare_mfa_retry_packet(parent, Path("/tmp") / f"mfa-retry-test-{tmp_path.name}", stems,
+    retry_root = tmp_path / "retry_root"
+    packet = prepare_mfa_retry_packet(parent, retry_root, stems,
                                       frozen_stems=stems, accepted_stems=[])
     assert packet["schema"] == MFA_RETRY_SCHEMA
     assert packet["stems"] == stems
@@ -100,7 +101,8 @@ def test_mfa_retry_packet_is_exact_and_bound(tmp_path: Path):
 def test_mfa_retry_rejects_accepted_intersection(tmp_path: Path):
     parent = _fixture_parent(tmp_path, ["s0"])
     try:
-        prepare_mfa_retry_packet(parent, Path("/tmp") / f"mfa-retry-test-bad-{tmp_path.name}", ["s0"],
+        retry_root = tmp_path / "retry_root"
+        prepare_mfa_retry_packet(parent, retry_root, ["s0"],
                                  frozen_stems=["s0"], accepted_stems=["s0"])
     except ValueError as exc:
         assert "accepted" in str(exc)
@@ -125,39 +127,37 @@ def test_persistent_generic_failure_has_no_rescue():
     assert state["state"] == "permanent_failure" and not state["rescue_used"]
 
 
-def test_batch_10_to_9_then_singleton_rc0_to_1_completes_without_rescue():
+def test_each_missing_stem_gets_one_isolated_attempt():
     expected = [f"s{i}" for i in range(10)]
     calls = []
     def retry(missing):
         calls.append(list(missing))
-        if len(calls) == 1:
-            return {"return_code": 0, "produced": expected[:-1]}
-        return {"return_code": 0, "produced": [expected[-1]]}
+        assert len(missing) == 1
+        return {"return_code": 0, "produced": list(missing)}
     state = run_mfa_retry_coordinator(
         expected, {"return_code": 0, "produced": []}, retry,
-        rescue_stem=expected[-1],
         rescue_executor=lambda stem: (_ for _ in ()).throw(AssertionError("rescue forbidden")))
     assert state["merge_allowed"] and not state["rescue_used"]
-    assert calls == [expected, [expected[-1]]]
-    assert state["attempts"][1]["produced_individual"] == expected[:-1]
-    assert state["history"][1]["produced"] == expected[:-1]
-    assert state["history"][2]["produced"] == expected
+    assert calls == [[stem] for stem in expected]
+    assert all(row["settings"] == {"beam": 20, "retry_beam": 80, "num_jobs": 1}
+               for row in state["receipts"])
 
 
 def test_noalignments_isolation_allows_one_rescue():
     calls = []
     def retry(missing):
         calls.append(("retry", list(missing)))
-        if len([x for x in calls if x[0] == "retry"]) == 1:
-            return {"return_code": 0, "produced": ["a", "b"]}
-        return {"return_code": 1, "produced": [], "exception": "NoAlignmentsError"}
+        if missing == ["c"]:
+            return {"return_code": 1, "produced": [], "exception": "NoAlignmentsError"}
+        return {"return_code": 0, "produced": list(missing)}
     state = run_mfa_retry_coordinator(
         ["a", "b", "c"], {"return_code": 0, "produced": []}, retry,
         rescue_stem="c",
         rescue_executor=lambda stem: (calls.append(("rescue", stem)) or
                                        {"return_code": 0, "produced": [stem]}))
     assert state["merge_allowed"] and state["rescue_used"]
-    assert calls == [("retry", ["a", "b", "c"]), ("retry", ["c"]), ("rescue", "c")]
+    assert calls == [("retry", ["a"]), ("retry", ["b"]),
+                     ("retry", ["c"]), ("rescue", "c")]
 
 
 def test_rescue_stem_is_derived_after_large_batch():
@@ -165,22 +165,48 @@ def test_rescue_stem_is_derived_after_large_batch():
     retry_calls = []
     def retry(missing):
         retry_calls.append(list(missing))
-        if len(retry_calls) == 1:
-            return {"return_code": 0, "produced": expected[:-1]}
-        return {"return_code": 1, "produced": [], "exception": "NoAlignmentsError"}
+        if missing == [expected[-1]]:
+            return {"return_code": 1, "produced": [], "exception": "NoAlignmentsError"}
+        return {"return_code": 0, "produced": list(missing)}
     rescue_calls = []
     state = run_mfa_retry_coordinator(
         expected, {"return_code": 0, "produced": []}, retry,
         rescue_executor=lambda stem: (rescue_calls.append(stem) or
                                        {"return_code": 0, "produced": [stem]}))
     assert state["merge_allowed"] and rescue_calls == [expected[-1]]
-    assert retry_calls == [expected, [expected[-1]]]
+    assert retry_calls == [[stem] for stem in expected]
 
 
-def test_rc0_singleton_missing_generic_extra_invalid_permanently_fail():
+def test_independent_stem_retries_recover_multiple_remaining_stems():
+    expected = [f"s{i}" for i in range(6)]
+    calls = []
+
+    def retry(missing):
+        calls.append(list(missing))
+        return {"return_code": 0, "produced": list(missing)}
+
+    state = run_mfa_retry_coordinator(
+        expected, {"return_code": 0, "produced": []}, retry)
+    assert state["merge_allowed"] and state["state"] == "complete"
+    assert calls == [[stem] for stem in expected]
+
+
+def test_rc0_singleton_omission_allows_one_wider_rescue():
+    calls = []
+    def retry(missing):
+        calls.append(("retry", list(missing)))
+        return {"return_code": 0, "produced": []}
+    state = run_mfa_retry_coordinator(
+        ["b"], {"return_code": 0, "produced": []}, retry,
+        rescue_executor=lambda stem: (calls.append(("rescue", stem)) or
+                                       {"return_code": 0, "produced": [stem]}))
+    assert state["merge_allowed"] and state["rescue_used"]
+    assert calls == [("retry", ["b"]), ("rescue", "b")]
+
+
+def test_generic_extra_invalid_singletons_permanently_fail():
     expected = ["a", "b"]
     cases = [
-        {"return_code": 0, "produced": []},
         {"return_code": 1, "produced": [], "exception": "GenericError"},
         {"return_code": 0, "produced": ["c"]},
         {"return_code": 0, "produced": [], "invalid": ["b"]},
@@ -195,7 +221,7 @@ def test_rc0_singleton_missing_generic_extra_invalid_permanently_fail():
             rescue_stem="b",
             rescue_executor=lambda stem: (_ for _ in ()).throw(AssertionError("rescue forbidden")))
         assert state["state"] == "permanent_failure" and not state["merge_allowed"]
-        assert calls == [expected, ["b"]]
+        assert calls == [["a"], ["b"]]
 
 
 def test_rescue_cap_is_one_attempt():
@@ -241,7 +267,7 @@ def self_test() -> None:
     test_cli_retry_and_rescue_modes_are_reachable()
     test_rc0_incomplete_retries_only_missing()
     test_persistent_generic_failure_has_no_rescue()
-    test_batch_10_to_9_then_singleton_rc0_to_1_completes_without_rescue()
+    test_each_missing_stem_gets_one_isolated_attempt()
     test_noalignments_isolation_allows_one_rescue()
     test_rc0_singleton_missing_generic_extra_invalid_permanently_fail()
     test_rescue_cap_is_one_attempt()

@@ -16,7 +16,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 POLICY_VERSION = "strict-ok-v3.2"
-EN_PROVENANCE_SCHEMA = "strict-en-mfa-v1"
+LEGACY_AUTHORITY_POLICY_VERSION = "strict-ok-v3.1"
+EN_PROVENANCE_SCHEMA = "strict-en-mfa-v2"
+HISTORICAL_EN_PROVENANCE_SCHEMA = "strict-en-mfa-v1"
+CANONICAL_UNITS_SCHEMA = "canonical-english-units-v1"
+SOS_PRONUNCIATION_POLICY_ID = "sos-exact-override-v1"
+SOS_EXPECTED_PRONUNCIATION = ("EH2", "S", "OW2", "EH1", "S")
+APP_EXPECTED_PRONUNCIATION = ("AE1", "P")
 
 
 def _verify_pipeline_accounting(manifest: dict, expected: set[str], rejected: set[str]) -> list[str]:
@@ -83,6 +89,106 @@ def _relative_regular_file(root: Path, value: object) -> Path | None:
     return target
 
 
+def _absolute_regular_file(value: object) -> Path | None:
+    """Resolve an absolute ordinary evidence file without following links."""
+    if not isinstance(value, str) or not value:
+        return None
+    path = Path(value)
+    try:
+        if not path.is_absolute() or path.is_symlink() or not path.is_file():
+            return None
+        return path.resolve(strict=True)
+    except OSError:
+        return None
+
+
+def _verify_transcript_evidence(stem: str, entry: dict,
+                                *, authority: bool) -> list[str]:
+    """Verify mutually exclusive authority/fallback per-stem evidence."""
+    errors: list[str] = []
+    reference = entry.get("reference")
+    fallback = entry.get("fallback_transcript")
+    if authority:
+        if not isinstance(reference, dict) or fallback is not None:
+            return ["authority_fallback_evidence_conflict"]
+        ref_path = _absolute_regular_file(reference.get("path"))
+        if ref_path is None or _sha256(ref_path) != reference.get("sha256"):
+            errors.append("reference_hash_mismatch")
+        return errors
+    if reference is not None:
+        errors.append("fallback_reference_evidence_present")
+    if not isinstance(fallback, dict):
+        return errors + ["fallback_transcript_evidence_missing"]
+    source = fallback.get("source")
+    if source not in {"asr_fallback", "lab_fallback"}:
+        errors.append("fallback_source_invalid")
+    path = _absolute_regular_file(fallback.get("path"))
+    if path is None:
+        errors.append("fallback_transcript_path_invalid")
+    else:
+        expected_name = (f"{stem}_text_cn.txt" if source == "asr_fallback"
+                         else f"{stem}.lab")
+        if path.name != expected_name:
+            errors.append("fallback_transcript_path_stem_mismatch")
+        try:
+            if not path.read_text(encoding="utf-8").strip():
+                errors.append("fallback_transcript_empty")
+        except (OSError, UnicodeError):
+            errors.append("fallback_transcript_unreadable")
+        if _sha256(path) != fallback.get("sha256"):
+            errors.append("fallback_transcript_hash_mismatch")
+    return errors
+
+
+def _load_bound_report(manifest: dict, root: Path) -> tuple[dict[str, dict], list[str]]:
+    binding = manifest.get("postprocess_report")
+    if binding is None:
+        # Historical authority manifests predate the report binding.  Their
+        # per-entry reference evidence remains fully verified below.
+        entries = manifest.get("ok")
+        authority_only = (
+            isinstance(entries, list) and bool(entries)
+            and all(isinstance(entry, dict)
+                    and "fallback_transcript" not in entry
+                    and entry.get("mode") != "fallback"
+                    for entry in entries)
+        )
+        if authority_only:
+            return {}, []
+        # A fallback entry was introduced with the bound-report contract; it
+        # must never inherit the historical authority-only exception.
+        return {}, ["postprocess_report_binding_missing"]
+    if not isinstance(binding, dict):
+        return {}, ["postprocess_report_binding_invalid"]
+    report = _absolute_regular_file(binding.get("path"))
+    expected_paths = {(root / "postprocess_report.jsonl").resolve()}
+    # Versioned publication copies the manifest byte-for-byte, so its report
+    # binding may still point at the retained staging run.  Accept that
+    # immutable source path as well, but only under the manifest's declared
+    # output root and with the same basename.
+    declared_root = Path(str(manifest.get("output_dir", "")))
+    if declared_root.is_absolute():
+        expected_paths.add((declared_root / "postprocess_report.jsonl").resolve())
+    if (report is None or report not in expected_paths
+            or _sha256(report) != binding.get("sha256")):
+        return {}, ["postprocess_report_hash_mismatch"]
+    rows: dict[str, dict] = {}
+    errors: list[str] = []
+    try:
+        for line_number, line in enumerate(report.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            stem = row.get("stem") if isinstance(row, dict) else None
+            if not _safe_stem(stem) or stem in rows:
+                errors.append(f"postprocess_report_row_invalid:{line_number}")
+            else:
+                rows[stem] = row
+    except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        errors.append(f"postprocess_report_unreadable:{exc}")
+    return rows, errors
+
+
 def _entry_has_english(tg: Path) -> bool:
     try:
         from postprocess_textgrids import parse_textgrid
@@ -94,6 +200,61 @@ def _entry_has_english(tg: Path) -> bool:
         # TextGrid integrity is checked independently by the auditor; a
         # verifier must never use parse failure to waive evidence requirements.
         return True
+
+
+def _verify_pronunciation_policies(ledger: dict) -> list[str]:
+    """Verify W1 pronunciation records from the copied v2 ledger."""
+    errors: list[str] = []
+    dictionary = ledger.get("dictionary_provenance")
+    dictionary_valid = (
+        isinstance(dictionary, dict)
+        and isinstance(dictionary.get("path"), str)
+        and isinstance(dictionary.get("sha256"), str)
+        and len(dictionary["sha256"]) == 64
+    )
+    if dictionary_valid:
+        dictionary_path = _absolute_regular_file(dictionary["path"])
+        dictionary_valid = (dictionary_path is not None
+                            and _sha256(dictionary_path) == dictionary["sha256"])
+    for segment in ledger.get("segments", []) if isinstance(ledger.get("segments"), list) else []:
+        if not isinstance(segment, dict):
+            continue
+        for word in segment.get("words", []) if isinstance(segment.get("words"), list) else []:
+            if not isinstance(word, dict):
+                continue
+            token = str(word.get("alignment_token", "")).casefold()
+            phones = word.get("phones")
+            if not isinstance(phones, list):
+                continue
+            labels = tuple(str(phone.get("label", "")).strip()
+                           for phone in phones if isinstance(phone, dict))
+            if token == "app":
+                if labels != APP_EXPECTED_PRONUNCIATION:
+                    errors.append("app_expected_pronunciation_mismatch")
+                continue
+            if token != "sos":
+                continue
+            policy = word.get("pronunciation_policy")
+            if (word.get("pronunciation_policy_id") != SOS_PRONUNCIATION_POLICY_ID
+                    or not isinstance(policy, dict)
+                    or policy.get("policy_id") != SOS_PRONUNCIATION_POLICY_ID
+                    or tuple(policy.get("expected_pronunciation", ())) != SOS_EXPECTED_PRONUNCIATION
+                    or tuple(policy.get("actual_source_sequence", ())) != labels
+                    or labels != SOS_EXPECTED_PRONUNCIATION
+                    or policy.get("dictionary_provenance") != dictionary
+                    or word.get("dictionary_provenance") != dictionary):
+                errors.append("sos_pronunciation_policy_mismatch")
+            if not dictionary_valid:
+                errors.append("sos_dictionary_hash_mismatch")
+            ordinals = [phone.get("ordinal") for phone in phones
+                        if isinstance(phone, dict)]
+            mfa_ordinals = [phone.get("mfa_phone_ordinal") for phone in phones
+                            if isinstance(phone, dict)]
+            if (ordinals != list(range(len(phones)))
+                    or any(type(value) is not int or value < 0 for value in mfa_ordinals)
+                    or len(mfa_ordinals) != len(set(mfa_ordinals))):
+                errors.append("sos_phone_ordinals_invalid")
+    return sorted(set(errors))
 
 
 def _verify_english_evidence(root: Path, tg: Path, entry: dict) -> list[str]:
@@ -110,6 +271,20 @@ def _verify_english_evidence(root: Path, tg: Path, entry: dict) -> list[str]:
     ledger_path = _relative_regular_file(root, ledger.get("path"))
     if ledger_path is None or _sha256(ledger_path) != ledger.get("sha256"):
         errors.append("english_provenance_ledger_hash_mismatch")
+    elif ledger_path is not None:
+        try:
+            payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+        if (not isinstance(payload, dict)
+                or payload.get("schema") != EN_PROVENANCE_SCHEMA
+                or payload.get("canonical_units") != CANONICAL_UNITS_SCHEMA):
+            errors.append("english_provenance_legacy_schema"
+                          if isinstance(payload, dict)
+                          and payload.get("schema") == HISTORICAL_EN_PROVENANCE_SCHEMA
+                          else "english_provenance_ledger_schema_invalid")
+        else:
+            errors.extend(_verify_pronunciation_policies(payload))
     sources = evidence.get("source_textgrids")
     if not isinstance(sources, list) or (needs_evidence and not sources):
         errors.append("english_provenance_source_missing")
@@ -130,7 +305,8 @@ def verify(path: Path, output_dir: Path | None = None) -> list[str]:
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return [f"invalid_manifest:{exc}"]
-    if manifest.get("policy_version") != POLICY_VERSION:
+    policy_version = manifest.get("policy_version")
+    if policy_version not in {POLICY_VERSION, LEGACY_AUTHORITY_POLICY_VERSION}:
         errors.append("policy_version_mismatch")
     policy = manifest.get("english_provenance_policy")
     if not isinstance(policy, dict) or policy.get("schema") != EN_PROVENANCE_SCHEMA or policy.get("required") is not True:
@@ -142,6 +318,8 @@ def verify(path: Path, output_dir: Path | None = None) -> list[str]:
     root = output_dir or Path(manifest.get("output_dir", ""))
     if not root.is_dir():
         return errors + ["output_dir_missing"]
+    report_rows, report_errors = _load_bound_report(manifest, root)
+    errors.extend(report_errors)
     expected_raw = manifest.get("expected_stems")
     if not isinstance(expected_raw, list):
         errors.append("invalid_expected_stems")
@@ -173,10 +351,31 @@ def verify(path: Path, output_dir: Path | None = None) -> list[str]:
             if _sha256(tg) != entry["textgrid_sha256"]:
                 errors.append(f"textgrid_hash_mismatch:{stem}")
             errors.extend(f"{error}:{stem}" for error in _verify_english_evidence(root, tg, entry))
-            reference = entry["reference"]
-            ref_path = Path(reference["path"])
-            if _sha256(ref_path) != reference["sha256"]:
-                errors.append(f"reference_hash_mismatch:{stem}")
+            mode = entry.get("mode")
+            has_fallback = "fallback_transcript" in entry
+            if mode == "fallback":
+                entry_errors = _verify_transcript_evidence(stem, entry, authority=False)
+            elif mode == "authority" or (mode is None and not has_fallback):
+                # mode=None is the legacy authority entry shape.
+                entry_errors = _verify_transcript_evidence(stem, entry, authority=True)
+            else:
+                entry_errors = ["transcript_mode_invalid"]
+            errors.extend(f"{error}:{stem}" for error in entry_errors)
+            report_row = report_rows.get(stem)
+            if report_rows and report_row is None:
+                errors.append(f"postprocess_report_stem_missing:{stem}")
+            elif report_row is not None:
+                if mode == "fallback":
+                    entry_fallback = entry.get("fallback_transcript")
+                    entry_fallback = entry_fallback if isinstance(entry_fallback, dict) else {}
+                    if (report_row.get("reference_mode") != "fallback"
+                            or report_row.get("reference_source") != entry_fallback.get("source")
+                            or report_row.get("fallback_transcript") != entry_fallback):
+                        errors.append(f"fallback_report_binding_mismatch:{stem}")
+                elif report_row.get("reference_mode") == "fallback":
+                    errors.append(f"authority_report_binding_mismatch:{stem}")
+            if policy_version == LEGACY_AUTHORITY_POLICY_VERSION and has_fallback:
+                errors.append(f"legacy_policy_fallback_unsupported:{stem}")
         except (KeyError, OSError, TypeError):
             errors.append("invalid_ok_entry")
     rejected = manifest.get("rejected")
@@ -297,7 +496,8 @@ def _write_fixture(root: Path, stem: str = "demo") -> dict[str, Path]:
         paths={"output": str(output.resolve()), "filtered": str(filtered.resolve())})
     en_manifest = en_phones / "en_alignment_manifest.json"
     en_manifest.write_text(json.dumps({
-        "schema": EN_PROVENANCE_SCHEMA, "status": "no_english", "strict_provenance": True,
+        "schema": EN_PROVENANCE_SCHEMA, "canonical_units": CANONICAL_UNITS_SCHEMA,
+        "status": "no_english", "strict_provenance": True,
         "mfa": {}, "expected_segments": [], "produced_segments": [], "rejected_segments": [],
         "stem_ledgers": [], "counts": {"english_stems": 0, "english_segments": 0,
             "english_words": 0, "verified_words": 0, "rejected_words": 0}, "reason": "",
@@ -351,11 +551,15 @@ def _write_english_unk_fixture(root: Path) -> dict[str, Path]:
     from audit_strict_ok import _sha256
     ledger = {
         "schema": EN_PROVENANCE_SCHEMA, "stem": "demo",
+        "canonical_units": CANONICAL_UNITS_SCHEMA,
         "ctc_textgrid_sha256": _sha256(paths["ctc"] / "demo.TextGrid"),
         "segments": [{"segment_id": "demo:s0", "segment_ordinal": 0, "status": "verified",
             "reason": "", "mfa_textgrid": {"path": str(source), "sha256": _sha256(source)},
             "words": [{"word_id": "demo:s0:w0", "ctc_ordinal": 0, "ctc_text": "unk",
                 "start": 0.0, "end": 1.0, "status": "verified", "reason": "",
+                "unit_id": "en-u0000", "alignment_token": "unk",
+                "source_ctc_ordinals": [0], "canonical_span": [0, 3],
+                "canonical_binding": CANONICAL_UNITS_SCHEMA,
                 "mfa_word": {"ordinal": 0, "text": "unk", "start": 0.0, "end": 1.0},
                 "phones": [{"ordinal": 0, "label": "AH", "start": 0.0, "end": 1.0,
                     "mfa_phone_ordinal": 0}], "provenance": "english_mfa_textgrid"}]}],
@@ -363,7 +567,8 @@ def _write_english_unk_fixture(root: Path) -> dict[str, Path]:
     ledger_path = paths["en_phones"] / "demo_en_phones.json"
     ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
     paths["en_manifest"].write_text(json.dumps({
-        "schema": EN_PROVENANCE_SCHEMA, "status": "success", "strict_provenance": True,
+        "schema": EN_PROVENANCE_SCHEMA, "canonical_units": CANONICAL_UNITS_SCHEMA,
+        "status": "success", "strict_provenance": True,
         "mfa": {"return_code": 0, "timed_out": False, "timeout_seconds": 1,
                  "command": ["fixture"], "acoustic_model_sha256": "a" * 64,
                  "dictionary_sha256": "b" * 64, "exception": ""},
@@ -569,6 +774,7 @@ def _self_test() -> int:
         from audit_strict_ok import _english_provenance_reasons, _load_english_manifest, _strict_parse
         paths = _write_english_unk_fixture(Path(td))
         raw = json.loads(paths["en_manifest"].read_text(encoding="utf-8"))
+        raw["status"] = "partial"
         raw["produced_segments"] = []
         raw["rejected_segments"] = [{"id": "demo:s0", "reason": "fixture_local_rejection"}]
         raw["counts"]["verified_words"] = 0; raw["counts"]["rejected_words"] = 1

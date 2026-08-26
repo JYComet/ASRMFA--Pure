@@ -1,0 +1,92 @@
+# v5_0707 → 0815：无参考文本批处理配置（冻结 inventory 驱动）
+#
+# 音频已完成静音补全；本配置不重复执行 pad_silence。
+# streaming.batch_cache 是冻结快照，不是动态目录发现；变更输入集合时必须重新生成 inventory。
+# 本次明确排除：Wumi、Mieli、Xiaoyuan。
+# 运行前须人工检查 /mnt/Raw 可写，确保 staging/upload 能够写入目标输出树。
+# 推荐命令（仅供运行前确认，本任务不执行）：
+#   python scripts/streaming_pipeline.py --config configs/v5_0707_to_0815_no_reference.yaml --pipelined
+
+mode: nvrasr_fallback
+reference_mode: fallback
+
+data_dir: //RS3621/Research_TTS/Data/Raw/v5_0707
+output_dir: //RS3621/Research_TTS/Data/Raw/0815
+output_staging: true
+keep_16k_audio: true
+
+workspace: /mnt/nvme3/mfa_workspace_v5_0707_0815
+temp_dir: temp
+
+pad_silence:
+  enabled: false
+
+streaming:
+  batch_cache: cache/v5_0707_to_0815_no_reference.cache.json
+  batch_size: 500
+  parallel: 8
+  num_gpus: 8
+  prefetch_buffer: 4
+  upload_buffer: 4
+  local_work:
+    - /mnt/nvme0/mfa_work_v5_0707_0815
+    - /mnt/nvme1/mfa_work_v5_0707_0815
+    - /mnt/nvme3/mfa_work_v5_0707_0815
+    - /mnt/nvme4/mfa_work_v5_0707_0815
+
+pipelined:
+  cpu_workers: 48
+  restore_ctc_cache: false
+
+ctc_prealign:
+  enabled: true
+  python: /home/user/miniconda3/envs/asr/bin/python
+  model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
+  device: cuda:0
+  all_gpus: true
+  limit: 0
+  timeout: 7200
+  nvv_enabled: true
+  allow_missing_reference: true
+
+ctc_adjust:
+  enabled: true
+  limit: 0
+
+ctc_ready:
+  allow_missing_reference: true
+
+mfa:
+  num_jobs: 8
+  single_speaker: true
+  output_format: long_textgrid
+  clean: false
+  fine_tune: false
+  skip_validate: true
+  beam: 20
+  retry_beam: 80
+  allow_partial: true
+  min_output_ratio: 0.90
+
+mfa_en:
+  enabled: true
+  strict_provenance: false
+  num_jobs: 4
+  beam: 10
+  retry_beam: 40
+  fine_tune: false
+
+postprocess:
+  strict_ok: false
+  allow_filtered_integrity_failures: true
+  merge_silence: true
+  min_sil_merge_sec: 0.2
+  fix_short_word: true
+  short_word_max_sec: 0.25
+  flank_silence_sec: 0.4
+  detect_bgm: true
+  filter_suspicious: true
+  filter_min_phone_coverage: 0.35
+  enable_text_correction: true
+  handle_unexpected_sil: true
+  workers: 0

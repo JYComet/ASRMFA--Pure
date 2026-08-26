@@ -44,7 +44,7 @@ DEFAULT_CONFIG = PROJECT_ROOT / "config.yaml"
 # ── Shared pipeline utilities (canonical implementations in pipeline_utils.py) ──
 sys.path.insert(0, str(SCRIPTS_DIR))
 from pipeline_utils import (
-    CTC_NORMALIZATION_MARKER, parse_ctc_normalization_marker,
+    parse_ctc_normalization_marker,
     find_mfa_python, get_mfa_env,
     build_ctc_presence, build_file_index, build_flat_file_names,
     count_files_fast, find_wav,
@@ -58,17 +58,24 @@ from pipeline_utils import (
     PIPELINE_ACCOUNTING_SCHEMA, make_pipeline_accounting_receipt,
     validate_pipeline_accounting_receipt,
     read_pipeline_accounting_receipt, write_pipeline_accounting_receipt,
+    make_pipeline_resume_fingerprints,
     compute_model_tree_digest, stable_json_digest,
     write_ctc_run_receipt, make_audio_transform_receipt,
     write_audio_transform_receipt, make_mfa_input_axis_receipt,
     make_mfa_alignment_axis_receipt, validate_mfa_axis_receipts,
     validate_ctc_run_receipt_v2, validate_audio_transform_receipt,
     CTC_RUN_RECEIPT_SCHEMA,
+    CTC_RAW_MANIFEST_NAME, CTC_WORK_RECEIPT_NAME,
+    CTC_RAW_MANIFEST_SCHEMA, CTC_WORK_RECEIPT_SCHEMA,
+    write_ctc_raw_manifest, validate_ctc_raw_manifest,
+    materialize_ctc_work, write_ctc_work_receipt,
+    validate_ctc_work_receipt,
     MFA_ALIGNMENT_AXIS_RECEIPT_V2_SCHEMA,
     make_mfa_alignment_axis_receipt_v2,
     MFA_INPUT_AXIS_RECEIPT_SCHEMA, MFA_ALIGNMENT_AXIS_RECEIPT_SCHEMA,
     _axis_audio_metadata,
     _textgrid_global_bounds,
+    classify_input_path,
 )
 
 
@@ -162,9 +169,17 @@ def resolve_input_path(raw: str, base: Path = PROJECT_ROOT) -> Path:
     - Absolute path (already translated) -> returned as-is
     - Relative path -> resolved against *base*
     """
-    if not raw:
+    kind = classify_input_path(raw)
+    if kind == "empty":
         return base
+    if kind == "windows_drive" and platform.system() != "Windows":
+        raise ValueError(f"Windows drive path is not mapped on POSIX: {raw}")
     translated = translate_path(raw)
+    if kind == "unc" and platform.system() != "Windows":
+        if classify_input_path(translated) == "unc":
+            raise ValueError(f"UNC path is not mapped to a local mount: {raw}")
+    if platform.system() != "Windows" and kind == "relative":
+        translated = translated.replace("\\", "/")
     p = Path(translated)
     if p.is_absolute():
         return p
@@ -255,14 +270,23 @@ DEFAULT_CFG: dict = {
     },
     "mfa_en": {
         "enabled": True,
+        # Run-local namespace names.  Defaults preserve the historical
+        # layout; explicit overrides let evidence-producing replays coexist
+        # without overwriting a previous English alignment run.
+        "output_dir": "en_phones",
+        "temp_dir": "temp_en_mfa",
         "num_jobs": 4,
         "normalize_workers": 0,       # 0=auto: min(32, cpu_count)
         "corpus_workers": 0,          # 0=auto: min(16, cpu_count)
-        "padding_ms": 50,
+        "padding_ms": 75,
         "min_segment_dur_ms": 150,
         "max_gap_merge_s": 0.35,
         "beam": 10,
         "retry_beam": 40,
+        "singleton_retry_beam": 100,
+        "singleton_retry_retry_beam": 1000,
+        "singleton_retry_timeout": 600,
+        "singleton_retry_limit": 16,
         "acoustic_model": "pretrained_models/acoustic/english_us_arpa.zip",
         "dictionary": "dict/cmudict.dict",
         "g2p_model": "pretrained_models/g2p/english_us_arpa.zip",
@@ -363,8 +387,207 @@ def resolve_path(base: Path, value: str | None) -> Path | None:
     """Resolve a path relative to PROJECT_ROOT if not absolute."""
     if value is None:
         return None
-    p = Path(value)
-    return p if p.is_absolute() else base / p
+    return resolve_input_path(value, base)
+
+
+def validate_workspace_target(workspace: Path) -> Path:
+    """Reject repository metadata/root paths before creating a workspace."""
+    candidate = Path(workspace).resolve(strict=False)
+    project_root = PROJECT_ROOT.resolve()
+    git_root = project_root / ".git"
+    if candidate == project_root or candidate == git_root \
+            or git_root in candidate.parents:
+        raise ValueError(f"unsafe workspace target: {candidate}")
+    if candidate.exists() and not candidate.is_dir():
+        raise ValueError(f"workspace target is not a directory: {candidate}")
+    return candidate
+
+
+def resolve_workspace_namespace(workspace: Path, value: str, label: str) -> Path:
+    """Resolve a configurable mutable namespace strictly below *workspace*."""
+    raw = Path(str(value))
+    if raw.is_absolute() or not raw.parts or any(part in {"", ".", ".."} for part in raw.parts):
+        raise ValueError(f"{label} must be a relative workspace path: {value!r}")
+    root = Path(workspace).resolve(strict=False)
+    lexical = root / raw
+    cursor = root
+    for part in raw.parts:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ValueError(f"{label} must not traverse a symlink: {cursor}")
+    candidate = lexical.resolve(strict=False)
+    if candidate == root or not candidate.is_relative_to(root):
+        raise ValueError(f"{label} escapes workspace: {value!r}")
+    return candidate
+
+
+def guard_fresh_workspace_targets(workspace: Path, output: Path | None = None,
+                                  *, required: bool = False,
+                                  mode: str = "") -> None:
+    """Reject every mutable run target before any stage creates directories.
+
+    ``require_fresh_workspace`` is a lifecycle contract, not a ctc_ready-only
+    convenience.  Check the workspace, configured output and symlink targets
+    together so fallback modes cannot enter a pre-existing run by another
+    route.
+    """
+    if not required:
+        return
+    targets = [(Path(workspace), "workspace")]
+    if output is not None:
+        targets.append((Path(output), "output"))
+    existing = [
+        f"{label}={path.resolve(strict=False)}"
+        for path, label in targets
+        if path.exists() or path.is_symlink()
+    ]
+    if existing:
+        suffix = f" for mode={mode}" if mode else ""
+        raise ValueError(
+            "require_fresh_workspace=true rejects pre-existing run target"
+            f"{suffix}: " + ", ".join(existing))
+
+
+def _path_fingerprint(path: Path) -> dict:
+    """Return content identity for a file or deterministic directory tree."""
+    path = Path(path)
+    if path.is_file() and not path.is_symlink():
+        return {"path": str(path.resolve()), "sha256": _sha256_file(path)}
+    if not path.is_dir() or path.is_symlink():
+        return {"path": str(path.resolve(strict=False)), "sha256": None}
+    rows = []
+    for child in sorted(path.rglob("*")):
+        if child.is_file() and not child.is_symlink():
+            rows.append({"path": child.relative_to(path).as_posix(),
+                         "sha256": _sha256_file(child),
+                         "size": child.stat().st_size})
+    return {"path": str(path.resolve()), "sha256": stable_json_digest(rows),
+            "files": len(rows)}
+
+
+def _scoped_data_dir_fingerprint(ctx: dict) -> dict | None:
+    """Fingerprint only the frozen pre-CTC selection when it is trustworthy.
+
+    The selection index is an explicit provenance boundary.  If it cannot be
+    proven complete and rooted below ``data_dir``, return ``None`` so callers
+    retain the conservative whole-tree fingerprint.
+    """
+    data_dir = Path(ctx.get("data_dir", ""))
+    expected_value = ctx.get("expected_stems")
+    index = ctx.get("pre_ctc_audio_index")
+    if (not data_dir.is_dir() or data_dir.is_symlink()
+            or not isinstance(expected_value, (list, tuple, set))
+            or not expected_value or not isinstance(index, dict)):
+        return None
+
+    expected = list(expected_value)
+    if (any(not isinstance(stem, str) or not stem for stem in expected)
+            or len(set(expected)) != len(expected)
+            or set(index) != set(expected)):
+        return None
+
+    try:
+        root = data_dir.resolve(strict=True)
+        files: list[dict] = []
+        for stem in sorted(expected):
+            indexed_value = index[stem]
+            if not isinstance(indexed_value, (str, Path)):
+                return None
+            wav = Path(indexed_value)
+            if (wav.is_symlink() or not wav.is_file()
+                    or wav.suffix.lower() != ".wav" or wav.stem != stem):
+                return None
+            resolved_wav = wav.resolve(strict=True)
+            try:
+                wav_relative = resolved_wav.relative_to(root)
+            except ValueError:
+                return None
+
+            files.append({
+                "stem": stem,
+                "role": "wav",
+                "path": wav_relative.as_posix(),
+                "size": resolved_wav.stat().st_size,
+                "sha256": _sha256_file(resolved_wav),
+            })
+
+            authority = resolved_wav.parent / f"{stem}.txt"
+            if authority.is_symlink() or (authority.exists() and not authority.is_file()):
+                return None
+            try:
+                authority_relative = authority.resolve(strict=False).relative_to(root)
+            except ValueError:
+                return None
+            if authority.is_file():
+                files.append({
+                    "stem": stem,
+                    "role": "authority_txt",
+                    "path": authority_relative.as_posix(),
+                    "status": "present",
+                    "size": authority.stat().st_size,
+                    "sha256": _sha256_file(authority),
+                })
+            else:
+                files.append({
+                    "stem": stem,
+                    "role": "authority_txt",
+                    "path": authority_relative.as_posix(),
+                    "status": "missing",
+                    "size": None,
+                    "sha256": None,
+                })
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+    selected = sorted(expected)
+    return {
+        "schema": "data-dir-scoped-fingerprint-v1",
+        "scope": "frozen_expected_stems",
+        "root": str(root),
+        "selected_stems": selected,
+        "selected_stems_digest": stable_json_digest(selected),
+        "selected_count": len(selected),
+        "files": files,
+        "digest": stable_json_digest(files),
+    }
+
+
+def _pipeline_resume_fingerprints(ctx: dict, cfg: dict, *, outputs=None) -> dict:
+    """Build the shared C fingerprint block for production/resume receipts."""
+    raw = Path(ctx.get("ctc_pretg", ""))
+    raw_manifest = Path(ctx.get("ctc_raw_manifest", raw / CTC_RAW_MANIFEST_NAME))
+    producer_receipt = raw / ".ctc_run_receipt.json"
+    module_paths = [Path(__file__), SCRIPTS_DIR / "pipeline_utils.py"]
+    if (SCRIPTS_DIR / "ctc_prealign.py").is_file():
+        module_paths.append(SCRIPTS_DIR / "ctc_prealign.py")
+    producer = {str(path.relative_to(PROJECT_ROOT)): _sha256_file(path)
+                for path in module_paths if path.is_file()}
+    effective = stable_json_digest(cfg)
+    dependencies = {
+        "raw_manifest": _path_fingerprint(raw_manifest),
+        "producer_receipt": _path_fingerprint(producer_receipt),
+        "models": _path_fingerprint(Path(ctx.get("models_dir", ""))),
+        "mfa_python": str(ctx.get("mfa_python", "")),
+    }
+    expected = tuple(ctx.get("expected_stems",
+                             ctx.get("accounting_eligible_stems", ())))
+    data_dir = Path(ctx.get("data_dir", ""))
+    scoped_data = _scoped_data_dir_fingerprint(ctx)
+    inputs = {
+        "data_dir": (scoped_data if scoped_data is not None
+                     else _path_fingerprint(data_dir)),
+        "reference_mode": ctx.get("reference_mode", "auto"),
+    }
+    output_paths = outputs if outputs is not None else {
+        "ctc_work": _path_fingerprint(Path(ctx.get("ctc_pretg_adj", ""))),
+        "mfa_audio": _path_fingerprint(Path(ctx.get("mfa_audio_dir", ""))),
+    }
+    return make_pipeline_resume_fingerprints(
+        producer=producer, effective_config=effective,
+        dependencies=dependencies, inputs=inputs,
+        expected_stems=stable_json_digest(sorted(expected)),
+        outputs=output_paths,
+    )
 
 
 def strict_run_paths(workspace: Path, configured_output: Path, run_id: str,
@@ -528,11 +751,15 @@ def _cleanup_nvme_cache(cache_dir: Path, is_temp: bool) -> None:
 # ---------------------------------------------------------------------------
 
 def run_python(script: Path, script_args: list[str], mfa_python: Path,
-               models_dir: Path, desc: str = "", timeout: int = 86400) -> int:
+               models_dir: Path, desc: str = "", timeout: int = 86400,
+               extra_env: dict[str, str] | None = None) -> int:
     cmd = [str(mfa_python), str(script)] + script_args
     print(f"\n{'='*60}\n  {desc or script.name}\n  {' '.join(cmd)}\n{'='*60}\n")
     try:
-        result = subprocess.run(cmd, env=get_mfa_env(mfa_python, models_dir),
+        env = get_mfa_env(mfa_python, models_dir)
+        if extra_env:
+            env.update({str(key): str(value) for key, value in extra_env.items()})
+        result = subprocess.run(cmd, env=env,
                                 timeout=timeout, capture_output=False)
         return result.returncode
     except subprocess.TimeoutExpired:
@@ -550,6 +777,150 @@ def run_mfa(mfa_args: list[str], mfa_python: Path, models_dir: Path,
         ).returncode
     except subprocess.TimeoutExpired:
         print(f"  TIMEOUT after {timeout}s: {desc or 'MFA'}")
+        return 1
+
+
+def _seal_ctc_raw(ctx: dict) -> int:
+    """Create/validate the immutable raw manifest after producer writes finish."""
+    raw = Path(ctx["ctc_pretg"])
+    try:
+        manifest = write_ctc_raw_manifest(
+            raw, producer_receipt=raw / ".ctc_run_receipt.json",
+            stems=list(ctx.get("accounting_eligible_stems", ())) or None)
+        ctx["ctc_raw_manifest"] = raw / CTC_RAW_MANIFEST_NAME
+        ctx["ctc_raw_manifest_data"] = manifest
+        return 0
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"  ERROR: CTC raw manifest seal failed: {exc}")
+        return 1
+
+
+def _ensure_ctc_work(ctx: dict, *, overwrite: bool = False) -> Path | None:
+    """Bind the derived work root and reject raw/work cache mismatches."""
+    raw = Path(ctx["ctc_pretg"])
+    manifest_path = raw / CTC_RAW_MANIFEST_NAME
+    work_value = ctx.get("ctc_pretg_adj")
+    if work_value is None and "workspace" not in ctx and not manifest_path.exists():
+        # Small direct unit callers historically supplied only ctc_pretg.  Keep
+        # that isolated compatibility path; production contexts always bind a
+        # workspace/ctc_pretg_adj and therefore remain lifecycle-enforced.
+        ctx["ctc_pretg_adj"] = raw
+        ctx["_ctc_legacy_direct"] = True
+        return raw
+    work = Path(work_value or (ctx["workspace"] / "ctc_pretg_adj"))
+    try:
+        if not manifest_path.is_file():
+            if _seal_ctc_raw(ctx) != 0:
+                return None
+        else:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            errors = validate_ctc_raw_manifest(raw, manifest)
+            if errors:
+                raise ValueError("; ".join(errors))
+            ctx["ctc_raw_manifest"] = manifest_path
+            ctx["ctc_raw_manifest_data"] = manifest
+        had_receipt = (work / CTC_WORK_RECEIPT_NAME).is_file()
+        receipt = materialize_ctc_work(
+            raw, work, raw_manifest_path=manifest_path, overwrite=overwrite)
+        if not overwrite and had_receipt:
+            freshness_errors = _validate_ctc_work_freshness(
+                ctx, work, receipt)
+            if freshness_errors:
+                raise ValueError("; ".join(freshness_errors))
+        receipt = _write_ctc_work_freshness(ctx, work, receipt)
+        ctx["ctc_work_receipt"] = receipt
+        ctx["ctc_work_receipt_path"] = work / CTC_WORK_RECEIPT_NAME
+        ctx["ctc_pretg_adj"] = work
+        return work
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"  ERROR: CTC work binding failed: {exc}")
+        return None
+
+
+def _ctc_work_freshness_fingerprints(ctx: dict, work: Path,
+                                     receipt: dict) -> dict:
+    """Build a content-bound freshness block for derived CTC work."""
+    raw = Path(ctx["ctc_pretg"])
+    raw_manifest = Path(ctx.get("ctc_raw_manifest", raw / CTC_RAW_MANIFEST_NAME))
+    producer_receipt = raw / ".ctc_run_receipt.json"
+    module_paths = [Path(__file__), SCRIPTS_DIR / "pipeline_utils.py"]
+    if (SCRIPTS_DIR / "ctc_prealign.py").is_file():
+        module_paths.append(SCRIPTS_DIR / "ctc_prealign.py")
+    producer = {str(path.relative_to(PROJECT_ROOT)): _sha256_file(path)
+                for path in module_paths if path.is_file()}
+    rows = []
+    for path in sorted(work.iterdir()):
+        if path.name == CTC_WORK_RECEIPT_NAME or not path.is_file() or path.is_symlink():
+            continue
+        rows.append({"name": path.name, "size": path.stat().st_size,
+                     "sha256": _sha256_file(path)})
+    expected = tuple(ctx.get("expected_stems",
+                             ctx.get("accounting_eligible_stems", ())))
+    return make_pipeline_resume_fingerprints(
+        producer=producer,
+        effective_config=stable_json_digest(ctx.get("config", {})),
+        dependencies={
+            "raw_manifest": _path_fingerprint(raw_manifest),
+            "producer_receipt": _path_fingerprint(producer_receipt),
+        },
+        inputs={"data_dir": str(Path(ctx.get("data_dir", "")).resolve()),
+                "reference_mode": ctx.get("reference_mode", "auto")},
+        expected_stems=stable_json_digest(sorted(expected)),
+        outputs={"work_root": str(work.resolve()),
+                 "files_digest": stable_json_digest(rows),
+                 "file_count": len(rows)},
+    )
+
+
+def _write_ctc_work_freshness(ctx: dict, work: Path, receipt: dict) -> dict:
+    receipt = dict(receipt)
+    receipt["fingerprints"] = _ctc_work_freshness_fingerprints(ctx, work, receipt)
+    identity = dict(receipt)
+    identity.pop("identity", None)
+    receipt["identity"] = stable_json_digest(identity)
+    path = work / CTC_WORK_RECEIPT_NAME
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.fresh.tmp")
+    tmp.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, path)
+    return receipt
+
+
+def _validate_ctc_work_freshness(ctx: dict, work: Path,
+                                 receipt: dict) -> list[str]:
+    fingerprints = receipt.get("fingerprints") if isinstance(receipt, dict) else None
+    if not isinstance(fingerprints, dict):
+        return ["legacy_ctc_work_receipt_not_resumable"]
+    expected = _ctc_work_freshness_fingerprints(ctx, work, receipt)
+    errors = []
+    if fingerprints != expected:
+        for key in ("schema", "producer", "effective_config", "dependencies",
+                    "inputs", "expected_stems", "outputs", "digest"):
+            if fingerprints.get(key) != expected.get(key):
+                errors.append(f"ctc_work_fingerprint_mismatch:{key}")
+    return errors
+
+
+def _record_ctc_work_stage(ctx: dict, stage: str, *, status: str = "completed") -> int:
+    if ctx.get("_ctc_legacy_direct"):
+        return 0
+    work = Path(ctx.get("ctc_pretg_adj", ""))
+    raw_manifest = Path(ctx.get("ctc_raw_manifest", ""))
+    try:
+        prior = json.loads((work / CTC_WORK_RECEIPT_NAME).read_text(encoding="utf-8"))
+        ledger = list(prior.get("transform_ledger", []))
+        ledger.append({"stage": stage, "status": status,
+                       "work_files_digest": stable_json_digest(
+                           [{"name": p.name, "sha256": _sha256_file(p)}
+                            for p in sorted(work.iterdir())
+                            if p.is_file() and p.name != CTC_WORK_RECEIPT_NAME])})
+        receipt = write_ctc_work_receipt(work, raw_manifest,
+                                         transform_ledger=ledger)
+        receipt = _write_ctc_work_freshness(ctx, work, receipt)
+        ctx["ctc_work_receipt"] = receipt
+        return 0
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"  ERROR: CTC work receipt refresh failed after {stage}: {exc}")
         return 1
 
 
@@ -596,7 +967,13 @@ def _resample_one(wav_path: Path, audio_dir: Path, out_dir: Path,
     sys.path.insert(0, str(SCRIPTS_DIR))
     from audio_utils import resample_audio
 
-    rel = wav_path.relative_to(audio_dir)
+    # MFA consumes a flat audio namespace keyed by corpus stem.  The source
+    # dataset may be nested by speaker, but preserving that relative
+    # directory here makes ``audio_16k/{stem}.wav`` invisible to MFA and
+    # produces a false "missing audio" failure after a successful resample.
+    # Duplicate physical stems are rejected when the pre-CTC denominator is
+    # frozen, so flattening is deterministic and collision-safe.
+    rel = Path(f"{wav_path.stem}.wav")
     out = out_dir / rel
     if out.exists() and not overwrite:
         return (str(rel), False, "skipped")
@@ -638,6 +1015,120 @@ def _resample_one(wav_path: Path, audio_dir: Path, out_dir: Path,
     return (str(rel), True, "resampled")
 
 
+def _freeze_pre_ctc_stems(cfg: dict, ctx: dict) -> tuple[str, ...] | None:
+    """Freeze one auditable pre-CTC stem denominator for fresh full runs.
+
+    ``ctc_prealign.limit`` is a selection boundary, not merely a producer
+    optimization.  Freeze the sorted, unique physical WAV stem universe once
+    before resample/pad/CTC and make every later stage consume the manifest.
+    Existing explicit denominators remain authoritative.
+    """
+    if ctx.get("mode") not in ("nvrasr_fallback", "full"):
+        return tuple(ctx.get("expected_stems", ())) or None
+    if ctx.get("expected_stems"):
+        return tuple(ctx["expected_stems"])
+
+    audio_dir = Path(ctx["audio_dir"])
+    workspace = Path(ctx["workspace"])
+    manifest = workspace / "pre_ctc_stems.txt"
+    prealign_cfg = cfg.get("ctc_prealign", {})
+    limit = int(prealign_cfg.get("limit", 0) or 0)
+    fixed_manifest = prealign_cfg.get("selection_manifest")
+    fixed_expected_hash = prealign_cfg.get("selection_stems_sha256")
+    try:
+        entries = sorted(
+            (path for path in audio_dir.rglob("*.wav")
+             if path.is_file() and not path.is_symlink()),
+            key=lambda path: path.as_posix(),
+        )
+        by_stem: dict[str, list[Path]] = {}
+        for path in entries:
+            by_stem.setdefault(path.stem, []).append(path)
+        duplicates = {stem: paths for stem, paths in by_stem.items()
+                      if len(paths) > 1}
+        if duplicates:
+            sample = "; ".join(
+                f"{stem}: {', '.join(str(path) for path in paths[:3])}"
+                for stem, paths in sorted(duplicates.items())[:5])
+            print("  ERROR: pre-CTC physical WAV denominator has duplicate stems")
+            print(f"    {sample}")
+            return None
+        universe = tuple(sorted(by_stem))
+        if not universe:
+            print("  ERROR: pre-CTC physical WAV denominator is empty")
+            return None
+
+        if fixed_manifest:
+            fixed_path = resolve_input_path(str(fixed_manifest), PROJECT_ROOT)
+            if not fixed_path.is_file():
+                raise ValueError(f"fixed selection manifest is missing: {fixed_path}")
+            payload = json.loads(fixed_path.read_text(encoding="utf-8"))
+            selected = tuple(payload.get("stems", ())) if isinstance(payload, dict) else ()
+            declared_hash = payload.get("stems_sha256") if isinstance(payload, dict) else None
+            expected_hash = fixed_expected_hash or declared_hash
+            if (not selected or len(selected) != 1000
+                    or payload.get("count") != len(selected)
+                    or stable_json_digest(sorted(selected)) != expected_hash
+                    or (declared_hash is not None and declared_hash != expected_hash)):
+                raise ValueError("fixed selection manifest count/hash contract failed")
+            if len(set(selected)) != len(selected) or tuple(sorted(selected)) != selected:
+                raise ValueError("fixed selection manifest must be sorted and unique")
+            selection_source = f"fixed_manifest:{fixed_path}"
+        elif manifest.is_file():
+            selected = tuple(line.strip() for line in
+                             manifest.read_text(encoding="utf-8").splitlines()
+                             if line.strip())
+            if (not selected or selected != tuple(sorted(set(selected)))
+                    or any(stem not in by_stem for stem in selected)
+                    or (limit > 0 and len(selected) > limit)):
+                print("  ERROR: invalid pre-CTC stem selection manifest")
+                return None
+            selection_source = "existing_manifest"
+        else:
+            selected = universe[:limit] if limit > 0 else universe
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text("\n".join(selected) + "\n", encoding="utf-8")
+            selection_source = "physical_wav_scan"
+
+        if fixed_manifest:
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            existing_text = (manifest.read_text(encoding="utf-8")
+                             if manifest.is_file() else "")
+            selected_text = "\n".join(selected) + "\n"
+            if existing_text and existing_text != selected_text:
+                raise ValueError("workspace selection manifest differs from fixed manifest")
+            if not existing_text:
+                manifest.write_text(selected_text, encoding="utf-8")
+
+        ctx["expected_stems"] = selected
+        ctx["pre_ctc_stems_file"] = manifest
+        ctx["pre_ctc_audio_index"] = {stem: by_stem[stem][0]
+                                       for stem in selected}
+        ctx["pre_ctc_selection"] = {
+            "schema": "pre-ctc-stem-selection-v1",
+            "manifest": str(manifest),
+            "source": selection_source,
+            "source_count": len(universe),
+            "selected_count": len(selected),
+            "limit": limit,
+            "stems": list(selected),
+        }
+        # Keep the physical source universe distinct from the selected
+        # denominator in the final accounting receipt.
+        ctx["accounting_source_stems"] = universe
+        ctx["accounting_eligible_stems"] = selected
+        ctx["accounting_exclusions"] = tuple(
+            {"stem": stem, "reason": "pre_ctc_limit"}
+            for stem in universe if stem not in set(selected))
+        print(f"  Frozen pre-CTC stems: {len(selected)}/{len(universe)}"
+              f" (limit={ctx['pre_ctc_selection']['limit']},"
+              f" source={selection_source})")
+        return selected
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"  ERROR: unable to freeze pre-CTC stem denominator: {exc}")
+        return None
+
+
 def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     """Resample trimmed audio to 16kHz for MFA (parallelised).
 
@@ -654,7 +1145,45 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     target_sr = 16000
     overwrite = args.overwrite
 
+    # ``--skip-to resample`` resumes after the producer step, so the in-memory
+    # CTC axis receipt has not necessarily been loaded by ``step_prealign``.
+    # Rebind it here before creating transform receipts; otherwise a perfectly
+    # valid raw bundle is reported as ``missing CTC input binding`` merely
+    # because the process was resumed at this stage.
+    if overwrite and mfa_audio_dir.exists():
+        # An interrupted/restarted run may leave the old nested source layout
+        # behind.  Overwrite means this derived MFA namespace is rebuildable;
+        # clear only its children so the exact flat denominator can be
+        # validated after the workers finish.
+        import shutil as _shutil
+        for child in list(mfa_audio_dir.iterdir()):
+            if child.is_dir() and not child.is_symlink():
+                _shutil.rmtree(child)
+            elif child.is_file() or child.is_symlink():
+                child.unlink()
+
+    # Capture this before freezing expected_stems: the frozen selection must
+    # not make a fresh pre-CTC route look like a post-CTC subset.
+    pre_ctc_mode = (ctx.get("mode") in ("nvrasr_fallback", "full")
+                    and not ctx.get("expected_stems"))
+    if pre_ctc_mode:
+        if _freeze_pre_ctc_stems(cfg, ctx) is None:
+            return 1
     expected_stems = tuple(ctx.get("expected_stems", ()))
+    if ctx.get("ctc_ready_subset") and not expected_stems:
+        print("  ERROR: frozen ctc_ready subset is unavailable; refusing "
+              "full data_dir resample fallback")
+        return 1
+
+    if not isinstance(ctx.get("ctc_axis_receipt"), dict):
+        _ctc_root = Path(ctx.get("ctc_pretg", ""))
+        # ``--skip-to resample`` has no producer-stage memory, so restore the
+        # raw CTC axis only after the pre-CTC source index has been rebuilt.
+        # Keep this helper usable by isolated/non-CTC resampling callers.
+        if ((_ctc_root / ".ctc_run_receipt.json").is_file()
+                or (_ctc_root / CTC_RAW_MANIFEST_NAME).is_file()):
+            if _ensure_ctc_axis_receipt(ctx) != 0:
+                return 1
 
     # Use scandir for fast flat-listing (common case)
     wavs: list[Path] = []
@@ -677,7 +1206,49 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                 return 1
             wavs.append(candidate)
         print(f"  Selected {len(wavs)} evidenced WAVs from the immutable audio_view")
+    elif expected_stems and ctx.get("pre_ctc_selection"):
+        missing: list[str] = []
+        for stem in expected_stems:
+            candidate = audio_dir / f"{stem}.wav"
+            if not candidate.is_file() or candidate.is_symlink():
+                candidate = Path(ctx.get("pre_ctc_audio_index", {}).get(stem, ""))
+            if not candidate.is_file() or candidate.is_symlink():
+                missing.append(stem)
+            else:
+                wavs.append(candidate)
+        if missing or len(wavs) != len(expected_stems):
+            print("  ERROR: frozen pre-CTC resample input is incomplete")
+            return 1
+        print(f"  Selected {len(wavs)} WAVs from frozen pre-CTC subset"
+              " (source namespace may contain extras)")
+    elif expected_stems and ctx.get("ctc_ready_subset"):
+        # A filtered ctc_ready run deliberately reads from a complete,
+        # possibly read-only data_dir.  Construct only the frozen stem paths;
+        # never require the source namespace itself to contain only the
+        # selected subset and never fall back to a directory scan.
+        missing: list[str] = []
+        unsafe: list[str] = []
+        for stem in expected_stems:
+            candidate = audio_dir / f"{stem}.wav"
+            if candidate.is_symlink() or not candidate.is_file():
+                missing.append(stem)
+            elif candidate.parent.resolve() != audio_dir.resolve():
+                unsafe.append(stem)
+            else:
+                wavs.append(candidate)
+        if missing or unsafe or len(wavs) != len(expected_stems):
+            print("  ERROR: frozen subset audio input is incomplete or unsafe")
+            if missing:
+                print(f"    missing={len(missing)}")
+            if unsafe:
+                print(f"    non-flat={len(unsafe)}")
+            return 1
+        print(f"  Selected {len(wavs)} WAVs from frozen ctc_ready subset"
+              f" (source namespace may contain extras)")
     elif expected_stems:
+        # Preserve the historical full-denominator contract for ordinary
+        # non-filtered callers that already provide expected_stems: their
+        # source namespace must equal the frozen full set.
         expected_names = {f"{stem}.wav" for stem in expected_stems}
         try:
             entries = list(audio_dir.iterdir())
@@ -700,7 +1271,15 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         import json as _json
         try:
             manifest = _json.loads(manifest_path.read_text())
+            if manifest.get("schema") != CTC_READY_MANIFEST_SCHEMA:
+                raise ValueError("legacy ctc_ready manifest is not trusted")
             stems = manifest.get("stems", [])
+            if (not isinstance(stems, list)
+                    or any(not isinstance(stem, str) or not stem or Path(stem).name != stem
+                           for stem in stems)
+                    or len(stems) != len(set(stems))
+                    or manifest.get("n_stems") != len(stems)):
+                raise ValueError("ctc_ready manifest stem contract invalid")
             if stems:
                 wavs = []
                 missing = 0
@@ -733,6 +1312,12 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         print("  No WAVs found in audio dir.")
         return 1
 
+    # Preserve the exact physical source chosen for each stem.  A full run
+    # normally uses a flat trimmed directory; the pre-CTC fallback may use a
+    # nested speaker directory.  Transform receipts must bind to the actual
+    # source path in either case.
+    ctx["mfa_source_audio_index"] = {path.stem: path for path in wavs}
+
     # Fast count via scandir (avoid rglob on SMB)
     existing_count = 0
     if mfa_audio_dir.exists():
@@ -745,6 +1330,16 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
             pass
     if existing_count >= len(wavs) and not overwrite:
         print(f"  {existing_count} resampled WAVs already exist. Use --overwrite to redo.")
+        if expected_stems:
+            entries = list(mfa_audio_dir.iterdir())
+            actual_names = {entry.name for entry in entries
+                            if entry.is_file() and not entry.is_symlink()}
+            expected_names = {f"{stem}.wav" for stem in expected_stems}
+            if (actual_names != expected_names or len(entries) != len(expected_names)
+                    or any(entry.is_symlink() or not entry.is_file()
+                           for entry in entries)):
+                print("  ERROR: existing resampled WAV set differs from frozen denominator")
+                return 1
         stems_for_receipts = sorted(ctx.get("expected_stems", ()) or {p.stem for p in wavs})
         return _ensure_mfa_transform_receipts(ctx, stems_for_receipts)
 
@@ -831,12 +1426,19 @@ def step_mfa_validate(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
 
 def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     """Run NVASR CTC forced alignment -> produce MFA anchor TextGrids."""
+    if (ctx.get("mode") in ("nvrasr_fallback", "full")
+            and not ctx.get("expected_stems")):
+        if _freeze_pre_ctc_stems(cfg, ctx) is None:
+            return 1
     pc = cfg.get("ctc_prealign", {})
     if not pc.get("enabled", False):
         print("  CTC prealign disabled in config (ctc_prealign.enabled=false). Skipping.")
         return 0
 
     ctc_out = ctx["ctc_pretg"]
+    if (ctc_out / CTC_RAW_MANIFEST_NAME).is_file() and args.overwrite:
+        print("  ERROR: sealed CTC raw root is immutable; --overwrite cannot rerun producer in place")
+        return 1
     if ctc_out.exists() and not args.overwrite:
         _marker = ctc_out / ".ctc_normalized"
         _manifest = ctc_out / "manifest.json"
@@ -852,15 +1454,16 @@ def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                     print(f"  CTC prealign complete ({_marker_data['stems']} stems,"
                           f" marker v4). Use --overwrite to re-run.")
                     rc = _load_ctc_accounting(ctx, required=True)
-                    return rc if rc else _ensure_ctc_axis_receipt(ctx)
+                    if rc:
+                        return rc
+                    rc = _ensure_ctc_axis_receipt(ctx)
+                    return rc if rc else _seal_ctc_raw(ctx)
                 print(f"  CTC .ctc_normalized manifest digest mismatch —"
                       f" re-running (stale marker).")
             else:
-                # v3 legacy marker: accept (no content-identity to verify)
-                print(f"  CTC prealign has legacy v3 marker — re-using."
-                      f" Use --overwrite to upgrade to v4 provenance marker.")
-                rc = _load_ctc_accounting(ctx, required=True)
-                return rc if rc else _ensure_ctc_axis_receipt(ctx)
+                # Legacy markers carry no content identity and cannot certify
+                # a current run.  Re-run so the producer emits v4 evidence.
+                print("  CTC prealign has a legacy marker — re-running for v4 provenance.")
         else:
             _tg_count = len(list(ctc_out.glob("*.TextGrid")))
             _lab_count = len(list(ctc_out.glob("*.lab")))
@@ -896,10 +1499,19 @@ def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         prealign_args.append("--no-nvv")
     if pc.get("allow_missing_reference", False):
         prealign_args.append("--allow-missing-reference")
-    if pc.get("limit", 0) > 0:
-        prealign_args += ["--limit", str(pc["limit"])]
-    if pc.get("offset", 0) > 0:
-        prealign_args += ["--offset", str(pc["offset"])]
+    # Keep transcript authority explicit across CTC and postprocess.  ``auto``
+    # preserves the historical per-stem discovery behaviour for legacy
+    # configs; authority/fallback configs are fail-closed and cannot be mixed.
+    prealign_args += ["--reference-mode", str(ctx.get("reference_mode", "auto"))]
+    # A frozen pre-CTC manifest is the single denominator.  Do not pass a
+    # second limit/offset selector that could rescan or shrink it differently.
+    if ctx.get("pre_ctc_stems_file"):
+        prealign_args += ["--stems-file", str(ctx["pre_ctc_stems_file"])]
+    else:
+        if pc.get("limit", 0) > 0:
+            prealign_args += ["--limit", str(pc["limit"])]
+        if pc.get("offset", 0) > 0:
+            prealign_args += ["--offset", str(pc["offset"])]
     if args.overwrite:
         prealign_args.append("--overwrite")
     if pc.get("all_gpus", False):
@@ -912,7 +1524,10 @@ def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     if rc != 0:
         return rc
     rc = _load_ctc_accounting(ctx, required=True)
-    return rc if rc else _ensure_ctc_axis_receipt(ctx)
+    if rc:
+        return rc
+    rc = _ensure_ctc_axis_receipt(ctx)
+    return rc if rc else _seal_ctc_raw(ctx)
 
 
 def _ensure_ctc_axis_receipt(ctx: dict) -> int:
@@ -925,6 +1540,32 @@ def _ensure_ctc_axis_receipt(ctx: dict) -> int:
     ctc_dir = Path(ctx["ctc_pretg"])
     audio_dir = Path(ctx.get("audio_dir", ctx.get("mfa_audio_dir", Path())))
     receipt_path = ctc_dir / ".ctc_run_receipt.json"
+    raw_manifest_path = ctc_dir / CTC_RAW_MANIFEST_NAME
+    if raw_manifest_path.is_file():
+        try:
+            manifest = json.loads(raw_manifest_path.read_text(encoding="utf-8"))
+            errors = validate_ctc_raw_manifest(ctc_dir, manifest)
+            if errors:
+                raise ValueError("; ".join(errors))
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            expected = sorted(receipt.get("input_stems", []))
+            bindings = receipt.get("audio_bindings")
+            if (isinstance(bindings, list) and expected
+                    and len(bindings) == len(expected)):
+                ctx["ctc_axis_receipt"] = receipt
+                ctx["ctc_raw_manifest"] = raw_manifest_path
+                ctx["ctc_raw_manifest_data"] = manifest
+                return 0
+            # A raw bundle may have been sealed after a producer-only run
+            # before the axis-binding promotion completed.  Reconstruct the
+            # missing binding below instead of making every resume fail with
+            # ``missing CTC input binding``.
+            print("  CTC receipt has incomplete audio_bindings; rebuilding axis binding")
+            ctx["ctc_raw_manifest"] = raw_manifest_path
+            ctx["ctc_raw_manifest_data"] = manifest
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            print(f"  ERROR: immutable CTC raw manifest validation failed: {exc}")
+            return 1
     if not receipt_path.is_file():
         print(f"  ERROR: missing CTC run receipt: {receipt_path}")
         return 1
@@ -936,8 +1577,21 @@ def _ensure_ctc_axis_receipt(ctx: dict) -> int:
         if not stems:
             stems = sorted(path.stem for path in ctc_dir.glob("*.lab"))
         bindings = []
+        source_index = {
+            str(stem): Path(path)
+            for stem, path in dict(ctx.get("pre_ctc_audio_index", {})).items()
+            if isinstance(stem, str) and path
+        }
         for stem in stems:
+            # ``pad_silence`` changes ``ctx["audio_dir"]`` to the padded
+            # namespace before prealign returns.  Bind the receipt to that
+            # current axis first; the pre-CTC index is only a fallback for
+            # runs whose current audio root is nested or otherwise lacks the
+            # flat stem file.  Using the old source here makes every padded
+            # TextGrid appear to exceed the unpadded audio duration.
             wav = audio_dir / f"{stem}.wav"
+            if wav.is_symlink() or not wav.is_file():
+                wav = source_index.get(stem, wav)
             if wav.is_symlink() or not wav.is_file():
                 raise ValueError(f"missing CTC MFA-axis audio: {stem}")
             metadata = _axis_audio_metadata(wav)
@@ -976,11 +1630,25 @@ def _ensure_ctc_axis_receipt(ctx: dict) -> int:
         receipt["audio_bindings"] = bindings
         receipt["audio_axis_role"] = "ctc_input_audio"
         receipt_errors = validate_ctc_run_receipt_v2(
-            receipt, expected_stems=stems, audio_root=audio_dir)
+            receipt, expected_stems=stems)
         if receipt_errors:
             raise ValueError("; ".join(receipt_errors))
-        receipt_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
-                                encoding="utf-8")
+        # The producer receipt belongs to the sealed raw CTC bundle.  A
+        # resumed run may need to derive missing physical-audio bindings, but
+        # must never rewrite that raw receipt: doing so changes its producer
+        # hash and invalidates every already-materialized CTC work receipt.
+        # Keep the derived binding in the current context (and in a separate
+        # workspace artifact for inspection) instead.
+        derived_path = Path(ctx.get("workspace", ctc_dir)) / ".ctc_input_axis_receipt.json"
+        try:
+            derived_path.write_text(
+                json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8")
+            ctx["ctc_axis_receipt_path"] = derived_path
+        except OSError:
+            # The in-memory receipt is sufficient for the current process;
+            # failure to write the diagnostic copy must not alter semantics.
+            pass
         ctx["ctc_axis_receipt"] = receipt
         return 0
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -1004,6 +1672,11 @@ def _ensure_mfa_transform_receipts(ctx: dict, stems: list[str]) -> int:
     input_rows = {row.get("stem"): row for row in ctc_receipt.get("audio_bindings", [])
                   if isinstance(row, dict)}
     audio_root = Path(ctx["audio_dir"])
+    source_index = {
+        str(stem): Path(path)
+        for stem, path in dict(ctx.get("mfa_source_audio_index", {})).items()
+        if isinstance(stem, str) and path
+    }
     mfa_root = Path(ctx["mfa_audio_dir"])
     receipt_dir = Path(ctx["workspace"]) / "audio_transform_receipts"
     receipt_dir.mkdir(parents=True, exist_ok=True)
@@ -1011,7 +1684,7 @@ def _ensure_mfa_transform_receipts(ctx: dict, stems: list[str]) -> int:
     try:
         for stem in sorted(stems):
             row = input_rows.get(stem)
-            source = audio_root / f"{stem}.wav"
+            source = source_index.get(stem, audio_root / f"{stem}.wav")
             output = mfa_root / f"{stem}.wav"
             if not isinstance(row, dict):
                 raise ValueError(f"missing CTC input binding: {stem}")
@@ -1045,10 +1718,15 @@ def _guard_mfa_axis(ctx: dict, stems: list[str], ctc_dir: Path) -> int:
     """Build and validate the actual MFA input axis before any MFA process."""
     ctc_receipt = ctx.get("ctc_axis_receipt")
     if not isinstance(ctc_receipt, dict):
-        try:
-            ctc_receipt = json.loads((ctc_dir / ".ctc_run_receipt.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            print(f"  ERROR: MFA axis CTC receipt unavailable: {exc}")
+        # A cold resume may enter MFA directly from the adjusted CTC work
+        # root.  The producer receipt belongs to the raw CTC root; restore it
+        # through the raw-aware helper rather than inferring ownership from
+        # ``ctc_dir`` (which is often ``ctc_pretg_adj`` here).
+        if _ensure_ctc_axis_receipt(ctx) != 0:
+            return 1
+        ctc_receipt = ctx.get("ctc_axis_receipt")
+        if not isinstance(ctc_receipt, dict):
+            print("  ERROR: MFA axis CTC receipt unavailable after raw restore")
             return 1
     if ctc_receipt.get("schema") != CTC_RUN_RECEIPT_SCHEMA:
         print("  ERROR: MFA axis requires CTC run receipt v2")
@@ -1092,7 +1770,7 @@ def _guard_mfa_axis(ctx: dict, stems: list[str], ctc_dir: Path) -> int:
         axis = make_mfa_input_axis_receipt(sorted(stems), axis_rows, axis_root=mfa_root,
                                            transform_receipts=[ctx["mfa_transform_receipts"][s]["path"] for s in sorted(stems)])
         axis["tts_authoritative_audio_root"] = str(Path(ctx.get("tts_authoritative_audio_dir", ctx["audio_dir"])).resolve())
-        axis_path = ctc_dir / ".mfa_input_axis_receipt.json"
+        axis_path = Path(ctx["workspace"]) / ".mfa_input_axis_receipt.json"
         axis_path.write_text(json.dumps(axis, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         errors.extend(validate_mfa_axis_receipts(axis, stems=stems, audio_root=mfa_root,
                                                  ctc_receipt=ctc_receipt))
@@ -1102,7 +1780,11 @@ def _guard_mfa_axis(ctx: dict, stems: list[str], ctc_dir: Path) -> int:
             print(f"    - {error}")
         return 1
     ctx["mfa_input_axis_receipt"] = axis
-    ctx["mfa_input_axis_receipt_path"] = ctc_dir / ".mfa_input_axis_receipt.json"
+    # The receipt is written beside the MFA audio/alignment roots, i.e. at
+    # the workspace root.  Do not point consumers at the CTC directory: that
+    # path happens to be valid-looking, but it makes the downstream axis
+    # contract report a missing receipt after a successful MFA run.
+    ctx["mfa_input_axis_receipt_path"] = axis_path
     ctx["mfa_axis_audio_dir"] = mfa_root
     return 0
 
@@ -1240,7 +1922,7 @@ def _write_strict_replay_axis_receipts(ctx: dict) -> int:
         axis = make_mfa_input_axis_receipt(stems, bindings, axis_root=audio_root)
         axis["tts_authoritative_audio_root"] = str(
             Path(ctx["tts_authoritative_audio_dir"]).resolve())
-        axis_path = ctc_dir / ".mfa_input_axis_receipt.json"
+        axis_path = Path(ctx["workspace"]) / ".mfa_input_axis_receipt.json"
         axis_path.write_text(json.dumps(axis, ensure_ascii=False, indent=2) + "\n",
                              encoding="utf-8")
         ctx["ctc_axis_receipt"] = ctc_receipt
@@ -1287,8 +1969,47 @@ def _load_ctc_accounting(ctx: dict, *, required: bool = False) -> int:
     eligible = tuple(receipt["eligible"]["stems"])
     existing = tuple(ctx.get("expected_stems", ()))
     if existing and set(existing) != set(eligible):
-        print("  ERROR: frozen v2 eligible stems differ from pipeline denominator")
-        return 1
+        # A resumed nvrasr/full route may have a producer accounting receipt
+        # for the physical eligible universe (for example 55,998 files),
+        # while the frozen pre-CTC selection deliberately contains only the
+        # configured batch (for example 1,000 files).  Project only when the
+        # selection is explicitly frozen and every selected stem is present
+        # in the producer eligible/output evidence.  Arbitrary denominator
+        # changes remain fail-closed.
+        selected = set(existing)
+        source_eligible = set(eligible)
+        source_output = set(receipt["output"]["stems"])
+        if (ctx.get("pre_ctc_selection")
+                and selected <= source_eligible
+                and selected <= source_output):
+            selected_output = sorted(source_output & selected)
+            selected_filtered = sorted(selected - set(selected_output))
+            excluded = list(receipt.get("exclusions", ()))
+            existing_exclusions = {
+                (row.get("stem"), row.get("reason"))
+                for row in excluded if isinstance(row, dict)
+            }
+            excluded.extend(
+                {"stem": stem, "reason": "pre_ctc_limit"}
+                for stem in sorted(source_eligible - selected)
+                if (stem, "pre_ctc_limit") not in existing_exclusions
+            )
+            projected = make_pipeline_accounting_receipt(
+                list(receipt["source"]["stems"]), sorted(selected),
+                excluded, selected_output, selected_filtered,
+                run_id=str(receipt.get("run_id", "")),
+                mode=str(receipt.get("mode", "")),
+                route=list(receipt.get("route", [])) + ["project_pre_ctc_selection"],
+                paths=dict(receipt.get("paths", {})),
+                shards=None,
+                extra={**dict(receipt.get("extra", {})),
+                       "denominator_projection": "frozen_pre_ctc_selection"})
+            write_pipeline_accounting_receipt(receipt_path.parent, projected)
+            receipt = projected
+            eligible = tuple(projected["eligible"]["stems"])
+        else:
+            print("  ERROR: frozen v2 eligible stems differ from pipeline denominator")
+            return 1
     ctx.update({"accounting_receipt": receipt,
                 "accounting_receipt_path": receipt_path,
                 "accounting_source_stems": tuple(receipt["source"]["stems"]),
@@ -1301,13 +2022,11 @@ def _load_ctc_accounting(ctx: dict, *, required: bool = False) -> int:
 def _skip_if_ctc_normalized(ctx: dict) -> bool:
     """Return True if ctc_prealign already ran normalize_* steps.
 
-    A v3 (string-only) marker is accepted for backward compatibility with
-    data written by older pipeline versions.  A v4 marker additionally
-    validates that its embedded stem count and manifest digest match the
-    current on-disk state — a mismatch means the data was modified after
-    normalization and must be re-validated.
+    Only a v4 marker is a current success certificate.  It validates that
+    its embedded stem count and manifest digest match the current on-disk
+    state; legacy markers are historical and force re-validation.
     """
-    _marker = ctx.get("ctc_pretg", Path()) / ".ctc_normalized"
+    _marker = ctx.get("ctc_pretg_adj", ctx.get("ctc_pretg", Path())) / ".ctc_normalized"
     try:
         if not _marker.exists():
             return False
@@ -1315,15 +2034,10 @@ def _skip_if_ctc_normalized(ctx: dict) -> bool:
     except (OSError, UnicodeError):
         return False
 
-    # v3 legacy marker: exact string match
-    if _text == CTC_NORMALIZATION_MARKER:
-        print(f"  Skipping: ctc_prealign already normalized (v3 marker: {_marker})")
-        return True
-
     # v4 content-identity marker: parse and validate
     _info = parse_ctc_normalization_marker(_text)
     if _info is not None:
-        _ctc_dir = ctx.get("ctc_pretg", Path())
+        _ctc_dir = ctx.get("ctc_pretg_adj", ctx.get("ctc_pretg", Path()))
         _actual_labs = len(list(_ctc_dir.glob("*.lab")))
         if _info["stems"] != _actual_labs:
             print(f"  Re-running normalization: stem count mismatch "
@@ -1353,15 +2067,17 @@ def step_normalize_punct(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     3. Merge adjacent punctuation — no two puncts side by side;
        timestamps in _punct.json are merged to span the combined range.
     """
+    ctc_dir = _ensure_ctc_work(ctx, overwrite=bool(getattr(args, "overwrite", False)))
+    if ctc_dir is None:
+        return 1
     if _skip_if_ctc_normalized(ctx):
-        return 0
+        return _record_ctc_work_stage(ctx, "normalize_punct", status="skipped")
     import json
 
     ALLOWED_PUNCT = frozenset("，。！？、；：…")
     ASCII_MAP = {
         ",": "，", ".": "。", "?": "？", "!": "！", ";": "；", ":": "：",
     }
-    ctc_dir = ctx["ctc_pretg"]
     count = 0
     missing = 0
 
@@ -1490,7 +2206,7 @@ def step_normalize_punct(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     if missing:
         print(f"  WARNING: {missing} _text_cn.txt file(s) not found, skipped")
     print(f"  Normalized punctuation in {count} files")
-    return 0
+    return _record_ctc_work_stage(ctx, "normalize_punct")
 
 
 def step_normalize_text(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
@@ -1501,14 +2217,16 @@ def step_normalize_text(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     recovered from its validated tokens JSONL sequence.
     """
     import re
+    ctc_dir = _ensure_ctc_work(ctx, overwrite=bool(getattr(args, "overwrite", False)))
+    if ctc_dir is None:
+        return 1
     if _skip_if_ctc_normalized(ctx):
-        return 0
+        return _record_ctc_work_stage(ctx, "normalize", status="skipped")
     try:
         import cn2an
     except ImportError:
         cn2an = None
         print("  cn2an not installed; validating CTC bundles without text numeral conversion.")
-    ctc_dir = ctx["ctc_pretg"]
     text_changed = 0
     lab_recovered = 0
     failures: list[tuple[str, str]] = []
@@ -1582,7 +2300,8 @@ def step_normalize_text(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
             if current_words != token_words:
                 rebuild_lab_from_tokens(tokens_path, lab_path)
                 lab_recovered += 1
-            bundle_errors = validate_ctc_transcript_bundle(ctc_dir, stem)
+            bundle_errors = validate_ctc_transcript_bundle(
+                ctc_dir, stem, _require_processed=False)
             if bundle_errors:
                 raise ValueError("; ".join(bundle_errors))
         except (OSError, ValueError) as exc:
@@ -1607,7 +2326,7 @@ def step_normalize_text(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         if len(failures) > 20:
             print(f"    ... and {len(failures) - 20} more")
         return 1
-    return 0
+    return _record_ctc_work_stage(ctx, "normalize")
 
 def step_normalize_ria(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     """Merge legacy ria fragments across lab, tokens and CTC TextGrid.
@@ -1616,14 +2335,16 @@ def step_normalize_ria(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     ctc_prealign (align_text gets CJK→ria before tokenizer).
     Does NOT modify _text_cn.txt / _text_raw.txt (ASR archive).
     """
+    ctc_dir = _ensure_ctc_work(ctx, overwrite=bool(getattr(args, "overwrite", False)))
+    if ctc_dir is None:
+        return 1
     if _skip_if_ctc_normalized(ctx):
-        return 0
+        return _record_ctc_work_stage(ctx, "normalize_ria", status="skipped")
     import json, re
     from normalize_english_tokens import rewrite_ctc_textgrid_words
 
-    ctc_dir = ctx["ctc_pretg"]
     if not ctc_dir or not ctc_dir.exists():
-        return 0
+        return _record_ctc_work_stage(ctx, "normalize_ria", status="skipped")
 
     changed_count = 0
     failures: list[tuple[str, str]] = []
@@ -1677,7 +2398,8 @@ def step_normalize_ria(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
             rewrite_ctc_textgrid_words(tg_path, new_entries)
             tokens_tmp.replace(tokens_path)
             lab_tmp.replace(lab_file)
-            errors = validate_ctc_transcript_bundle(ctc_dir, stem)
+            errors = validate_ctc_transcript_bundle(
+                ctc_dir, stem, _require_processed=False)
             if errors:
                 raise ValueError("; ".join(errors))
             changed_count += 1
@@ -1687,11 +2409,19 @@ def step_normalize_ria(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     if changed_count:
         print(f"  [normalize_ria] {changed_count} synchronized bundle(s)")
     if failures:
+        # A malformed CTC token bundle can still be isolated by downstream
+        # postprocess/filtering when MFA partial mode is explicitly enabled.
+        # Preserve the per-stem evidence in the shared context so that the
+        # partial run is auditable; the RIA merge algorithm remains unchanged.
+        ctx["ctc_normalize_ria_failures"] = tuple(failures)
         print(f"  ERROR: {len(failures)} RIA bundle(s) failed")
         for stem, reason in failures[:20]:
             print(f"    - {stem}: {reason}")
+        if cfg.get("mfa", {}).get("allow_partial", False):
+            print("  RIA partial mode: preserving failed bundle(s) for downstream filtering")
+            return _record_ctc_work_stage(ctx, "normalize_ria", status="partial")
         return 1
-    return 0
+    return _record_ctc_work_stage(ctx, "normalize_ria")
 
 
 def step_normalize_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
@@ -1701,11 +2431,13 @@ def step_normalize_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     (e.g. "ria"->"rui4"+"ya4").  This step merges them back into the
     canonical spelling before MFA alignment.
     """
+    ctc_dir = _ensure_ctc_work(ctx, overwrite=bool(getattr(args, "overwrite", False)))
+    if ctc_dir is None:
+        return 1
     if _skip_if_ctc_normalized(ctx):
-        return 0
-    ctc_dir = ctx["ctc_pretg"]
+        return _record_ctc_work_stage(ctx, "normalize_en", status="skipped")
     if not ctc_dir or not ctc_dir.exists():
-        return 0
+        return _record_ctc_work_stage(ctx, "normalize_en", status="skipped")
 
     script = SCRIPTS_DIR / "normalize_english_tokens.py"
     norm_en_args = ["--txt-dir", str(ctc_dir)]
@@ -1724,7 +2456,8 @@ def step_normalize_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
 
     invalid: list[tuple[str, list[str]]] = []
     for lab_path in sorted(ctc_dir.glob("*.lab")):
-        errors = validate_ctc_transcript_bundle(ctc_dir, lab_path.stem)
+        errors = validate_ctc_transcript_bundle(
+            ctc_dir, lab_path.stem, _require_processed=False)
         if errors:
             invalid.append((lab_path.stem, errors))
     if invalid:
@@ -1735,25 +2468,99 @@ def step_normalize_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
             print(f"    ... and {len(invalid) - 20} more")
         return 1
     print(f"  CTC bundle validation: {len(list(ctc_dir.glob('*.lab')))} OK")
-    return 0
+    return _record_ctc_work_stage(ctx, "normalize_en")
+
+
+def _processed_geometry_cache_complete(ctc_dir: Path,
+                                       stems: set[str]) -> bool:
+    """Return whether an adjusted CTC cache has all derived English spans.
+
+    Non-English rows do not need processed geometry.  Every canonical
+    English row does: accepting a cache based only on TextGrid/label presence
+    would let a raw copy bypass the adjust stage and fail later as
+    ``processed_geometry_missing``.
+    """
+    for stem in stems:
+        token_path = ctc_dir / f"{stem}_tokens.jsonl"
+        if not token_path.is_file() or token_path.is_symlink():
+            return False
+        try:
+            rows = [json.loads(line) for line in
+                    token_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(
+                    row.get("canonical_unit"), dict):
+                continue
+            span = row.get("processed_ctc_span")
+            source = row.get("processed_ctc_boundary_source")
+            if (not isinstance(span, list) or len(span) != 2
+                    or not all(isinstance(value, (int, float))
+                               and not isinstance(value, bool)
+                               and math.isfinite(float(value))
+                               for value in span)
+                    or span[1] <= span[0]
+                    or not isinstance(source, str) or not source):
+                return False
+    return True
 
 
 def step_adjust_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     """Run energy-based CTC anchor boundary adjustment before MFA."""
     ac = cfg.get("ctc_adjust", {})
+    ctc_work = _ensure_ctc_work(ctx, overwrite=bool(getattr(args, "overwrite", False)))
+    if ctc_work is None:
+        return 1
+    # CTC timestamps live on the TTS-authoritative axis.  During a resumed
+    # ``--skip-to adjust`` run, ``audio_dir`` may again point at the original
+    # unpadded corpus, while the validated axis receipt restores this root.
+    adjustment_audio = Path(ctx.get(
+        "tts_authoritative_audio_dir", ctx["audio_dir"]))
     if not ac.get("enabled", True):
-        print("  CTC adjust disabled in config (ctc_adjust.enabled=false). Skipping.")
-        ctx["ctc_pretg_adj"] = ctx["ctc_pretg"]
-        return 0
+        print("  CTC energy adjust disabled; creating processed English geometry only.")
+        geometry_audio = adjustment_audio
+        local_audio = Path(ctx.get("mfa_audio_dir", ""))
+        expected_geometry_stems = tuple(ctx.get("expected_stems", ()))
+        if (local_audio.is_dir() and expected_geometry_stems
+                and all((local_audio / f"{stem}.wav").is_file()
+                        for stem in expected_geometry_stems)):
+            # Geometry-only needs duration and (for a final English token)
+            # VAD, not the authoritative sample axis.  Use the already
+            # materialized local 16 kHz view to avoid rereading NAS audio.
+            geometry_audio = local_audio
+            print(f"  Geometry audio: local MFA view {geometry_audio}")
+        adjust_args = [
+            "--ctc-dir", str(ctc_work),
+            "--audio-dir", str(geometry_audio),
+            "--output-dir", str(ctc_work),
+            "--raw-manifest", str(ctx["ctc_raw_manifest"]),
+            "--geometry-only",
+        ]
+        if args.overwrite:
+            adjust_args.append("--overwrite")
+        rc = run_python(
+            SCRIPTS_DIR / "adjust_ctc_boundaries.py", adjust_args, mfa_python,
+            ctx["models_dir"], "Step 5: Build processed CTC geometry")
+        if rc != 0:
+            return rc
+        ctx["ctc_pretg_adj"] = ctc_work
+        return _record_ctc_work_stage(ctx, "adjust", status="geometry_only")
 
-    ctc_in = ctx["ctc_pretg"]
-    ctc_out = ctx["ctc_pretg_adj"]
+    ctc_in = ctc_work
+    ctc_out = ctc_work
 
     if ctc_out.exists() and not args.overwrite:
-        # Verify adjusted output contains ALL input stems — not just any .TextGrid
+        # Verify adjusted output contains ALL input stems and the derived
+        # processed geometry.  ctc_work is intentionally an in-place derived
+        # root; a raw/work copy can therefore already contain a complete set
+        # of TextGrids while still lacking processed_ctc_span.  TextGrid
+        # presence alone must never certify the adjust stage.
         _in_labs = {p.stem for p in ctc_in.glob("*.lab")}
         _out_tgs = {p.stem for p in ctc_out.glob("*.TextGrid")}
-        if _in_labs and _in_labs == _out_tgs:
+        if (_in_labs and _in_labs == _out_tgs
+                and _processed_geometry_cache_complete(ctc_out, _in_labs)):
             print(f"  Adjusted CTC anchors complete ({len(_out_tgs)} stems)."
                   f" Use --overwrite to re-run.")
             ctx["ctc_pretg_adj"] = ctc_out
@@ -1766,14 +2573,17 @@ def step_adjust_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                 _detail.append(f"missing={len(_missing)}")
             if _extra:
                 _detail.append(f"extra={len(_extra)}")
+            if _in_labs == _out_tgs:
+                _detail.append("processed-geometry-missing-or-incomplete")
             print(f"  Adjusted CTC anchors incomplete ({', '.join(_detail)}) —"
                   f" re-running.")
         # fall through to re-run
 
     adjust_args = [
         "--ctc-dir", str(ctc_in),
-        "--audio-dir", str(ctx["audio_dir"]),
+        "--audio-dir", str(adjustment_audio),
         "--output-dir", str(ctc_out),
+        "--raw-manifest", str(ctx["ctc_raw_manifest"]),
     ]
     if ac.get("limit", 0) > 0:
         adjust_args += ["--limit", str(ac["limit"])]
@@ -1785,7 +2595,9 @@ def step_adjust_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
 
     if rc == 0:
         ctx["ctc_pretg_adj"] = ctc_out
-    return rc
+    if rc != 0:
+        return rc
+    return _record_ctc_work_stage(ctx, "adjust")
 
 
 def _validate_mfa_shard_axis_links(stems: list[str], link_tasks: list[tuple[Path, Path]],
@@ -1817,6 +2629,159 @@ def _validate_mfa_shard_axis_links(stems: list[str], link_tasks: list[tuple[Path
         except (OSError, ValueError, KeyError):
             errors.append(f"MFA shard audio symlink unreadable: {stem}")
     return errors
+
+
+def _prepare_retained_mfa_retry_inputs(source_corpus: Path, source_audio: Path,
+                                       source_anchors: Path | None,
+                                       retry_root: Path, stem: str) -> dict:
+    """Copy one MFA member into an exact, isolated retry corpus."""
+    import shutil
+
+    if not stem or Path(stem).name != stem:
+        raise ValueError("invalid retained MFA retry stem")
+    paths = {
+        "corpus": retry_root / "corpus",
+        "audio": retry_root / "audio",
+        "anchors": retry_root / "anchors",
+        "output": retry_root / "output",
+    }
+    for path in paths.values():
+        path.mkdir(parents=True, exist_ok=False)
+
+    sources = {
+        "lab": source_corpus / f"{stem}.lab",
+        "wav": source_audio / f"{stem}.wav",
+    }
+    if source_anchors is not None:
+        sources["anchor"] = source_anchors / f"{stem}.TextGrid"
+    for role, source in sources.items():
+        if not source.is_file():
+            raise ValueError(f"missing retained shard {role}: {stem}")
+        destination_root = paths[
+            "corpus" if role == "lab" else "audio" if role == "wav" else "anchors"]
+        shutil.copy2(source, destination_root / source.name)
+
+    return {
+        **paths,
+        "lab": paths["corpus"] / f"{stem}.lab",
+        "wav": paths["audio"] / f"{stem}.wav",
+        "anchor": (paths["anchors"] / f"{stem}.TextGrid"
+                   if source_anchors is not None else None),
+    }
+
+
+def _execute_single_process_mfa_retry(
+    *, stem: str, retry_root: Path, source_corpus: Path,
+    source_audio: Path, source_anchors: Path | None, dict_path: Path,
+    acoustic_model: str, mfa_python: Path, models_dir: Path,
+    output_format: str, beam: int, retry_beam: int,
+    boost_silence: float, single_speaker: bool, no_tokenization: bool,
+    timeout: int | None, attempt_ordinal: int,
+) -> dict:
+    """Run one complete, anchor-preserving retry for a fallback MFA run."""
+    import json as _json
+
+    retry_root.mkdir(parents=True, exist_ok=False)
+    try:
+        inputs = _prepare_retained_mfa_retry_inputs(
+            source_corpus, source_audio, source_anchors, retry_root, stem)
+    except (OSError, ValueError) as exc:
+        return {"return_code": 1, "produced": [], "invalid": [],
+                "invocation_outcome": "not_started",
+                "exception_type": type(exc).__name__, "exception": str(exc)}
+
+    command = [
+        str(mfa_python), "-m", "montreal_forced_aligner.command_line.mfa",
+        "align", str(inputs["corpus"]), str(dict_path), acoustic_model,
+        str(inputs["output"]), "--audio_directory", str(inputs["audio"]),
+        "--temporary_directory", str(retry_root / "temp"),
+        "--output_format", output_format, "--num_jobs", "1", "--overwrite",
+        "--no_textgrid_cleanup", "--beam", str(beam),
+        "--retry_beam", str(retry_beam),
+        "--boost_silence", str(boost_silence),
+    ]
+    if inputs["anchor"] is not None:
+        command += ["--textgrid_directory", str(inputs["anchors"])]
+    if single_speaker:
+        command.append("--single_speaker")
+    if no_tokenization:
+        command.append("--no_tokenization")
+
+    env = get_mfa_env(mfa_python, models_dir)
+    mfa_root = retry_root / "mfa_root"
+    mfa_root.mkdir(parents=True, exist_ok=True)
+    env["MFA_ROOT_DIR"] = str(mfa_root)
+    invocation_outcome = "completed"
+    exception_type = None
+    exception = ""
+    stdout = ""
+    stderr = ""
+    return_code: int | str | None = 1
+    try:
+        completed = subprocess.run(
+            command, cwd=str(PROJECT_ROOT), env=env, capture_output=True,
+            text=True, timeout=timeout)
+        return_code = completed.returncode
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+    except subprocess.TimeoutExpired as exc:
+        invocation_outcome = "timeout"
+        exception_type = type(exc).__name__
+        exception = str(exc)
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        return_code = "timeout"
+    except Exception as exc:
+        invocation_outcome = "exception"
+        exception_type = type(exc).__name__
+        exception = str(exc)
+        return_code = None
+    (retry_root / "retry.stdout.log").write_text(stdout, encoding="utf-8")
+    (retry_root / "retry.stderr.log").write_text(stderr, encoding="utf-8")
+
+    produced: list[str] = []
+    invalid: list[str] = []
+    for grid in inputs["output"].glob("*.TextGrid"):
+        if validate_strict_mfa_textgrid(grid):
+            invalid.append(grid.stem)
+        else:
+            produced.append(grid.stem)
+    if exception_type is None and "NoAlignmentsError" in stderr:
+        exception_type = "NoAlignmentsError"
+    receipt = {
+        "schema": MFA_ATTEMPT_RECEIPT_SCHEMA,
+        "stem": stem, "ordinal": attempt_ordinal,
+        "settings": {"beam": beam, "retry_beam": retry_beam,
+                     "num_jobs": 1},
+        "isolation": "singleton", "invocation_outcome": invocation_outcome,
+        "exception_type": exception_type,
+        "exception": exception or (stderr[-500:] or None),
+        "return_code": return_code,
+        "produced_outputs": sorted(produced),
+        "invalid_outputs": sorted(invalid),
+        "inputs": {
+            "lab_sha256": _sha256_file(inputs["lab"]),
+            "wav_sha256": _sha256_file(inputs["wav"]),
+            "anchor_sha256": (_sha256_file(inputs["anchor"])
+                              if inputs["anchor"] is not None else None),
+        },
+    }
+    receipt_path = retry_root / "mfa_attempt_receipt.json"
+    receipt_path.write_text(
+        _json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8")
+    return {
+        "return_code": return_code, "produced": sorted(produced),
+        "invalid": sorted(invalid), "invocation_outcome": invocation_outcome,
+        "exception_type": exception_type,
+        "exception": exception or (stderr[-500:] or ""),
+        "produced_output_paths": [
+            str(inputs["output"] / f"{name}.TextGrid")
+            for name in sorted(produced)],
+        "output_dir": str(inputs["output"]),
+        "attempt_receipt": receipt,
+        "attempt_receipt_path": str(receipt_path),
+    }
 
 
 def _run_mfa_sharded(
@@ -2139,43 +3104,139 @@ def _run_mfa_sharded(
                              if rec.get("retry_missing") for stem in rec.get("missing", [])})
     if _retry_missing:
         _retry_invocation = 0
-        def _execute_retained_missing(_missing, *, _beam=beam, _retry_beam=retry_beam):
-            """Retry only retained missing shard inputs with resolved MFA context."""
+        def _execute_retained_missing(_missing, *, _beam=20, _retry_beam=80,
+                                      _attempt_ordinal=1):
+            """Run exactly one retained stem in an isolated MFA workspace."""
             nonlocal _retry_invocation
+            if len(_missing) != 1:
+                return {"return_code": 1, "produced": [],
+                        "invocation_outcome": "not_started",
+                        "exception_type": "ValueError",
+                        "exception": "per-stem MFA recovery requires one stem"}
+            _stem = str(_missing[0])
             _retry_invocation += 1
             _root = _shard_root / f"retry_missing_{_retry_invocation:02d}"
             _root.mkdir(parents=True, exist_ok=False)
-            _corpus, _audio, _out = _root / "corpus", _root / "audio", _root / "output"
-            _corpus.mkdir(); _audio.mkdir(); _out.mkdir()
-            for _stem in _missing:
-                _src_shard = next((_sd for (_i, _p, _sd, _lh, _lp, _ex, _st) in _procs if _stem in _ex), None)
-                if _src_shard is None: continue
-                for _suffix in (".lab", ".txt"):
-                    _src = _src_shard / "corpus" / f"{_stem}{_suffix}"
-                    if _src.is_file(): shutil.copy2(_src, _corpus / _src.name)
-                _src = _src_shard / "audio" / f"{_stem}.wav"
-                if _src.is_file(): shutil.copy2(_src, _audio / _src.name)
+            _src_shard = next((_sd for (_i, _p, _sd, _lh, _lp, _ex, _st) in _procs if _stem in _ex), None)
+            if _src_shard is None:
+                return {"return_code": 1, "produced": [],
+                        "invocation_outcome": "not_started",
+                        "exception_type": "MissingInput",
+                        "exception": f"missing retained shard input: {_stem}"}
+            # A retry must preserve the original alignment problem.  The
+            # shard ran with CTC anchors, so silently dropping the matching
+            # TextGrid here changes both the search space and the provenance
+            # contract.  This used to make otherwise alignable singleton
+            # omissions fail again at both 20/80 and 200/800.
+            try:
+                _retry_inputs = _prepare_retained_mfa_retry_inputs(
+                    _src_shard / "corpus", _src_shard / "audio",
+                    _src_shard / "anchors" if anchors_dir is not None else None,
+                    _root, _stem)
+            except (OSError, ValueError) as _input_exc:
+                return {"return_code": 1, "produced": [],
+                        "invocation_outcome": "not_started",
+                        "exception_type": type(_input_exc).__name__,
+                        "exception": str(_input_exc)}
+            _corpus = _retry_inputs["corpus"]
+            _audio = _retry_inputs["audio"]
+            _anchors = _retry_inputs["anchors"]
+            _out = _retry_inputs["output"]
+            _retry_anchor = _retry_inputs["anchor"]
             _cmd = [str(mfa_python), "-m", "montreal_forced_aligner.command_line.mfa", "align",
                     str(_corpus), str(dict_path), acoustic_model, str(_out), "--audio_directory", str(_audio),
                     "--temporary_directory", str(_root / "temp"), "--output_format", output_format,
-                    "--num_jobs", str(_jobs_per_shard), "--overwrite", "--no_textgrid_cleanup", "--single_speaker",
+                    "--num_jobs", "1", "--overwrite", "--no_textgrid_cleanup", "--single_speaker",
                     "--no_tokenization", "--beam", str(_beam), "--retry_beam", str(_retry_beam),
                     "--boost_silence", str(boost_silence)]
+            if _retry_anchor is not None:
+                _cmd += ["--textgrid_directory", str(_anchors)]
             _retry_env = get_mfa_env(mfa_python, models_dir)
             _retry_mfa_root = _root / "mfa_root"
             _retry_mfa_root.mkdir(parents=True, exist_ok=True)
             _retry_env["MFA_ROOT_DIR"] = str(_retry_mfa_root)
-            _proc = subprocess.run(_cmd, cwd=str(PROJECT_ROOT), env=_retry_env,
-                                   capture_output=True, text=True)
-            (_root / "retry.stdout.log").write_text(_proc.stdout or "", encoding="utf-8")
-            (_root / "retry.stderr.log").write_text(_proc.stderr or "", encoding="utf-8")
+            _invocation_outcome = "completed"
+            _exception_type = None
+            _exception = ""
+            _return_code = 1
+            _stdout = ""
+            _stderr = ""
+            try:
+                _proc = subprocess.run(
+                    _cmd, cwd=str(PROJECT_ROOT), env=_retry_env,
+                    capture_output=True, text=True, timeout=timeout)
+                _return_code = _proc.returncode
+                _stdout = _proc.stdout or ""
+                _stderr = _proc.stderr or ""
+            except subprocess.TimeoutExpired as _exc:
+                _invocation_outcome = "timeout"
+                _exception_type = type(_exc).__name__
+                _exception = str(_exc)
+                _stdout = (_exc.stdout or "") if isinstance(_exc.stdout, str) else ""
+                _stderr = (_exc.stderr or "") if isinstance(_exc.stderr, str) else ""
+                _return_code = "timeout"
+            except Exception as _exc:
+                _invocation_outcome = "exception"
+                _exception_type = type(_exc).__name__
+                _exception = str(_exc)
+                _return_code = None
+            (_root / "retry.stdout.log").write_text(_stdout, encoding="utf-8")
+            (_root / "retry.stderr.log").write_text(_stderr, encoding="utf-8")
             _produced = [] ; _invalid = []
             for _tg in _out.glob("*.TextGrid"):
-                if validate_strict_mfa_textgrid(_tg): _invalid.append(_tg.stem)
-                else: _produced.append(_tg.stem)
-            return {"return_code": _proc.returncode, "produced": _produced,
-                    "invalid": _invalid, "exception": _proc.stderr[-500:],
-                    "output_dir": str(_out)}
+                if validate_strict_mfa_textgrid(_tg):
+                    _invalid.append(_tg.stem)
+                else:
+                    _produced.append(_tg.stem)
+            _explicit_noalign = "NoAlignmentsError" in _stderr
+            if _exception_type is None and _explicit_noalign:
+                _exception_type = "NoAlignmentsError"
+            _result = {"return_code": _return_code, "produced": sorted(_produced),
+                       "invalid": sorted(_invalid), "exception": (_exception or _stderr[-500:]),
+                       "exception_type": _exception_type,
+                       "invocation_outcome": _invocation_outcome,
+                       "produced_output_paths": [str(_out / f"{_name}.TextGrid")
+                                                 for _name in sorted(_produced)],
+                       "output_dir": str(_out)}
+            _disposition = (
+                "recovered" if _return_code == 0 and _produced == [_stem]
+                and not _invalid else
+                "rescue_authorized" if _attempt_ordinal == 1
+                and _return_code not in (0, None, "timeout")
+                and _explicit_noalign and not _produced and not _invalid
+                else "unrecovered")
+            _receipt = {
+                "schema": MFA_ATTEMPT_RECEIPT_SCHEMA,
+                "stem": _stem,
+                "ordinal": _attempt_ordinal,
+                "settings": {"beam": _beam, "retry_beam": _retry_beam,
+                              "num_jobs": 1},
+                "isolation": "singleton",
+                "invocation_outcome": _invocation_outcome,
+                "exception_type": _exception_type,
+                "exception": _exception or (_stderr[-500:] or None),
+                "return_code": _return_code,
+                "produced_outputs": sorted(_produced),
+                "produced_output_paths": _result["produced_output_paths"],
+                "invalid_outputs": sorted(_invalid),
+                "inputs": {
+                    "lab_sha256": _sha256_file(_retry_inputs["lab"]),
+                    "wav_sha256": _sha256_file(_retry_inputs["wav"]),
+                    "anchor_sha256": (
+                        _sha256_file(_retry_anchor)
+                        if _retry_anchor is not None else None),
+                    "anchor_directory": (
+                        str(_anchors) if _retry_anchor is not None else None),
+                },
+                "final_disposition": _disposition,
+            }
+            _receipt_path = _root / "mfa_attempt_receipt.json"
+            _receipt_path.write_text(
+                _json.dumps(_receipt, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8")
+            _result["attempt_receipt"] = _receipt
+            _result["attempt_receipt_path"] = str(_receipt_path)
+            return _result
         _initial_attempt = {"return_code": 0, "produced": sorted(set().union(*(_usable_by_shard.values() or [set()]))),
                             "invalid": [], "exception": "rc0_incomplete"}
         _retry_state = run_mfa_retry_coordinator(
@@ -2186,7 +3247,8 @@ def _run_mfa_sharded(
             # batch retry.  The executor is therefore supplied unconditionally
             # but can be reached solely after the coordinator's explicit
             # nonzero NoAlignmentsError isolation gate.
-            rescue_executor=(lambda stem: _execute_retained_missing([stem], _beam=200, _retry_beam=800)))
+            rescue_executor=(lambda stem: _execute_retained_missing(
+                [stem], _beam=200, _retry_beam=800, _attempt_ordinal=2)))
         _manifest_path.write_text(_json.dumps({"schema": "mfa-output-manifest-v2", "run_id": _run_id,
             "expected_total": _n, "shards": _manifest_rows}, ensure_ascii=False, indent=2), encoding="utf-8")
         _retry_plan = _log_dir / "mfa_missing_retry_plan.json"
@@ -2312,6 +3374,28 @@ def _run_mfa_sharded(
           f" {_n_shards} shards completed")
     print(f"  MFA manifest: {_manifest_path}")
     return 0
+
+
+def _record_single_process_mfa_partition(ctx: dict, stems: list[str],
+                                         produced: set[str],
+                                         allow_partial: bool) -> tuple[list[str], list[str]]:
+    """Apply the same missing/extra partition contract as sharded MFA."""
+    expected = set(stems)
+    missing = sorted(expected - produced)
+    extra = sorted(produced - expected)
+    if missing:
+        if not allow_partial:
+            print("  ERROR: single-process MFA output set is incomplete")
+            print(f"    missing ({len(missing)}): {missing[:10]}")
+            return missing, extra
+        ctx["mfa_missing_stems"] = tuple(missing)
+        ctx["mfa_aligned_stems"] = tuple(sorted(produced))
+        print(f"  MFA partial mode: {len(produced)}/{len(stems)} aligned; "
+              f"{len(missing)} explicitly skipped")
+    if extra:
+        print("  ERROR: single-process MFA output set has unexpected stems")
+        print(f"    extra ({len(extra)}): {extra[:10]}")
+    return missing, extra
 
 
 def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
@@ -2506,18 +3590,78 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     )
     if _rc != 0:
         return _rc
-    if _write_mfa_alignment_axis_receipt(ctx, ctx["aligned_dir"]) != 0:
-        return 1
+    # The sharded path records an explicit missing-stem ledger before it
+    # writes the v2 alignment receipt.  Keep the single-process fallback on
+    # the same contract: when partial MFA is enabled, a small set of
+    # acoustically unalignable utterances is valid filtered evidence rather
+    # than an alignment-step failure.  Without this assignment the receipt
+    # writer rejects the missing partition and postprocess cannot consume the
+    # otherwise complete alignment result.
     _produced = {path.stem for path in ctx["aligned_dir"].glob("*.TextGrid")}
-    _expected = set(_stems)
-    _missing = sorted(_expected - _produced)
-    _extra = sorted(_produced - _expected)
-    if _missing or _extra:
-        print("  ERROR: single-process MFA output set is incomplete")
-        if _missing:
-            print(f"    missing ({len(_missing)}): {_missing[:10]}")
-        if _extra:
-            print(f"    extra ({len(_extra)}): {_extra[:10]}")
+    _single_missing = sorted(set(_stems) - _produced)
+    _single_extra = sorted(_produced - set(_stems))
+    if _single_missing and not _single_extra:
+        # Batches below the sharding threshold use this fallback path.  They
+        # must receive the same anchor-preserving singleton recovery contract
+        # as sharded MFA; otherwise batch size alone changes which utterances
+        # can be published.
+        _retry_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        _retry_parent = (ctx["workspace"] / "mfa_single_process_retries"
+                         / f"{_retry_id}_{os.getpid()}")
+        _retry_parent.mkdir(parents=True, exist_ok=False)
+        _retry_counter = 0
+
+        def _execute_single_missing(_missing, *, _beam=20,
+                                    _retry_beam=80, _attempt_ordinal=1):
+            nonlocal _retry_counter
+            if len(_missing) != 1:
+                return {"return_code": 1, "produced": [],
+                        "invocation_outcome": "not_started",
+                        "exception_type": "ValueError",
+                        "exception": "single-process MFA recovery requires one stem"}
+            _retry_counter += 1
+            return _execute_single_process_mfa_retry(
+                stem=str(_missing[0]),
+                retry_root=_retry_parent / f"attempt_{_retry_counter:03d}",
+                source_corpus=corpus_dir, source_audio=_mfa_audio_dir,
+                source_anchors=ctc_dir if use_anchors else None,
+                dict_path=ctx["mfa_dict"], acoustic_model=acoustic_model_arg2,
+                mfa_python=mfa_python, models_dir=ctx["models_dir"],
+                output_format=mc.get("output_format", "long_textgrid"),
+                beam=_beam, retry_beam=_retry_beam,
+                boost_silence=mc.get("boost_silence", 1.0),
+                single_speaker=mc.get("single_speaker", False),
+                no_tokenization=mc.get("no_tokenization", False),
+                timeout=mc.get("timeout"), attempt_ordinal=_attempt_ordinal)
+
+        _single_retry_state = run_mfa_retry_coordinator(
+            _stems, {"return_code": 0, "produced": sorted(_produced),
+                     "invalid": [], "exception": "rc0_incomplete"},
+            _execute_single_missing,
+            rescue_executor=lambda stem: _execute_single_missing(
+                [stem], _beam=200, _retry_beam=800, _attempt_ordinal=2))
+        for _attempt in _single_retry_state.get("attempts", [])[1:]:
+            _retry_output = Path(_attempt.get("output_dir", ""))
+            for _grid in _retry_output.glob("*.TextGrid") if _retry_output.is_dir() else ():
+                if (_grid.stem in set(_stems)
+                        and not validate_strict_mfa_textgrid(_grid)):
+                    shutil.copy2(_grid, ctx["aligned_dir"] / _grid.name)
+        _single_retry_plan = _retry_parent / "mfa_missing_retry_plan.json"
+        _single_retry_plan.write_text(json.dumps({
+            "schema": MFA_RETRY_SCHEMA,
+            "reason": "single_process_rc0_incomplete",
+            "initial_missing": _single_missing,
+            "coordinator": _single_retry_state,
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _produced = {path.stem for path in ctx["aligned_dir"].glob("*.TextGrid")}
+        print(f"  Single-process MFA retry recovered "
+              f"{len(set(_single_missing) & _produced)}/{len(_single_missing)}; "
+              f"plan={_single_retry_plan}")
+    _missing, _extra = _record_single_process_mfa_partition(
+        ctx, _stems, _produced, bool(mc.get("allow_partial", False)))
+    if _extra or (_missing and not mc.get("allow_partial", False)):
+        return 1
+    if _write_mfa_alignment_axis_receipt(ctx, ctx["aligned_dir"]) != 0:
         return 1
     # ── Strict TextGrid validation (Case 83 / R7) ──────────────────
     _invalid_count = 0
@@ -2532,7 +3676,7 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         print(f"  ERROR: {_invalid_count} MFA TextGrid(s) failed strict validation")
         return 1
     # ─────────────────────────────────────────────────────────────────
-    print(f"  MFA output set: {len(_produced)}/{len(_expected)} complete")
+    print(f"  MFA output set: {len(_produced)}/{len(_stems)} complete")
     return 0
 
 
@@ -2553,7 +3697,7 @@ def step_mfa_align_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     if not ctc_dir.exists() or not any(ctc_dir.iterdir()):
         ctc_dir = ctx["ctc_pretg"]
     audio_dir = ctx["mfa_audio_dir"]
-    output_dir = ctx["workspace"] / "en_phones"
+    output_dir = Path(ctx.get("en_phones_dir", ctx["workspace"] / "en_phones"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Resolve English model paths
@@ -2580,7 +3724,13 @@ def step_mfa_align_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
             else:
                 en_g2p = str(resolved)
 
-    temp_dir = ctx["temp_dir"] / "en_mfa"
+    # English MFA produces one TextGrid per extracted segment.  A configured
+    # global temp directory (historically /tmp/mfa_temp) can contain outputs
+    # from another run; strict provenance must never resolve those as this
+    # run's source evidence.  Bind the complete English workspace to the
+    # current pipeline workspace so corpus, MFA output, and manifest are one
+    # immutable run-local namespace.
+    temp_dir = Path(ctx.get("en_mfa_temp_dir", ctx["workspace"] / "temp_en_mfa"))
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     align_en_args = [
@@ -2592,11 +3742,17 @@ def step_mfa_align_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         "--g2p-model", en_g2p,
         "--temp-dir", str(temp_dir),
         "--num-jobs", str(resolve_num_jobs(en_cfg.get("num_jobs", 4))),
-        "--padding-ms", str(en_cfg.get("padding_ms", 50)),
+        "--padding-ms", str(en_cfg.get("padding_ms", 75)),
         "--min-segment-dur-ms", str(en_cfg.get("min_segment_dur_ms", 150)),
         "--max-gap-merge-s", str(en_cfg.get("max_gap_merge_s", 0.35)),
         "--beam", str(en_cfg.get("beam", 10)),
         "--retry-beam", str(en_cfg.get("retry_beam", 40)),
+        "--singleton-retry-beam", str(en_cfg.get("singleton_retry_beam", 100)),
+        "--singleton-retry-retry-beam", str(
+            en_cfg.get("singleton_retry_retry_beam", 1000)),
+        "--singleton-retry-timeout", str(
+            en_cfg.get("singleton_retry_timeout", 600)),
+        "--singleton-retry-limit", str(en_cfg.get("singleton_retry_limit", 16)),
         "--timeout", str(en_cfg.get("timeout", 1800)),
         "--g2p-timeout", str(en_cfg.get("g2p_timeout", 300)),
     ]
@@ -2641,12 +3797,22 @@ def _refresh_postprocess_accounting(ctx: dict, output_stems: set[str],
         route = list(source.get("route", []))
         if "postprocess" not in route:
             route.append("postprocess")
+        extra = dict(source.get("extra", {}))
+        filtered_reasons = ctx.get("filtered_reason_map", {})
+        if isinstance(filtered_reasons, dict) and filtered_reasons:
+            prior_reasons = extra.get("filtered_reasons", {})
+            merged_reasons = dict(prior_reasons) if isinstance(prior_reasons, dict) else {}
+            for reason, stems in filtered_reasons.items():
+                if isinstance(reason, str) and isinstance(stems, (list, tuple, set)):
+                    merged_reasons[reason] = sorted(set(str(stem) for stem in stems))
+            if merged_reasons:
+                extra["filtered_reasons"] = merged_reasons
         refreshed = make_pipeline_accounting_receipt(
             list(source["source"]["stems"]), list(source["eligible"]["stems"]),
             source.get("exclusions", []), sorted(output_stems), sorted(filtered_stems),
             run_id=str(source.get("run_id", "")), mode=str(source.get("mode", "")),
             route=route, paths=paths, shards=source.get("shards"),
-            extra=source.get("extra", {}))
+            extra=extra)
         write_pipeline_accounting_receipt(receipt_path, refreshed)
         ctx["accounting_receipt"] = refreshed
         return 0
@@ -2783,10 +3949,12 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         "--wav-dir", str(ctx["mfa_audio_dir"]),
         "--raw-text-dir", str(ctx.get("raw_text_dir", ctx["data_dir"])),
         "--original-txt-dir", str(ctx.get("raw_text_dir", ctx["data_dir"])),
+        "--reference-mode", str(ctx.get("reference_mode", "auto")),
         "--pinyin-dict", str(resolve_path(PROJECT_ROOT, cfg.get("pinyin_dict", "dict/fullpinyin_enword.dict"))),
         "--ipa-dict", str(ctx.get(
             "mfa_dict", resolve_path(PROJECT_ROOT, cfg.get("mfa_dict", "dict/mfa_ipa.dict")))),
-        "--en-phones-dir", str(ctx["workspace"] / "en_phones"),
+        "--en-phones-dir", str(ctx.get(
+            "en_phones_dir", ctx["workspace"] / "en_phones")),
         "--tone-ref", str(ctx["output_dir"] / "tone_mapping.json"),
     ]
     # Silence merge
@@ -2843,6 +4011,9 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         pp_args.append("--no-filter-suspicious")
     if pc.get("strict_ok", True):
         pp_args.append("--strict-ok")
+    if (cfg.get("mfa_en", {}).get("enabled", True)
+            and cfg.get("mfa_en", {}).get("strict_provenance", True)):
+        pp_args.append("--strict-en-provenance")
     if pc.get("allow_filtered_integrity_failures", False):
         pp_args.append("--allow-filtered-integrity-failures")
     # Text correction & unexpected silence handling
@@ -2856,12 +4027,32 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     if axis_args is None:
         return 1
     pp_args += axis_args
+    raw_manifest_path = Path(ctx.get("ctc_raw_manifest", ctx["ctc_pretg"] / CTC_RAW_MANIFEST_NAME))
+    work_receipt_path = Path(ctx.get("ctc_work_receipt_path",
+                                    ctc_dir / CTC_WORK_RECEIPT_NAME))
+    if (not raw_manifest_path.is_file() or raw_manifest_path.is_symlink()
+            or not work_receipt_path.is_file() or work_receipt_path.is_symlink()):
+        print("  ERROR: CTC raw/work lifecycle bindings unavailable for postprocess")
+        return 1
+    ctx["ctc_raw_manifest"] = raw_manifest_path
+    ctx["ctc_work_receipt_path"] = work_receipt_path
     if args.overwrite:
         pp_args.append("--overwrite")
     rc = run_python(SCRIPTS_DIR / "postprocess_textgrids.py", pp_args, mfa_python,
-                    ctx["models_dir"], "Step 7: Post-processing")
+                    ctx["models_dir"], "Step 7: Post-processing",
+                    extra_env={
+                        "CTC_RAW_MANIFEST": str(raw_manifest_path.resolve()),
+                        "CTC_WORK_RECEIPT": str(work_receipt_path.resolve()),
+                    })
+    # postprocess returns non-zero when it isolated mandatory-integrity
+    # candidates, even though it may have produced a complete output/filtered
+    # partition.  Do not return before refreshing the formal receipt: strict
+    # audit must consume the actual partition, not the pre-stage placeholder
+    # (output=0, filtered=eligible).  A genuinely incomplete/error run still
+    # fails below through the exact-set/report contract.
     if rc != 0:
-        return rc
+        print("  Postprocess reported filtered/error rows; validating the complete "
+              "partition before deciding whether the pipeline can continue.")
 
     # Preserve full-set accounting when MFA could not emit a TextGrid.  These
     # are rejected bookkeeping artifacts, not publication candidates: copy
@@ -2891,6 +4082,9 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                 }, ensure_ascii=False) + "\n")
         print(f"  Partial MFA accounting: {len(mfa_missing_stems)} stems "
               f"placed in filtered/ as missing_mfa_alignment")
+        ctx["filtered_reason_map"] = {
+            "missing_mfa_alignment": sorted(mfa_missing_stems),
+        }
 
     # Validate the complete publication set before the caller can sync it.
     import json as _json
@@ -2968,11 +4162,16 @@ def step_strict_ok(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         "--filtered-dir", str(ctx["filtered_dir"]),
         "--ctc-dir", str(ctc_dir),
         "--reference-dir", str(ctx["raw_text_dir"]),
+        "--reference-mode", str(ctx.get("reference_mode", "auto")),
         "--wav-dir", str(ctx["mfa_audio_dir"]),
         "--aligned-dir", str(ctx["aligned_dir"]),
-        "--en-phones-dir", str(ctx["workspace"] / "en_phones"),
-        "--en-aligned-dir", str(ctx["temp_dir"] / "en_mfa" / "en_aligned"),
-        "--en-manifest", str(ctx["workspace"] / "en_phones" / "en_alignment_manifest.json"),
+        "--en-phones-dir", str(ctx.get(
+            "en_phones_dir", ctx["workspace"] / "en_phones")),
+        "--en-aligned-dir", str(Path(ctx.get(
+            "en_mfa_temp_dir", ctx["workspace"] / "temp_en_mfa")) / "en_aligned"),
+        "--en-manifest", str(Path(ctx.get(
+            "en_phones_dir", ctx["workspace"] / "en_phones")) /
+            "en_alignment_manifest.json"),
         "--report", str(ctx["output_dir"] / "postprocess_report.jsonl"),
         "--manifest", str(manifest),
     ]
@@ -2995,8 +4194,23 @@ def step_strict_ok(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                     or replay_en != workspace / "strict_replay_english_import.json"):
                 raise ValueError("strict replay English import path unsafe")
             payload = json.loads(replay_en.read_text(encoding="utf-8"))
-            if payload.get("schema") != STRICT_REPLAY_ENGLISH_IMPORT_SCHEMA or payload.get("scope") != "strict_replay":
+            if (payload.get("schema") != STRICT_REPLAY_ENGLISH_IMPORT_SCHEMA
+                    or payload.get("scope") != "strict_replay"
+                    or payload.get("english_schema") != STRICT_ENGLISH_SCHEMA
+                    or payload.get("canonical_units") != CANONICAL_ENGLISH_UNITS_SCHEMA):
                 raise ValueError("strict replay English import schema invalid")
+            records = payload.get("records")
+            if not isinstance(records, list):
+                raise ValueError("strict replay English import records missing")
+            for record in records:
+                ledger = record.get("ledger") if isinstance(record, dict) else None
+                if (not isinstance(record, dict)
+                        or record.get("schema") != STRICT_ENGLISH_SCHEMA
+                        or record.get("canonical_units") != CANONICAL_ENGLISH_UNITS_SCHEMA
+                        or not isinstance(ledger, dict)
+                        or ledger.get("schema") != STRICT_ENGLISH_SCHEMA
+                        or ledger.get("canonical_units") != CANONICAL_ENGLISH_UNITS_SCHEMA):
+                    raise ValueError("strict replay English import canonical contract invalid")
             import_path = workspace / "strict_replay_import.json"
             import_hash = _sha256_file(import_path)
             if payload.get("replay_import_manifest_sha256") != import_hash:
@@ -3977,9 +5191,16 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
             if errors:
                 raise ValueError("; ".join(errors))
             target_receipt.parent.mkdir(parents=True, exist_ok=True)
-            target_receipt.write_text(
-                json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8")
+            raw_manifest = target_receipt.parent / CTC_RAW_MANIFEST_NAME
+            if raw_manifest.is_file():
+                existing = json.loads(target_receipt.read_text(encoding="utf-8"))
+                if existing.get("schema") != CTC_RUN_RECEIPT_SCHEMA:
+                    raise ValueError("sealed raw root has invalid producer receipt")
+                receipt = existing
+            else:
+                target_receipt.write_text(
+                    json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8")
             ctx["ctc_axis_receipt"] = receipt
             return 0
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -4044,19 +5265,88 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         rc = _step_link_ctc_strict(args, cfg, ctx)
         if rc != 0:
             return rc
-        return _bind_reuse_ctc_receipt(resolve_input_path(cfg["ctc_ready"]["ctc_dir"], PROJECT_ROOT))
+        rc = _bind_reuse_ctc_receipt(resolve_input_path(cfg["ctc_ready"]["ctc_dir"], PROJECT_ROOT))
+        return rc if rc else _seal_ctc_raw(ctx)
 
     cr = cfg.get("ctc_ready", {})
 
     # -- Fast path: if manifest exists from a previous run, verify integrity --
     ctc_out_early = ctx["ctc_pretg"]
+    raw_manifest_early = ctc_out_early / CTC_RAW_MANIFEST_NAME
+    if raw_manifest_early.is_file():
+        try:
+            raw_payload = json.loads(raw_manifest_early.read_text(encoding="utf-8"))
+            raw_errors = validate_ctc_raw_manifest(ctc_out_early, raw_payload)
+            if raw_errors:
+                raise ValueError("; ".join(raw_errors))
+            if args.overwrite:
+                print("ERROR: sealed CTC raw root is immutable; --overwrite cannot rewrite it")
+                return 1
+            ctx["ctc_raw_manifest"] = raw_manifest_early
+            ctx["ctc_raw_manifest_data"] = raw_payload
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            print(f"ERROR: invalid sealed CTC raw root: {exc}")
+            return 1
     manifest_early = ctc_out_early / "ctc_ready_manifest.json"
+    # An explicit ctc_ready selector is a frozen ownership boundary.  A
+    # manifest left by a different (for example, full 54k) run must never be
+    # treated as a reusable input and then allowed to repopulate the subset
+    # denominator through the no-scan fast path.
+    _configured_subset_stems: tuple[str, ...] = ()
+    if cr.get("stems") is not None:
+        try:
+            _configured_subset_stems = tuple(sorted(
+                f"{cr.get('stem_prefix', '')}{stem}" for stem in cr["stems"]))
+        except (TypeError, ValueError):
+            print("ERROR: explicit ctc_ready stems selector is invalid")
+            return 1
+    elif cr.get("stem_range") is not None:
+        try:
+            lo, hi = cr["stem_range"]
+            prefix = str(cr.get("stem_prefix", ""))
+            _configured_subset_stems = tuple(
+                f"{prefix}{i}" for i in range(int(lo), int(hi) + 1))
+        except (TypeError, ValueError):
+            print("ERROR: explicit ctc_ready stem_range selector is invalid")
+            return 1
+    if _configured_subset_stems and ctc_out_early.exists():
+        _present_ctc_stems: set[str] = set()
+        try:
+            _early_entries = ctc_out_early.iterdir()
+            for _entry in _early_entries:
+                if not _entry.is_file() or _entry.is_symlink():
+                    continue
+                for _suffix in _CTC_SUFFIXES:
+                    if _entry.name.endswith(_suffix):
+                        _present_ctc_stems.add(_entry.name[:-len(_suffix)])
+                        break
+        except OSError as exc:
+            print(f"ERROR: cannot inspect existing ctc_ready namespace: {exc}")
+            return 1
+        _extra_ctc_stems = _present_ctc_stems - set(_configured_subset_stems)
+        if _extra_ctc_stems:
+            print("ERROR: existing ctc_ready namespace contains stems outside "
+                  "the explicit frozen subset")
+            print(f"  extra={len(_extra_ctc_stems)}")
+            return 1
     if manifest_early.exists() and not args.overwrite:
         try:
             prev = _json.loads(manifest_early.read_text())
             prev_stems = prev.get("stems", [])
             if not prev_stems:
                 raise ValueError("empty stems list")
+            if _configured_subset_stems:
+                expected_selector = set(_configured_subset_stems)
+                if (set(prev_stems) != expected_selector
+                        or len(prev_stems) != len(expected_selector)):
+                    print("ERROR: ctc_ready fast-path manifest does not match "
+                          "the explicit frozen subset; refusing stale workspace reuse")
+                    print(f"  expected={len(expected_selector)} manifest={len(prev_stems)}")
+                    return 1
+                # Pin the selector before loading the accounting receipt.  A
+                # stale receipt with a different denominator is then rejected
+                # by _load_ctc_accounting instead of widening the run.
+                ctx["expected_stems"] = tuple(sorted(prev_stems))
             # Verify the flat manifest in one directory pass.  The previous
             # per-stem ``Path.is_file`` loop issued one metadata syscall per
             # expected stem; this preserves flat-layout semantics while
@@ -4070,7 +5360,10 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                 print(f"  Link already done ({len(prev_stems)} stems verified)."
                       f" Use --overwrite to re-link.")
                 rc = _load_ctc_accounting(ctx, required=True)
-                return rc if rc else _bind_reuse_ctc_receipt(resolve_input_path(cr["ctc_dir"], PROJECT_ROOT))
+                if rc:
+                    return rc
+                rc = _bind_reuse_ctc_receipt(resolve_input_path(cr["ctc_dir"], PROJECT_ROOT))
+                return rc if rc else _seal_ctc_raw(ctx)
         except Exception:
             pass  # corrupt/incomplete manifest, proceed with scan
 
@@ -4293,11 +5586,22 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     # Stems present in CTC but absent from the WAV universe are not source
     # denominator members and are rejected by the existing manifest checks.
     valid = sorted(_authoritative_valid)
+    _subset_frozen = bool(is_filtered)
+    _subset_source_audio = {
+        stem: audio_index[stem] for stem in valid if stem in audio_index
+    }
     ctx.update({"accounting_source_stems": _source_stems,
                 "accounting_eligible_stems": tuple(valid),
                 "accounting_exclusions": tuple(
                     {"stem": s, "reason": r}
-                    for s, r in sorted(_source_exclusions.items()))})
+                    for s, r in sorted(_source_exclusions.items())),
+                # An explicit ctc_ready filter is the authoritative subset
+                # boundary.  Downstream stages must not reconstruct it by
+                # scanning the complete data_dir.
+                "ctc_ready_subset": _subset_frozen,
+                "expected_source_audio_map": _subset_source_audio})
+    if _subset_frozen:
+        ctx["expected_stems"] = tuple(valid)
 
     scan_only = getattr(args, 'scan_only', False)
     if not valid:
@@ -4431,6 +5735,12 @@ def step_link_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         print(f"ERROR: unable to write v2 accounting receipt: {exc}")
         return 1
 
+    if scan_only:
+        print(f"  Scan-only: source receipt validated ({len(valid)} stems)")
+        return 0
+    rc = _seal_ctc_raw(ctx)
+    if rc:
+        return rc
     print(f"  Ready for MFA pipeline ({len(valid)} stems)")
     return 0
 
@@ -4442,6 +5752,11 @@ def step_pad_silence(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     All CTC timestamps (.TextGrid, _tokens.jsonl, _punct.json) are shifted
     by the net head change so downstream steps see consistent alignment.
     """
+    pre_ctc_mode = (ctx.get("mode") in ("nvrasr_fallback", "full")
+                    and not ctx.get("expected_stems"))
+    if pre_ctc_mode:
+        if _freeze_pre_ctc_stems(cfg, ctx) is None:
+            return 1
     pc = cfg.get("pad_silence", {})
     if not pc.get("enabled", True):
         print("  pad_silence disabled in config. Skipping.")
@@ -4463,50 +5778,21 @@ def step_pad_silence(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         pad_args += ["--output-audio-dir", str(output_audio_dir)]
 
     expected_stems = tuple(ctx.get("expected_stems", ()))
-    pre_ctc = not bool(expected_stems) and ctx.get("mode") in ("nvrasr_fallback", "full")
+    pre_ctc = pre_ctc_mode
     if pre_ctc:
-        try:
-            # The fresh RIA cache is speaker-partitioned (one direct child per
-            # speaker), so a direct ``iterdir`` scan silently produced an
-            # empty denominator.  Freeze the physical source universe
-            # recursively, while still rejecting duplicate *stems* because
-            # every downstream CTC/MFA artifact is flat and stem-addressed.
-            entries = sorted(
-                (entry for entry in ctx["audio_dir"].rglob("*.wav")
-                 if entry.is_file() and not entry.is_symlink()),
-                key=lambda p: str(p),
-            )
-            by_stem: dict[str, list[Path]] = {}
-            for entry in entries:
-                by_stem.setdefault(entry.stem, []).append(entry)
-            duplicates = {stem: paths for stem, paths in by_stem.items()
-                          if len(paths) > 1}
-            expected_stems = tuple(sorted(by_stem))
-            if not expected_stems:
-                print("  ERROR: pre-CTC physical WAV denominator is empty")
-                return 1
-            if duplicates:
-                sample = "; ".join(
-                    f"{stem}: {', '.join(str(p) for p in paths[:3])}"
-                    for stem, paths in sorted(duplicates.items())[:5])
-                print("  ERROR: pre-CTC physical WAV denominator has duplicate stems")
-                print(f"    {sample}")
-                return 1
-            manifest = ctx["workspace"] / "pre_ctc_stems.txt"
-            manifest.write_text("\n".join(expected_stems) + "\n", encoding="utf-8")
-            ctx["expected_stems"] = expected_stems
-            ctx["pre_ctc_stems_file"] = manifest
-            # Keep the recursive inventory for the receipt pass below.  Calling
-            # find_wav() once per stem would recursively rescan the entire
-            # speaker-partitioned cache for every item (O(N^2)); on a 54k run
-            # that can appear hung and is easy to interrupt after padding has
-            # already completed.
-            ctx["pre_ctc_audio_index"] = {
-                stem: paths[0] for stem, paths in by_stem.items()
-            }
-        except OSError as exc:
-            print(f"  ERROR: unable to freeze pre-CTC WAV denominator: {exc}")
-            return 1
+        # The shared selector above is the only owner of the physical WAV
+        # inventory.  Padding must consume its exact manifest, never rescan
+        # and re-expand the denominator.
+        expected_stems = tuple(ctx.get("expected_stems", ()))
+        source_index = ctx.get("pre_ctc_audio_index")
+        if isinstance(source_index, dict):
+            index_path = ctx["workspace"] / "pre_ctc_wav_index.json"
+            index_path.write_text(
+                json.dumps({stem: str(source_index[stem])
+                            for stem in expected_stems},
+                           ensure_ascii=False, sort_keys=True, indent=2),
+                encoding="utf-8")
+            pad_args += ["--wav-index", str(index_path)]
     if expected_stems:
         stems_file = ctx.get("strict_selected_stems_file", ctx.get("pre_ctc_stems_file"))
         if stems_file is None:
@@ -4603,7 +5889,7 @@ NVASR_FALLBACK_STEP_ORDER = ["pad_silence", "prealign", "normalize_punct", "norm
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _KNOWN_TOP_KEYS: set[str] = {
-    "mode", "workspace", "data_dir", "audio_dir", "pinyin_dir",
+    "mode", "reference_mode", "workspace", "data_dir", "audio_dir", "pinyin_dir",
     "aligned_dir", "output_dir", "filtered_dir", "validate_dir",
     "temp_dir", "models_dir", "mfa_dict", "acoustic_model",
     "mfa", "mfa_en", "ctc_prealign", "ctc_adjust", "ctc_ready",
@@ -4611,6 +5897,7 @@ _KNOWN_TOP_KEYS: set[str] = {
     "normalize_punct", "pad_silence", "postprocess",
     "audio_axis",
     "output_staging", "nvme_cache", "auto_cache", "keep_16k_audio",
+    "require_fresh_workspace",
     "strict_ctc_ready", "streaming", "pipelined", "batch", "pipeline",
     "use_cache",
     # Deprecated but still parsed
@@ -4623,6 +5910,7 @@ _KNOWN_TOP_KEYS: set[str] = {
 
 _CONFIG_TYPES: dict[str, type | tuple] = {
     "mode": str,
+    "reference_mode": str,
     "workspace": str,
     "data_dir": str,
     "audio_dir": str,
@@ -4648,6 +5936,7 @@ _CONFIG_TYPES: dict[str, type | tuple] = {
     "batch": dict,
     "pipeline": dict,
     "output_staging": bool,
+    "require_fresh_workspace": bool,
     "use_cache": bool,
     "nvme_cache": (str, type(None)),
     "auto_cache": bool,
@@ -4656,12 +5945,34 @@ _CONFIG_TYPES: dict[str, type | tuple] = {
 }
 
 
+def resolve_reference_mode(cfg: dict) -> str:
+    """Resolve the transcript-authority policy shared by all stages.
+
+    New configs should set ``reference_mode`` explicitly.  For older configs,
+    an explicitly configured ``allow_missing_reference`` remains a compatible
+    signal; otherwise ``auto`` preserves the historical per-stem discovery.
+    """
+    requested = cfg.get("reference_mode")
+    if requested in {"authority", "fallback", "auto"}:
+        return requested
+    for section in (cfg.get("ctc_prealign", {}), cfg.get("ctc_ready", {})):
+        if "allow_missing_reference" in section:
+            return "fallback" if section["allow_missing_reference"] else "authority"
+    return "auto"
+
+
 def validate_config(cfg: dict, mode: str) -> list[str]:
     """Validate config schema: unknown keys, types, and cross-field rules.
 
     Returns a list of error strings (empty = valid).
     """
     errors: list[str] = []
+
+    reference_mode = cfg.get("reference_mode")
+    if reference_mode is not None and reference_mode not in {"auto", "authority", "fallback"}:
+        errors.append(
+            "reference_mode must be one of 'auto', 'authority', or 'fallback'"
+        )
 
     # 1. Unknown top-level keys
     for key in sorted(cfg):
@@ -4687,6 +5998,20 @@ def validate_config(cfg: dict, mode: str) -> list[str]:
 
     # 4. Mode/step incompatibilities
     pc = cfg.get("ctc_prealign", {})
+    for section_name in ("ctc_prealign", "ctc_ready"):
+        section = cfg.get(section_name, {})
+        if reference_mode == "authority" and section.get("allow_missing_reference") is True:
+            errors.append(
+                f"reference_mode=authority conflicts with {section_name}.allow_missing_reference=true"
+            )
+        if reference_mode == "fallback" and section.get("allow_missing_reference") is False:
+            errors.append(
+                f"reference_mode=fallback conflicts with {section_name}.allow_missing_reference=false"
+            )
+    if reference_mode == "fallback" and pc.get("nvv_enabled") is False:
+        errors.append(
+            "reference_mode=fallback requires ctc_prealign.nvv_enabled=true"
+        )
     if pc.get("all_gpus") and pc.get("enabled") is False:
         errors.append("ctc_prealign.all_gpus=true but ctc_prealign.enabled=false")
     if (pc.get("enabled", True) and pc.get("all_gpus")
@@ -4769,6 +6094,10 @@ STRICT_REPLAY_CONFIG_PATH = PROJECT_ROOT / "configs" / "hecheng_ria_fresh.yaml"
 STRICT_REPLAY_CONFIG_SHA256 = "78053e0455711ae943e8fabf2926014006f9f9449a96f8414c91b857a15ad553"
 STRICT_REPLAY_CANONICAL_SCHEMA = "mfa-quality-canonical-samples-v1"
 STRICT_REPLAY_SCHEMA = "strict-replay-import-v2.1"
+CTC_READY_MANIFEST_SCHEMA = "ctc-ready-manifest-v2"
+STRICT_ENGLISH_SCHEMA = "strict-en-mfa-v2"
+HISTORICAL_STRICT_ENGLISH_SCHEMA = "strict-en-mfa-v1"
+CANONICAL_ENGLISH_UNITS_SCHEMA = "canonical-english-units-v1"
 STRICT_REPLAY_CTC_SUFFIXES = (".TextGrid", ".lab", "_tokens.jsonl", "_punct.json",
                                "_text_cn.txt", "_text_raw.txt")
 STRICT_REPLAY_CATEGORIES = (
@@ -4778,13 +6107,115 @@ STRICT_REPLAY_CATEGORIES = (
 )
 STRICT_REPLAY_RANGES = ("000000-017999", "018000-035999", "036000-053999")
 
+
+def _validate_strict_english_ledger_payload(payload: object, stem: str, label: str) -> dict:
+    """Validate one current-v2 English ledger without rewriting it.
+
+    ``strict-en-mfa-v1`` is historical evidence only.  A ledger is current
+    evidence only when both its producer schema and canonical-unit binding
+    are present; this also catches a v2 wrapper around a tampered v1 payload.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} is not an object")
+    if payload.get("schema") != STRICT_ENGLISH_SCHEMA:
+        raise ValueError(f"{label} schema is not {STRICT_ENGLISH_SCHEMA}")
+    if payload.get("canonical_units") != CANONICAL_ENGLISH_UNITS_SCHEMA:
+        raise ValueError(f"{label} canonical unit binding missing")
+    if payload.get("stem") != stem:
+        raise ValueError(f"{label} stem mismatch")
+    segments = payload.get("segments")
+    if not isinstance(segments, list):
+        raise ValueError(f"{label} segments missing")
+    for index, segment in enumerate(segments):
+        if not isinstance(segment, dict) or segment.get("canonical_units") != CANONICAL_ENGLISH_UNITS_SCHEMA:
+            raise ValueError(f"{label} segment {index} canonical unit binding missing")
+        words = segment.get("words")
+        if not isinstance(words, list):
+            raise ValueError(f"{label} segment {index} words missing")
+        for word_index, word in enumerate(words):
+            if not isinstance(word, dict) or word.get("canonical_binding") != CANONICAL_ENGLISH_UNITS_SCHEMA:
+                raise ValueError(f"{label} word {index}:{word_index} canonical unit binding missing")
+    return payload
+
+
+def _validate_strict_english_manifest_payload(payload: object, label: str) -> dict:
+    """Validate the current-v2 English producer manifest contract."""
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} is not an object")
+    if payload.get("schema") != STRICT_ENGLISH_SCHEMA:
+        raise ValueError(f"{label} schema is not {STRICT_ENGLISH_SCHEMA}")
+    if payload.get("canonical_units") != CANONICAL_ENGLISH_UNITS_SCHEMA:
+        raise ValueError(f"{label} canonical unit binding missing")
+    if payload.get("strict_provenance") is not True:
+        raise ValueError(f"{label} strict provenance missing")
+    if payload.get("status") not in {"success", "no_english"}:
+        raise ValueError(f"{label} status is not successful")
+    return payload
+
 # ---------------------------------------------------------------------------
 # Filtered recovery (provenance-quarantined, non-publishing)
 # ---------------------------------------------------------------------------
 
-FILTERED_RECOVERY_SCHEMA = "filtered-recovery-import-v1"
+# W2 recovery packages are immutable, exact-denominator manifests.  Keep the
+# mode-specific helpers below, but do not accept the former loose subset plan.
+FILTERED_RECOVERY_SCHEMA = "filtered-recovery-package-v2"
 MFA_RETRY_SCHEMA = "mfa-retry-evidence-v1"
 MFA_RESCUE_SCHEMA = "mfa-rescue-evidence-v1"
+MFA_ATTEMPT_RECEIPT_SCHEMA = "mfa-attempt-receipt-v1"
+
+
+def _mfa_attempt_return_code(attempt: dict):
+    """Return an invocation code without turning timeout/exception into success."""
+    value = attempt.get("return_code", 1)
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    return value
+
+
+def _mfa_explicit_noalignments(attempt: dict) -> bool:
+    """Recognise only an explicit MFA NoAlignmentsError invocation failure."""
+    code = _mfa_attempt_return_code(attempt)
+    if code == 0 or code in {None, "timeout"}:
+        return False
+    if str(attempt.get("invocation_outcome", "")).lower() in {
+            "timeout", "exception", "not_started"}:
+        # A typed NoAlignmentsError is still explicit when surfaced by the
+        # executor; an opaque exception/timeout is never rescue-eligible.
+        if attempt.get("exception_type") != "NoAlignmentsError":
+            return False
+    if attempt.get("exception_type") == "NoAlignmentsError":
+        return True
+    # Compatibility with lightweight test/external executors that only
+    # provide a canonical exception name.  Wrapped/ambiguous messages are
+    # deliberately not rescue-eligible.
+    return str(attempt.get("exception", "")).strip() == "NoAlignmentsError"
+
+
+def _mfa_attempt_receipt(stem: str, ordinal: int, attempt: dict, *,
+                         settings: dict, isolation: str,
+                         final_disposition: str) -> dict:
+    """Build the immutable, per-stem evidence row for one invocation."""
+    produced = sorted(set(attempt.get("produced_individual",
+                                       attempt.get("produced", [])) or []))
+    return {
+        "schema": MFA_ATTEMPT_RECEIPT_SCHEMA,
+        "stem": stem,
+        "ordinal": ordinal,
+        "settings": dict(settings),
+        "isolation": isolation,
+        "invocation_outcome": attempt.get("invocation_outcome", "completed"),
+        "exception_type": attempt.get("exception_type"),
+        "exception": attempt.get("exception"),
+        "return_code": _mfa_attempt_return_code(attempt),
+        "produced_outputs": produced,
+        "produced_output_paths": sorted(set(attempt.get("produced_output_paths", []) or [])),
+        "invalid_outputs": sorted(set(attempt.get("invalid", []) or [])),
+        "receipt_path": attempt.get("attempt_receipt_path"),
+        "output_dir": attempt.get("output_dir"),
+        "final_disposition": final_disposition,
+    }
 
 
 def reconcile_mfa_outputs(expected_stems, produced_stems, *, return_code: int,
@@ -4801,92 +6232,177 @@ def reconcile_mfa_outputs(expected_stems, produced_stems, *, return_code: int,
 
 
 def mfa_retry_state_machine(expected_stems, attempts, *, rescue_stem=None) -> dict:
-    """Fail-closed retry policy with explicit batch/isolation/rescue phases.
+    """Evaluate the fail-closed per-stem MFA recovery state machine.
 
-    ``produced`` in an executor result is that attempt's individual output;
-    ``produced_individual`` is accepted as an explicit alias when callers
-    have already annotated it.  Reconciliation always uses the cumulative
-    union, while retaining each attempt in ``history`` for auditability.
+    The first row is the already completed MFA invocation.  Every following
+    row must be a singleton attempt.  A singleton may authorize exactly one
+    rescue row for that same stem when its own invocation either reports an
+    explicit ``NoAlignmentsError`` or cleanly returns rc=0 without producing
+    that singleton.  MFA can silently omit an unalignable item in partial
+    mode; the exact singleton denominator makes one wider-beam rescue just as
+    auditable as the typed exception.  The function reasons only about
+    reported actual outputs; it never creates or infers TextGrids.
     """
     expected = set(_filtered_recovery_sorted_unique(list(expected_stems), "MFA expected"))
-    state = "initial"; rescue_used = False; history = []; cumulative: set[str] = set()
+    state = "initial"
+    rescue_used = False
+    history = []
+    cumulative: set[str] = set()
+    recovered_stems: set[str] = set()
     for index, attempt in enumerate(attempts):
         individual = set(_filtered_recovery_sorted_unique(
-            list(attempt.get("produced_individual", attempt.get("produced", []))),
+            list(attempt.get("produced_individual", attempt.get("produced", [])) or []),
             f"MFA produced attempt {index}"))
         cumulative.update(individual)
-        result = reconcile_mfa_outputs(expected, sorted(cumulative),
-                                       return_code=int(attempt.get("return_code", 1)),
-                                       invalid_stems=attempt.get("invalid", []))
-        result["attempt_index"] = index
-        result["produced_individual"] = sorted(individual)
-        result["produced"] = sorted(cumulative)
+        result = reconcile_mfa_outputs(
+            expected, sorted(cumulative),
+            return_code=_mfa_attempt_return_code(attempt)
+            if isinstance(_mfa_attempt_return_code(attempt), int) else 1,
+            invalid_stems=attempt.get("invalid", []))
+        result.update({
+            "attempt_index": index,
+            "stem": attempt.get("stem"),
+            "ordinal": attempt.get("ordinal"),
+            "produced_individual": sorted(individual),
+            "produced": sorted(cumulative),
+            "invocation_outcome": attempt.get("invocation_outcome", "completed"),
+            "exception_type": attempt.get("exception_type"),
+        })
         history.append(result)
+        if attempt.get("ordinal") == 2 and isinstance(attempt.get("stem"), str):
+            rescue_used = True
         if result["complete"]:
-            state = "complete"; break
+            state = "complete"
+            break
+
         clean_missing = (not result["extra"] and not result["invalid"]
                          and bool(result["missing"]))
         if index == 0 and result["retry_missing"]:
-            state = "unchanged_retry"; continue
-        # A batch retry that leaves exactly one cumulative gap must be
-        # followed by an unchanged 20/80 singleton isolation attempt.
-        if index == 1 and clean_missing and len(result["missing"]) == 1:
-            state = "singleton_isolation"; continue
-        # Only a nonzero, explicit NoAlignmentsError from that isolation
-        # attempt can authorize the single 200/800 rescue.
-        if (index == 2 and rescue_stem and clean_missing
-                and result["missing"] == [rescue_stem]
-                and int(attempt.get("return_code", 1)) != 0
-                and "NoAlignmentsError" in str(attempt.get("exception", ""))):
-            rescue_used = True; state = "singleton_rescue"; continue
-        state = "permanent_failure"; break
+            state = "per_stem_isolation"
+            continue
+        stem = attempt.get("stem")
+        individual_success = (
+            isinstance(stem, str)
+            and attempt.get("ordinal") == 1
+            and _mfa_attempt_return_code(attempt) == 0
+            and sorted(individual) == [stem]
+            and not attempt.get("invalid")
+            and not result["extra"])
+        if individual_success:
+            recovered_stems.add(stem)
+            state = "per_stem_isolation"
+            continue
+        clean_singleton_omission = (
+            attempt.get("ordinal") == 1
+            and _mfa_attempt_return_code(attempt) == 0
+            and not individual and not attempt.get("invalid"))
+        if (attempt.get("ordinal") == 1 and clean_missing
+                and (_mfa_explicit_noalignments(attempt)
+                     or clean_singleton_omission)):
+            state = "singleton_rescue"
+            continue
+        if (attempt.get("ordinal") == 2 and isinstance(stem, str)):
+            if (_mfa_attempt_return_code(attempt) == 0
+                    and sorted(individual) == [stem]
+                    and not attempt.get("invalid")
+                    and not result["extra"]):
+                recovered_stems.add(stem)
+            state = "singleton_rescue"
+            continue
+        # An ordinary failure is terminal for this stem, but not for the
+        # other independent missing stems in the same recovery set.
+        state = "permanent_failure"
+    residual_stems = set(history[0].get("missing", [])) if history else expected
+    if expected <= (cumulative if attempts else set()) and state != "complete":
+        # A complete union is accepted only when every residual stem was
+        # reported as a valid successful singleton attempt.  This prevents a
+        # stray/ambiguous output from fabricating completion.
+        if residual_stems <= recovered_stems:
+            state = "complete"
+    if state != "complete" and not (residual_stems <= recovered_stems):
+        state = "permanent_failure"
     return {"state": state, "rescue_used": rescue_used, "history": history,
             "merge_allowed": state == "complete"}
 
 
 def run_mfa_retry_coordinator(expected_stems, initial_attempt: dict, retry_executor,
                               *, rescue_stem=None, rescue_executor=None) -> dict:
-    """Execute batch retry, singleton isolation, then one guarded rescue."""
+    """Execute one isolated recovery attempt per missing stem.
+
+    ``retry_executor`` is called once with ``[stem]`` at 20/80.  It is never
+    called again for that stem unless the result is either an explicit nonzero
+    ``NoAlignmentsError`` or a clean rc=0 singleton omission and a rescue
+    executor is supplied; that executor is called once with the bare stem and
+    must use 200/800.  This keeps the
+    coordinator compatible with the historical one-argument executor API
+    while enforcing the new per-stem policy at the boundary.
+    """
     expected = set(_filtered_recovery_sorted_unique(list(expected_stems), "MFA expected"))
     attempts = [dict(initial_attempt)]
+    receipts = []
     effective_rescue_stem = rescue_stem
     initial_rec = reconcile_mfa_outputs(
-        expected, initial_attempt.get("produced_individual", initial_attempt.get("produced", [])),
-        return_code=int(initial_attempt.get("return_code", 1)),
+        expected, initial_attempt.get("produced_individual",
+                                      initial_attempt.get("produced", [])),
+        return_code=_mfa_attempt_return_code(initial_attempt)
+        if isinstance(_mfa_attempt_return_code(initial_attempt), int) else 1,
         invalid_stems=initial_attempt.get("invalid", []))
     if initial_rec["retry_missing"]:
-        batch_missing = initial_rec["missing"]
-        batch = dict(retry_executor(batch_missing))
-        batch["produced_individual"] = sorted(set(batch.get("produced", [])))
-        attempts.append(batch)
-        # Evaluate the cumulative batch result before deciding whether the
-        # unchanged 20/80 singleton isolation is warranted.
-        batch_state = mfa_retry_state_machine(expected, attempts, rescue_stem=rescue_stem)
-        batch_history = batch_state["history"][-1]
-        if (batch_state["state"] == "singleton_isolation"
-                and len(batch_history["missing"]) == 1):
-            # In production the initial missing set can be large, so the
-            # singleton eligible for rescue is only knowable after the batch
-            # union.  A caller-supplied stem remains a strict binding check.
-            effective_rescue_stem = (batch_history["missing"][0]
-                                     if rescue_stem is None else rescue_stem)
-            isolation = dict(retry_executor(batch_history["missing"]))
-            isolation["produced_individual"] = sorted(set(isolation.get("produced", [])))
-            attempts.append(isolation)
-            isolation_state = mfa_retry_state_machine(expected, attempts,
-                                                      rescue_stem=effective_rescue_stem)
-            isolation_history = isolation_state["history"][-1]
-            explicit_noalign = (
-                isolation_history["missing"] == [effective_rescue_stem]
-                and not isolation_history["extra"] and not isolation_history["invalid"]
-                and int(isolation.get("return_code", 1)) != 0
-                and "NoAlignmentsError" in str(isolation.get("exception", "")))
-            if explicit_noalign and rescue_executor and effective_rescue_stem:
-                rescue = dict(rescue_executor(effective_rescue_stem))
-                rescue["produced_individual"] = sorted(set(rescue.get("produced", [])))
+        for stem in initial_rec["missing"]:
+            first = dict(retry_executor([stem]))
+            first["stem"] = stem
+            first["ordinal"] = 1
+            first["produced_individual"] = sorted(set(first.get("produced", []) or []))
+            first_success = (
+                _mfa_attempt_return_code(first) == 0
+                and first["produced_individual"] == [stem]
+                and not first.get("invalid")
+                and not set(first["produced_individual"]) - {stem})
+            noalign = (
+                first["produced_individual"] == []
+                and not first.get("invalid")
+                and _mfa_explicit_noalignments(first))
+            clean_omission = (
+                _mfa_attempt_return_code(first) == 0
+                and first["produced_individual"] == []
+                and not first.get("invalid"))
+            rescue_eligible = noalign or clean_omission
+            first["final_disposition"] = "recovered" if first_success else (
+                "rescue_authorized" if rescue_eligible else "unrecovered")
+            first["attempt_receipt"] = _mfa_attempt_receipt(
+                stem, 1, first,
+                settings={"beam": 20, "retry_beam": 80, "num_jobs": 1},
+                isolation="singleton",
+                final_disposition=first["final_disposition"])
+            receipts.append(first["attempt_receipt"])
+            attempts.append(first)
+
+            if rescue_eligible and rescue_executor is not None:
+                effective_rescue_stem = stem if rescue_stem is None else rescue_stem
+                if effective_rescue_stem != stem:
+                    continue
+                rescue = dict(rescue_executor(stem))
+                rescue["stem"] = stem
+                rescue["ordinal"] = 2
+                rescue["produced_individual"] = sorted(
+                    set(rescue.get("produced", []) or []))
+                rescue_success = (
+                    _mfa_attempt_return_code(rescue) == 0
+                    and rescue["produced_individual"] == [stem]
+                    and not rescue.get("invalid"))
+                rescue["final_disposition"] = (
+                    "recovered" if rescue_success else "unrecovered")
+                rescue["attempt_receipt"] = _mfa_attempt_receipt(
+                    stem, 2, rescue,
+                    settings={"beam": 200, "retry_beam": 800, "num_jobs": 1},
+                    isolation="singleton",
+                    final_disposition=rescue["final_disposition"])
+                receipts.append(rescue["attempt_receipt"])
                 attempts.append(rescue)
     state = mfa_retry_state_machine(expected, attempts, rescue_stem=effective_rescue_stem)
     state["attempts"] = attempts
+    state["receipts"] = receipts
+    state["missing_stems"] = state["history"][-1]["missing"] if state["history"] else sorted(expected)
     return state
 
 
@@ -5047,6 +6563,109 @@ def import_filtered_recovery_assets(
     return rows
 
 
+def _localize_filtered_recovery_transform_receipt(
+    source_row: dict, stem: str, *, parent_root: Path, parent_tts_audio: Path,
+    parent_mfa_audio: Path, localized_tts_audio: Path,
+    localized_mfa_audio: Path, destination_dir: Path,
+) -> dict:
+    """Validate and localize one parent-produced audio transform receipt.
+
+    The parent receipt is producer evidence, not a replay input to be
+    regenerated.  Its audio metadata and paths must bind the explicit parent
+    padded/16k files and the parent MFA input-axis row before only the two
+    paths are rewritten into the fresh import namespace.
+    """
+    if not isinstance(source_row, dict) or source_row.get("stem") != stem:
+        raise ValueError(f"filtered recovery input axis row mismatch: {stem}")
+    parent_root = Path(parent_root).resolve(strict=True)
+    parent_tts_audio = Path(parent_tts_audio)
+    parent_mfa_audio = Path(parent_mfa_audio)
+    localized_tts_audio = Path(localized_tts_audio)
+    localized_mfa_audio = Path(localized_mfa_audio)
+
+    def _parent_file(path: Path, label: str) -> Path:
+        raw = Path(path)
+        if (not raw.is_absolute() or ".." in raw.parts or raw.is_symlink()
+                or not raw.is_file() or raw.stat().st_nlink != 1):
+            raise ValueError(f"filtered recovery {label} missing/unsafe: {raw}")
+        resolved = raw.resolve(strict=True)
+        try:
+            resolved.relative_to(parent_root)
+        except ValueError as exc:
+            raise ValueError(f"filtered recovery {label} escapes parent: {raw}") from exc
+        if resolved != raw:
+            raise ValueError(f"filtered recovery {label} path is not canonical: {raw}")
+        return resolved
+
+    parent_tts_audio = _parent_file(parent_tts_audio, f"TTS audio {stem}")
+    parent_mfa_audio = _parent_file(parent_mfa_audio, f"MFA audio {stem}")
+    expected_tts = parent_root / "padded_audio" / f"{stem}.wav"
+    expected_mfa = parent_root / "audio_16k" / f"{stem}.wav"
+    if parent_tts_audio != expected_tts or parent_mfa_audio != expected_mfa:
+        raise ValueError(f"filtered recovery explicit audio path mismatch: {stem}")
+    for path, label in ((localized_tts_audio, f"localized TTS audio {stem}"),
+                        (localized_mfa_audio, f"localized MFA audio {stem}")):
+        if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+            raise ValueError(f"filtered recovery {label} missing/unsafe: {path}")
+    localized_tts_audio = localized_tts_audio.resolve(strict=True)
+    localized_mfa_audio = localized_mfa_audio.resolve(strict=True)
+
+    row_path = source_row.get("path")
+    if not isinstance(row_path, str) or Path(row_path).resolve() != parent_mfa_audio:
+        raise ValueError(f"filtered recovery parent input-axis path mismatch: {stem}")
+    try:
+        mfa_metadata = _axis_audio_metadata(parent_mfa_audio)
+        tts_metadata = _axis_audio_metadata(parent_tts_audio)
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError(f"filtered recovery parent audio metadata unreadable: {stem}") from exc
+    for key, actual in mfa_metadata.items():
+        if source_row.get(key) != actual:
+            raise ValueError(f"filtered recovery parent input-axis {key} mismatch: {stem}")
+
+    raw_receipt = source_row.get("transform_receipt")
+    if not isinstance(raw_receipt, str) or not raw_receipt:
+        raise ValueError(f"filtered recovery transform receipt missing: {stem}")
+    source_receipt = _parent_file(Path(raw_receipt), f"transform receipt {stem}")
+    source_bytes = source_receipt.read_bytes()
+    source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    try:
+        transform_payload = json.loads(source_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"filtered recovery transform receipt unreadable: {stem}") from exc
+    if not isinstance(transform_payload, dict):
+        raise ValueError(f"filtered recovery transform receipt malformed: {stem}")
+    errors = validate_audio_transform_receipt(
+        transform_payload, input_audio=parent_tts_audio, output_audio=parent_mfa_audio)
+    if errors:
+        raise ValueError(f"filtered recovery transform receipt invalid {stem}: {'; '.join(errors)}")
+    for key, actual in tts_metadata.items():
+        if transform_payload["input"].get(key) != actual:
+            raise ValueError(f"filtered recovery transform input {key} mismatch: {stem}")
+    for key, actual in mfa_metadata.items():
+        if transform_payload["output"].get(key) != actual:
+            raise ValueError(f"filtered recovery transform output {key} mismatch: {stem}")
+
+    localized_payload = json.loads(json.dumps(transform_payload))
+    localized_payload["input"]["path"] = str(localized_tts_audio)
+    localized_payload["output"]["path"] = str(localized_mfa_audio)
+    destination_dir = Path(destination_dir)
+    if destination_dir.is_symlink() or not destination_dir.is_dir():
+        raise ValueError(f"filtered recovery transform destination unsafe: {destination_dir}")
+    replay_transform = destination_dir / source_receipt.name
+    _strict_replay_write_once_json(replay_transform, localized_payload)
+    if _sha256_file(source_receipt) != source_sha256:
+        raise ValueError(f"filtered recovery transform receipt changed during localization: {stem}")
+    localized_errors = validate_audio_transform_receipt(
+        localized_payload, input_audio=localized_tts_audio, output_audio=localized_mfa_audio)
+    if localized_errors:
+        raise ValueError(f"filtered recovery localized transform invalid {stem}: {'; '.join(localized_errors)}")
+    return {"label": f"audio_transform:{stem}",
+            "source": str(source_receipt), "destination": str(replay_transform.resolve()),
+            "sha256": source_sha256, "source_sha256": source_sha256,
+            "destination_sha256": _sha256_file(replay_transform),
+            "localized": True, "scope": "frozen_only"}
+
+
 def make_filtered_recovery_receipt(
     partition: dict, imports: list[dict], parent_hashes: dict[str, str],
     parent_hashes_after: dict[str, str] | None = None, *, strict_id: str | None = None,
@@ -5106,6 +6725,8 @@ def prepare_mfa_retry_packet(parent_root: Path, retry_root: Path, stems: list[st
     accepted = set(_filtered_recovery_sorted_unique(accepted_stems, "accepted"))
     if not set(stems) <= frozen or set(stems) & accepted:
         raise ValueError("MFA retry stems must be a frozen subset and exclude parent accepted stems")
+    if execute and len(stems) != 1:
+        raise ValueError("MFA retry execution is per-stem; provide exactly one stem")
     ws = parent / "workspace"
     axis_path = ws / ".mfa_alignment_axis_receipt.json"
     post_path = next(iter(ws.glob("strict_ok_runs/*/output/postprocess_report.jsonl")), None)
@@ -5158,6 +6779,8 @@ def prepare_mfa_retry_packet(parent_root: Path, retry_root: Path, stems: list[st
         cwd=str(PROJECT_ROOT), text=True, capture_output=True, env=preflight_env)
     if preflight.returncode != 0:
         raise ValueError(f"MFA librosa preflight failed: {preflight.stderr[-500:]}")
+    _isolated = len(stems) == 1
+    _num_jobs = 1 if _isolated else 12
     command = [str(mfa_bin), "align", str(corpus), str(dictionary), str(model), str(output),
                "--audio_directory", str(audio), "--num_jobs", "12", "--single_speaker",
                "--no_tokenization", "--beam", "20", "--retry_beam", "80",
@@ -5178,7 +6801,8 @@ def prepare_mfa_retry_packet(parent_root: Path, retry_root: Path, stems: list[st
                "preflight": {"librosa_note_to_midi": "C4=60", "python": str(mfa_python),
                              "return_code": preflight.returncode, "stdout": preflight.stdout[-200:],
                              "stderr": preflight.stderr[-200:]},
-               "options": {"num_jobs": 12, "single_speaker": True, "no_tokenization": True,
+               "options": {"num_jobs": _num_jobs, "isolation": "singleton" if _isolated else "batch",
+                           "single_speaker": True, "no_tokenization": True,
                            "beam": 20, "retry_beam": 80, "boost_silence": 1.0,
                            "fine_tune": False, "clean": False, "output_format": "long_textgrid"},
                "environment": {"PATH_prefix": str(mfa_bin_dir),
@@ -5187,6 +6811,7 @@ def prepare_mfa_retry_packet(parent_root: Path, retry_root: Path, stems: list[st
                                "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
                                "OPENBLAS_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1"},
                "execution": {"attempted": False}}
+    command[command.index("12")] = str(_num_jobs)
     if execute:
         output.mkdir(parents=True, exist_ok=True)
         started = time.time()
@@ -5196,10 +6821,36 @@ def prepare_mfa_retry_packet(parent_root: Path, retry_root: Path, stems: list[st
         mfa_root_dir.mkdir(parents=True, exist_ok=True)
         retry_env["MFA_ROOT_DIR"] = str(mfa_root_dir)
         retry_env["NUMBA_CACHE_DIR"] = str(numba_cache)
-        proc = subprocess.run(command, cwd=str(PROJECT_ROOT), text=True, capture_output=True, env=retry_env)
-        (retry_root / "mfa.stdout.log").write_text(proc.stdout or "", encoding="utf-8")
-        (retry_root / "mfa.stderr.log").write_text(proc.stderr or "", encoding="utf-8")
-        produced = sorted(p.stem for p in output.glob("*.TextGrid") if p.is_file() and not p.is_symlink())
+        _invocation_outcome = "completed"
+        _exception_type = None
+        _exception = None
+        _return_code = 1
+        _stdout = ""
+        _stderr = ""
+        try:
+            proc = subprocess.run(command, cwd=str(PROJECT_ROOT), text=True,
+                                  capture_output=True, env=retry_env)
+            _return_code = proc.returncode
+            _stdout = proc.stdout or ""
+            _stderr = proc.stderr or ""
+        except subprocess.TimeoutExpired as exc:
+            _invocation_outcome = "timeout"
+            _exception_type = type(exc).__name__
+            _exception = str(exc)
+            _return_code = "timeout"
+        except Exception as exc:
+            _invocation_outcome = "exception"
+            _exception_type = type(exc).__name__
+            _exception = str(exc)
+            _return_code = None
+        (retry_root / "mfa.stdout.log").write_text(_stdout, encoding="utf-8")
+        (retry_root / "mfa.stderr.log").write_text(_stderr, encoding="utf-8")
+        _output_paths = [p for p in output.glob("*.TextGrid")
+                         if p.is_file() and not p.is_symlink()]
+        _invalid_outputs = [p.stem for p in _output_paths
+                            if validate_strict_mfa_textgrid(p)]
+        produced = sorted(p.stem for p in _output_paths
+                          if p.stem not in _invalid_outputs)
         produced_set = set(produced)
         per_stem = []
         for stem in stems:
@@ -5207,17 +6858,48 @@ def prepare_mfa_retry_packet(parent_root: Path, retry_root: Path, stems: list[st
             per_stem.append({"stem": stem, "produced": stem in produced_set,
                              "sha256": _sha256_file(artifact) if artifact.is_file() else None,
                              "oov": [], "invalid": bool(artifact.is_symlink()),
-                             "return_code": proc.returncode, "started": started, "finished": time.time()})
-        receipt["execution"] = {"attempted": True, "return_code": proc.returncode,
+                             "return_code": _return_code, "started": started, "finished": time.time()})
+        receipt["execution"] = {"attempted": True, "return_code": _return_code,
                                  "started": started, "finished": time.time(),
                                  "produced": produced, "missing": sorted(set(stems) - set(produced)),
                                  "extra": sorted(set(produced) - set(stems)),
-                                 "invalid": [row["stem"] for row in per_stem if row["invalid"]],
+                                 "invalid": sorted(set(_invalid_outputs) | {
+                                     row["stem"] for row in per_stem if row["invalid"]}),
                                  "per_stem": per_stem,
                                  "stdout": str(retry_root / "mfa.stdout.log"),
                                  "stderr": str(retry_root / "mfa.stderr.log"),
                                  "path_prefix": str(mfa_bin_dir),
-                                 "mfa_root_dir": str(mfa_root_dir)}
+                                 "mfa_root_dir": str(mfa_root_dir),
+                                 "invocation_outcome": _invocation_outcome,
+                                 "exception_type": _exception_type,
+                                 "exception": _exception or (_stderr[-500:] or None)}
+        if _exception_type is None and "NoAlignmentsError" in _stderr:
+            receipt["execution"]["exception_type"] = "NoAlignmentsError"
+        _attempt_receipt = {
+            "schema": MFA_ATTEMPT_RECEIPT_SCHEMA,
+            "stem": stems[0],
+            "ordinal": 1,
+            "settings": {"beam": 20, "retry_beam": 80, "num_jobs": 1},
+            "isolation": "singleton",
+            "invocation_outcome": _invocation_outcome,
+            "exception_type": receipt["execution"].get("exception_type"),
+            "exception": _exception or (_stderr[-500:] or None),
+            "return_code": _return_code,
+            "produced_outputs": produced,
+            "produced_output_paths": [str(output / f"{name}.TextGrid")
+                                      for name in produced],
+            "invalid_outputs": sorted(set(_invalid_outputs) | {
+                row["stem"] for row in per_stem if row["invalid"]}),
+            "final_disposition": (
+                "recovered" if _return_code == 0 and produced == stems else
+                "rescue_authorized" if _return_code not in (0, None, "timeout")
+                and receipt["execution"].get("exception_type") == "NoAlignmentsError"
+                and not produced else "unrecovered"),
+        }
+        receipt["attempt_receipt"] = _attempt_receipt
+        (retry_root / "mfa_attempt_receipt.json").write_text(
+            json.dumps(_attempt_receipt, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8")
     receipt_path = retry_root / "mfa_retry_receipt.json"
     receipt_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return receipt
@@ -5257,10 +6939,36 @@ def run_mfa_singleton_rescue(parent_root: Path, rescue_root: Path, stem: str,
     env["NUMBA_CACHE_DIR"] = str(rescue_root / "numba_cache")
     (rescue_root / "mfa_root").mkdir(parents=True, exist_ok=True)
     (rescue_root / "numba_cache").mkdir(parents=True, exist_ok=True)
-    proc = subprocess.run(command, cwd=str(PROJECT_ROOT), text=True, capture_output=True, env=env)
-    (rescue_root / "mfa.stdout.log").write_text(proc.stdout or "", encoding="utf-8")
-    (rescue_root / "mfa.stderr.log").write_text(proc.stderr or "", encoding="utf-8")
-    produced = sorted(p.stem for p in output.glob("*.TextGrid") if p.is_file() and not p.is_symlink())
+    _invocation_outcome = "completed"
+    _exception_type = None
+    _exception = None
+    _return_code = 1
+    _stdout = ""
+    _stderr = ""
+    try:
+        proc = subprocess.run(command, cwd=str(PROJECT_ROOT), text=True,
+                              capture_output=True, env=env)
+        _return_code = proc.returncode
+        _stdout = proc.stdout or ""
+        _stderr = proc.stderr or ""
+    except subprocess.TimeoutExpired as exc:
+        _invocation_outcome = "timeout"
+        _exception_type = type(exc).__name__
+        _exception = str(exc)
+        _return_code = "timeout"
+    except Exception as exc:
+        _invocation_outcome = "exception"
+        _exception_type = type(exc).__name__
+        _exception = str(exc)
+        _return_code = None
+    (rescue_root / "mfa.stdout.log").write_text(_stdout, encoding="utf-8")
+    (rescue_root / "mfa.stderr.log").write_text(_stderr, encoding="utf-8")
+    _output_paths = [p for p in output.glob("*.TextGrid")
+                     if p.is_file() and not p.is_symlink()]
+    _invalid_outputs = [p.stem for p in _output_paths
+                        if validate_strict_mfa_textgrid(p)]
+    produced = sorted(p.stem for p in _output_paths
+                      if p.stem not in _invalid_outputs)
     receipt = {"schema": MFA_RESCUE_SCHEMA, "stem": stem,
                "policy": {"attempts": 1, "beam": 200, "retry_beam": 800,
                            "reason": "NoAlignmentsError at unchanged beam20/retry80"},
@@ -5274,12 +6982,38 @@ def run_mfa_singleton_rescue(parent_root: Path, rescue_root: Path, stem: str,
                "model": packet["model"], "dictionary": packet["dictionary"],
                "mfa_executable": packet["mfa_executable"],
                "execution": {"attempted": True, "attempts": 1,
-                             "return_code": proc.returncode, "started": started,
+                             "return_code": _return_code, "started": started,
                              "finished": time.time(), "produced": produced,
                              "missing": sorted({stem} - set(produced)), "extra": sorted(set(produced) - {stem}),
+                             "invalid": sorted(_invalid_outputs),
                              "stdout": str(rescue_root / "mfa.stdout.log"),
                              "stderr": str(rescue_root / "mfa.stderr.log"),
-                             "textgrid_sha256": _sha256_file(output / f"{stem}.TextGrid") if (output / f"{stem}.TextGrid").is_file() else None}}
+                             "textgrid_sha256": _sha256_file(output / f"{stem}.TextGrid") if (output / f"{stem}.TextGrid").is_file() else None,
+                             "invocation_outcome": _invocation_outcome,
+                             "exception_type": _exception_type,
+                             "exception": _exception or (_stderr[-500:] or None)}}
+    if _exception_type is None and "NoAlignmentsError" in _stderr:
+        receipt["execution"]["exception_type"] = "NoAlignmentsError"
+    receipt["attempt_receipt"] = {
+        "schema": MFA_ATTEMPT_RECEIPT_SCHEMA,
+        "stem": stem,
+        "ordinal": 2,
+        "settings": {"beam": 200, "retry_beam": 800, "num_jobs": 1},
+        "isolation": "singleton",
+        "invocation_outcome": _invocation_outcome,
+        "exception_type": receipt["execution"].get("exception_type"),
+        "exception": _exception or (_stderr[-500:] or None),
+        "return_code": _return_code,
+        "produced_outputs": produced,
+        "produced_output_paths": [str(output / f"{name}.TextGrid")
+                                  for name in produced],
+        "invalid_outputs": sorted(_invalid_outputs),
+        "final_disposition": "recovered" if _return_code == 0 and produced == [stem]
+        else "unrecovered",
+    }
+    (rescue_root / "mfa_attempt_receipt.json").write_text(
+        json.dumps(receipt["attempt_receipt"], ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8")
     path = rescue_root / "mfa_rescue_receipt.json"
     path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return receipt
@@ -5313,7 +7047,9 @@ def _read_filtered_recovery_evidence(path: Path, frozen, plan: dict) -> dict:
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"filtered recovery evidence receipt missing: {path}")
     evidence = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(evidence, dict) or evidence.get("schema") != "filtered-recovery-evidence-v1":
+    if (not isinstance(evidence, dict)
+            or evidence.get("schema") not in {"filtered-recovery-evidence-v1",
+                                               "filtered-recovery-evidence-v3"}):
         raise ValueError("filtered recovery evidence receipt schema mismatch")
     digest = evidence.get("frozen_stems_sha256")
     if digest != _filtered_recovery_stem_digest(frozen):
@@ -5362,7 +7098,39 @@ def run_filtered_recovery(args, cfg: dict, config_path: Path | None = None) -> i
     without touching the parent or copying files.
     """
     try:
+        package_arg = getattr(args, "filtered_recovery_package", None)
+        if not package_arg:
+            raise ValueError("filtered_recovery requires explicit --filtered-recovery-package")
+        # Package preflight is the only selector for recovery.  It binds one
+        # named strict run and hashes its producer receipts before any replay
+        # asset enumeration or destination creation.
+        from filtered_recovery_package import PackageError as RecoveryPackageError
+        from filtered_recovery_package import preflight_package
+        package_path = Path(package_arg)
+        package_result = preflight_package(package_path)
         parent = _filtered_recovery_root(Path(args.filtered_recovery_parent_root), "filtered recovery parent")
+        if Path(package_result["source_root"]).resolve() != parent:
+            raise ValueError("filtered recovery package parent binding mismatch")
+        if package_result.get("frozen") != 262 or package_result.get("artifact_only") != 259 \
+                or package_result.get("mfa_axis") != 3:
+            raise ValueError("filtered recovery package is not the frozen 259+3 denominator")
+        package_frozen = package_path / "frozen_filtered.json"
+        package_accepted = package_path / "accepted_manifest.json"
+        package_manifest = package_path / "filtered_recovery_manifest.json"
+        package_evidence = package_path / "evidence_receipt.json"
+        for candidate in (package_frozen, package_accepted, package_manifest, package_evidence):
+            if candidate.is_symlink() or not candidate.is_file():
+                raise ValueError(f"filtered recovery package member missing: {candidate}")
+        # Make all recovery inputs explicit package members.  User-supplied
+        # alternate manifests cannot silently widen or subset the frozen set.
+        for attr, expected in (("filtered_recovery_frozen_manifest", package_frozen),
+                               ("filtered_recovery_accepted_manifest", package_accepted),
+                               ("filtered_recovery_manifest", package_manifest),
+                               ("filtered_recovery_evidence_receipt", package_evidence)):
+            supplied = getattr(args, attr, None)
+            if supplied is not None and Path(supplied).resolve() != expected.resolve():
+                raise ValueError(f"filtered recovery {attr} must be the package member")
+            setattr(args, attr, str(expected))
         workspace = Path(args.workspace) if args.workspace else parent / "workspace" / "filtered_recovery"
         output = Path(args.output_dir) if args.output_dir else workspace / "output"
         if getattr(args, "filtered_recovery_validate_only", False):
@@ -5463,10 +7231,10 @@ def run_filtered_recovery(args, cfg: dict, config_path: Path | None = None) -> i
         except (OSError, ValueError) as exc:
             raise ValueError("filtered recovery strict output escapes parent root") from exc
         filtered_root = strict_output.parent / "filtered"
-        aligned_root = Path(args.filtered_recovery_aligned_root) if getattr(args, "filtered_recovery_aligned_root", None) else parent / "workspace" / "aligned"
+        aligned_root = Path(args.filtered_recovery_aligned_root) if getattr(args, "filtered_recovery_aligned_root", None) else parent / "aligned"
         aligned_root = _filtered_recovery_root(aligned_root, "filtered recovery aligned root")
-        ctc_root = parent / "workspace" / "ctc_pretg"
-        en_root = parent / "workspace" / "en_phones"
+        ctc_root = parent / "ctc_pretg"
+        en_root = parent / "en_phones"
         ctc_override_root = None
         en_override_root = None
         en_aligned_override_root = None
@@ -5482,14 +7250,16 @@ def run_filtered_recovery(args, cfg: dict, config_path: Path | None = None) -> i
             en_aligned_override_root = _filtered_recovery_root(
                 Path(args.filtered_recovery_english_aligned_root),
                 "filtered recovery English aligned override root")
-        input_root = parent / "input"
-        mfa_audio_root = parent / "workspace" / "audio_16k"
-        tts_audio_root = parent / "workspace" / "padded_audio"
+        # Parent artifacts are addressed explicitly; there is no input-root
+        # discovery fallback in frozen recovery.
+        input_root = ctc_root
+        mfa_audio_root = parent / "audio_16k"
+        tts_audio_root = parent / "padded_audio"
         rejected_rows = accepted_payload.get("rejected", {})
         missing_mfa = {stem for stem, reasons in rejected_rows.items()
                        if "missing_mfa_alignment" in str(reasons)} if isinstance(rejected_rows, dict) else set()
         if not missing_mfa:
-            axis_path = parent / "workspace" / ".mfa_alignment_axis_receipt.json"
+            axis_path = parent / ".mfa_alignment_axis_receipt.json"
             try:
                 axis_rows = json.loads(axis_path.read_text(encoding="utf-8")).get("alignments", [])
                 missing_mfa = {row.get("stem") for row in axis_rows
@@ -5501,8 +7271,8 @@ def run_filtered_recovery(args, cfg: dict, config_path: Path | None = None) -> i
         for stem in frozen:
             required = {
                 f"filtered_textgrid:{stem}": filtered_root / f"{stem}.TextGrid",
-                f"audio:{stem}": input_root / f"{stem}.wav",
-                f"reference:{stem}": input_root / f"{stem}.txt",
+                f"audio:{stem}": mfa_audio_root / f"{stem}.wav",
+                f"reference:{stem}": ctc_root / f"{stem}_ref.txt",
             }
             mfa_audio = mfa_audio_root / f"{stem}.wav"
             tts_audio = tts_audio_root / f"{stem}.wav"
@@ -5512,9 +7282,8 @@ def run_filtered_recovery(args, cfg: dict, config_path: Path | None = None) -> i
                 raise ValueError(f"filtered recovery TTS-authoritative audio missing: {tts_audio}")
             required[f"mfa_audio:{stem}"] = mfa_audio
             required[f"tts_audio:{stem}"] = tts_audio
-            transform_candidates = sorted((parent / "workspace" / "audio_transform_receipts").glob(f"{stem}.*.json"))
-            if transform_candidates:
-                required[f"audio_transform:{stem}"] = transform_candidates[0]
+            # Transform receipt paths are already bound by the input-axis
+            # receipt.  Do not glob the parent receipt directory here.
             for suffix in (".txt", "_ref.txt", ".lab", ".TextGrid", "_tokens.jsonl", "_punct.json", "_text_cn.txt", "_text_raw.txt"):
                 ctc = ctc_root / f"{stem}{suffix}"
                 if ctc_override_root is not None:
@@ -5544,19 +7313,31 @@ def run_filtered_recovery(args, cfg: dict, config_path: Path | None = None) -> i
                     raise ValueError(f"filtered recovery required asset missing: {source}")
                 assets[label] = source
                 category = label.split(":", 1)[0]
-                destination_names[label] = f"{category}/{source.name}"
+                destination_names[label] = (
+                    f"{category}/{stem}.txt" if category == "reference"
+                    else f"{category}/{source.name}")
         en_manifest = en_root / "en_alignment_manifest.json"
         if en_override_root is not None:
             override_manifest = en_override_root / "en_alignment_manifest.json"
             if override_manifest.is_file() and not override_manifest.is_symlink():
                 en_manifest = override_manifest
         if en_manifest.is_file() and not en_manifest.is_symlink():
-            assets["english_manifest_source"] = en_manifest
-            destination_names["english_manifest_source"] = "english_phones/en_alignment_manifest.source.json"
+            # The parent-global manifest is read-only producer evidence.  It
+            # is intentionally not copied into imports because it contains
+            # accepted stems; only frozen ledgers/segment grids may enter the
+            # recovery namespace.
+            pass
         import_root = workspace / "imports"
         imports = import_filtered_recovery_assets(
             assets, import_root, allowlist=set(assets),
             destination_names=destination_names)
+        accepted_imports = []
+        for row in imports:
+            label_parts = str(row.get("label", "")).split(":")
+            if len(label_parts) >= 2 and label_parts[1] in set(accepted):
+                accepted_imports.append(row)
+        if accepted_imports:
+            raise ValueError("filtered recovery accepted-stem asset import forbidden")
         # Localize the fresh English producer manifest and its ledger/grid
         # references into the quarantine namespace.  The source manifest is
         # retained verbatim as ``*.source.json``; the canonical manifest is a
@@ -5564,13 +7345,11 @@ def run_filtered_recovery(args, cfg: dict, config_path: Path | None = None) -> i
         # regular file (never a historical absolute path).
         localized_en_manifest = None
         localized_en_ledgers = {}
-        source_en_manifest_path = import_root / "english_phones" / "en_alignment_manifest.source.json"
+        source_en_manifest_path = en_manifest
         if source_en_manifest_path.is_file():
             source_en_manifest = json.loads(source_en_manifest_path.read_text(encoding="utf-8"))
-            if (source_en_manifest.get("schema") != "strict-en-mfa-v1"
-                    or source_en_manifest.get("strict_provenance") is not True
-                    or source_en_manifest.get("status") not in {"success", "no_english"}):
-                raise ValueError("filtered recovery English source manifest is not strict-en-mfa-v1")
+            _validate_strict_english_manifest_payload(
+                source_en_manifest, "filtered recovery English source manifest")
             source_ledgers = source_en_manifest.get("stem_ledgers")
             _validate_filtered_recovery_english_ledger_scope(source_ledgers, frozen, accepted)
             expected_ids = [item for item in source_en_manifest.get("expected_segments", [])
@@ -5590,9 +7369,9 @@ def run_filtered_recovery(args, cfg: dict, config_path: Path | None = None) -> i
                 imported_ledger = import_root / "english_phones" / Path(source_row["path"]).name
                 if not imported_ledger.is_file() or imported_ledger.is_symlink():
                     raise ValueError(f"filtered recovery English ledger import missing: {stem}")
-                ledger_payload = json.loads(imported_ledger.read_text(encoding="utf-8"))
-                if ledger_payload.get("schema") != "strict-en-mfa-v1" or ledger_payload.get("stem") != stem:
-                    raise ValueError(f"filtered recovery English ledger invalid: {stem}")
+                ledger_payload = _validate_strict_english_ledger_payload(
+                    json.loads(imported_ledger.read_text(encoding="utf-8")),
+                    stem, f"filtered recovery English ledger {stem}")
                 for segment in ledger_payload.get("segments", []):
                     if not isinstance(segment, dict):
                         raise ValueError(f"filtered recovery English segment invalid: {stem}")
@@ -5736,9 +7515,8 @@ def run_filtered_recovery(args, cfg: dict, config_path: Path | None = None) -> i
         # Materialize a stem-restricted axis contract in quarantine so the
         # committed entry point can run the filtered-only postprocess without
         # consulting accepted-parent assets.
-        import_rows = {row["label"]: row for row in imports}
         parent_input_axis = json.loads((ctc_root / ".mfa_input_axis_receipt.json").read_text(encoding="utf-8"))
-        parent_alignment_axis = json.loads((parent / "workspace" / ".mfa_alignment_axis_receipt.json").read_text(encoding="utf-8"))
+        parent_alignment_axis = json.loads((parent / ".mfa_alignment_axis_receipt.json").read_text(encoding="utf-8"))
         input_rows = []
         replay_transform_dir = import_root / "axis" / "audio_transform_receipts"
         replay_transform_dir.mkdir(parents=True, exist_ok=True)
@@ -5748,14 +7526,15 @@ def run_filtered_recovery(args, cfg: dict, config_path: Path | None = None) -> i
                 raise ValueError(f"filtered recovery input axis row missing: {stem}")
             row = dict(source_row)
             row["path"] = str((import_root / "mfa_audio" / f"{stem}.wav").resolve())
-            transform = import_rows.get(f"audio_transform:{stem}")
-            if transform:
-                transform_payload = json.loads(Path(transform["destination"]).read_text(encoding="utf-8"))
-                transform_payload["input"]["path"] = str((import_root / "tts_audio" / f"{stem}.wav").resolve())
-                transform_payload["output"]["path"] = str((import_root / "mfa_audio" / f"{stem}.wav").resolve())
-                replay_transform = replay_transform_dir / Path(transform["destination"]).name
-                _strict_replay_write_once_json(replay_transform, transform_payload)
-                row["transform_receipt"] = str(replay_transform.resolve())
+            localized_transform = _localize_filtered_recovery_transform_receipt(
+                source_row, stem, parent_root=parent,
+                parent_tts_audio=tts_audio_root / f"{stem}.wav",
+                parent_mfa_audio=mfa_audio_root / f"{stem}.wav",
+                localized_tts_audio=import_root / "tts_audio" / f"{stem}.wav",
+                localized_mfa_audio=import_root / "mfa_audio" / f"{stem}.wav",
+                destination_dir=replay_transform_dir)
+            imports.append(localized_transform)
+            row["transform_receipt"] = localized_transform["destination"]
             input_rows.append(row)
         input_axis = make_mfa_input_axis_receipt(sorted(frozen), input_rows,
                                                   axis_root=import_root / "mfa_audio")
@@ -5887,7 +7666,9 @@ def run_filtered_recovery(args, cfg: dict, config_path: Path | None = None) -> i
                                                       "sha256": _sha256_file(copied_ledger)},
                                           "source_textgrids": source_grids})
         _strict_replay_write_once_json(english_ledger, {
-            "schema": "strict-en-mfa-v1", "source": "localized_filtered_recovery",
+            "schema": STRICT_ENGLISH_SCHEMA,
+            "canonical_units": CANONICAL_ENGLISH_UNITS_SCHEMA,
+            "source": "localized_filtered_recovery",
             "localized_manifest": localized_manifest_ref,
             "stems": english_evidence_rows,
         })
@@ -5899,12 +7680,14 @@ def run_filtered_recovery(args, cfg: dict, config_path: Path | None = None) -> i
                      "reference": {"path": str(ref), "sha256": _sha256_file(ref)}}
             evidence_row = next((row for row in english_evidence_rows if row["stem"] == stem), None)
             if evidence_row is not None:
-                entry["english_provenance"] = {"schema": "strict-en-mfa-v1",
+                entry["english_provenance"] = {
+                    "schema": STRICT_ENGLISH_SCHEMA,
+                    "canonical_units": CANONICAL_ENGLISH_UNITS_SCHEMA,
                     "ledger": evidence_row["ledger"],
                     "source_textgrids": evidence_row["source_textgrids"],
                     "localized_manifest": localized_manifest_ref}
             ok_entries.append(entry)
-        strict_manifest = {"policy_version": "strict-ok-v3.2", "english_provenance_policy": {"schema": "strict-en-mfa-v1", "required": True, "evidence_root": str(output)}, "output_dir": str(output), "filtered_dir": str(replay_filtered), "expected_stems": sorted(frozen), "ok": ok_entries, "rejected": {stem: ["filtered"] for stem in sorted(still_filtered)}, "safe_empty": False, "safe_empty_applied": False, "global_reasons": [], "pipeline_accounting_receipt": {"schema": accounting["schema"], "path": str(accounting_path), "sha256": _sha256_file(accounting_path)}}
+        strict_manifest = {"policy_version": "strict-ok-v3.2", "english_provenance_policy": {"schema": STRICT_ENGLISH_SCHEMA, "canonical_units": CANONICAL_ENGLISH_UNITS_SCHEMA, "required": True, "evidence_root": str(output)}, "output_dir": str(output), "filtered_dir": str(replay_filtered), "expected_stems": sorted(frozen), "ok": ok_entries, "rejected": {stem: ["filtered"] for stem in sorted(still_filtered)}, "safe_empty": False, "safe_empty_applied": False, "global_reasons": [], "pipeline_accounting_receipt": {"schema": accounting["schema"], "path": str(accounting_path), "sha256": _sha256_file(accounting_path)}}
         _strict_replay_write_once_json(workspace / "filtered_recovery_strict_manifest.json", strict_manifest)
         observed_after = {name: _sha256_file((parent / name).resolve(strict=True)) for name in sorted(parent_hashes)}
         if observed_after != observed:
@@ -5923,7 +7706,7 @@ def run_filtered_recovery(args, cfg: dict, config_path: Path | None = None) -> i
         _strict_replay_write_once_json(receipt_path, receipt)
         print(f"filtered_recovery replayed {len(validated['stems'])} frozen stems in quarantine: {receipt_path}")
         return 0
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"ERROR: filtered_recovery: {exc}")
         return 1
 
@@ -6134,8 +7917,7 @@ def _strict_replay_english_subset(
     source_manifest = _strict_replay_file(en_root / "en_alignment_manifest.json", en_root,
                                           "English producer manifest")
     raw = json.loads(source_manifest.read_text(encoding="utf-8"))
-    if raw.get("schema") != "strict-en-mfa-v1" or raw.get("strict_provenance") is not True:
-        raise ValueError("English producer manifest schema/provenance invalid")
+    _validate_strict_english_manifest_payload(raw, "English producer manifest")
     parent_hash = _sha256_file(source_manifest)
     parent_copy = en_stage / "en_alignment_manifest.json"
     if parent_copy.exists() or parent_copy.is_symlink():
@@ -6175,7 +7957,9 @@ def _strict_replay_english_subset(
         raise ValueError("English subset ledger membership mismatch")
     entries = []
     for ledger in ledgers:
-        ledger_payload = json.loads((en_stage / Path(ledger["path"]).name).read_text(encoding="utf-8"))
+        ledger_payload = _validate_strict_english_ledger_payload(
+            json.loads((en_stage / Path(ledger["path"]).name).read_text(encoding="utf-8")),
+            ledger["stem"], f"{ledger['stem']} English ledger")
         segments = [segment for segment in ledger_payload.get("segments", [])
                     if isinstance(segment, dict)]
         entries.append({"stem": ledger["stem"], "ledger": ledger,
@@ -6403,9 +8187,8 @@ def write_strict_replay_english_import(
             != str(parent_english_manifest_path)):
         raise ValueError("English parent_global_manifest path must be normalized")
     parent_payload = _json.loads(parent_english_manifest_path.read_text(encoding="utf-8"))
-    if (parent_payload.get("schema") != "strict-en-mfa-v1"
-            or parent_payload.get("strict_provenance") is not True):
-        raise ValueError("English parent manifest schema/provenance invalid")
+    _validate_strict_english_manifest_payload(parent_payload,
+                                              "English parent manifest")
     assets = payload.get("assets")
     if not isinstance(assets, list) or len({row.get("stem") for row in assets}) != len(assets):
         raise ValueError("replay asset membership duplicate/malformed")
@@ -6470,8 +8253,8 @@ def write_strict_replay_english_import(
         if ledger_path.is_symlink() or not ledger_path.is_file() or not ledger_path.is_relative_to(workspace):
             raise ValueError(f"ledger path invalid: {stem}")
         ledger_payload = _json.loads(ledger_path.read_text(encoding="utf-8"))
-        if ledger_payload.get("schema") != "strict-en-mfa-v1" or ledger_payload.get("stem") != stem:
-            raise ValueError(f"ledger schema/stem invalid: {stem}")
+        _validate_strict_english_ledger_payload(
+            ledger_payload, stem, f"{stem} English ledger")
         source_tgs = []
         for key in ("ctc",):
             tg = row.get("assets", {}).get(key, {}).get(".TextGrid")
@@ -6487,8 +8270,12 @@ def write_strict_replay_english_import(
                 raise ValueError(f"aligned TextGrid path invalid: {stem}")
             source_tgs.append({"path": str(ap.relative_to(workspace)), "sha256": _sha256_file(ap)})
         records.append({"stem": stem, "status": "english_required",
+                        "schema": STRICT_ENGLISH_SCHEMA,
+                        "canonical_units": CANONICAL_ENGLISH_UNITS_SCHEMA,
                         "ledger": {"path": str(ledger_path.relative_to(workspace)),
-                                   "sha256": _sha256_file(ledger_path), "schema": ledger_payload["schema"]},
+                                   "sha256": _sha256_file(ledger_path),
+                                   "schema": ledger_payload["schema"],
+                                   "canonical_units": ledger_payload["canonical_units"]},
                         "source_textgrids": source_tgs,
                         "validation": copy.deepcopy(row.get("english", {}).get("validation", {}))})
     if records != sorted(records, key=lambda item: item["stem"]) or len({r["stem"] for r in records}) != len(records):
@@ -6508,6 +8295,8 @@ def write_strict_replay_english_import(
     def digest(values: list[str]) -> str:
         return stable_json_digest(sorted(values))
     result = {"schema": STRICT_REPLAY_ENGLISH_IMPORT_SCHEMA, "scope": "strict_replay",
+              "english_schema": STRICT_ENGLISH_SCHEMA,
+              "canonical_units": CANONICAL_ENGLISH_UNITS_SCHEMA,
               "run_id": "strict-replay", "timestamp_utc": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "canonical_manifest_path": str(cpath), "canonical_manifest_sha256": STRICT_REPLAY_CANONICAL_SHA256,
               "replay_import_manifest_path": str(import_path), "replay_import_manifest_sha256": import_hash,
@@ -6599,6 +8388,12 @@ def run_strict_replay(args, cfg: dict, config_path: Path) -> int:
         en_root = _strict_replay_root(Path(args.strict_replay_en_dir), "English root")
         canonical, slots = _strict_replay_canonical(Path(args.strict_replay_manifest))
         selected_slots, selector = _strict_replay_select_pilot(canonical, slots, bool(args.strict_replay_pilot))
+        en_manifest = _strict_replay_file(
+            en_root / "en_alignment_manifest.json", en_root,
+            "English producer manifest")
+        _validate_strict_english_manifest_payload(
+            json.loads(en_manifest.read_text(encoding="utf-8")),
+            "English producer manifest")
         workspace.mkdir(parents=True, exist_ok=False)
         output.mkdir(parents=True, exist_ok=False)
     except (OSError, ValueError) as exc:
@@ -6639,21 +8434,25 @@ def run_strict_replay(args, cfg: dict, config_path: Path) -> int:
                 else:
                     bundle["aligned"] = {"status": "missing_mfa", "reason": "missing_mfa_alignment"}
                     missing_mfa.append(stem)
-                en_manifest = _strict_replay_file(en_root / "en_alignment_manifest.json", en_root, "English producer manifest")
                 ledger = _strict_replay_file(en_root / f"{stem}_en_phones.json", en_root, f"{stem} English ledger")
+                ledger_payload = _validate_strict_english_ledger_payload(
+                    json.loads(ledger.read_text(encoding="utf-8")),
+                    stem, f"{stem} English ledger")
                 bundle["english"] = {
                     "producer_manifest": _strict_replay_copy(en_manifest, workspace / "inputs" / stem / "english" / en_manifest.name, "English producer manifest"),
                     "ledger": _strict_replay_copy(ledger, workspace / "inputs" / stem / "english" / ledger.name, f"{stem} English ledger"),
                 }
                 try:
                     em = json.loads(en_manifest.read_text(encoding="utf-8"))
-                    ledger_payload = json.loads(ledger.read_text(encoding="utf-8"))
                     bundle["english"]["validation"] = {
                         "manifest_schema": em.get("schema"), "manifest_status": em.get("status"),
                         "ledger_schema": ledger_payload.get("schema"), "ledger_stem": ledger_payload.get("stem"),
+                        "canonical_units": ledger_payload.get("canonical_units"),
                         "source_manifest_sha256": em.get("source_manifest_sha256", em.get("source_manifest_hash", _sha256_file(en_manifest))),
                         "producer_manifest_sha256": em.get("producer_manifest_sha256", em.get("producer_manifest_hash", _sha256_file(en_manifest))),
-                        "valid": ledger_payload.get("stem") == stem,
+                        "valid": (ledger_payload.get("stem") == stem
+                                  and ledger_payload.get("schema") == STRICT_ENGLISH_SCHEMA
+                                  and ledger_payload.get("canonical_units") == CANONICAL_ENGLISH_UNITS_SCHEMA),
                     }
                 except Exception as exc:
                     raise ValueError(f"English provenance validation failed for {stem}: {exc}") from exc
@@ -6957,6 +8756,8 @@ def main() -> int:
                         help="Select the frozen 24-slot strict_replay pilot subset.")
     parser.add_argument("--filtered-recovery-parent-root", type=str, default=None,
                         help="Read-only sealed parent root for filtered_recovery.")
+    parser.add_argument("--filtered-recovery-package", type=str, default=None,
+                        help="Explicit preflighted frozen-262 recovery package.")
     parser.add_argument("--filtered-recovery-strict-id", type=str, default=None,
                         help="Opaque sealed-parent strict run identifier for evidence binding.")
     parser.add_argument("--filtered-recovery-frozen-manifest", type=str, default=None,
@@ -7078,6 +8879,21 @@ def main() -> int:
     # create ordinary production workspaces, discover caches, or execute any
     # acoustic/postprocess step.  All paths and assets are frozen by the
     # dedicated import routine above.
+    if cfg.get("require_fresh_workspace") is True and mode in (
+            "strict_replay", "filtered_recovery", "mfa_retry", "mfa_rescue"):
+        special_workspace = (
+            args.workspace or getattr(args, "mfa_retry_workspace", None)
+            or getattr(args, "mfa_rescue_workspace", None))
+        if special_workspace:
+            try:
+                guard_fresh_workspace_targets(
+                    resolve_input_path(special_workspace, PROJECT_ROOT),
+                    resolve_input_path(args.output_dir, PROJECT_ROOT)
+                    if args.output_dir else None,
+                    required=True, mode=mode)
+            except ValueError as exc:
+                print(f"ERROR: {exc}")
+                return 1
     if mode == "strict_replay":
         return run_strict_replay(args, cfg, config_path)
     if mode == "filtered_recovery":
@@ -7260,7 +9076,6 @@ def main() -> int:
             if not sub_ws_name.isascii():
                 sub_ws_name = __import__('re').sub(r'[^\x00-\x7F]+', '_', sub_ws_name).strip('_') or "workspace"
             sub_workspace = sub_output_root / sub_ws_name
-            sub_workspace.mkdir(parents=True, exist_ok=True)
 
             # Resolve paths for this dataset
             sub_data_dir = resolve_input_path(sub_cfg["data_dir"], PROJECT_ROOT)
@@ -7268,12 +9083,33 @@ def main() -> int:
             sub_output_dir = resolve_input_path(sub_cfg.get("output_dir", "output"), sub_workspace)
             if not sub_output_dir.is_absolute():
                 sub_output_dir = sub_workspace / sub_cfg.get("output_dir", "output")
+            try:
+                guard_fresh_workspace_targets(
+                    sub_workspace, sub_output_dir,
+                    required=sub_cfg.get("require_fresh_workspace") is True,
+                    mode="batch_ctc_ready")
+            except ValueError as exc:
+                print(f"  ERROR: {ds_name} fresh target rejected: {exc}")
+                fail_list.append(ds_name)
+                continue
+            sub_workspace.mkdir(parents=True, exist_ok=True)
             sub_aligned_dir = sub_workspace / sub_cfg.get("aligned_dir", "aligned")
             sub_filtered_dir = sub_workspace / sub_cfg.get("filtered_dir", "filtered")
             sub_validate_dir = sub_workspace / sub_cfg.get("validate_dir", "validate")
             sub_temp_dir = sub_workspace / sub_cfg.get("temp_dir", "temp")
             sub_ctc_pretg = sub_workspace / sub_cfg.get("ctc_pretg", "ctc_pretg")
             sub_ctc_pretg_adj = sub_workspace / sub_cfg.get("ctc_pretg_adj", "ctc_pretg_adj")
+            try:
+                sub_en_phones_dir = resolve_workspace_namespace(
+                    sub_workspace, sub_cfg.get("mfa_en", {}).get("output_dir", "en_phones"),
+                    "mfa_en.output_dir")
+                sub_en_mfa_temp_dir = resolve_workspace_namespace(
+                    sub_workspace, sub_cfg.get("mfa_en", {}).get("temp_dir", "temp_en_mfa"),
+                    "mfa_en.temp_dir")
+            except ValueError as exc:
+                print(f"  ERROR: {ds_name} English namespace rejected: {exc}")
+                fail_list.append(ds_name)
+                continue
 
             for d in [sub_output_dir, sub_aligned_dir, sub_filtered_dir,
                        sub_validate_dir, sub_temp_dir, sub_ctc_pretg,
@@ -7295,6 +9131,8 @@ def main() -> int:
                 "mfa_audio_dir": sub_workspace / "audio_16k",
                 "ctc_pretg": sub_ctc_pretg,
                 "ctc_pretg_adj": sub_ctc_pretg_adj,
+                "en_phones_dir": sub_en_phones_dir,
+                "en_mfa_temp_dir": sub_en_mfa_temp_dir,
                 # In ctc_ready mode the reference may be external.  If no
                 # external directory is configured, step_link_ctc copies it
                 # as *_ref.txt into the workspace CTC directory.
@@ -7366,18 +9204,36 @@ def main() -> int:
     if _strict_ready:
         workspace = _strict_workspace
         try:
+            requested_output = resolve_input_path(
+                args.output_dir or cfg.get("output_dir", "output"), workspace)
+            guard_fresh_workspace_targets(
+                workspace, requested_output,
+                required=cfg.get("require_fresh_workspace") is True,
+                mode=mode)
             workspace.mkdir(parents=True, exist_ok=False)
-        except FileExistsError:
-            print(f"ERROR: strict workspace raced/preexists: {workspace}")
+        except (FileExistsError, ValueError) as exc:
+            print(f"ERROR: strict fresh target rejected: {exc}")
             return 1
     elif args.workspace:
-        workspace = Path(args.workspace)
-        if not workspace.is_absolute():
-            workspace = PROJECT_ROOT / workspace
+        try:
+            workspace = validate_workspace_target(
+                resolve_input_path(args.workspace, PROJECT_ROOT))
+        except (OSError, ValueError) as exc:
+            print(f"ERROR: invalid workspace path: {exc}")
+            return 1
+        raw_output = args.output_dir or cfg.get("output_dir", "output")
+        requested_output = resolve_input_path(raw_output, workspace)
+        try:
+            guard_fresh_workspace_targets(
+                workspace, requested_output,
+                required=cfg.get("require_fresh_workspace") is True,
+                mode=mode)
+        except ValueError as exc:
+            print(f"ERROR: {exc}")
+            return 1
         workspace.mkdir(parents=True, exist_ok=True)
     else:
         output_root = PROJECT_ROOT / "output"
-        output_root.mkdir(parents=True, exist_ok=True)
         workspace_name = cfg.get("workspace", "default")
         # MFA's C++ backend (pywrapfst) does not support non-ASCII paths on
         # Windows.  Warn and fall back to a safe ASCII name if needed.
@@ -7388,6 +9244,16 @@ def main() -> int:
             print(f"  MFA cannot handle Unicode paths. Using '{safe}' instead.")
             workspace_name = safe
         workspace = output_root / workspace_name
+        raw_output = args.output_dir or cfg.get("output_dir", "output")
+        requested_output = resolve_input_path(raw_output, workspace)
+        try:
+            guard_fresh_workspace_targets(
+                workspace, requested_output,
+                required=cfg.get("require_fresh_workspace") is True,
+                mode=mode)
+        except ValueError as exc:
+            print(f"ERROR: {exc}")
+            return 1
         workspace.mkdir(parents=True, exist_ok=True)
 
     # Input: apply UNC->Linux translation, then resolve relative to PROJECT_ROOT
@@ -7547,6 +9413,17 @@ def main() -> int:
         print("No steps to run.")
         return 0
 
+    try:
+        en_phones_dir = resolve_workspace_namespace(
+            workspace, cfg.get("mfa_en", {}).get("output_dir", "en_phones"),
+            "mfa_en.output_dir")
+        en_mfa_temp_dir = resolve_workspace_namespace(
+            workspace, cfg.get("mfa_en", {}).get("temp_dir", "temp_en_mfa"),
+            "mfa_en.temp_dir")
+    except ValueError as exc:
+        print(f"ERROR: English namespace rejected: {exc}")
+        return 1
+
     # Only create dirs needed by the steps being run
     _ctc_pretg_dir = workspace / cfg.get("ctc_pretg", "ctc_pretg")
     _ctc_pretg_adj_dir = workspace / cfg.get("ctc_pretg_adj", "ctc_pretg_adj")
@@ -7559,7 +9436,7 @@ def main() -> int:
         "adjust": [_ctc_pretg_adj_dir],
         "validate": [validate_dir, temp_dir, _ctc_pretg_dir],
         "align": [aligned_dir, temp_dir, _ctc_pretg_dir],
-        "align_en": [workspace / "en_phones", temp_dir],
+        "align_en": [en_phones_dir, en_mfa_temp_dir],
         "postprocess": [output_dir, filtered_dir],
         "strict_ok": [output_dir, filtered_dir],
     }
@@ -7589,6 +9466,19 @@ def main() -> int:
         "temp_dir": temp_dir, "mfa_dict": mfa_dict,
         "workspace": workspace,
         "mode": mode,
+        "config": cfg,
+        "config_path": config_path,
+        "mfa_python": str(mfa_python),
+        "reference_mode": resolve_reference_mode(cfg),
+        # Freeze the route shape before any resume/manifest fast path.  The
+        # link step refreshes this from the validated eligible set; keeping
+        # the flag in ctx also prevents a resumed explicit subset from
+        # falling back to full-directory resampling.
+        "ctc_ready_subset": (
+            mode == "ctc_ready"
+            and (cfg.get("ctc_ready", {}).get("stems") is not None
+                 or cfg.get("ctc_ready", {}).get("stem_range") is not None)
+        ),
         "strict_ready": _strict_ready,
         # v2 accounting is mandatory for pipeline execution/resume.  Direct
         # unit callers that omit this flag retain legacy fixture behaviour.
@@ -7602,9 +9492,19 @@ def main() -> int:
         # replaced by validated receipt-bound paths once each stage freezes.
         "mfa_axis_audio_dir": workspace / "audio_16k",
         "tts_authoritative_audio_dir": audio_dir,
+        # Bind existing axis receipts as soon as a resumed run is created.
+        # Full runs overwrite these paths after prealign/align; postprocess
+        # resumes must still pass the same explicit evidence instead of
+        # treating a valid prior stage as unavailable.
+        "mfa_input_axis_receipt_path": (
+            workspace / ".mfa_input_axis_receipt.json"),
+        "mfa_alignment_axis_receipt_path": (
+            workspace / ".mfa_alignment_axis_receipt.json"),
         "axis_contract_required": True,
         "ctc_pretg": workspace / cfg.get("ctc_pretg", "ctc_pretg"),
         "ctc_pretg_adj": workspace / cfg.get("ctc_pretg_adj", "ctc_pretg_adj"),
+        "en_phones_dir": en_phones_dir,
+        "en_mfa_temp_dir": en_mfa_temp_dir,
         # Keep the reference transcript available to postprocess.  Full and
         # fallback modes read {stem}.txt from data_dir; ctc_ready uses the
         # configured external text_dir or the linked *_ref.txt files.
@@ -7615,6 +9515,30 @@ def main() -> int:
                   if mode == "ctc_ready" else data_dir)
         ),
     }
+    # A resumed postprocess/strict-ok invocation has not executed pad_silence,
+    # so its default TTS root is the input directory.  Rebind it to the root
+    # frozen by the existing MFA input-axis receipt; the receipt remains the
+    # authority and _axis_interface_args performs the full validation.
+    _existing_axis = ctx["mfa_input_axis_receipt_path"]
+    try:
+        if _existing_axis.is_file() and not _existing_axis.is_symlink():
+            _axis_payload = json.loads(_existing_axis.read_text(encoding="utf-8"))
+            _declared_tts = Path(str(_axis_payload.get("tts_authoritative_audio_root", "")))
+            if _declared_tts.is_absolute() and _declared_tts.is_dir():
+                ctx["tts_authoritative_audio_dir"] = _declared_tts
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+
+    # Later-stage resumes still need the same frozen pre-CTC denominator that
+    # resample would have loaded in a fresh route.  Restore it before
+    # postprocess/strict accounting; otherwise a valid 1,000-item selection
+    # is mistaken for an unbounded source universe.
+    if (args.skip_to and args.skip_to not in {"trim", "resample", "prealign"}
+            and mode in ("nvrasr_fallback", "full")
+            and not ctx.get("expected_stems")):
+        if _freeze_pre_ctc_stems(cfg, ctx) is None:
+            print("ERROR: unable to restore frozen pre-CTC denominator for resume")
+            return 1
 
     failed = []
     for step_name in run_list:
@@ -7739,13 +9663,31 @@ def main() -> int:
     _eligible_set = set(_eligible_stems)
     _observed_filtered = (set(_filtered_stems) | (_eligible_set - set(_output_stems))) & _eligible_set
     try:
+        _pipeline_extra = {"failed_steps": list(failed), "source_frozen": True}
+        if isinstance(ctx.get("pre_ctc_selection"), dict):
+            _pipeline_extra["pre_ctc_selection"] = ctx["pre_ctc_selection"]
+        _filtered_reason_map = ctx.get("filtered_reason_map", {})
+        if isinstance(_filtered_reason_map, dict) and _filtered_reason_map:
+            _pipeline_extra["filtered_reasons"] = {
+                str(reason): sorted(set(str(stem) for stem in stems))
+                for reason, stems in _filtered_reason_map.items()
+                if isinstance(stems, (list, tuple, set))
+            }
         _pipeline_accounting = make_pipeline_accounting_receipt(
             source_stems=list(_input_stems), eligible_stems=list(_eligible_stems),
             exclusions=_exclusions, output_stems=_output_stems,
             filtered_stems=sorted(_observed_filtered), run_id=_run_id, mode=mode,
             route=run_list,
             paths={"output": str(output_dir), "filtered": str(filtered_dir)},
-            extra={"failed_steps": list(failed), "source_frozen": True},
+            extra=_pipeline_extra,
+            fingerprints=_pipeline_resume_fingerprints(
+                ctx, cfg,
+                outputs={
+                    "output": _path_fingerprint(output_dir),
+                    "filtered": _path_fingerprint(filtered_dir),
+                    "strict_manifest": _path_fingerprint(
+                        output_dir / "strict_ok_manifest.json"),
+                }),
         )
         write_pipeline_accounting_receipt(output_dir, _pipeline_accounting)
     except (TypeError, ValueError) as exc:

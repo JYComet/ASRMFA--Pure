@@ -10,6 +10,7 @@ the command is not a repair tool and never deletes an input result.
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import hashlib
 import json
 import math
@@ -29,11 +30,27 @@ from pipeline_utils import (  # noqa: E402
     PIPELINE_ACCOUNTING_SCHEMA, read_pipeline_accounting_receipt,
     validate_pipeline_accounting_receipt,
     stable_json_digest,
+    CTC_RAW_MANIFEST_NAME, CTC_WORK_RECEIPT_NAME,
+    validate_ctc_raw_manifest, validate_ctc_work_receipt,
+    normalize_authority_reference_numerals,
+    _axis_audio_metadata,
 )
-from postprocess_textgrids import parse_textgrid  # noqa: E402
+from english_units import (  # noqa: E402
+    EnglishUnitError, canonicalize_english_token, is_english_fragment_token,
+    parse_english_units,
+    project_authority_semantics,
+    resolve_processed_english_token,
+    validate_processed_english_token_binding,
+)
+from postprocess_textgrids import parse_textgrid, tier_by_name  # noqa: E402
 
 POLICY_VERSION = "strict-ok-v3.2"
-EN_PROVENANCE_SCHEMA = "strict-en-mfa-v1"
+EN_PROVENANCE_SCHEMA = "strict-en-mfa-v2"
+HISTORICAL_EN_PROVENANCE_SCHEMA = "strict-en-mfa-v1"
+CANONICAL_UNITS_SCHEMA = "canonical-english-units-v1"
+SOS_PRONUNCIATION_POLICY_ID = "sos-exact-override-v1"
+SOS_EXPECTED_PRONUNCIATION = ("EH2", "S", "OW2", "EH1", "S")
+APP_EXPECTED_PRONUNCIATION = ("AE1", "P")
 STRICT_REPLAY_SCHEMA = "strict-replay-import-v2.1"
 STRICT_REPLAY_CANONICAL_SCHEMA = "mfa-quality-canonical-samples-v1"
 STRICT_REPLAY_CANONICAL_SHA256 = "d88b9ac874283dbc67dc38003fb78d872b799597ce940175a8301f78aa2c5bcf"
@@ -44,9 +61,52 @@ MFA_ALIGNMENT_AXIS_SCHEMA = "mfa-alignment-axis-receipt-v1"
 MFA_ALIGNMENT_AXIS_V2_SCHEMA = "mfa-alignment-axis-receipt-v2"
 _CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _NVV = re.compile(r"<([A-Za-z][A-Za-z-]*)>")
-_ENGLISH = re.compile(r"[A-Za-z]+")
+_ENGLISH = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)*")
 _PINYIN = re.compile(r"^[a-z]+[1-5]$")
 _SP1 = re.compile(r"<sp1>", re.I)
+_UNKNOWN_REPAIR_PROOF_SCHEMA = "mfa-unknown-recovery-proof-v1"
+_EVIDENCE_REPAIR_SCHEMA = "evidence-constrained-repair-v1"
+CTC_LIFECYCLE_SCHEMA = "ctc-processed-input-lifecycle-v1"
+PROCESSED_GEOMETRY_SCHEMA = "processed-words-geometry-v1"
+
+
+def _canonicalize_reference_hyphens(text: str) -> str:
+    """Remove lexical ASCII hyphens without changing bracketed NVV labels."""
+    result: list[str] = []
+    in_angle_label = False
+    for char in str(text):
+        if char == "<":
+            in_angle_label = True
+        elif char == ">":
+            in_angle_label = False
+        if char != "-" or in_angle_label:
+            result.append(char)
+    return "".join(result)
+
+
+def _evidence_digest(value: object) -> str:
+    return hashlib.sha256(json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+
+
+def _lexical_identity(value: object, *, ctc_item: dict | None = None) -> str:
+    """Mirror postprocess lexical identity for independent disk auditing."""
+    text = str(value or "").strip()
+    if isinstance(ctc_item, dict):
+        canonical = ctc_item.get("canonical_unit")
+        if isinstance(canonical, dict):
+            match_key = canonical.get("match_key")
+            if isinstance(match_key, str) and match_key:
+                return match_key.casefold()
+    if is_unknown_token(text):
+        return "<unknown>"
+    if is_english_token(text):
+        try:
+            return canonicalize_english_token(text)
+        except (EnglishUnitError, TypeError, ValueError):
+            pass
+    return text.casefold()
 _SILENCE = re.compile(r"<sp[0-3]>", re.I)
 _PUNCT_MAP = str.maketrans({",": "，", ".": "。", "?": "？", "!": "！", ";": "；", ":": "："})
 
@@ -93,12 +153,239 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _regular_json(path: Path, label: str) -> dict:
+    """Read a non-symlink JSON object from the explicitly bound workspace."""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} missing or symlink")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} is not an object")
+    return value
+
+
+def _ctc_lifecycle_reasons(
+        args: argparse.Namespace,
+        expected: set[str] | None = None) -> tuple[list[str], dict | None]:
+    """Independently bind immutable CTC raw bytes to mutable work bytes.
+
+    The audit deliberately accepts a completely unbound legacy fixture.  The
+    moment either lifecycle marker is present, however, all bindings are
+    mandatory and a changed raw artifact invalidates the complete candidate
+    set.  Equal content between raw and work is expected; equal inode identity
+    is not, because work must be a physical copy.
+    """
+    ctc_dir = Path(getattr(args, "ctc_dir", ""))
+    raw_arg = getattr(args, "ctc_raw_manifest", None)
+    work_arg = getattr(args, "ctc_work_receipt", None)
+    work_path = Path(work_arg) if work_arg is not None else ctc_dir / CTC_WORK_RECEIPT_NAME
+    raw_path = (Path(raw_arg) if raw_arg is not None
+                else (ctc_dir / CTC_RAW_MANIFEST_NAME
+                      if (ctc_dir / CTC_RAW_MANIFEST_NAME).exists() else None))
+    marker_present = (raw_path is not None or work_path.is_file()
+                      or work_path.is_symlink()
+                      or (raw_path is not None and (raw_path.is_file() or raw_path.is_symlink())))
+    if not marker_present:
+        return [], None
+
+    errors: list[str] = []
+    raw_manifest: dict | None = None
+    work_receipt: dict | None = None
+    if work_path.is_file() and not work_path.is_symlink():
+        try:
+            work_receipt = _regular_json(work_path, "CTC work receipt")
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            errors.append(f"ctc_work_receipt_unreadable:{exc}")
+    if raw_path is None and isinstance(work_receipt, dict):
+        binding = work_receipt.get("raw_manifest")
+        if isinstance(binding, dict) and isinstance(binding.get("path"), str):
+            raw_path = Path(binding["path"])
+    if raw_path is None:
+        errors.append("ctc_raw_manifest_binding_missing")
+    elif raw_path.is_file() and not raw_path.is_symlink():
+        try:
+            raw_manifest = _regular_json(raw_path, "CTC raw manifest")
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            errors.append(f"ctc_raw_manifest_unreadable:{exc}")
+    else:
+        errors.append("ctc_raw_manifest_missing_or_symlink")
+    if work_path.is_symlink() or not work_path.is_file():
+        errors.append("ctc_work_receipt_missing_or_symlink")
+
+    raw_dir = raw_path.parent if raw_path is not None else None
+    work_dir = work_path.parent
+    if raw_dir is not None and raw_dir.resolve() == work_dir.resolve():
+        errors.append("ctc_raw_work_alias")
+    if raw_manifest is not None and raw_dir is not None:
+        errors.extend(validate_ctc_raw_manifest(raw_dir, raw_manifest))
+        if raw_manifest.get("raw_root") != str(raw_dir.resolve()):
+            errors.append("ctc_raw_manifest_root_binding_mismatch")
+        producer = raw_manifest.get("producer_receipt")
+        if isinstance(producer, dict):
+            expected_producer = raw_dir / str(producer.get("name", ""))
+            if producer.get("path") != str(expected_producer.resolve()):
+                errors.append("ctc_producer_receipt_path_binding_mismatch")
+    if work_receipt is not None and raw_path is not None:
+        errors.extend(validate_ctc_work_receipt(work_dir, raw_path, work_receipt))
+        binding = work_receipt.get("raw_manifest")
+        if not isinstance(binding, dict):
+            errors.append("ctc_work_raw_manifest_binding_missing")
+        else:
+            if binding.get("path") != str(raw_path.resolve()):
+                errors.append("ctc_work_raw_manifest_path_mismatch")
+            if raw_path.is_file() and not raw_path.is_symlink():
+                if binding.get("sha256") != _sha256(raw_path):
+                    errors.append("ctc_work_raw_manifest_digest_mismatch")
+                if raw_manifest is not None and binding.get("identity") != raw_manifest.get("identity"):
+                    errors.append("ctc_work_raw_manifest_identity_mismatch")
+        if work_receipt.get("work_root") != str(ctc_dir.resolve()):
+            errors.append("ctc_work_receipt_root_binding_mismatch")
+        if not isinstance(work_receipt.get("transform_ledger"), list):
+            errors.append("ctc_work_receipt_lineage_missing")
+
+    # Validate that raw and work are independent physical trees.  Hashes may
+    # intentionally match after a copy; inode identity may never match.
+    if raw_manifest is not None and raw_dir is not None and raw_dir.resolve() != work_dir.resolve():
+        for row in raw_manifest.get("files", []):
+            if not isinstance(row, dict) or not isinstance(row.get("name"), str):
+                continue
+            raw_file = raw_dir / row["name"]
+            work_file = work_dir / row["name"]
+            if raw_file.is_symlink() or work_file.is_symlink():
+                errors.append(f"ctc_raw_work_symlink:{row['name']}")
+                continue
+            if raw_file.is_file() and work_file.is_file():
+                try:
+                    if os.path.samestat(raw_file.stat(), work_file.stat()):
+                        errors.append(f"ctc_raw_work_alias:{row['name']}")
+                except OSError:
+                    errors.append(f"ctc_raw_work_stat_unreadable:{row['name']}")
+
+    if any("hash mismatch" in item.lower() or "digest mismatch" in item.lower()
+           or "identity mismatch" in item.lower() for item in errors):
+        errors.append("ctc_raw_digest_mismatch")
+    lifecycle = None
+    if raw_manifest is not None and work_receipt is not None and raw_path is not None:
+        ledger = work_receipt.get("transform_ledger")
+        lifecycle = {
+            "schema": CTC_LIFECYCLE_SCHEMA,
+            "raw_manifest": {"path": str(raw_path.resolve()),
+                             "sha256": _sha256(raw_path),
+                             "identity": raw_manifest.get("identity")},
+            "work_receipt": {"path": str(work_path.resolve()),
+                              "sha256": _sha256(work_path),
+                              "identity": work_receipt.get("identity"),
+                              "lineage_entries": len(ledger) if isinstance(ledger, list) else 0},
+        }
+    return sorted(set(errors)), lifecycle
+
+
+def _processed_geometry_digest(tg) -> str:
+    words = tier_by_name(tg, "words")
+    # Match postprocess_textgrids.write_textgrid's six-decimal serializer.
+    rows = [{"xmin": round(float(interval.xmin), 6),
+             "xmax": round(float(interval.xmax), 6),
+             "text": interval.text}
+            for interval in (words.intervals if words is not None else [])]
+    return _evidence_digest(rows)
+
+
+def _postprocess_contract_reasons(
+        row: dict | None, tg, lifecycle: dict | None) -> list[str]:
+    """Check report identity and frozen final geometry against disk."""
+    if not isinstance(row, dict):
+        return ["postprocess_report_missing"] if lifecycle is not None else []
+    fields_present = any(key in row for key in (
+        "ctc_lifecycle", "processed_geometry", "processed_geometry_digest",
+        "processed_operation_ledger"))
+    if lifecycle is None and not fields_present:
+        return []
+    reasons: list[str] = []
+    reported_lifecycle = row.get("ctc_lifecycle")
+    if lifecycle is not None:
+        if not isinstance(reported_lifecycle, dict):
+            reasons.append("postprocess_raw_work_identity_missing")
+        else:
+            for section in ("raw_manifest", "work_receipt"):
+                expected = lifecycle[section]
+                actual = reported_lifecycle.get(section)
+                if not isinstance(actual, dict):
+                    reasons.append(f"postprocess_{section}_identity_missing")
+                    continue
+                for key in ("path", "sha256", "identity"):
+                    if actual.get(key) != expected[key]:
+                        reasons.append(f"postprocess_{section}_{key}_mismatch")
+
+    geometry = row.get("processed_geometry")
+    digest = row.get("processed_geometry_digest")
+    ledger = row.get("processed_operation_ledger")
+    if not isinstance(geometry, dict):
+        reasons.append("processed_geometry_missing")
+        return sorted(set(reasons))
+    if geometry.get("schema") != PROCESSED_GEOMETRY_SCHEMA:
+        reasons.append("processed_geometry_schema_mismatch")
+    if geometry.get("frozen") is not True:
+        reasons.append("processed_geometry_not_frozen")
+    if not isinstance(digest, str) or not digest:
+        reasons.append("processed_geometry_digest_missing")
+    if not isinstance(ledger, list) or not ledger:
+        reasons.append("processed_operation_ledger_missing")
+    if geometry.get("digest") != digest or geometry.get("ledger") != ledger:
+        reasons.append("processed_geometry_report_binding_mismatch")
+    geometry_contract = row.get("processed_geometry_contract")
+    if isinstance(geometry_contract, dict) and geometry_contract.get("status") == "rejected":
+        reasons.extend(f"processed_geometry_contract:{item}"
+                       for item in geometry_contract.get("reasons", [])
+                       if isinstance(item, str))
+        if not geometry_contract.get("reasons"):
+            reasons.append("processed_geometry_contract:rejected")
+    if not any(isinstance(item, dict) and item.get("operation") == "boundary_freeze"
+               for item in (ledger if isinstance(ledger, list) else [])):
+        reasons.append("processed_geometry_freeze_operation_missing")
+    publication = row.get("publication_contract")
+    if isinstance(publication, dict):
+        if publication.get("status") != "verified":
+            reasons.append("publication_contract_not_verified")
+        if publication.get("reasons"):
+            reasons.append("publication_contract_has_reasons")
+    if tg is not None:
+        actual_digest = _processed_geometry_digest(tg)
+        if digest != actual_digest:
+            reasons.append("processed_geometry_digest_mismatch")
+
+        # The publication proof is deliberately based on final ``word_span``
+        # (or its explicit ``published_span`` alias).  ``resolved_span`` is
+        # historical evidence only and is never accepted as authority.
+        publication = row.get("publication_contract")
+        details = (publication.get("details", {})
+                   if isinstance(publication, dict) else {})
+        proofs = details.get("ctc_lexical_evidence_proof", [])
+        words = tier_by_name(tg, "words")
+        lexical = [iv for iv in (words.intervals if words is not None else [])
+                   if iv.text.strip() and not is_silence(iv.text) and not is_punct(iv.text)]
+        if not isinstance(proofs, list) or len(proofs) != len(lexical):
+            reasons.append("processed_published_span_binding_missing")
+        else:
+            for index, (proof, interval) in enumerate(zip(proofs, lexical)):
+                if not isinstance(proof, dict):
+                    reasons.append(f"processed_published_span_invalid:{index}")
+                    continue
+                span = proof.get("published_span", proof.get("word_span"))
+                if "published_span" not in proof and "word_span" not in proof:
+                    reasons.append(f"processed_published_span_missing:{index}")
+                    continue
+                try:
+                    if (len(span) != 2 or not _same_number(interval.xmin, span[0])
+                            or not _same_number(interval.xmax, span[1])):
+                        reasons.append(f"processed_published_span_mismatch:{index}")
+                except (TypeError, ValueError):
+                    reasons.append(f"processed_published_span_invalid:{index}")
+                if "published_span" not in proof and "resolved_span" in proof and "word_span" not in proof:
+                    reasons.append(f"resolved_span_not_publication_authority:{index}")
+    return sorted(set(reasons))
+
+
 def _wav_duration(path: Path) -> float:
-    with wave.open(str(path), "rb") as handle:
-        rate = handle.getframerate()
-        if rate <= 0:
-            raise ValueError("non-positive WAV sample rate")
-        return handle.getnframes() / rate
+    return float(_axis_audio_metadata(path)["duration_s"])
 
 
 def _axis_digest(value: object) -> str:
@@ -106,14 +393,11 @@ def _axis_digest(value: object) -> str:
 
 
 def _axis_wav_meta(path: Path) -> dict:
-    with wave.open(str(path), "rb") as handle:
-        rate = handle.getframerate()
-        frames = handle.getnframes()
-        if rate <= 0:
-            raise ValueError("invalid WAV sample rate")
-        return {"sha256": _sha256(path), "duration_s": frames / rate,
-                "sample_rate": rate, "frames": frames,
-                "channels": handle.getnchannels(), "sample_width": handle.getsampwidth()}
+    # Keep the auditor independent from postprocess while sharing the generic
+    # immutable audio-header reader used to create the axis receipts.  It
+    # preserves stdlib wave semantics for PCM and narrowly supports IEEE-float
+    # WAV/WAVEX through libsndfile.
+    return _axis_audio_metadata(path)
 
 
 def _axis_contract_reasons(args: argparse.Namespace,
@@ -150,8 +434,7 @@ def _axis_contract_reasons(args: argparse.Namespace,
     stems_valid = (isinstance(stems, list)
                    and all(isinstance(stem, str) and stem for stem in stems))
     if (not stems_valid or stems != sorted(set(stems))
-            or input_axis.get("stems_digest") != _axis_digest(stems)
-            or set(stems) != set(expected)):
+            or input_axis.get("stems_digest") != _axis_digest(stems)):
         errors.append("axis_stem_conservation_invalid")
         stems = []
     if Path(str(input_axis.get("axis_root", ""))).resolve() != mfa_root.resolve():
@@ -204,6 +487,21 @@ def _axis_contract_reasons(args: argparse.Namespace,
             errors.append("mfa_alignment_axis_status_partition_mismatch")
     else:
         return sorted(set(errors)), stem_reasons
+    # The immutable MFA input axis covers the full source set.  A v2
+    # alignment receipt may explicitly exclude stems for which MFA emitted no
+    # TextGrid; those stems are accounted for as exclusions in the pipeline
+    # receipt and must not make the axis look corrupt.  The strict candidate
+    # set is therefore the aligned partition, while the axis set remains the
+    # full source partition.
+    expected_axis_stems = (set(stems) if alignment_schema == MFA_ALIGNMENT_AXIS_SCHEMA
+                           else set(stems) - missing_stems)
+    # Production postprocess may retain explicit missing-MFA placeholders in
+    # the eligible/filtered partition, while replay receipts may model those
+    # same stems as exclusions.  Both are valid only when the v2 receipt and
+    # the missing-alignment ledger conserve the full axis; reject any other
+    # subset.
+    if set(expected) not in (set(stems), expected_axis_stems):
+        errors.append("axis_stem_conservation_invalid")
     input_by_stem = {row["stem"]: row for row in input_rows if isinstance(row, dict) and "stem" in row}
     align_by_stem = {row["stem"]: row for row in aligned_rows if isinstance(row, dict) and "stem" in row}
     if len(input_by_stem) != len(stems) or len(align_by_stem) != len(stems) - len(missing_stems):
@@ -264,12 +562,18 @@ def _axis_contract_reasons(args: argparse.Namespace,
             except (OSError, ValueError, TypeError, KeyError):
                 reasons.append("mfa_alignment_axis_mismatch")
         try:
-            tts = tts_root / f"{stem}.wav"
+            # TTS audio can be nested by speaker; the transform receipt binds
+            # this stem to its actual source path while MFA keeps a flat axis.
+            transform = transforms.get(stem)
+            transform_input = (transform.get("input", {})
+                               if isinstance(transform, dict) else {})
+            bound_tts = Path(str(transform_input.get("path", "")))
+            tts = (bound_tts if bound_tts.is_absolute()
+                   else tts_root / f"{stem}.wav")
             tts_meta = _axis_wav_meta(tts)
             identity = all(tts_meta[key] == actual[key]
                            for key in ("sha256", "sample_rate", "frames", "channels", "sample_width")) and abs(
                                tts_meta["duration_s"] - actual["duration_s"]) <= EPS
-            transform = transforms.get(stem)
             if transform is not None:
                 inp, out = transform.get("input"), transform.get("output")
                 valid_transform = (
@@ -294,41 +598,24 @@ def _axis_contract_reasons(args: argparse.Namespace,
 
 def _semantic_tokens(text: str) -> list[tuple[str, str]]:
     """Return ordered CJK/NVV/punctuation/English tokens, excluding silence."""
-    # Canonical silence labels are non-lexical alignment artifacts.  Strip
-    # all ``<spN>`` labels before semantic tokenization so punctuation-adjacent
-    # ``<sp2>`` cannot become a spurious English/other token sequence.
-    text = _SILENCE.sub("", text).translate(_PUNCT_MAP)
-    result: list[tuple[str, str]] = []
-    index = 0
-    while index < len(text):
-        char = text[index]
-        if char.isspace():
-            index += 1
-            continue
-        nvv = _NVV.match(text, index)
-        if nvv:
-            label = nvv.group(1).upper()
-            if is_nvv_token(label):
-                result.append(("nvv", label))
-            else:
-                result.append(("other", nvv.group(0)))
-            index = nvv.end()
-            continue
-        english = _ENGLISH.match(text, index)
-        if english:
-            word = english.group(0)
-            if not is_nvv_token(word):
-                result.append(("english", word.lower()))
-            index = english.end()
-            continue
-        if _CJK.fullmatch(char):
-            result.append(("cjk", char))
-        elif is_punct(char):
-            result.append(("punct", char))
-        elif char not in "<>[]":
-            result.append(("other", char))
-        index += 1
-    return result
+    return [(item["kind"], item["surface"].casefold()
+             if item["kind"] == "english" else item["surface"])
+            for item in project_authority_semantics(text)]
+
+
+def _semantic_sequence_compatible(reference: list[tuple[str, str]],
+                                  observed: list[tuple[str, str]]) -> bool:
+    """Allow missing reference punctuation, but reject all other drift."""
+    cursor = 0
+    for actual in observed:
+        while (cursor < len(reference)
+               and reference[cursor][0] == "punct"
+               and reference[cursor] != actual):
+            cursor += 1
+        if cursor >= len(reference) or reference[cursor] != actual:
+            return False
+        cursor += 1
+    return all(kind == "punct" for kind, _ in reference[cursor:])
 
 
 def _tier_text(tier) -> str:
@@ -458,20 +745,47 @@ def _report_reasons(row: dict) -> list[str]:
     # bookkeeping that postprocess emits for every corrected-but-valid stem.
     allowed = {
         "stem", "status", "output", "textgrid_duration", "reference_source",
-        "reference_text_authoritative", "reference_coverage", "warnings",
+        "reference_mode", "reference_text_authoritative", "fallback_transcript",
+        "reference_coverage", "warnings",
         "hard_integrity_reasons", "filter_reasons", "alignment_issues",
         "english_provenance", "silence_merges", "pp_deoverlap_fixed",
         "text_corrected", "pinyin_displacement", "text_order",
-        "sp3",
+        "sp3", "mfa_unknown_source_redeemed", "evidence_repairs",
+        "fallback_lexical_alignment", "cjk_details",
+        "ctc_lifecycle", "processed_geometry_contract",
+        "processed_geometry_digest", "processed_operation_ledger",
+        "processed_geometry", "publication_contract",
+        # Evidence/bookkeeping fields are positive provenance, not QC vetoes.
+        # They are independently checked through the reference, CTC, English
+        # ledger, and publication contracts below.
+        "authority_compound_reconciliation", "english_surface_units_restored",
+        "reference_numeral_normalization", "reference_text_normalized",
+        "reference_text_original_raw", "reference_text_raw_sha256",
+        "visual_reference_digest", "word_energy_audit", "swallowed_punct",
+        "terminal_punctuation_tail_absorption", "punctuation_gap_restorations",
     }
     coverage = row.get("reference_coverage") or {}
     displacement = row.get("pinyin_displacement") or {}
     order = row.get("text_order") or {}
+    fallback_safe = (
+        row.get("reference_mode") == "fallback"
+        and coverage.get("reference_validation_applied") is False
+        and (row.get("fallback_lexical_alignment") or {}).get("safe") is True
+    )
+    authority_text_corrected_ok = (
+        coverage.get("exact_cjk_sequence") is True
+        and displacement.get("mismatch_rate") == 0.0
+        and displacement.get("displacement_runs") == 0
+        and order.get("in_order") is True
+    )
+    fallback_text_corrected_ok = (
+        fallback_safe
+        and displacement.get("mismatch_rate", 0.0) == 0.0
+        and displacement.get("displacement_runs", 0) == 0
+        and (not order or order.get("in_order") is True)
+    )
     if row.get("text_corrected") and not (
-            coverage.get("exact_cjk_sequence") is True
-            and displacement.get("mismatch_rate") == 0.0
-            and displacement.get("displacement_runs") == 0
-            and order.get("in_order") is True):
+            authority_text_corrected_ok or fallback_text_corrected_ok):
         reasons.append("report_positive:text_corrected")
     if row.get("pinyin_displacement") and not (
             displacement.get("mismatch_rate") == 0.0
@@ -479,7 +793,8 @@ def _report_reasons(row: dict) -> list[str]:
         reasons.append("report_positive:pinyin_displacement")
     if row.get("text_order") and not (
             order.get("in_order") is True
-            and order.get("ref_cjk_count") == order.get("hanzi_cjk_count")):
+            and (order.get("ref_cjk_count") == order.get("hanzi_cjk_count")
+                 or fallback_safe)):
         reasons.append("report_positive:text_order")
     for key, value in row.items():
         if key not in allowed and value:
@@ -487,21 +802,383 @@ def _report_reasons(row: dict) -> list[str]:
     return reasons
 
 
-def _sp1_reasons(tg) -> list[str]:
+def _fallback_contract_reasons(stem: str, row: dict | None,
+                               reference_path: Path | None,
+                               ctc_dir: Path) -> list[str]:
+    """Bind a no-reference stem to one immutable transcript source.
+
+    The report is only a locator; the auditor reopens the expected source on
+    disk and verifies its mode, exact path, regular-file status and digest.
+    """
+    if not isinstance(row, dict):
+        return ["fallback_contract_report_missing"]
     reasons: list[str] = []
-    for tier in tg.tiers[:3]:
-        text = _tier_text(tier)
-        if not text.startswith("<sp1>") or len(_SP1.findall(text)) != 1:
-            reasons.append(f"sp1_contract:{tier.name}")
-    for tier in tg.tiers[3:]:
-        if not tier.intervals or tier.intervals[0].text.strip() != "<sp1>":
-            reasons.append(f"sp1_contract:{tier.name}")
+    report_mode = row.get("reference_mode")
+    source = row.get("reference_source")
+    authoritative = row.get("reference_text_authoritative")
+    evidence = row.get("fallback_transcript")
+    if reference_path is not None:
+        reasons.append("fallback_mode_reference_conflict")
+    if report_mode != "fallback":
+        reasons.append("fallback_mode_report_mismatch")
+    if authoritative is not False:
+        reasons.append("fallback_authority_flag_mismatch")
+    if source not in {"asr_fallback", "lab_fallback"}:
+        reasons.append("fallback_source_invalid")
+    if not isinstance(evidence, dict):
+        return sorted(set(reasons + ["fallback_transcript_evidence_missing"]))
+    if evidence.get("source") != source:
+        reasons.append("fallback_source_evidence_mismatch")
+    expected = (ctc_dir / f"{stem}_text_cn.txt" if source == "asr_fallback"
+                else ctc_dir / f"{stem}.lab")
+    raw_path = evidence.get("path")
+    path = Path(raw_path) if isinstance(raw_path, str) else None
+    if path is None or not path.is_absolute() or path != expected.absolute():
+        reasons.append("fallback_transcript_path_mismatch")
+    else:
+        try:
+            if path.is_symlink() or not path.is_file() or path.resolve() != expected.resolve():
+                reasons.append("fallback_transcript_not_regular")
+            elif not path.read_text(encoding="utf-8").strip():
+                reasons.append("fallback_transcript_empty")
+            if evidence.get("sha256") != _sha256(path):
+                reasons.append("fallback_transcript_hash_mismatch")
+        except (OSError, UnicodeError):
+            reasons.append("fallback_transcript_unreadable")
+    return sorted(set(reasons))
+
+
+def _unknown_recovery_proof_reasons(
+        stem: str, final_tg, reference: str, source_path: Path,
+        ctc_dir: Path, row: dict, global_manifest: dict | None) -> list[str]:
+    """Independently validate the structured initial-Mira unknown proof."""
+    proof = row.get("mfa_unknown_source_redeemed") if isinstance(row, dict) else None
+    if not isinstance(proof, dict):
+        return ["unknown_recovery_proof_missing"]
+    reasons: list[str] = []
+    if (proof.get("schema") != _UNKNOWN_REPAIR_PROOF_SCHEMA
+            or proof.get("scenario") != "initial_mira"
+            or proof.get("stem") != stem):
+        return ["unknown_recovery_proof_schema"]
+    try:
+        source_tg = parse_textgrid(source_path)
+        source_tiers = [tier for tier in source_tg.tiers if tier.name == "words"]
+        if len(source_tiers) != 1:
+            return ["unknown_recovery_source_invalid"]
+        source_intervals = source_tiers[0].intervals
+        unknowns = [(index, iv) for index, iv in enumerate(source_intervals)
+                    if is_unknown_token(iv.text.strip())]
+        if len(unknowns) != 1:
+            return ["unknown_recovery_source_unknown_count"]
+        source_index, source_iv = unknowns[0]
+        lexical_before = sum(1 for iv in source_intervals[:source_index]
+                             if iv.text.strip() and not is_silence(iv.text.strip())
+                             and not is_punct(iv.text.strip()))
+        if (lexical_before != 0 or source_index == 0
+                or source_intervals[source_index - 1].text.strip() != "<eps>"
+                or source_index + 1 >= len(source_intervals)
+                or source_intervals[source_index + 1].text.strip() != "<eps>"):
+            return ["unknown_recovery_source_geometry"]
+        source_value = {"ordinal": source_index, "start": float(source_iv.xmin),
+                        "end": float(source_iv.xmax), "text": source_iv.text.strip()}
+        source_proof = proof.get("source", {})
+        if (source_proof.get("interval") != source_value
+                or source_proof.get("interval_sha256") != _evidence_digest(source_value)
+                or source_proof.get("lexical_ordinal") != 0
+                or source_proof.get("neighbors") != ["<eps>", "<eps>"]):
+            return ["unknown_recovery_source_binding"]
+
+        token_path = ctc_dir / f"{stem}_tokens.jsonl"
+        tokens = [json.loads(line) for line in token_path.read_text(encoding="utf-8").splitlines()
+                  if line.strip()]
+        if not tokens or not isinstance(tokens[0], dict):
+            return ["unknown_recovery_ctc_missing"]
+        token = tokens[0]
+        token_value = {"ordinal": 0, "word": token.get("word", ""),
+                       "start_s": float(token["start_s"]),
+                       "end_s": float(token["end_s"]),
+                       "type": token.get("type", "word")}
+        ctc_proof = proof.get("ctc", {})
+        if (token_value["word"].strip().casefold() != "mira"
+                or token_value["type"] != "word"
+                or ctc_proof.get("token") != token_value
+                or ctc_proof.get("token_sha256") != _evidence_digest(token_value)
+                ):
+            return ["unknown_recovery_ctc_binding"]
+        if any(isinstance(item, dict)
+               and int(item.get("ordinal", index)) != index
+               for index, item in enumerate([token])):
+            return ["unknown_recovery_ctc_binding"]
+        source_sequence = [_lexical_identity(iv.text.strip()) for iv in source_intervals
+                           if iv.text.strip() and not is_silence(iv.text.strip())
+                           and not is_punct(iv.text.strip())]
+        source_unknown_position = next((index for index, value in enumerate(source_sequence)
+                                        if value == "<unknown>"), None)
+        if source_unknown_position is None:
+            return ["unknown_recovery_source_binding"]
+        source_sequence[source_unknown_position] = "mira"
+        ctc_sequence = [_lexical_identity(item.get("word", ""), ctc_item=item)
+                        for item in tokens
+                        if isinstance(item, dict) and item.get("type", "word") == "word"]
+        correspondence = proof.get("ordered_correspondence", {})
+        if (source_sequence != ctc_sequence
+                or correspondence.get("source_tokens") != source_sequence
+                or correspondence.get("ctc_tokens") != ctc_sequence
+                or correspondence.get("sha256") != _evidence_digest(source_sequence)):
+            return ["unknown_recovery_token_correspondence"]
+
+        reference_tokens = _semantic_tokens(reference)
+        reference_semantics = project_authority_semantics(reference)
+        reference_matches = [item for item in reference_semantics
+                             if item.get("kind") == "english"
+                             and item.get("alignment_token", "").casefold() == "mira"
+                             and item.get("reference_ordinal") == 0]
+        reference_proof = proof.get("reference", {})
+        if (len(reference_matches) != 1
+                or reference_proof.get("ordinal") != 0
+                or reference_proof.get("token") != str(reference_matches[0]["surface"]).casefold()):
+            return ["unknown_recovery_reference_binding"]
+
+        final_words = final_tg.tiers[3].intervals
+        final_lexical = [iv for iv in final_words
+                         if iv.text.strip() and not is_silence(iv.text)
+                         and not is_punct(iv.text)]
+        owners = [iv for index, iv in enumerate(final_lexical)
+                  if index == 0 and _lexical_identity(iv.text) == "mira"]
+        if len(owners) != 1:
+            return ["unknown_recovery_final_owner"]
+        owner = owners[0]
+        owner_value = {"text": owner.text.strip(), "start": float(owner.xmin),
+                       "end": float(owner.xmax)}
+        final_proof = proof.get("final", {})
+        if final_proof.get("owner") != owner_value:
+            return ["unknown_recovery_final_binding"]
+        final_sequence = _semantic_tokens(_tier_text(final_tg.tiers[2]))
+        if final_sequence != reference_tokens:
+            return ["unknown_recovery_final_semantic_mismatch"]
+        if (final_proof.get("semantic_sequence_sha256")
+                != _evidence_digest([[kind, value] for kind, value in final_sequence])
+                or final_proof.get("semantic_token_count") != len(final_sequence)):
+            return ["unknown_recovery_final_binding"]
+
+        ledger_proof = proof.get("english_ledger", {})
+        if not isinstance(global_manifest, dict):
+            return ["unknown_recovery_ledger_missing"]
+        ledger_info = global_manifest.get("_ledger_by_stem", {}).get(stem)
+        if not ledger_info:
+            return ["unknown_recovery_ledger_missing"]
+        ledger_path = ledger_info["path"]
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        if _sha256(ledger_path) != ledger_proof.get("ledger_sha256"):
+            return ["unknown_recovery_ledger_hash"]
+        records = [record for segment in ledger.get("segments", [])
+                   for record in segment.get("words", [])
+                   if isinstance(record, dict)
+                   and record.get("word_id") == ledger_proof.get("word_id")]
+        if len(records) != 1:
+            return ["unknown_recovery_ledger_word"]
+        record = records[0]
+        if (record.get("status") != "verified"
+                or record.get("provenance") != "english_mfa_textgrid"
+                or str(record.get("ctc_text", "")).casefold() != "mira"
+                or ledger_proof.get("ctc_ordinal") != record.get("ctc_ordinal")
+                or ledger_proof.get("ctc_text", "").casefold() != "mira"
+                or ledger_proof.get("word_sha256") != _evidence_digest(record)):
+            return ["unknown_recovery_ledger_word"]
+    except (OSError, ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError):
+        return ["unknown_recovery_proof_invalid"]
     return reasons
 
 
-def _content_reasons(tg, reference: str) -> list[str]:
+def _evidence_repair_reasons(stem: str, final_tg, row: dict) -> list[str]:
+    """Check repair records without trusting their report-only labels."""
+    repairs = row.get("evidence_repairs") if isinstance(row, dict) else None
+    if repairs is None:
+        return []
+    if not isinstance(repairs, list) or not repairs:
+        return ["evidence_repair_record_invalid"]
+    allowed_overlap = {"000240", "000314", "001776", "001802"}
+    words = final_tg.tiers[3].intervals
+    reasons: list[str] = []
+    for repair in repairs:
+        if (not isinstance(repair, dict)
+                or repair.get("schema") != _EVIDENCE_REPAIR_SCHEMA
+                or repair.get("stem") != stem
+                or repair.get("proof") != "source_mfa_ctc_unique_monotone_boundary"):
+            reasons.append("evidence_repair_record_invalid")
+            continue
+        indices = repair.get("word_indices")
+        if (not isinstance(indices, list) or len(indices) != 2
+                or any(type(index) is not int for index in indices)
+                or indices[1] != indices[0] + 1
+                or indices[0] < 0):
+            reasons.append("evidence_repair_geometry_invalid")
+            continue
+        source = repair.get("source_words")
+        ctc = repair.get("ctc_tokens")
+        if (not isinstance(source, list) or len(source) != 2
+                or not isinstance(ctc, list) or len(ctc) != 2):
+            reasons.append("evidence_repair_evidence_missing")
+            continue
+        # ``word_indices`` belongs to the pre-rebuild visual words tier.  The
+        # final tier can legitimately have a different number of intervals
+        # after MFA/authority reconciliation (for example an <eps> interval
+        # is removed).  Resolve the pair by its dual-evidence labels and the
+        # committed boundary instead of treating that historical index as a
+        # final-tier primary key.
+        expected_left = str(source[0].get("text", "")).strip()
+        expected_right = str(source[1].get("text", "")).strip()
+        if not expected_left or not expected_right:
+            expected_left = str(ctc[0].get("word", "")).strip()
+            expected_right = str(ctc[1].get("word", "")).strip()
+        boundary = repair.get("boundary_s")
+        candidates = [
+            (left, right) for left, right in zip(words, words[1:])
+            if left.text.strip().casefold() == expected_left.casefold()
+            and right.text.strip().casefold() == expected_right.casefold()
+        ]
+        if (not isinstance(boundary, (int, float)) or not candidates):
+            reasons.append("evidence_repair_boundary_invalid")
+            continue
+        matching = [
+            (left, right) for left, right in candidates
+            if _same_number(left.xmax, boundary)
+            and _same_number(right.xmin, boundary)
+            and left.xmax <= right.xmin + EPS
+        ]
+        if len(matching) != 1:
+            reasons.append("evidence_repair_boundary_invalid")
+            continue
+        left, right = matching[0]
+        if (not _PINYIN.fullmatch(left.text.strip())
+                or not _PINYIN.fullmatch(right.text.strip())):
+            reasons.append("evidence_repair_owner_invalid")
+        try:
+            if (source[0].get("ordinal") >= source[1].get("ordinal")
+                    or source[0].get("end") > source[1].get("start")
+                    or source[0].get("end") - source[0].get("start") < 0.030 - 1e-9
+                    or source[1].get("end") - source[1].get("start") < 0.030 - 1e-9
+                    or ctc[0].get("ordinal") >= ctc[1].get("ordinal")
+                    or ctc[0].get("end_s") > ctc[1].get("start_s") + 1e-3
+                    or ctc[0].get("end_s") - ctc[0].get("start_s") < 0.030 - 1e-9
+                    or ctc[1].get("end_s") - ctc[1].get("start_s") < 0.030 - 1e-9
+                    or source[0].get("text", "").casefold() != left.text.strip().casefold()
+                    or source[1].get("text", "").casefold() != right.text.strip().casefold()
+                    or ctc[0].get("word", "").casefold() != left.text.strip().casefold()
+                    or ctc[1].get("word", "").casefold() != right.text.strip().casefold()):
+                reasons.append("evidence_repair_dual_evidence_invalid")
+        except (AttributeError, TypeError):
+            reasons.append("evidence_repair_dual_evidence_invalid")
+        if repair.get("kind") == "overlap" and stem[:6] not in allowed_overlap:
+            reasons.append("evidence_repair_overlap_not_allowlisted")
+    return sorted(set(reasons))
+
+
+def _sp1_reasons(tg) -> list[str]:
+    reasons: list[str] = []
+    # raw_text and pinyin are the two surface tiers whose single full-span
+    # interval carries the preserved leading marker.  Derived tiers may start
+    # at t=0 with their first lexical owner; requiring a synthetic <sp1>
+    # interval in every derived tier falsely rejects valid head-silence output.
+    for tier in tg.tiers:
+        if tier.name not in {"raw_text", "pinyin"}:
+            continue
+        text = _tier_text(tier)
+        if not text.startswith("<sp1>") or len(_SP1.findall(text)) != 1:
+            reasons.append(f"sp1_contract:{tier.name}")
+    for tier in tg.tiers:
+        if tier.name in {"raw_text", "pinyin"}:
+            continue
+        for index, interval in enumerate(tier.intervals):
+            if not _SP1.search(interval.text or ""):
+                continue
+            if index == 0:
+                if interval.xmin > tier.xmin + EPS:
+                    reasons.append(f"sp1_contract:{tier.name}")
+                continue
+            # A final endpoint marker can remain after the last lexical or
+            # punctuation owner.  Only an interior marker with a later
+            # lexical owner violates the merge contract.
+            later_lexical = any(
+                not is_silence(next_iv.text)
+                and not is_punct(next_iv.text)
+                for next_iv in tier.intervals[index + 1:]
+            )
+            if later_lexical:
+                reasons.append(f"sp1_contract:{tier.name}")
+    return reasons
+
+
+def _publication_geometry_reasons(tg) -> list[str]:
+    """Independently validate the final display-owner partition.
+
+    ``pinyin_phones`` is intentionally sparse during true silence, so this
+    check requires ownership for each phone that exists but does not require
+    that tier to cover the axis.  The words and hanzi tiers are the published
+    display partition and must cover the complete axis within the shared
+    axis epsilon.
+    """
+    reasons: list[str] = []
+    words = tg.tiers[3]
+    hanzi = tg.tiers[2]
+
+    def partition_reasons(tier) -> None:
+        if not tier.intervals:
+            reasons.append(f"{tier.name}_empty")
+            return
+        first = tier.intervals[0]
+        if first.xmin > tg.xmin + EPS:
+            reasons.append(f"{tier.name}_coverage_hole")
+        previous = first
+        for current in tier.intervals[1:]:
+            delta = current.xmin - previous.xmax
+            if delta > EPS:
+                reasons.append(f"{tier.name}_coverage_hole")
+            elif delta < -EPS:
+                reasons.append(f"{tier.name}_overlap")
+            previous = current
+        if tier.intervals[-1].xmax < tg.xmax - EPS:
+            reasons.append(f"{tier.name}_coverage_hole")
+        if any(is_silence(interval.text)
+               and interval.xmin > tg.xmin + EPS
+               and interval.xmax < tg.xmax - EPS
+               for interval in tier.intervals):
+            reasons.append("strict_interior_sp")
+
+    partition_reasons(words)
+    partition_reasons(hanzi)
+    if len(words.intervals) != len(hanzi.intervals):
+        reasons.append("hanzi_words_count_mismatch")
+    for word, label in zip(words.intervals, hanzi.intervals):
+        if (abs(word.xmin - label.xmin) > EPS
+                or abs(word.xmax - label.xmax) > EPS):
+            reasons.append("hanzi_words_boundary_mismatch")
+            continue
+        word_text = word.text.strip()
+        label_text = label.text.strip()
+        if ((is_silence(word_text) or is_punct(word_text))
+                and word_text != label_text):
+            reasons.append("silence_or_punctuation_label_mismatch")
+            if is_silence(word_text) and is_silence(label_text):
+                reasons.append("silence_label_split")
+        elif is_english_token(word_text) and word_text != label_text:
+            reasons.append("english_label_mismatch")
+
+    phones = tg.tiers[4]
+    for phone in phones.intervals:
+        owners = [word for word in words.intervals
+                  if phone.xmin >= word.xmin
+                  and phone.xmax <= word.xmax]
+        if len(owners) != 1:
+            reasons.append("phone_owner_mismatch")
+            break
+    return sorted(set(reasons))
+
+
+def _content_reasons(tg, reference: str, *, reference_authoritative: bool = True) -> list[str]:
     reasons: list[str] = []
     raw, pinyin, hanzi, words, phones = tg.tiers
+    reasons.extend(_publication_geometry_reasons(tg))
     if any(len(tier.intervals) != 1 for tier in (raw, pinyin)):
         reasons.append("raw_or_pinyin_not_single_full_interval")
     for tier in (raw, pinyin):
@@ -516,33 +1193,49 @@ def _content_reasons(tg, reference: str) -> list[str]:
             reasons.append("hanzi_words_boundary_mismatch")
             break
 
-    reference_tokens = _semantic_tokens(reference)
-    final_tokens = _semantic_tokens(_tier_text(hanzi))
-    if reference_tokens != final_tokens:
-        reasons.append("reference_semantic_sequence_mismatch")
-    if _semantic_tokens(_tier_text(raw)) != reference_tokens:
-        reasons.append("reference_raw_semantic_sequence_mismatch")
-    # Pinyin syllables are the Chinese realization, not reference English
-    # words.  Remove only fully toned pinyin tokens before comparing the
-    # remaining NVV/punctuation/English sequence to authority.
-    pinyin_semantic = _semantic_tokens(re.sub(
-        r"(?<![A-Za-z])[a-z]+[1-5](?![A-Za-z0-9])", "",
-        _SP1.sub("", _tier_text(pinyin))))
-    reference_non_cjk = [token for token in reference_tokens if token[0] != "cjk"]
-    if pinyin_semantic != reference_non_cjk:
-        reasons.append("reference_pinyin_semantic_sequence_mismatch")
-    reference_cjk = [value for kind, value in reference_tokens if kind == "cjk"]
-    hanzi_cjk = [char for iv in hanzi.intervals for char in iv.text if _CJK.fullmatch(char)]
-    if reference_cjk != hanzi_cjk:
-        reasons.append("reference_hanzi_cjk_mismatch")
+    reference_tokens = _semantic_tokens(reference) if reference_authoritative else []
+    if reference_authoritative:
+        final_tokens = _semantic_tokens(
+            _canonicalize_reference_hyphens(_tier_text(hanzi)))
+        if not _semantic_sequence_compatible(reference_tokens, final_tokens):
+            reasons.append("reference_semantic_sequence_mismatch")
+        if not _semantic_sequence_compatible(
+                reference_tokens,
+                _semantic_tokens(_canonicalize_reference_hyphens(_tier_text(raw)))):
+            reasons.append("reference_raw_semantic_sequence_mismatch")
+        # Pinyin syllables are the Chinese realization, not reference English
+        # words.  Remove only fully toned pinyin tokens before comparing the
+        # remaining NVV/punctuation/English sequence to authority.
+        pinyin_semantic = _semantic_tokens(re.sub(
+            r"(?<![A-Za-z])[a-z]+[1-5](?![A-Za-z0-9])", "",
+            _canonicalize_reference_hyphens(_SP1.sub("", _tier_text(pinyin)))))
+        reference_non_cjk = [token for token in reference_tokens if token[0] != "cjk"]
+        if not _semantic_sequence_compatible(reference_non_cjk, pinyin_semantic):
+            reasons.append("reference_pinyin_semantic_sequence_mismatch")
+        reference_cjk = [value for kind, value in reference_tokens if kind == "cjk"]
+        hanzi_cjk = [char for iv in hanzi.intervals for char in iv.text if _CJK.fullmatch(char)]
+        if reference_cjk != hanzi_cjk:
+            reasons.append("reference_hanzi_cjk_mismatch")
+    else:
+        # Fallback has no lexical authority, but CJK ownership remains a
+        # common contract: toned-pinyin words and CJK hanzi intervals must
+        # occupy the same word slots.  This deliberately does not compare to
+        # source semantic text or source CJK counts.
+        pinyin_indices = {i for i, iv in enumerate(words.intervals)
+                          if _PINYIN.fullmatch(iv.text.strip())}
+        cjk_indices = {i for i, iv in enumerate(hanzi.intervals)
+                       if _CJK.fullmatch(iv.text.strip())}
+        if pinyin_indices != cjk_indices:
+            reasons.append("cjk_pinyin_ownership_mismatch")
+        reference_cjk = []
     if any(_PINYIN.search(iv.text.strip()) for iv in hanzi.intervals):
         reasons.append("hanzi_contains_pinyin")
 
     pinyin_words = [iv for iv in words.intervals if _PINYIN.fullmatch(iv.text.strip())]
-    if len(reference_cjk) != len(pinyin_words):
+    if reference_authoritative and len(reference_cjk) != len(pinyin_words):
         reasons.append("cjk_pinyin_count_mismatch")
     cjk_word_indices = [i for i, iv in enumerate(hanzi.intervals) if _CJK.fullmatch(iv.text.strip())]
-    if len(cjk_word_indices) != len(reference_cjk):
+    if reference_authoritative and len(cjk_word_indices) != len(reference_cjk):
         reasons.append("hanzi_cjk_interval_count_mismatch")
     for index in cjk_word_indices:
         if not _PINYIN.fullmatch(words.intervals[index].text.strip()):
@@ -553,7 +1246,7 @@ def _content_reasons(tg, reference: str) -> list[str]:
     # real en:-prefixed phones, never a self-referential lexical phone.
     for phone in phones.intervals:
         owners = [word for word in words.intervals
-                  if phone.xmin >= word.xmin - EPS and phone.xmax <= word.xmax + EPS]
+                  if phone.xmin >= word.xmin and phone.xmax <= word.xmax]
         if not owners:
             reasons.append("phone_outside_word")
             break
@@ -578,7 +1271,8 @@ def _content_reasons(tg, reference: str) -> list[str]:
             # A literal English "unk" is only acceptable with matching
             # authoritative reference and genuine English phone evidence.
             ref_english = [value for kind, value in reference_tokens if kind == "english"]
-            if "unk" not in ref_english or not owned or not all(p.startswith("en:") for p in owned):
+            if (reference_authoritative and
+                    ("unk" not in ref_english or not owned or not all(p.startswith("en:") for p in owned))):
                 reasons.append("ambiguous_bare_unk")
     for tier in tg.tiers:
         for interval in tier.intervals:
@@ -655,6 +1349,19 @@ def _ctc_english_words(path: Path) -> dict[int, str]:
             if is_english_token(iv.text.strip())}
 
 
+def _processed_ctc_tokens(ctc_dir: Path, stem: str) -> list[dict] | None:
+    """Load the independently produced processed-token sidecar, if present."""
+    path = ctc_dir / f"{stem}_tokens.jsonl"
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+    except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return rows if all(isinstance(row, dict) for row in rows) else None
+
+
 def _source_english_words(path: Path) -> list[dict]:
     """Validate source MFA phones directly; never trust a ledger phone list."""
     source_words, source_phones = _named_source_tiers(path)
@@ -709,6 +1416,51 @@ def _same_number(left: object, right: object) -> bool:
             and math.isfinite(left) and math.isfinite(right) and abs(left - right) <= EPS)
 
 
+def _pronunciation_consumer_reasons(record: dict, source_word: dict,
+                                    ledger: dict) -> list[str]:
+    """Independently validate W1 pronunciation policy at the strict audit."""
+    token = str(record.get("alignment_token", "")).casefold()
+    source_labels = tuple(str(phone.get("label", "")).strip()
+                          for phone in source_word.get("phones", [])
+                          if isinstance(phone, dict))
+    ledger_labels = tuple(str(phone.get("label", "")).strip()
+                          for phone in record.get("phones", [])
+                          if isinstance(phone, dict))
+    if token == "app":
+        return ([] if ledger_labels == APP_EXPECTED_PRONUNCIATION
+                and source_labels == APP_EXPECTED_PRONUNCIATION
+                else ["app_expected_pronunciation_mismatch"])
+    if token != "sos":
+        return []
+    policy = record.get("pronunciation_policy")
+    dictionary = ledger.get("dictionary_provenance")
+    errors: list[str] = []
+    if (record.get("pronunciation_policy_id") != SOS_PRONUNCIATION_POLICY_ID
+            or not isinstance(policy, dict)
+            or policy.get("policy_id") != SOS_PRONUNCIATION_POLICY_ID
+            or tuple(policy.get("expected_pronunciation", ())) != SOS_EXPECTED_PRONUNCIATION
+            or tuple(policy.get("actual_source_sequence", ())) != source_labels
+            or source_labels != SOS_EXPECTED_PRONUNCIATION
+            or ledger_labels != source_labels
+            or policy.get("dictionary_provenance") != dictionary
+            or record.get("dictionary_provenance") != dictionary):
+        errors.append("sos_pronunciation_policy_mismatch")
+    if (not isinstance(dictionary, dict)
+            or not isinstance(dictionary.get("path"), str)
+            or not isinstance(dictionary.get("sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", dictionary["sha256"])):
+        errors.append("sos_dictionary_provenance_invalid")
+    else:
+        try:
+            dictionary_path = Path(dictionary["path"])
+            if (dictionary_path.is_symlink() or not dictionary_path.is_file()
+                    or _sha256(dictionary_path) != dictionary["sha256"]):
+                errors.append("sos_dictionary_hash_mismatch")
+        except (OSError, ValueError, TypeError):
+            errors.append("sos_dictionary_provenance_unreadable")
+    return sorted(set(errors))
+
+
 def _load_english_manifest(args: argparse.Namespace) -> tuple[dict | None, list[str]]:
     """Load and validate the global strict-en-mfa-v1 contract once."""
     try:
@@ -716,9 +1468,13 @@ def _load_english_manifest(args: argparse.Namespace) -> tuple[dict | None, list[
         raw = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
         return None, ["english_provenance_manifest_failed"]
-    if raw.get("schema") != EN_PROVENANCE_SCHEMA or raw.get("strict_provenance") is not True:
-        return None, ["english_provenance_legacy_schema"]
-    if raw.get("status") not in {"success", "no_english"}:
+    if (raw.get("schema") != EN_PROVENANCE_SCHEMA
+            or raw.get("strict_provenance") is not True
+            or raw.get("canonical_units") != CANONICAL_UNITS_SCHEMA):
+        if raw.get("schema") == HISTORICAL_EN_PROVENANCE_SCHEMA:
+            return None, ["english_provenance_legacy_schema"]
+        return None, ["english_provenance_manifest_failed"]
+    if raw.get("status") not in {"success", "partial", "no_english"}:
         return None, ["english_provenance_manifest_failed"]
     for key in ("expected_segments", "produced_segments", "rejected_segments", "stem_ledgers", "counts"):
         if key not in raw:
@@ -732,11 +1488,15 @@ def _load_english_manifest(args: argparse.Namespace) -> tuple[dict | None, list[
         return None, ["english_provenance_manifest_failed"]
     rejected_ids: list[str] = []
     for item in rejected:
-        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+        if (not isinstance(item, dict) or not isinstance(item.get("id"), str)
+                or not isinstance(item.get("reason"), str) or not item.get("reason")):
             return None, ["english_provenance_manifest_failed"]
         rejected_ids.append(item["id"])
     if (len(rejected_ids) != len(set(rejected_ids)) or set(produced) & set(rejected_ids)
             or set(expected) != set(produced) | set(rejected_ids)):
+        return None, ["english_provenance_manifest_failed"]
+    if ((raw["status"] == "success" and rejected_ids)
+            or (raw["status"] == "partial" and not rejected_ids)):
         return None, ["english_provenance_manifest_failed"]
     if raw["status"] == "no_english":
         counts = raw.get("counts")
@@ -761,7 +1521,7 @@ def _load_english_manifest(args: argparse.Namespace) -> tuple[dict | None, list[
             ledger_by_stem[stem] = {"entry": entry, "path": ledger_path}
     except (KeyError, TypeError, OSError, ValueError):
         return None, ["english_provenance_hash_mismatch"]
-    if raw["status"] == "success":
+    if raw["status"] in {"success", "partial"}:
         try:
             expected_stems = set()
             for item in expected:
@@ -801,29 +1561,103 @@ def _safe_stem(value: object) -> bool:
 
 
 def _english_provenance_reasons(stem: str, final_tg, ctc_dir: Path,
-                                args: argparse.Namespace, global_manifest: dict | None) -> tuple[list[str], dict | None]:
+                                args: argparse.Namespace, global_manifest: dict | None,
+                                reference_text: str | None = None) -> tuple[list[str], dict | None]:
     """Cross-check source MFA TextGrids against final en: phones and ledger."""
+    def _compact_english(value: object) -> str:
+        # CTC canonicalizes hyphenated authority surfaces (e.g. V-Up) to
+        # vup, while the final words tier preserves the authority spelling.
+        # Compare lexical identity modulo separators at the provenance
+        # boundary; hyphen ownership is checked separately by authority-unit
+        # validation.
+        return re.sub(r"[^a-z0-9]", "", str(value).casefold())
+
     final_words = [iv for iv in final_tg.tiers[3].intervals if is_english_token(iv.text.strip())]
     if not final_words:
         return [], None
     if global_manifest is None:
         return ["english_provenance_manifest_missing"], None
-    if global_manifest.get("status") != "success":
+    if global_manifest.get("status") not in {"success", "partial"}:
         return ["english_provenance_manifest_failed"], None
+    rejected_for_stem = {
+        item["id"] for item in global_manifest.get("rejected_segments", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+        and item["id"].startswith(f"{stem}:s")
+    }
+    if rejected_for_stem:
+        return ["english_segment_rejected"], None
     try:
         ledger_info = global_manifest["_ledger_by_stem"].get(stem)
         if ledger_info is None:
             raise KeyError("missing ledger")
         ledger_path = ledger_info["path"]
         ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-        if ledger.get("schema") != EN_PROVENANCE_SCHEMA or ledger.get("stem") != stem:
-            return ["english_provenance_legacy_schema"], None
+        if (ledger.get("schema") != EN_PROVENANCE_SCHEMA
+                or ledger.get("stem") != stem
+                or ledger.get("canonical_units") != CANONICAL_UNITS_SCHEMA):
+            if ledger.get("schema") == HISTORICAL_EN_PROVENANCE_SCHEMA:
+                return ["english_provenance_legacy_schema"], None
+            return ["english_provenance_manifest_failed"], None
         ctc_path = ctc_dir / f"{stem}.TextGrid"
         if not ctc_path.is_file():
             ctc_path = ctc_dir / stem / f"{stem}.TextGrid"
         if not ctc_path.is_file() or _sha256(ctc_path) != ledger.get("ctc_textgrid_sha256"):
             return ["english_provenance_hash_mismatch"], None
         ctc_english = _ctc_english_words(ctc_path)
+        ctc_tg = parse_textgrid(ctc_path)
+        ctc_word_tier = next(
+            (tier for tier in ctc_tg.tiers if tier.name == "words"), None)
+        if ctc_word_tier is None:
+            return ["english_provenance_manifest_failed"], None
+        processed_tokens = _processed_ctc_tokens(ctc_dir, stem)
+        ctc_word_intervals = list(enumerate(ctc_word_tier.intervals))
+        used_ctc_ordinals: set[int] = set()
+
+        def _strict_span_valid(record: dict) -> bool:
+            """Apply the shared span contract with independently loaded CTC evidence."""
+            source = record.get("source_ctc_ordinals")
+            if (not isinstance(source, list) or not source
+                    or any(type(value) is not int or value < 0 for value in source)
+                    or any(left >= right for left, right in zip(source, source[1:]))):
+                return False
+            contiguous = all(right - left == 1
+                             for left, right in zip(source, source[1:]))
+            if contiguous:
+                return record.get("ctc_ordinal") == source[0]
+            token = resolve_processed_english_token(processed_tokens, source)
+            try:
+                validate_processed_english_token_binding(record, token)
+            except (EnglishUnitError, TypeError, ValueError):
+                return False
+            return True
+
+        def _actual_ctc_ordinal(record: dict) -> int | None:
+            """Resolve source-side ordinal to the actual named-tier ordinal.
+
+            Canonical token sidecars retain their own source ordinal lineage.
+            That ordinal can differ from the final words-tier ordinal when
+            blank/pause intervals were materialized.  Audit by the immutable
+            text/span evidence, then compare against the actual CTC tier.
+            """
+            text = _compact_english(record.get("ctc_text", ""))
+            span = record.get("canonical_span")
+            start = (float(span[0]) if isinstance(span, list) and len(span) == 2
+                     and isinstance(span[0], (int, float)) else None)
+            candidates = []
+            for ordinal, interval in ctc_word_intervals:
+                if ordinal in used_ctc_ordinals or ordinal not in ctc_english:
+                    continue
+                actual = _compact_english(interval.text)
+                if not actual or not text or not (actual == text
+                        or actual.startswith(text) or text.startswith(actual)):
+                    continue
+                if start is not None and abs(float(interval.xmin) - start) > 0.012:
+                    continue
+                candidates.append(ordinal)
+            if len(candidates) == 1:
+                used_ctc_ordinals.add(candidates[0])
+                return candidates[0]
+            return None
         segments = ledger.get("segments")
         if not isinstance(segments, list) or not segments:
             return ["english_provenance_manifest_failed"], None
@@ -839,6 +1673,7 @@ def _english_provenance_reasons(stem: str, final_tg, ctc_dir: Path,
                 or set(segment_ids) != set(expected_ids)):
             return ["english_provenance_manifest_failed"], None
         verified_words: list[dict] = []
+        seen_unit_ids: set[str] = set()
         sources: list[Path] = []
         used_source_paths: set[Path] = set()
         for segment in sorted(segments, key=lambda item: item.get("segment_ordinal", -1)):
@@ -874,18 +1709,30 @@ def _english_provenance_reasons(stem: str, final_tg, ctc_dir: Path,
             if not isinstance(ledger_words, list) or len(ledger_words) != len(source_words):
                 return ["english_word_unmatched"], None
             for index, (record, source_word) in enumerate(zip(ledger_words, source_words)):
-                expected_id = f"{sid}:w{record.get('ctc_ordinal')}"
                 mfa_word = record.get("mfa_word")
+                actual_ctc_ordinal = _actual_ctc_ordinal(record)
+                expected_id = (f"{sid}:w{actual_ctc_ordinal}"
+                               if actual_ctc_ordinal is not None
+                               else f"{sid}:w{record.get('ctc_ordinal')}")
                 if (record.get("status") != "verified" or record.get("word_id") != expected_id
                         or not isinstance(mfa_word, dict)
-                        or record.get("ctc_ordinal") not in ctc_english
-                        or ctc_english[record.get("ctc_ordinal")].casefold() != record.get("ctc_text", "").casefold()
-                        or record.get("ctc_text", "").casefold() != source_word["text"].casefold()
+                        or actual_ctc_ordinal is None
+                        or _compact_english(ctc_english[actual_ctc_ordinal]) != _compact_english(record.get("ctc_text", ""))
+                        or _compact_english(record.get("ctc_text", "")) != _compact_english(source_word["text"])
                         or mfa_word.get("ordinal") != source_word["ordinal"]
                         or not _same_number(mfa_word.get("start"), source_word["start"])
                         or not _same_number(mfa_word.get("end"), source_word["end"])
-                        or record.get("provenance") != "english_mfa_textgrid"):
+                        or record.get("provenance") != "english_mfa_textgrid"
+                        or record.get("canonical_binding") != CANONICAL_UNITS_SCHEMA
+                        or not isinstance(record.get("unit_id"), str)
+                        or not isinstance(record.get("alignment_token"), str)
+                        or not isinstance(record.get("source_ctc_ordinals"), list)
+                        or not isinstance(record.get("canonical_span"), list)
+                        or len(record.get("canonical_span", [])) != 2):
                     return ["english_word_unmatched"], None
+                source_ordinals = record["source_ctc_ordinals"]
+                if not _strict_span_valid(record):
+                    return ["english_provenance_manifest_failed"], None
                 ledger_phones = record.get("phones")
                 if not isinstance(ledger_phones, list) or len(ledger_phones) != len(source_word["phones"]):
                     return ["final_sequence_mismatch"], None
@@ -896,63 +1743,110 @@ def _english_provenance_reasons(stem: str, final_tg, ctc_dir: Path,
                             or not _same_number(ledger_phone.get("start"), source_phone["start"])
                             or not _same_number(ledger_phone.get("end"), source_phone["end"])):
                         return ["english_provenance_hash_mismatch"], None
-                verified_words.append({"ledger": record, "source": source_word})
+                pronunciation_reasons = _pronunciation_consumer_reasons(
+                    record, source_word, ledger)
+                if pronunciation_reasons:
+                    return pronunciation_reasons, None
+                verified_words.append({"ledger": record, "source": source_word,
+                                       "actual_ctc_ordinal": actual_ctc_ordinal})
+                seen_unit_ids.add(record["unit_id"])
             sources.append(source_path); used_source_paths.add(source_path)
         verified_words.sort(key=lambda item: item["ledger"].get("ctc_ordinal", -1))
-        source_ordinals = [item["ledger"].get("ctc_ordinal") for item in verified_words]
+        source_ordinals = [item.get("actual_ctc_ordinal") for item in verified_words]
         if source_ordinals != sorted(ctc_english) or len(source_ordinals) != len(ctc_english):
             return ["english_word_unmatched"], None
-        # The reference transcript can preserve a contiguous English spelling
-        # as one word while CTC/MFA tokenization splits it into several
-        # verified words (for example ``Sila`` -> ``S`` + ``il`` + ``a``).
-        # Group only exact ordered concatenations so every source word and
-        # phone remains accounted for in the independent audit.
-        grouped_verified: list[dict] = []
-        cursor = 0
-        for final_word in final_words:
-            target = final_word.text.strip().casefold()
-            joined = ""
-            matched_end = None
-            for candidate_end in range(cursor + 1, len(verified_words) + 1):
-                item = verified_words[candidate_end - 1]
-                ordinal = item["ledger"].get("ctc_ordinal")
-                joined += str(ctc_english.get(ordinal, ""))
-                if joined.casefold() == target:
-                    matched_end = candidate_end
-                    break
-                if not target.startswith(joined.casefold()):
-                    break
-            if matched_end is None:
-                return ["english_word_unmatched"], None
-            chunk = verified_words[cursor:matched_end]
-            if len(chunk) == 1:
-                grouped_verified.append(chunk[0])
-            else:
-                first = chunk[0]
-                last = chunk[-1]
-                combined_ledger = dict(first["ledger"])
-                combined_ledger["ctc_text"] = final_word.text.strip()
-                combined_source = dict(first["source"])
-                combined_source["text"] = final_word.text.strip()
-                combined_source["start"] = first["source"]["start"]
-                combined_source["end"] = last["source"]["end"]
-                combined_source["phones"] = [
-                    phone
-                    for item in chunk
-                    for phone in item["source"]["phones"]
-                ]
-                grouped_verified.append({"ledger": combined_ledger,
-                                         "source": combined_source})
-            cursor = matched_end
-        if cursor != len(verified_words):
-            return ["english_word_unmatched"], None
-        verified_words = grouped_verified
+        try:
+            authority_units = parse_english_units(reference_text) if reference_text else ()
+        except (EnglishUnitError, TypeError, ValueError):
+            authority_units = ()
+        if reference_text:
+            if len(authority_units) != len(final_words):
+                return ["english_authoritative_compound_split"], None
+            grouped: list[dict] = []
+            record_cursor = 0
+            for unit in authority_units:
+                start_cursor = record_cursor
+                compact = ""
+                while record_cursor < len(verified_words):
+                    evidence = verified_words[record_cursor]
+                    source_text = str(evidence["source"].get("text", ""))
+                    if not is_english_fragment_token(source_text):
+                        break
+                    compact += re.sub(r"[^a-z0-9]", "", source_text.casefold())
+                    if compact != re.sub(r"[^a-z0-9]", "", unit.surface_text.casefold())[:len(compact)]:
+                        return ["english_authoritative_compound_split"], None
+                    record_cursor += 1
+                    if compact == re.sub(r"[^a-z0-9]", "", unit.surface_text.casefold()):
+                        break
+                members = verified_words[start_cursor:record_cursor]
+                if (not members
+                        or compact != re.sub(r"[^a-z0-9]", "", unit.surface_text.casefold())):
+                    return ["english_authoritative_compound_split"], None
+                if any(item["ledger"].get("unit_id") != unit.unit_id
+                       or item["ledger"].get("alignment_token") != unit.alignment_token
+                       for item in members):
+                    return ["english_unit_owner_mismatch"], None
+                ordinals = [ordinal for item in members
+                            for ordinal in item["ledger"].get("source_ctc_ordinals", [])]
+                if not ordinals:
+                    return ["english_authoritative_compound_split"], None
+                combined = deepcopy(members[0]["ledger"])
+                combined["ctc_text"] = unit.surface_text
+                combined["unit_id"] = unit.unit_id
+                combined["alignment_token"] = unit.alignment_token
+                combined["source_ctc_ordinals"] = ordinals
+                combined["ctc_ordinal"] = ordinals[0]
+                combined["canonical_span"] = [
+                    members[0]["ledger"]["canonical_span"][0],
+                    members[-1]["ledger"]["canonical_span"][1]]
+                if not _strict_span_valid(combined):
+                    return ["english_authoritative_compound_split"], None
+                combined["mfa_word"] = deepcopy(members[0]["ledger"]["mfa_word"])
+                combined["mfa_word"]["text"] = unit.alignment_token
+                combined["mfa_word"]["start"] = members[0]["ledger"]["mfa_word"]["start"]
+                combined["mfa_word"]["end"] = members[-1]["ledger"]["mfa_word"]["end"]
+                phones = []
+                for member in members:
+                    phones.extend(deepcopy(member["ledger"].get("phones", [])))
+                for ordinal, phone in enumerate(phones):
+                    phone["ordinal"] = ordinal
+                    phone["mfa_phone_ordinal"] = ordinal
+                combined["phones"] = phones
+                source = deepcopy(members[0]["source"])
+                source["text"] = unit.surface_text
+                source["start"] = members[0]["source"]["start"]
+                source["end"] = members[-1]["source"]["end"]
+                source_phones = []
+                for member in members:
+                    source_phones.extend(deepcopy(member["source"].get("phones", [])))
+                for ordinal, phone in enumerate(source_phones):
+                    phone["ordinal"] = ordinal
+                source["phones"] = source_phones
+                grouped.append({"ledger": combined, "source": source})
+            if record_cursor != len(verified_words):
+                return ["english_authoritative_compound_split"], None
+            verified_words = grouped
+        elif len(verified_words) != len(final_words):
+            return ["english_word_count_mismatch"], None
         final_phones = final_tg.tiers[4].intervals
         matched_en_phone_indices: set[int] = set()
-        for final_word, evidence in zip(final_words, verified_words):
+        for position, (final_word, evidence) in enumerate(zip(final_words, verified_words)):
             record, source_word = evidence["ledger"], evidence["source"]
             ordinal = record.get("ctc_ordinal")
-            if final_word.text.strip().casefold() != record.get("ctc_text", "").casefold():
+            if authority_units:
+                unit = authority_units[position]
+                if (record.get("unit_id") != unit.unit_id
+                        or record.get("alignment_token") != unit.alignment_token
+                        or final_word.text.strip() != unit.surface_text):
+                    return ["english_unit_owner_mismatch"], None
+                hanzi_owners = [iv for iv in final_tg.tiers[2].intervals
+                                if is_english_token(iv.text.strip())
+                                and abs(iv.xmin - final_word.xmin) <= EPS
+                                and abs(iv.xmax - final_word.xmax) <= EPS]
+                if len(hanzi_owners) != 1 or hanzi_owners[0].text.strip() != unit.surface_text:
+                    return ["english_hanzi_owner_mismatch"], None
+            if (re.sub(r"[^a-z0-9]", "", final_word.text.strip().casefold())
+                    != re.sub(r"[^a-z0-9]", "", record.get("alignment_token", "").casefold())):
                 return ["english_word_unmatched"], None
             # Every positive-overlap phone inside an English word is part of
             # its evidence sequence.  Silence cannot be smuggled into the
@@ -1412,6 +2306,7 @@ def _strict_replay_receipt_reasons(receipt: dict, output_dir: Path,
 
 def audit(args: argparse.Namespace) -> tuple[dict, bool]:
     ctc_dir = args.ctc_dir
+    reference_mode_policy = getattr(args, "reference_mode", "auto")
     receipt_path = getattr(args, "pipeline_receipt", None)
     if receipt_path is None:
         # Receipt discovery from ctc/workspace siblings is forbidden.  The
@@ -1423,6 +2318,14 @@ def audit(args: argparse.Namespace) -> tuple[dict, bool]:
                 if pipeline_receipt is not None else set(ctc_stems))
     axis_global_reasons, axis_stem_reasons = _axis_contract_reasons(args, expected)
     global_reasons = list(axis_global_reasons)
+    lifecycle_reasons, lifecycle = _ctc_lifecycle_reasons(args, expected)
+    global_reasons.extend(lifecycle_reasons)
+    if lifecycle_reasons:
+        axis_stem_reasons = {
+            stem: sorted(set(axis_stem_reasons.get(stem, [])
+                             + ["ctc_lifecycle_invalid"]))
+            for stem in expected
+        }
     if axis_global_reasons:
         # Infrastructure-invalid receipts must not leave a publication
         # candidate behind.  Mark every expected stem for isolation below.
@@ -1449,6 +2352,12 @@ def audit(args: argparse.Namespace) -> tuple[dict, bool]:
                 or row.get("status") != "filtered_missing_mfa_alignment"):
             global_reasons.append(f"mfa_alignment_missing_ledger_mismatch:{stem}")
     reference_index, reference_errors = _reference_index(args.reference_dir, expected)
+    if reference_mode_policy == "fallback":
+        # The batch policy, not incidental files in reference_dir, decides
+        # authority.  This keeps an ASR-only audit isolated from stale
+        # reference TXT files copied into the same source tree.
+        reference_index = {}
+        reference_errors = []
     global_reasons.extend(reference_errors)
     global_reasons.extend(receipt_reasons)
     if pipeline_receipt is not None:
@@ -1481,8 +2390,19 @@ def audit(args: argparse.Namespace) -> tuple[dict, bool]:
                     dictionary_path=getattr(args, "mfa_en_dictionary", None)))
             except (ImportError, OSError, ValueError, TypeError) as exc:
                 global_reasons.append(f"strict_replay_english_import_verifier_failed:{exc}")
-    if pipeline_receipt is not None and ctc_stems != expected:
-        global_reasons.append("ctc_eligible_membership_mismatch")
+    if pipeline_receipt is not None:
+        # CTC is produced on the full immutable MFA axis.  The accounting
+        # receipt's eligible set can be smaller when MFA explicitly reports
+        # missing alignments, so compare CTC against the axis set rather than
+        # incorrectly requiring it to equal the post-MFA eligible subset.
+        axis_stems: set[str] = set()
+        try:
+            axis_payload = json.loads(Path(args.mfa_input_axis_receipt).read_text(encoding="utf-8"))
+            axis_stems = set(axis_payload.get("stems", []))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        if (axis_stems and ctc_stems != axis_stems) or (not axis_stems and ctc_stems != expected):
+            global_reasons.append("ctc_eligible_membership_mismatch")
     _replay_mode = pipeline_receipt is not None and pipeline_receipt.get("mode") == "strict_replay"
     # Replay preserves the parent-global manifest byte-for-byte but uses the
     # separately verified selected-stem subset for denominator/provenance.
@@ -1514,7 +2434,13 @@ def audit(args: argparse.Namespace) -> tuple[dict, bool]:
         },
         "pipeline_accounting": (pipeline_receipt.get("derived", {})
                                  if pipeline_receipt is not None else {}),
+        "postprocess_report": {
+            "path": str(args.report.resolve()),
+            "sha256": _sha256(args.report) if args.report.is_file() else "",
+        },
+        "ctc_lifecycle": lifecycle,
         "expected_stems": sorted(expected),
+        "reference_mode_policy": reference_mode_policy,
         "ok": [],
         "rejected": {},
     }
@@ -1555,16 +2481,49 @@ def audit(args: argparse.Namespace) -> tuple[dict, bool]:
             manifest["rejected"][stem] = ["preexisting_filtered_candidate"]
             continue
         reference_path = reference_index.get(stem)
-        reference = (reference_path.read_text(encoding="utf-8").strip()
-                     if reference_path is not None else "")
-        if reference_path is None:
-            reasons.append("non_authoritative_reference")
+        reference_original = (reference_path.read_text(encoding="utf-8").strip()
+                              if reference_path is not None else "")
+        reference = reference_original
+        if reference_path is not None:
+            # The postprocessor projects authority references after the
+            # target1/target2 -> target一/target二 normalization step.  The
+            # independent disk audit must consume the same canonical
+            # semantic stream; otherwise a correct final ``一``/``二`` is
+            # compared against the raw ASCII suffix and rejected.
+            if reference_mode_policy != "fallback":
+                reference = normalize_authority_reference_numerals(reference)
+            # Match postprocess's in-memory authority canonicalization.  The
+            # source file remains untouched; only audit comparisons use the
+            # hyphenless lexical projection.
+            reference = _canonicalize_reference_hyphens(reference)
+        row = report_rows.get(stem)
+        reference_authoritative = (
+            reference_mode_policy == "authority"
+            or (reference_mode_policy == "auto" and reference_path is not None)
+        )
+        if reference_mode_policy == "authority" and reference_path is None:
+            reasons.append("authority_reference_missing")
+        if reference_authoritative:
+            # A legacy authority report has no explicit mode fields.  New
+            # reports must still agree with the disk-selected authority.
+            if isinstance(row, dict):
+                if row.get("reference_mode") not in (None, "authority"):
+                    reasons.append("authority_mode_report_mismatch")
+                if row.get("reference_source") in {"asr_fallback", "lab_fallback"}:
+                    reasons.append("authority_source_report_mismatch")
+                if row.get("reference_text_authoritative") not in (None, True):
+                    reasons.append("authority_flag_report_mismatch")
+                if row.get("fallback_transcript"):
+                    reasons.append("authority_fallback_evidence_present")
+        else:
+            reasons.extend(_fallback_contract_reasons(stem, row, reference_path, ctc_dir))
         wav = args.wav_dir / f"{stem}.wav"
         aligned = args.aligned_dir / f"{stem}.TextGrid"
         if not wav.is_file():
             reasons.append("missing_wav")
         if not aligned.is_file():
             reasons.append("missing_aligned")
+        tg = None
         provenance_evidence = None
         provenance_reasons: list[str] = []
         if not reasons:
@@ -1572,12 +2531,21 @@ def audit(args: argparse.Namespace) -> tuple[dict, bool]:
                 tg = _strict_parse(candidate)
                 reasons.extend(_numeric_reasons(tg, _wav_duration(wav)))
                 reasons.extend(_sp1_reasons(tg))
-                reasons.extend(_content_reasons(tg, reference))
+                reasons.extend(_content_reasons(
+                    tg, reference, reference_authoritative=reference_authoritative))
                 if _replay_mode:
                     provenance_reasons, provenance_evidence = [], None
                 else:
                     provenance_reasons, provenance_evidence = _english_provenance_reasons(
-                        stem, tg, ctc_dir, args, english_manifest)
+                        stem, tg, ctc_dir, args, english_manifest,
+                        # Use the normalized authority text, but preserve
+                        # lexical hyphens for English surface identity.  The
+                        # ``reference`` variable above is additionally
+                        # hyphen-canonicalized for semantic comparison; using
+                        # it here would turn ``V-Up`` into ``VUp`` and create
+                        # a false English-unit owner mismatch.
+                        (normalize_authority_reference_numerals(reference_original)
+                         if reference_authoritative else None))
                 reasons.extend(provenance_reasons)
             except Exception as exc:
                 reasons.append(f"invalid_final_textgrid:{exc}")
@@ -1592,12 +2560,40 @@ def audit(args: argparse.Namespace) -> tuple[dict, bool]:
                     item for item in aligned_rejection_reasons
                     if item != "aligned_english_self_referential_phone"
                 ]
+            # MFA may emit ``unk``/``spn`` on the source Chinese alignment
+            # while postprocess has independently redeemed that interval via
+            # the authoritative reference, complete final geometry, and the
+            # verified English ledger.  In that explicit case the source
+            # placeholder is diagnostic evidence, not the published label;
+            # final TextGrid checks above remain mandatory.
+            if (isinstance(row, dict)
+                    and isinstance(row.get("mfa_unknown_source_redeemed"), dict)):
+                # ``reference`` is the hyphenless semantic projection used by
+                # the general content checks.  Unknown recovery also binds
+                # the final English surface, so preserve lexical hyphens for
+                # its independent semantic-sequence verification.
+                proof_reference = (
+                    normalize_authority_reference_numerals(reference_original)
+                    if reference_authoritative else reference)
+                proof_reasons = _unknown_recovery_proof_reasons(
+                    stem, tg, proof_reference, aligned, ctc_dir, row,
+                    english_manifest)
+                reasons.extend(proof_reasons)
+                if not proof_reasons:
+                    aligned_rejection_reasons = [
+                        item for item in aligned_rejection_reasons
+                        if item not in {"aligned_unknown_token", "aligned_lexical_spn"}
+                    ]
             reasons.extend(aligned_rejection_reasons)
-        row = report_rows.get(stem)
         if row is None:
             reasons.append("missing_report_row")
         else:
             reasons.extend(_report_reasons(row))
+            if tg is not None:
+                reasons.extend(_evidence_repair_reasons(stem, tg, row))
+                reasons.extend(_postprocess_contract_reasons(row, tg, lifecycle))
+            elif lifecycle is not None:
+                reasons.extend(_postprocess_contract_reasons(row, None, lifecycle))
         reasons = sorted(set(reasons))
         if reasons:
             manifest["rejected"][stem] = reasons
@@ -1639,8 +2635,20 @@ def audit(args: argparse.Namespace) -> tuple[dict, bool]:
             entry = {
                 "stem": stem,
                 "textgrid_sha256": _sha256(candidate),
-                "reference": {"path": str(reference_path.resolve()), "sha256": _sha256(reference_path)},
+                "mode": "authority" if reference_authoritative else "fallback",
             }
+            if reference_authoritative:
+                entry["reference"] = {
+                    "path": str(reference_path.resolve()),
+                    "sha256": _sha256(reference_path),
+                }
+            else:
+                fallback = row.get("fallback_transcript", {}) if isinstance(row, dict) else {}
+                entry["fallback_transcript"] = {
+                    "source": fallback.get("source"),
+                    "path": fallback.get("path"),
+                    "sha256": fallback.get("sha256"),
+                }
             if copied_evidence is not None:
                 entry["english_provenance"] = copied_evidence
             manifest["ok"].append(entry)
@@ -1699,8 +2707,15 @@ def main() -> int:
     parser.add_argument("--pipeline-receipt", type=Path, default=None,
                         help="pipeline-run-receipt-v2 (defaults to ctc-dir/.pipeline_run_receipt_v2.json)")
     parser.add_argument("--reference-dir", type=Path, required=True)
+    parser.add_argument("--reference-mode", choices=("auto", "authority", "fallback"),
+                        default="auto",
+                        help="Transcript authority policy; fallback ignores reference-dir TXT files.")
     parser.add_argument("--wav-dir", type=Path, required=True)
     parser.add_argument("--aligned-dir", type=Path, required=True)
+    parser.add_argument("--ctc-raw-manifest", type=Path, default=None,
+                        help="Explicit immutable CTC raw manifest; otherwise derive from work receipt.")
+    parser.add_argument("--ctc-work-receipt", type=Path, default=None,
+                        help="Explicit mutable CTC work receipt; otherwise use ctc-dir/.ctc_work_receipt.json.")
     parser.add_argument("--mfa-input-axis-receipt", type=Path, default=None)
     parser.add_argument("--mfa-alignment-axis-receipt", type=Path, default=None)
     parser.add_argument("--mfa-axis-audio-root", type=Path, default=None)
