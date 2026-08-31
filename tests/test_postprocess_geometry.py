@@ -11,7 +11,12 @@ from scripts.postprocess_textgrids import (
     Interval,
     Tier,
     TextGrid,
+    EN_PHONE_PREFIX,
     _duration_ticks,
+    _phone_duration_qc_issues,
+    _proportional_initial_split,
+    _register_suspicious_alignment,
+    build_pinyin_phones_tier,
     _absorb_tiny_gaps,
     _build_gap_ownership_evidence,
     _bind_source_phone_lineage,
@@ -21,6 +26,7 @@ from scripts.postprocess_textgrids import (
     _reconcile_publication_geometry,
     _find_internal_pp_gaps,
     _fix_overlapping_boundaries,
+    absorb_nvv_trailing,
     absorb_silence_into_punct,
     handle_unexpected_silences,
     _repair_authority_punctuation_geometry,
@@ -33,6 +39,8 @@ from scripts.postprocess_textgrids import (
     _pure_silence_label,
     _freeze_processed_geometry,
     _rebuild_derived_from_frozen_words,
+    _nvasr_candidate_provenance_audit,
+    _fallback_punctuation_surface_ledger,
     _inject_punctuation,
     _strict_semantic_tokens,
     detect_issues,
@@ -91,6 +99,142 @@ def test_duration_ticks_are_exact_at_30ms_boundary():
     assert _duration_ticks(0.0, 0.030000) == 30_000
     assert _duration_ticks(0.0, 0.029999) == 29_999
     assert _duration_ticks(11.54, 11.569999999999999) == 30_000
+
+
+@pytest.mark.parametrize("english,label,threshold", [
+    (False, "b", 0.015),
+    (True, f"{EN_PHONE_PREFIX}B", 0.010),
+])
+def test_phone_qc_accepts_exact_serialized_short_threshold_and_rejects_one_tick_below(
+        english, label, threshold):
+    start = 7.905
+    exact = Interval(start, start + threshold, label)
+    one_tick_short = Interval(start, start + threshold - 0.000001, label)
+
+    exact_issues = _phone_duration_qc_issues(
+        exact, 1, filter_short_phone=True, short_phone_sec=threshold,
+        long_consonant_sec=999.0, long_vowel_sec=999.0,
+        english=english)
+    short_issues = _phone_duration_qc_issues(
+        one_tick_short, 1, filter_short_phone=True,
+        short_phone_sec=threshold, long_consonant_sec=999.0,
+        long_vowel_sec=999.0, english=english)
+
+    expected_rule = "short_phone_en" if english else "short_phone"
+    assert exact_issues == []
+    assert short_issues == [{
+        "rule": expected_rule, "text": label,
+        "phone_idx": 1, "duration": round(threshold - 0.000001, 6),
+    }]
+
+
+def test_detect_issues_uses_serialized_ticks_for_adjacent_15ms_chinese_phones():
+    words = Tier("words", 7.89, 7.92, [
+        Interval(7.89, 7.92, "bu4"),
+    ])
+    phones = Tier("pinyin_phones", 7.89, 7.92, [
+        Interval(7.89, 7.905, "b"),
+        Interval(7.905, 7.92, "u4"),
+    ])
+    args = _qc_args(filter_short_phone=True)
+
+    issues = detect_issues(TextGrid(7.89, 7.92, [words, phones]), args)
+    assert not [row for row in issues if row["rule"] == "short_phone"]
+
+    phones.intervals[1] = Interval(7.905, 7.919999, "u4")
+    issues = detect_issues(TextGrid(7.89, 7.92, [words, phones]), args)
+    assert [row for row in issues if row["rule"] == "short_phone"] == [{
+        "rule": "short_phone", "text": "u4",
+        "phone_idx": 2, "duration": 0.014999,
+    }]
+
+
+def _split_fixture(word_duration: float, initial_duration: float) -> Tier:
+    words = Tier("words", 0.0, 1.0, [
+        Interval(0.0, word_duration, "jia3"),
+    ])
+    phones = Tier("phones", 0.0, 1.0, [
+        Interval(0.0, initial_duration, "j"),
+        Interval(initial_duration, word_duration, "a"),
+    ])
+    return build_pinyin_phones_tier(
+        phones, {}, words, {"jia3": ["j", "ia3"]})
+
+
+def test_mfa_three_to_five_ms_initial_falls_back_to_proportional_split():
+    tier = _split_fixture(0.100, 0.005)
+    assert [round(iv.duration, 3) for iv in tier.intervals] == [0.035, 0.065]
+
+
+def test_mfa_split_for_40ms_word_is_balanced_at_20ms_floor():
+    tier = _split_fixture(0.040, 0.004)
+    assert [round(iv.duration, 3) for iv in tier.intervals] == [0.020, 0.020]
+
+
+def test_mfa_split_for_40ms_word_rejects_sub_floor_final():
+    tier = _split_fixture(0.040, 0.028)
+    assert [round(iv.duration, 3) for iv in tier.intervals] == [0.020, 0.020]
+
+
+def test_valid_mfa_initial_split_is_retained():
+    tier = _split_fixture(0.100, 0.035)
+    assert [round(iv.duration, 3) for iv in tier.intervals] == [0.035, 0.065]
+
+
+def test_late_short_phone_issue_registers_suspicious_alignment_once():
+    reasons: list[str] = []
+    issues = [{"rule": "short_phone", "text": "j", "duration": 0.004}]
+    _register_suspicious_alignment(issues, reasons)
+    issues.append({"rule": "short_phone", "text": "j", "duration": 0.004})
+    _register_suspicious_alignment(issues, reasons)
+    assert reasons == ["suspicious_alignment"]
+    assert len(issues) == 1
+
+
+@pytest.mark.parametrize("label,expected", [
+    ("<sp0>", True), ("<SP1>", True), ("<sP2>", True),
+    ("<Sp3>", True),
+    ("sp0", True), ("sp1", True), ("sp2", True), ("sp3", True),
+    ("<sil>", True), ("sil", True), ("<eps>", True), ("spn", True),
+    ("<sp-malformed>", True),
+    ("SIL", False), ("<SIL>", False), ("SPN", False),
+    ("<Sp-malformed>", False), ("<SP0>tail", False),
+])
+def test_is_silence_uses_narrow_casefolded_canonical_and_bare_sp_contract(
+        label, expected):
+    assert is_silence(label) is expected
+
+
+def test_mixed_case_bracketed_canonical_resolves_like_lowercase():
+    decisions = []
+    for label in ("<sp0>", "<Sp0>", "<SP0>"):
+        grid = _visual_grid((0.4, 0.5))
+        grid.tiers[0].intervals[1].text = label
+        decision = _resolve_visual_short_silence_merges(
+            grid, None, 16000, _visual_args(), {})[0]
+        decisions.append((decision, grid))
+
+    assert [decision["decision"] for decision, _ in decisions] == [
+        "merged_left", "merged_left", "merged_left"]
+    assert [decision["reason"] for decision, _ in decisions] == [
+        "merged_left_fallback"] * 3
+    assert all(len(grid.tiers[0].intervals) == 2 for _, grid in decisions)
+
+
+@pytest.mark.parametrize("label", ("sp0", "sp1", "sp2", "sp3"))
+def test_bare_sp_labels_are_recognized_but_not_canonical_resolver_owners(label):
+    grid = _visual_grid((0.4, 0.5))
+    grid.tiers[0].intervals[1].text = label
+    report = {}
+    decision = _resolve_visual_short_silence_merges(
+        grid, None, 16000, _visual_args(), report)[0]
+
+    assert is_silence(label)
+    assert _pure_silence_label(label) is None
+    assert decision["decision"] == "preserve"
+    assert decision["reason"] == "mixed_or_noncanonical_silence_labels"
+    assert decision["operation"] is None
+    assert len(grid.tiers[0].intervals) == 3
 
 
 def test_ctc_authority_is_restored_after_late_tier_mutation():
@@ -675,6 +819,8 @@ def test_visual_energy_left_and_right_owner_are_committed_from_snapshot():
     right_decisions = _resolve_visual_short_silence_merges(
         right_grid, _gap_audio(0.0, 0.2), 16000, _visual_args(), right_report)
     assert right_decisions[0]["decision"] == "merged_right"
+    assert right_decisions[0]["reason"] == "energy_owner"
+    assert right_decisions[0]["direction_source"] == "energy_owner"
     assert [(iv.xmin, iv.xmax, iv.text)
             for iv in right_grid.tiers[0].intervals] == [
                 (0.0, 0.4, "ni3"), (0.4, 0.9, "hao3")]
@@ -717,35 +863,38 @@ def test_final_internal_silence_labels_use_integer_ticks_after_owner_commit(
     assert len(records) == (stale != expected)
 
 
-def test_exact_200ms_stale_sp0_is_not_reclassified_before_owner_decision():
+def test_exact_200ms_stale_sp0_is_merged_at_inclusive_configured_bound():
     grid = _visual_grid((0.4, 0.6))
     report = {}
     decisions = _resolve_visual_short_silence_merges(
         grid, None, 16000, _visual_args(merge_max_sil_sec=0.5), report)
-    # The stale label is still the resolver input and therefore does not
-    # activate Case 161's forced-left policy.
+    # Frame quantisation can turn a sub-200 ms sp0 into exactly 200 ms.  The
+    # configured 200 ms merge maximum is inclusive, so it remains an sp0
+    # owner decision and is forwarded instead of becoming an interior sp1.
     assert decisions[0]["label"] == "<sp0>"
     assert decisions[0]["expected_label"] == "<sp1>"
-    assert decisions[0]["decision"] == "preserve"
-    assert decisions[0]["reason"] == "silence_label_duration_mismatch"
+    assert decisions[0]["decision"] == "merged_left"
+    assert decisions[0]["reason"] == "merged_left_fallback"
+    assert decisions[0]["valid_internal_sp0"] is True
     assert [(iv.xmin, iv.xmax, iv.text)
             for iv in grid.tiers[0].intervals] == [
-                (0.0, 0.4, "ni3"), (0.4, 0.6, "<sp0>"),
-                (0.6, 0.9, "hao3")]
+                (0.0, 0.6, "ni3"), (0.6, 0.9, "hao3")]
 
     records = _normalize_final_internal_silence_labels(grid, report)
-    assert records and records[0]["from_label"] == "<sp0>"
-    assert grid.tiers[0].intervals[1].text == "<sp1>"
-    assert len(grid.tiers[0].intervals) == 3
+    assert records == []
+    assert len(grid.tiers[0].intervals) == 2
     assert [(iv.xmin, iv.xmax) for iv in grid.tiers[0].intervals] == [
-        (0.0, 0.4), (0.4, 0.6), (0.6, 0.9)]
+        (0.0, 0.6), (0.6, 0.9)]
     assert report["silence_merges"][0]["reason"] == (
-        "silence_label_duration_mismatch")
-    assert report["silence_merges"][0]["normalization_status"] == "relabelled"
+        "merged_left_fallback")
+    assert report["silence_merges"][0]["normalization_status"] == (
+        "not_retained_or_non_internal")
 
 
 def test_final_internal_silence_label_normalization_is_idempotent_and_ledgered():
-    grid = _visual_grid((0.4, 0.6))
+    # One microsecond above the inclusive sp0 merge boundary remains a stale
+    # label that the final normalization pass must repair.
+    grid = _visual_grid((0.4, 0.600001))
     report = {}
     _resolve_visual_short_silence_merges(
         grid, None, 16000, _visual_args(merge_max_sil_sec=0.5), report)
@@ -802,7 +951,7 @@ def test_frozen_hanzi_rebuild_preserves_exact_threshold_silence_labels():
 
 
 def test_normalized_internal_pause_remains_mid_and_strict_interior_rejected():
-    grid = _visual_grid((0.4, 0.6))
+    grid = _visual_grid((0.4, 0.600001))
     report = {}
     _resolve_visual_short_silence_merges(
         grid, None, 16000, _visual_args(merge_max_sil_sec=0.5), report)
@@ -823,24 +972,25 @@ def test_normalized_internal_pause_remains_mid_and_strict_interior_rejected():
     assert mid_sp == interior
 
     hanzi = Tier("hanzi", 0.0, 1.0, [
-        Interval(0.0, 0.4, "你"), Interval(0.4, 0.6, "<sp1>"),
-        Interval(0.6, 0.9, "好")])
+        Interval(0.0, 0.4, "你"), Interval(0.4, 0.600001, "<sp1>"),
+        Interval(0.600001, 0.9, "好")])
     phones = Tier("phones", 0.0, 1.0, [
         Interval(0.0, 0.2, "n"), Interval(0.2, 0.4, "i"),
-        Interval(0.6, 0.7, "h"), Interval(0.7, 0.9, "ao")])
+        Interval(0.600001, 0.7, "h"), Interval(0.7, 0.9, "ao")])
     pp = Tier("pinyin_phones", 0.0, 1.0, list(phones.intervals))
     reasons, details = _publication_contract_audit(
         words, hanzi, pp, phones, "你好",
         [{"text": "ni3", "start": 0.0, "end": 0.4},
-         {"text": "hao3", "start": 0.6, "end": 0.9}],
+         {"text": "hao3", "start": 0.600001, "end": 0.9}],
         [{"type": "word", "word": "ni3", "start_s": 0.0, "end_s": 0.4},
-         {"type": "word", "word": "hao3", "start_s": 0.6, "end_s": 0.9}],
+         {"type": "word", "word": "hao3", "start_s": 0.600001,
+          "end_s": 0.9}],
         False, None)
     assert "strict_interior_sp" in reasons
     assert details["strict_interior_sp"][0]["label"] == "<sp1>"
 
 
-def test_visual_energy_sp1_always_forwards_to_left_owner():
+def test_visual_energy_sp1_commits_accepted_owner():
     for right_level in (0.0, 0.2):
         grid = _visual_grid((0.4, 0.6))
         grid.tiers[0].intervals[1].text = "<sp1>"
@@ -849,12 +999,14 @@ def test_visual_energy_sp1_always_forwards_to_left_owner():
             grid, _gap_audio(0.2 if right_level == 0.0 else 0.0,
                              right_level, gap=(0.4, 0.6)), 16000,
                              _visual_args(merge_max_sil_sec=0.5), report)
-        assert decisions[0]["decision"] == "merged_left"
-        assert decisions[0]["reason"] == "forced_internal_sp1_forward"
-        assert decisions[0]["policy"] == "forced_internal_sp1_forward"
-        assert decisions[0]["direction_source"] == "forced_left"
+        assert decisions[0]["decision"] == (
+            "merged_left" if right_level == 0.0 else "merged_right")
+        assert decisions[0]["reason"] == "energy_owner"
+        assert decisions[0]["policy"] == "energy_owner"
+        assert decisions[0]["direction_source"] == "energy_owner"
         assert decisions[0]["label"] == "<sp1>"
         assert decisions[0]["expected_label"] == "<sp1>"
+        assert decisions[0]["forced_internal_sp1"] is True
         assert decisions[0]["effective_max_sil_sec"] == 0.5
         assert report["silence_merges"][0]["gap_duration"] == 0.2
 
@@ -866,9 +1018,9 @@ def test_visual_energy_sp1_default_bound_and_duration_boundaries():
         default_grid, _gap_audio(gap=(0.4, 0.6)), 16000,
         _visual_args(), {})[0]
     assert default_decision["decision"] == "merged_left"
-    assert default_decision["reason"] == "forced_internal_sp1_forward"
-    assert default_decision["policy"] == "forced_internal_sp1_forward"
-    assert default_decision["direction_source"] == "forced_left"
+    assert default_decision["reason"] == "energy_owner"
+    assert default_decision["policy"] == "energy_owner"
+    assert default_decision["direction_source"] == "energy_owner"
     assert default_decision["effective_max_sil_sec"] == 0.2
 
     for gap, label, expected_decision, expected_label in [
@@ -912,9 +1064,9 @@ def test_visual_energy_sp1_low_zero_ambiguous_and_single_frame_are_preserved():
         decision = _resolve_visual_short_silence_merges(
             grid, audio, 16000, _visual_args(merge_max_sil_sec=0.5), {})[0]
         assert decision["decision"] == "merged_left"
-        assert decision["reason"] == "forced_internal_sp1_forward"
-        assert decision["policy"] == "forced_internal_sp1_forward"
-        assert decision["direction_source"] == "forced_left"
+        assert decision["reason"] == "merged_left_fallback"
+        assert decision["policy"] == "merged_left_fallback"
+        assert decision["direction_source"] == "forced_left_fallback"
         assert decision["forced_original_reason"] == reason
         assert len(grid.tiers[0].intervals) == 2
 
@@ -956,14 +1108,19 @@ def test_visual_energy_sp1_protects_labels_owners_and_lineage_evidence():
             _visual_args(merge_max_sil_sec=0.5), {}, **kwargs)[0]
         if reason in {"phone_hole", "phone_lineage_ambiguous"}:
             assert decision["decision"] == "merged_left"
-            assert decision["reason"] == "forced_internal_sp1_forward"
-            assert decision["direction_source"] == "forced_left"
+            assert decision["reason"] == "merged_left_fallback"
+            assert decision["direction_source"] == "forced_left_fallback"
             assert decision["phone_reason"] == reason
             assert len(grid.tiers[0].intervals) == 2
-        else:
+        elif reason in {"reference_punctuation_owner", "edge"}:
             assert decision["decision"] == "preserve"
             assert decision["reason"] == reason
             assert len(grid.tiers[0].intervals) == 3
+        else:
+            assert decision["decision"] == "merged_left"
+            assert decision["reason"] == "energy_owner"
+            assert decision["direction_source"] == "energy_owner"
+            assert len(grid.tiers[0].intervals) == 2
 
     ctc_punctuation = _visual_grid((0.4, 0.6))
     ctc_punctuation.tiers[0].intervals[1].text = "<sp1>"
@@ -984,8 +1141,8 @@ def test_visual_energy_sp1_protects_labels_owners_and_lineage_evidence():
             {"type": "word", "word": "ctc", "start_s": 0.45, "end_s": 0.55}]
     )[0]
     assert lexical_ctc_decision["decision"] == "merged_left"
-    assert lexical_ctc_decision["reason"] == "forced_internal_sp1_forward"
-    assert lexical_ctc_decision["policy"] == "forced_internal_sp1_forward"
+    assert lexical_ctc_decision["reason"] == "energy_owner"
+    assert lexical_ctc_decision["policy"] == "energy_owner"
 
     mixed = TextGrid(0.0, 1.0, [Tier("words", 0.0, 1.0, [
         Interval(0.0, 0.4, "ni3"), Interval(0.4, 0.5, "<sp0>"),
@@ -1024,8 +1181,8 @@ def test_visual_forced_internal_sp1_ignores_switch_and_max_but_keeps_diagnostics
             grid, _gap_audio(gap=(0.4, 0.6)), 16000,
             _visual_args(**overrides), {})[0]
         assert decision["decision"] == "merged_left"
-        assert decision["policy"] == "forced_internal_sp1_forward"
-        assert decision["direction_source"] == "forced_left"
+        assert decision["policy"] == "energy_owner"
+        assert decision["direction_source"] == "energy_owner"
         assert "merge_disabled" in decision["forced_gate_reasons"] or (
             "long_pause" in decision["forced_gate_reasons"])
         assert len(grid.tiers[0].intervals) == 2
@@ -1090,6 +1247,211 @@ def test_visual_terminal_punctuation_tail_absorbs_once_and_preserves_negative_ca
     assert nvv_tail.tiers[0].intervals[-1].text == "<sp1>"
 
 
+def test_visual_terminal_punctuation_head_absorbs_final_lexical_to_punctuation_gap():
+    words = Tier("words", 0.0, 1.0, [
+        Interval(0.0, 0.60, "la5"),
+        Interval(0.60, 0.72, "<sp0>"),
+        Interval(0.72, 1.00, "。"),
+    ])
+    report = {}
+    decisions = _resolve_visual_short_silence_merges(
+        TextGrid(0.0, 1.0, [words]), None, 16000,
+        _visual_args(merge_max_sil_sec=0.5), report)
+    assert [(iv.xmin, iv.xmax, iv.text) for iv in words.intervals] == [
+        (0.0, 0.60, "la5"), (0.60, 1.00, "。")]
+    assert decisions[0]["operation"] == "terminal_punctuation_head_absorption"
+    assert decisions[0]["policy"] == "terminal_punctuation_head_absorption"
+    assert report["terminal_punctuation_head_absorption"][0]["punctuation_label"] == "。"
+
+    # An existing terminal lexical owner without punctuation is never
+    # synthesized by this repair.
+    no_punctuation = TextGrid(0.0, 1.0, [Tier("words", 0.0, 1.0, [
+        Interval(0.0, 0.60, "la5"), Interval(0.60, 0.90, "<sp1>"),
+        Interval(0.90, 1.00, "hao3")])])
+    _resolve_visual_short_silence_merges(
+        no_punctuation, None, 16000, _visual_args(), {})
+    assert not any(iv.text == "。" for iv in no_punctuation.tiers[0].intervals)
+
+
+def test_visual_terminal_nvv_sp0_absorbs_only_short_axis_closing_tail():
+    words = Tier("words", 0.0, 1.0, [
+        Interval(0.0, 0.70, "<BREATHING>"),
+        Interval(0.70, 0.88, "<sp0>"),
+        Interval(0.88, 1.00, "<sp0>"),
+    ])
+    # Consecutive pure SP0 intervals form one 300 ms run and therefore fail
+    # the under-200-ms terminal NVV policy.
+    decisions = _resolve_visual_short_silence_merges(
+        TextGrid(0.0, 1.0, [words]), None, 16000,
+        _visual_args(merge_max_sil_sec=0.5), {})
+    assert decisions[-1]["reason"] != "terminal_nvv_sp0_absorption"
+    assert any(is_silence(iv.text) for iv in words.intervals)
+
+    words = Tier("words", 0.0, 1.20, [
+        Interval(0.0, 0.70, "<BREATHING>"),
+        Interval(0.70, 1.00, "<sp1>"),
+        Interval(1.00, 1.20, "hao3"),
+    ])
+    report = {}
+    decisions = _resolve_visual_short_silence_merges(
+        TextGrid(0.0, 1.20, [words]), None, 16000,
+        _visual_args(merge_max_sil_sec=0.5), report)
+    assert [(iv.xmin, iv.xmax, iv.text) for iv in words.intervals] == [
+        (0.0, 1.00, "<BREATHING>"), (1.00, 1.20, "hao3")]
+
+    # A true terminal NVV -> short SP0 -> axis end has no following owner.
+    words = Tier("words", 0.0, 1.0, [
+        Interval(0.0, 0.88, "<BREATHING>"),
+        Interval(0.88, 1.00, "<sp0>"),
+    ])
+    report = {}
+    decisions = _resolve_visual_short_silence_merges(
+        TextGrid(0.0, 1.0, [words]), None, 16000,
+        _visual_args(merge_max_sil_sec=0.5), report)
+    assert [(iv.xmin, iv.xmax, iv.text) for iv in words.intervals] == [
+        (0.0, 1.00, "<BREATHING>")]
+    assert decisions[0]["operation"] == "terminal_nvv_sp0_absorption"
+    assert decisions[0]["policy"] == "terminal_nvv_sp0_absorption"
+    assert report["terminal_nvv_sp0_absorption"][0]["left_owner"] == "<BREATHING>"
+
+
+def test_nvv_trailing_absorption_preserves_sealed_source_punctuation():
+    words = Tier("words", 0.0, 1.0, [
+        Interval(0.0, 0.30, "BREATHING"),
+        Interval(0.30, 0.40, "，"),
+        Interval(0.40, 0.70, "<sp1>"),
+        Interval(0.70, 1.0, "hao3"),
+    ])
+    grid = TextGrid(0.0, 1.0, [words])
+    grid._fallback_punctuation_surface_ledger = \
+        _fallback_punctuation_surface_ledger("<BREATHING>，好")
+    absorb_nvv_trailing(grid)
+    assert [(iv.xmin, iv.xmax, iv.text) for iv in words.intervals] == [
+        (0.0, 0.30, "BREATHING"), (0.30, 0.40, "，"),
+        (0.40, 0.70, "<sp1>"), (0.70, 1.0, "hao3")]
+
+
+def test_visual_nvv_adjacent_sp1_uses_unique_ordinal_ctc_containment_only():
+    def run(items, ctc):
+        words = Tier("words", 0.0, 1.47, [
+            Interval(0.0, 0.75, "<sp0>"),
+            *items,
+        ])
+        report = {}
+        decisions = _resolve_visual_short_silence_merges(
+            TextGrid(0.0, 1.47, [words]), None, 16000,
+            _visual_args(merge_max_sil_sec=0.2), report,
+            ctc_tokens=ctc)
+        return words, decisions, report
+
+    words, decisions, _ = run([
+        Interval(0.75, 1.02, "la5"),
+        Interval(1.02, 1.23, "<sp1>"),
+        Interval(1.23, 1.47, "BREATHING"),
+    ], [
+        {"type": "word", "word": "la5", "start_s": 0.75, "end_s": 1.23},
+        {"type": "word", "word": "BREATHING", "start_s": 1.23, "end_s": 1.47},
+    ])
+    assert [(iv.xmin, iv.xmax, iv.text) for iv in words.intervals] == [
+        (0.0, 0.75, "<sp0>"), (0.75, 1.23, "la5"),
+        (1.23, 1.47, "BREATHING")]
+    assert decisions[1]["operation"] == "nvv_adjacent_sp1_ctc_merge"
+    assert decisions[1]["policy"] == "nvv_adjacent_sp1_ctc_containing_owner"
+    assert decisions[1]["nvv_adjacent_sp1_ctc_evidence"]["ctc_span"] == [
+        0.75, 1.23]
+
+    # Historical 00057 shape: the ordinary right owner starts after the gap,
+    # so its ordinal-bound CTC span cannot contain the NVV-adjacent SP1.
+    words, decisions, _ = run([
+        Interval(0.57, 0.99, "LAUGHTER"),
+        Interval(0.99, 1.39, "<sp1>"),
+        Interval(1.39, 1.47, "xie4"),
+    ], [
+        {"type": "word", "word": "LAUGHTER", "start_s": 0.57, "end_s": 0.99},
+        {"type": "word", "word": "xie4", "start_s": 1.41, "end_s": 1.47},
+    ])
+    assert any(is_silence(iv.text) for iv in words.intervals)
+    assert decisions[1]["reason"] == "merged_left_fallback"
+
+    # Duplicate ordinal evidence is ambiguous and missing evidence has no
+    # direction; both cases use the canonical SP1 merged-left fallback.
+    for ctc in (
+        [{"type": "word", "word": "la5", "lexical_ordinal": 0,
+          "start_s": 0.75, "end_s": 1.23},
+         {"type": "word", "word": "la5", "lexical_ordinal": 0,
+          "start_s": 0.70, "end_s": 1.23}],
+        [],
+    ):
+        words, decisions, _ = run([
+            Interval(0.75, 1.02, "la5"),
+            Interval(1.02, 1.23, "<sp1>"),
+            Interval(1.23, 1.47, "BREATHING"),
+        ], ctc)
+        assert any(is_silence(iv.text) for iv in words.intervals)
+        assert decisions[1]["reason"] == "merged_left_fallback"
+
+
+def test_visual_sp0_ctc_owner_precedes_energy_and_duplicate_falls_back_left():
+    words = Tier("words", 0.0, 1.0, [
+        Interval(0.0, 0.4, "ni3"), Interval(0.4, 0.5, "<sp0>"),
+        Interval(0.5, 0.9, "hao3")])
+    grid = TextGrid(0.0, 1.0, [words])
+    decision = _resolve_visual_short_silence_merges(
+        grid, _gap_audio(0.0, 0.2), 16000, _visual_args(), {},
+        ctc_tokens=[
+            {"type": "word", "word": "ni3", "start_s": 0.0, "end_s": 0.4},
+            {"type": "word", "word": "hao3", "start_s": 0.4, "end_s": 0.9},
+        ])[0]
+    assert decision["decision"] == "merged_right"
+    assert decision["reason"] == "ctc_containing_owner"
+    assert decision["policy"] == "ctc_containing_owner"
+    assert decision["direction_source"] == "ctc_containing_owner"
+    assert decision["operation"] == "ctc_containing_owner_merge"
+    assert [(iv.text, iv.xmin, iv.xmax) for iv in words.intervals] == [
+        ("ni3", 0.0, 0.4), ("hao3", 0.4, 0.9)]
+
+    duplicate = TextGrid(0.0, 1.0, [Tier("words", 0.0, 1.0, [
+        Interval(0.0, 0.4, "ni3"), Interval(0.4, 0.5, "<sp0>"),
+        Interval(0.5, 0.9, "hao3")])])
+    duplicate_decision = _resolve_visual_short_silence_merges(
+        duplicate, np.zeros(16000, dtype=np.float32), 16000,
+        _visual_args(), {}, ctc_tokens=[
+            {"type": "word", "word": "ni3", "start_s": 0.0, "end_s": 0.4},
+            {"type": "word", "word": "hao3", "lexical_ordinal": 1,
+             "start_s": 0.4, "end_s": 0.9},
+            {"type": "word", "word": "hao3", "lexical_ordinal": 1,
+             "start_s": 0.45, "end_s": 0.9},
+        ])[0]
+    assert duplicate_decision["decision"] == "merged_left"
+    assert duplicate_decision["reason"] == "merged_left_fallback"
+    assert duplicate_decision["direction_source"] == "forced_left_fallback"
+
+
+@pytest.mark.parametrize("label,gap", [("<sp0>", (0.4, 0.5)),
+                                        ("<sp1>", (0.4, 0.6))])
+def test_visual_canonical_sp_ignores_merge_switch_and_config_max(label, gap):
+    grid = _visual_grid(gap)
+    grid.tiers[0].intervals[1].text = label
+    decision = _resolve_visual_short_silence_merges(
+        grid, np.zeros(16000, dtype=np.float32), 16000,
+        _visual_args(merge_silence=False, merge_max_sil_sec=0.001), {})[0]
+    assert decision["decision"] == "merged_left"
+    assert decision["direction_source"] == "forced_left_fallback"
+    assert decision["reason"] == "merged_left_fallback"
+    assert "merge_disabled" in decision["forced_gate_reasons"]
+    assert len(grid.tiers[0].intervals) == 2
+
+
+def test_stale_sp0_one_tick_above_boundary_is_hard_vetoed():
+    grid = _visual_grid((0.4, 0.600001))
+    decision = _resolve_visual_short_silence_merges(
+        grid, np.zeros(16000, dtype=np.float32), 16000,
+        _visual_args(merge_max_sil_sec=0.5), {})[0]
+    assert decision["decision"] == "preserve"
+    assert decision["reason"] == "silence_label_duration_mismatch"
+    assert len(grid.tiers[0].intervals) == 3
+
+
 def test_visual_sp1_merge_is_idempotent_through_freeze_and_derived_sync():
     words = Tier("words", 0.0, 0.9, [
         Interval(0.0, 0.4, "ni3"), Interval(0.4, 0.6, "<sp1>"),
@@ -1127,7 +1489,7 @@ def test_visual_sp1_merge_is_idempotent_through_freeze_and_derived_sync():
                    for iv in next(t for t in tg.tiers if t.name == "phones").intervals)
 
 
-def test_visual_energy_ambiguous_or_missing_audio_forwards_unknown_sp0():
+def test_visual_valid_internal_sp0_forwards_left_even_without_energy_evidence():
     cases = [
         (_gap_audio(0.2, 0.2), "preserve_ambiguous_energy"),
         (_gap_audio(0.2 * 0.54, 0.2 * 0.46), "preserve_ambiguous_energy"),
@@ -1143,17 +1505,19 @@ def test_visual_energy_ambiguous_or_missing_audio_forwards_unknown_sp0():
         decisions = _resolve_visual_short_silence_merges(
             grid, audio, 16000, _visual_args(), {})
         assert decisions[0]["decision"] == "merged_left"
-        assert decisions[0]["reason"] == "unknown_sp0_forward"
-        assert decisions[0]["policy"] == "unknown_sp0_forward"
+        assert decisions[0]["reason"] == "merged_left_fallback"
+        assert decisions[0]["policy"] == "merged_left_fallback"
         assert decisions[0]["forced_original_reason"] == reason
+        assert decisions[0]["forced_internal_sp1"] is False
         assert len(grid.tiers[0].intervals) == 2
 
     grid = _visual_grid()
     decisions = _resolve_visual_short_silence_merges(
         grid, None, 16000, _visual_args(), {})
-    assert decisions[0]["reason"] == "unknown_sp0_forward"
-    assert decisions[0]["policy"] == "unknown_sp0_forward"
+    assert decisions[0]["reason"] == "merged_left_fallback"
+    assert decisions[0]["policy"] == "merged_left_fallback"
     assert decisions[0]["forced_original_reason"] == "missing_audio"
+    assert decisions[0]["forced_internal_sp1"] is False
     assert len(grid.tiers[0].intervals) == 2
 
 
@@ -1171,8 +1535,26 @@ def test_visual_energy_structural_owners_and_long_pause_are_preserved():
         grid.tiers[0].intervals[1].text = label
         decisions = _resolve_visual_short_silence_merges(
             grid, _gap_audio(gap=gap), 16000, _visual_args(), {})
-        assert decisions[0]["decision"] == "preserve"
-        assert len(grid.tiers[0].intervals) == 3
+        inclusive_sp0 = label == "<sp0>" and gap == (0.4, 0.6)
+        expected_decision = ("merged_left" if
+                             words == ("ni3", "<LAUGHTER>") or inclusive_sp0
+                             else "preserve")
+        assert decisions[0]["decision"] == expected_decision
+        assert len(grid.tiers[0].intervals) == (
+            2 if words == ("ni3", "<LAUGHTER>") or inclusive_sp0 else 3)
+
+        if words == ("ni3", "<LAUGHTER>"):
+            assert decisions[0]["reason"] == "energy_owner"
+            assert decisions[0]["policy"] == "energy_owner"
+            assert decisions[0]["operation"] == "energy_short_sp_merge"
+            assert decisions[0]["direction_source"] == "energy_owner"
+            assert decisions[0]["left_is_nvv"] is False
+            assert decisions[0]["right_is_nvv"] is True
+        elif inclusive_sp0:
+            assert decisions[0]["reason"] == "energy_owner"
+            assert decisions[0]["policy"] == "energy_owner"
+        else:
+            assert decisions[0]["decision"] == "preserve"
 
     grid = _visual_grid()
     decisions = _resolve_visual_short_silence_merges(
@@ -1231,10 +1613,10 @@ def test_visual_gap_rejects_phone_hole_and_ambiguous_lineage():
         Interval(0.0, 0.4, "n"), Interval(0.5, 0.9, "h")]))
     decisions = _resolve_visual_short_silence_merges(
         grid, _gap_audio(), 16000, _visual_args(), {})
-    assert decisions[0]["reason"] == "unknown_sp0_forward"
-    assert decisions[0]["policy"] == "unknown_sp0_forward"
+    assert decisions[0]["reason"] == "merged_left_fallback"
+    assert decisions[0]["policy"] == "merged_left_fallback"
     assert decisions[0]["direction_source"] == "forced_left_fallback"
-    assert decisions[0]["operation"] == "unknown_sp0_forward_merge"
+    assert decisions[0]["operation"] == "merged_left_fallback"
     assert len(grid.tiers[0].intervals) == 2
 
     grid = _visual_grid()
@@ -1244,22 +1626,33 @@ def test_visual_gap_rejects_phone_hole_and_ambiguous_lineage():
     }
     decisions = _resolve_visual_short_silence_merges(
         grid, _gap_audio(), 16000, _visual_args(), {})
-    assert decisions[0]["reason"] == "unknown_sp0_forward"
-    assert decisions[0]["policy"] == "unknown_sp0_forward"
+    assert decisions[0]["reason"] == "merged_left_fallback"
+    assert decisions[0]["policy"] == "merged_left_fallback"
     assert len(grid.tiers[0].intervals) == 2
 
 
-def test_unknown_internal_sp0_forwards_to_left_owner():
+def test_valid_internal_sp0_forwards_to_left_owner():
     grid = _visual_grid((0.4, 0.5))
     decisions = _resolve_visual_short_silence_merges(
         grid, np.zeros(16000, dtype=np.float32), 16000,
         _visual_args(), {})
     assert decisions[0]["decision"] == "merged_left"
-    assert decisions[0]["reason"] == "unknown_sp0_forward"
-    assert decisions[0]["policy"] == "unknown_sp0_forward"
+    assert decisions[0]["reason"] == "merged_left_fallback"
+    assert decisions[0]["policy"] == "merged_left_fallback"
     assert decisions[0]["direction_source"] == "forced_left_fallback"
     assert [(iv.xmin, iv.xmax, iv.text) for iv in grid.tiers[0].intervals] == [
         (0.0, 0.5, "ni3"), (0.5, 0.9, "hao3")]
+
+
+def test_internal_sp0_over_configured_maximum_fails_closed():
+    grid = _visual_grid((0.4, 0.5))
+    decision = _resolve_visual_short_silence_merges(
+        grid, np.zeros(16000, dtype=np.float32), 16000,
+        _visual_args(merge_max_sil_sec=0.05), {})[0]
+    assert decision["decision"] == "merged_left"
+    assert decision["reason"] == "merged_left_fallback"
+    assert decision["forced_internal_sp1"] is False
+    assert len(grid.tiers[0].intervals) == 2
 
 
 def test_broad_punctuation_span_does_not_protect_later_internal_sp0():
@@ -1275,9 +1668,64 @@ def test_broad_punctuation_span_does_not_protect_later_internal_sp0():
                      "start_s": 0.25, "end_s": 0.55}])
     assert [item["punctuation_owner"] for item in decisions] == [None, None]
     assert [item["policy"] for item in decisions] == [
-        "unknown_sp0_forward", "unknown_sp0_forward"]
+        "merged_left_fallback", "merged_left_fallback"]
     assert [(iv.xmin, iv.xmax, iv.text) for iv in grid.tiers[0].intervals] == [
         (0.0, 0.4, "ni3"), (0.4, 0.6, "hao3"), (0.6, 0.9, "ma1")]
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [("ni3", "<UHM>"), ("<UHM>", "hao3"), ("<UHM>", "<LAUGHTER>")],
+)
+def test_nvv_adjacent_sp0_always_merges_left_with_exact_policy(left, right):
+    grid = _visual_grid((0.4, 0.54), left=left, right=right)
+    first = _resolve_visual_short_silence_merges(
+        grid, np.zeros(16000, dtype=np.float32), 16000, _visual_args(), {})
+    decision = first[0]
+    assert decision["decision"] == "merged_left"
+    assert decision["reason"] == "nvv_adjacent_sp0_forward"
+    assert decision["policy"] == "nvv_adjacent_sp0_forward"
+    assert decision["operation"] == "nvv_adjacent_sp0_forward_merge"
+    assert decision["direction_source"] == "forced_left_fallback"
+    assert decision["left_is_nvv"] is (left.startswith("<"))
+    assert decision["right_is_nvv"] is (right.startswith("<"))
+    assert [(iv.text, iv.xmin, iv.xmax) for iv in grid.tiers[0].intervals] == [
+        (left, 0.0, 0.54), (right, 0.54, 0.9)]
+    assert _resolve_visual_short_silence_merges(
+        grid, np.zeros(16000, dtype=np.float32), 16000, _visual_args(), {}) == []
+
+
+@pytest.mark.parametrize("left,right", [
+    ("<UHM>", "hao3"), ("ni3", "<UHM>"), ("<UHM>", "<LAUGHTER>"),
+])
+def test_nvv_adjacent_sp1_missing_ctc_uses_left_fallback(left, right):
+    grid = _visual_grid((0.4, 0.6), left=left, right=right)
+    grid.tiers[0].intervals[1].text = "<sp1>"
+    decision = _resolve_visual_short_silence_merges(
+        grid, np.zeros(16000, dtype=np.float32), 16000,
+        _visual_args(merge_max_sil_sec=0.5), {})[0]
+    assert decision["decision"] == "merged_left"
+    assert decision["reason"] == "merged_left_fallback"
+    assert decision["forced_internal_sp1"] is False
+    assert decision["operation"] == "merged_left_fallback"
+    assert len(grid.tiers[0].intervals) == 2
+
+
+def test_laria_kan4_sp0_owns_gap_without_moving_uhm():
+    words = Tier("words", 5.91, 6.75, [
+        Interval(5.91, 6.25, "kan4"),
+        Interval(6.25, 6.39, "<sp0>"),
+        Interval(6.39, 6.75, "UHM"),
+    ])
+    grid = TextGrid(5.91, 6.75, [words])
+    decision = _resolve_visual_short_silence_merges(
+        grid, np.zeros(16000 * 7, dtype=np.float32), 16000,
+        _visual_args(), {})[0]
+    assert decision["reason"] == "nvv_adjacent_sp0_forward"
+    assert decision["operation"] == "nvv_adjacent_sp0_forward_merge"
+    assert decision["direction_source"] == "forced_left_fallback"
+    assert [(iv.xmin, iv.xmax, iv.text) for iv in words.intervals] == [
+        (5.91, 6.39, "kan4"), (6.39, 6.75, "UHM")]
 
 
 def test_local_explicit_punctuation_gap_is_restored_as_punctuation():
@@ -1382,3 +1830,94 @@ def test_frozen_rebuild_preserves_canonical_english_units_and_duplicate_phone_ed
     assert rebuilt_pp.intervals[-1].xmax == words.intervals[-1].xmax
     assert [(iv.xmin, iv.xmax) for iv in rebuilt_hanzi.intervals] == [
         (iv.xmin, iv.xmax) for iv in words.intervals]
+
+
+def test_nvasr_audit_reports_all_spans_and_rejects_final_ctc_divergence():
+    candidate = {
+        "word": "BREATHING",
+        "candidate_kind": "nvv",
+        "provenance_schema": "nvasr-candidate-provenance-v1",
+        "candidate_id": "nvasr-candidate-0004",
+        "mapping_basis": "raw_ctc_label_neighbors_forced_overlap-v2",
+        "mapping_outcome": "unique",
+        "mapping_key": {"left_lexical_ordinal": 6,
+                        "right_lexical_ordinal": 7},
+        "raw_span": [3.66, 3.72],
+        "raw_start_s": 3.66,
+        "raw_end_s": 3.72,
+        "raw_start_frame": 61,
+        "raw_end_frame": 62,
+        "raw_frame_count": 1,
+        "frame_ms": 60,
+        "speech_span": [3.42, 3.48],
+        "forced_span": [3.39, 3.45],
+        "adjusted_span": [3.39, 3.45],
+    }
+    words = Tier("words", 0.0, 4.0,
+                 [Interval(3.39, 3.45, "BREATHING")])
+    audit = _nvasr_candidate_provenance_audit([candidate], words)
+    assert audit["status"] == "verified"
+    assert audit["candidates"][0]["final_span"] == [3.39, 3.45]
+    assert audit["candidates"][0]["verified_one_frame"] is True
+    assert audit["candidates"][0]["display_is_acoustic_evidence"] is False
+
+    words.intervals[0].xmax = 3.50
+    rejected = _nvasr_candidate_provenance_audit([candidate], words)
+    assert rejected["status"] == "rejected"
+    assert "unauthorized_final_ctc_divergence:0" in rejected["reasons"]
+
+    nvv_surface = dict(candidate, word="UHM")
+    nvv_surface["candidate_id"] = "nvasr-candidate-0002"
+    nvv_words = Tier("words", 0.0, 4.0, [Interval(3.39, 3.45, "<UHM>")])
+    assert _nvasr_candidate_provenance_audit(
+        [nvv_surface], nvv_words)["status"] == "verified"
+
+
+def test_nvasr_audit_rejects_final_nvv_when_candidate_rows_are_empty():
+    words = Tier("words", 0.0, 1.0,
+                 [Interval(0.2, 0.8, "<LAUGHTER>")])
+    unprovenanced = [{
+        "word": "LAUGHTER", "start_s": 0.2, "end_s": 0.8,
+        "start_ms": 200.0, "end_ms": 800.0, "type": "word",
+    }]
+
+    audit = _nvasr_candidate_provenance_audit(unprovenanced, words)
+
+    assert audit["status"] == "rejected"
+    assert audit["candidate_count"] == 0
+    assert "final_nvv_without_candidate_provenance" in audit["reasons"]
+    assert "ctc_nvv_without_candidate_provenance" in audit["reasons"]
+
+    authority = _nvasr_candidate_provenance_audit(
+        unprovenanced, words, required=False)
+    assert authority["status"] == "not_applicable"
+    assert authority["reasons"] == []
+
+
+def test_nvasr_audit_allows_only_frozen_full_ctc_bound_divergence():
+    candidate = {
+        "word": "BREATHING",
+        "candidate_kind": "nvv",
+        "provenance_schema": "nvasr-candidate-provenance-v1",
+        "candidate_id": "nvasr-candidate-0065",
+        "mapping_basis": "raw_ctc_label_neighbors_forced_overlap-v2",
+        "mapping_outcome": "unique",
+        "ctc_lexical_ordinal": 0,
+        "raw_span": [1.26, 1.32], "raw_start_s": 1.26,
+        "raw_end_s": 1.32, "raw_start_frame": 21,
+        "raw_end_frame": 22, "raw_frame_count": 1, "frame_ms": 60,
+        "speech_span": [1.02, 1.08], "forced_span": [1.20, 1.26],
+        "adjusted_span": [1.20, 1.26],
+    }
+    words = Tier("words", 0.0, 2.0, [Interval(1.30, 1.36, "BREATHING")])
+    words._ctc_word_authority = [{
+        "ctc_lexical_ordinal": 0, "text": "BREATHING",
+        "boundary_source": "ctc", "ctc_span": [1.20, 1.26],
+        "published_span": [1.30, 1.36],
+    }]
+
+    assert _nvasr_candidate_provenance_audit([candidate], words)["status"] == "verified"
+
+    unbound = Tier("words", 0.0, 2.0, [Interval(1.30, 1.36, "BREATHING")])
+    assert _nvasr_candidate_provenance_audit(
+        [candidate], unbound)["status"] == "rejected"

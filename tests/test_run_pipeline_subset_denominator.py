@@ -278,6 +278,145 @@ def test_pre_ctc_limit_freezes_sorted_manifest_and_accounting(tmp_path):
     assert ctx["pre_ctc_selection"]["selected_count"] == 2
 
 
+def _pre_ctc_accounting_ctx(tmp_path: Path):
+    receipt_path = tmp_path / "formal" / ".pipeline_run_receipt_v2.json"
+    return {
+        "accounting_receipt_path": receipt_path,
+        "expected_stems": ("a", "b"),
+        "pre_ctc_selection": {
+            "schema": "pre-ctc-stem-selection-v1",
+            "stems": ["a", "b"],
+            "selected_count": 2,
+            "source_count": 4,
+            "limit": 2,
+        },
+        "accounting_source_stems": ("a", "b", "c", "d"),
+        "accounting_eligible_stems": ("a", "b"),
+        "accounting_exclusions": (
+            {"stem": "c", "reason": "pre_ctc_limit"},
+            {"stem": "d", "reason": "pre_ctc_limit"},
+        ),
+    }
+
+
+def _write_ctc_accounting(path: Path, *, source, eligible, output, filtered,
+                          extra=None):
+    receipt = make_pipeline_accounting_receipt(
+        source, eligible, [], output, filtered,
+        run_id="producer", mode="ctc_prealign", route=["ctc_prealign"],
+        extra=extra,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(receipt), encoding="utf-8")
+    return receipt
+
+
+def test_load_ctc_accounting_projects_bounded_producer_onto_pipeline_scope(
+        tmp_path):
+    ctx = _pre_ctc_accounting_ctx(tmp_path)
+    producer = _write_ctc_accounting(
+        ctx["accounting_receipt_path"],
+        source=["a", "b"], eligible=["a", "b"], output=["a"], filtered=["b"],
+        extra={"producer_note": "preserve"},
+    )
+
+    assert run_pipeline._load_ctc_accounting(ctx, required=True) == 0
+    formal = json.loads(ctx["accounting_receipt_path"].read_text())
+    assert formal["source"]["stems"] == ["a", "b", "c", "d"]
+    assert formal["eligible"]["stems"] == ["a", "b"]
+    assert formal["exclusions"] == [
+        {"stem": "c", "reason": "pre_ctc_limit"},
+        {"stem": "d", "reason": "pre_ctc_limit"},
+    ]
+    assert formal["output"]["stems"] == ["a"]
+    assert formal["filtered"]["stems"] == ["b"]
+    assert formal["route"].count("project_pre_ctc_selection") == 1
+    assert formal["extra"]["producer_note"] == "preserve"
+    assert formal["extra"]["denominator_projection"] == (
+        "frozen_pre_ctc_selection")
+    assert formal["extra"]["producer_scope_identity"] == {
+        "source_stems_digest": producer["source"]["stems_digest"],
+        "eligible_stems_digest": producer["eligible"]["stems_digest"],
+        "output_stems_digest": producer["output"]["stems_digest"],
+        "filtered_stems_digest": producer["filtered"]["stems_digest"],
+    }
+    assert ctx["accounting_source_stems"] == ("a", "b", "c", "d")
+    assert ctx["accounting_eligible_stems"] == ("a", "b")
+
+
+def test_load_ctc_accounting_projection_is_byte_stable_on_resume(tmp_path):
+    ctx = _pre_ctc_accounting_ctx(tmp_path)
+    producer = _write_ctc_accounting(
+        ctx["accounting_receipt_path"],
+        source=["a", "b"], eligible=["a", "b"], output=["a"], filtered=["b"],
+    )
+
+    assert run_pipeline._load_ctc_accounting(ctx, required=True) == 0
+    first_bytes = ctx["accounting_receipt_path"].read_bytes()
+    first_formal = json.loads(first_bytes)
+    first_identity = first_formal["extra"]["producer_scope_identity"]
+    assert first_identity["source_stems_digest"] == producer["source"]["stems_digest"]
+    assert first_identity["eligible_stems_digest"] == producer["eligible"]["stems_digest"]
+
+    assert run_pipeline._load_ctc_accounting(ctx, required=True) == 0
+    assert ctx["accounting_receipt_path"].read_bytes() == first_bytes
+    second_formal = json.loads(ctx["accounting_receipt_path"].read_bytes())
+    assert second_formal["extra"]["producer_scope_identity"] == first_identity
+
+
+@pytest.mark.parametrize("tampered", [
+    {"accounting_source_stems": ("a", "b", "c")},
+    {"accounting_exclusions": (
+        {"stem": "c", "reason": "pre_ctc_limit"},)},
+])
+def test_load_ctc_accounting_rejects_tampered_upper_scope(tmp_path, tampered):
+    ctx = _pre_ctc_accounting_ctx(tmp_path)
+    _write_ctc_accounting(
+        ctx["accounting_receipt_path"],
+        source=["a", "b"], eligible=["a", "b"], output=["a"], filtered=["b"],
+    )
+    original = ctx["accounting_receipt_path"].read_bytes()
+    ctx.update(tampered)
+
+    assert run_pipeline._load_ctc_accounting(ctx, required=True) == 1
+    assert ctx["accounting_receipt_path"].read_bytes() == original
+
+
+def test_load_ctc_accounting_without_selection_keeps_producer_scope(tmp_path):
+    receipt_path = tmp_path / ".pipeline_run_receipt_v2.json"
+    producer = _write_ctc_accounting(
+        receipt_path,
+        source=["a", "b"], eligible=["a", "b"], output=["a"], filtered=["b"],
+        extra={"producer_note": "direct"},
+    )
+    ctx = {"accounting_receipt_path": receipt_path,
+           "expected_stems": ("a", "b")}
+
+    assert run_pipeline._load_ctc_accounting(ctx, required=True) == 0
+    formal = json.loads(receipt_path.read_text())
+    assert formal == producer
+    assert "denominator_projection" not in formal.get("extra", {})
+
+
+def test_load_ctc_accounting_projects_legacy_full_producer_compatibly(tmp_path):
+    ctx = _pre_ctc_accounting_ctx(tmp_path)
+    producer = _write_ctc_accounting(
+        ctx["accounting_receipt_path"],
+        source=["a", "b", "c", "d"],
+        eligible=["a", "b", "c", "d"],
+        output=["a", "c"], filtered=["b", "d"],
+    )
+
+    assert run_pipeline._load_ctc_accounting(ctx, required=True) == 0
+    formal = json.loads(ctx["accounting_receipt_path"].read_text())
+    assert formal["source"]["stems"] == ["a", "b", "c", "d"]
+    assert formal["eligible"]["stems"] == ["a", "b"]
+    assert formal["output"]["stems"] == ["a"]
+    assert formal["filtered"]["stems"] == ["b"]
+    assert formal["extra"]["producer_scope_identity"]["source_stems_digest"] == (
+        producer["source"]["stems_digest"])
+
+
 def test_pre_ctc_manifest_is_reused_by_prealign_without_second_limit(
         tmp_path, monkeypatch):
     source = tmp_path / "audio"

@@ -44,13 +44,23 @@ CONTINUATION_SCOPE_SCHEMA = "gpu1000-continuation-scope-v1"
 CONTINUATION_PREFLIGHT_V2_SCHEMA = "gpu1000-continuation-preflight-v2"
 
 try:
-    from scripts.pipeline_utils import make_mfa_alignment_axis_receipt, make_mfa_input_axis_receipt, validate_strict_mfa_textgrid, make_pipeline_accounting_receipt, validate_pipeline_accounting_receipt
+    from scripts.pipeline_utils import make_mfa_alignment_axis_receipt, make_mfa_input_axis_receipt, validate_strict_mfa_textgrid, make_pipeline_accounting_receipt, validate_pipeline_accounting_receipt, resolve_mfa_dither
 except ImportError:  # direct script execution
-    from pipeline_utils import make_mfa_alignment_axis_receipt, make_mfa_input_axis_receipt, validate_strict_mfa_textgrid, make_pipeline_accounting_receipt, validate_pipeline_accounting_receipt
+    from pipeline_utils import make_mfa_alignment_axis_receipt, make_mfa_input_axis_receipt, validate_strict_mfa_textgrid, make_pipeline_accounting_receipt, validate_pipeline_accounting_receipt, resolve_mfa_dither
 
 
 class SafetyError(RuntimeError):
     pass
+
+
+def _has_deterministic_mfa_dither(command: Any) -> bool:
+    """Return whether an MFA argv explicitly disables random MFCC dither."""
+    if not isinstance(command, list) or command.count("--dither") != 1:
+        return False
+    try:
+        return resolve_mfa_dither(command[command.index("--dither") + 1]) == 0.0
+    except (IndexError, TypeError, ValueError):
+        return False
 
 
 def _continuation_scope(path: Path) -> dict[str, Any]:
@@ -288,6 +298,8 @@ def continuation_preflight(root: Path, scope_path: Path | None = None, *, expect
                     # proof paths; hash equality is the binding authority.
             if not isinstance(cmd, list) or len(cmd) < 5: errors.append("proven_mfa_command_missing")
             else:
+                if not _has_deterministic_mfa_dither(cmd):
+                    errors.append("proven_mfa_dither_not_zero")
                 if cmd[0] != proof.get("mfa_executable", {}).get("path"): errors.append("mfa_executable_path_mismatch")
                 if cmd[3] != proof.get("dictionary", {}).get("path") or cmd[4] != proof.get("model", {}).get("path"): errors.append("mfa_model_dictionary_path_mismatch")
                 for value in (cmd[0], cmd[3], cmd[4]):
@@ -397,6 +409,8 @@ def _transform_retry_command(command: list[str], *, corpus: Path, audio: Path,
     """Transform only proven path tokens in the retry command."""
     if not isinstance(command, list) or len(command) < 6:
         raise SafetyError("proven retry command missing positional MFA paths")
+    if not _has_deterministic_mfa_dither(command):
+        raise SafetyError("proven retry command must set --dither 0.0")
     result = [str(token) for token in command]
     replacements: dict[str, str] = {}
     old_corpus = proof.get("corpus") or proof.get("input_corpus")
@@ -951,8 +965,10 @@ def _downstream_resume_preflight(root: Path, *, python: str = sys.executable) ->
             attempts[0].get("attempt") != "20_80" or attempts[0].get("returncode") != 1 or
             "NoAlignmentsError" not in str(attempts[0].get("stderr", "")) or
             beam_value(attempts[0], "--beam") != "20" or beam_value(attempts[0], "--retry_beam") != "80" or
+            beam_value(attempts[0], "--dither") != "0.0" or
             attempts[1].get("attempt") != "200_800" or attempts[1].get("returncode") != 0 or
-            beam_value(attempts[1], "--beam") != "200" or beam_value(attempts[1], "--retry_beam") != "800"):
+            beam_value(attempts[1], "--beam") != "200" or beam_value(attempts[1], "--retry_beam") != "800" or
+            beam_value(attempts[1], "--dither") != "0.0"):
         errors.append("resume_singleton_attempts_invalid")
     if merge.get("status") != "READY_FOR_DOWNSTREAM": errors.append("resume_merge_not_ready")
     if merge.get("preflight_v2_path") != str(v2_path.resolve()) or merge.get("preflight_v2_sha256") != v2_sha:

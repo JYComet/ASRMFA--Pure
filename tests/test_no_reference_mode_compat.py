@@ -312,6 +312,7 @@ def test_fallback_projection_skips_source_insertion_without_global_shift():
     assert alignment["safe"] is True
     assert alignment["source_only"] == 1
     assert alignment["actual_only"] == 0
+    assert alignment["actual_to_source"] == {0: 0, 1: 2, 2: 3}
 
     tier = post._build_hanzi_tier(
         words, "你好吗你", reference_authoritative=False)

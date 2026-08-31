@@ -96,6 +96,8 @@ def test_mfa_retry_packet_is_exact_and_bound(tmp_path: Path):
     assert packet["accepted_intersection"] == 0
     assert packet["execution"]["attempted"] is False
     assert packet["options"]["num_jobs"] == 12
+    assert packet["options"]["dither"] == 0.0
+    assert packet["command"][packet["command"].index("--dither") + 1] == "0.0"
 
 
 def test_mfa_retry_rejects_accepted_intersection(tmp_path: Path):
@@ -139,7 +141,8 @@ def test_each_missing_stem_gets_one_isolated_attempt():
         rescue_executor=lambda stem: (_ for _ in ()).throw(AssertionError("rescue forbidden")))
     assert state["merge_allowed"] and not state["rescue_used"]
     assert calls == [[stem] for stem in expected]
-    assert all(row["settings"] == {"beam": 20, "retry_beam": 80, "num_jobs": 1}
+    assert all(row["settings"] == {"beam": 20, "retry_beam": 80,
+                                    "num_jobs": 1, "dither": 0.0}
                for row in state["receipts"])
 
 

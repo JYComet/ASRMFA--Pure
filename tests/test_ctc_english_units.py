@@ -31,6 +31,53 @@ def _row(text: str, ordinal: int, start: float, end: float) -> dict:
     }
 
 
+def _ria_row(text: str, ordinal: int) -> dict:
+    start = ordinal * 0.1
+    return {"word": text, "start": start, "end": start + 0.1}
+
+
+@pytest.mark.parametrize("token", ["a1", "a2", "a3", "a4", "a5"])
+def test_protect_ria_keeps_tone_number_pinyin_unchanged(token):
+    rows = [_ria_row(token, 0)]
+    assert ctc._protect_ria(rows) == rows
+
+
+@pytest.mark.parametrize("token", ["a", "i", "r", "ri", "ia", "ai", "rr"])
+def test_protect_ria_keeps_partial_fragments_unchanged(token):
+    rows = [_ria_row(token, 0)]
+    assert ctc._protect_ria(rows) == rows
+
+
+def test_protect_ria_rejects_phrase_shaped_or_hyphenated_tokens():
+    rows = [_ria_row(token, index) for index, token in enumerate(
+        ["le5", "a5", "SURPRISE-WA"])]
+    assert ctc._protect_ria(rows) == rows
+
+
+@pytest.mark.parametrize("tokens", [["R", "I", "A"], ["R", "ia"], ["ri", "A"]])
+def test_protect_ria_merges_only_exact_positive_spans(tokens):
+    rows = [_ria_row(token, index) for index, token in enumerate(tokens)]
+    result = ctc._protect_ria(rows)
+    assert [(row["word"], row["start"], row["end"]) for row in result] == [
+        ("ria", 0.0, len(tokens) * 0.1)]
+
+
+def test_protect_ria_stops_at_shortest_exact_match_and_preserves_later_tokens():
+    rows = [_ria_row(token, index) for index, token in enumerate(
+        ["r", "i", "a", "ria", "ia"])]
+    result = ctc._protect_ria(rows)
+    assert [row["word"] for row in result] == ["ria", "ria", "ia"]
+    assert result[0]["start"] == pytest.approx(0.0)
+    assert result[0]["end"] == pytest.approx(0.3)
+    assert result[1]["start"] == pytest.approx(0.3)
+    assert result[1]["end"] == pytest.approx(0.4)
+
+
+@pytest.mark.parametrize("token", ["RIA", "Ria", "ria"])
+def test_protect_ria_keeps_standalone_name(token):
+    assert [row["word"] for row in ctc._protect_ria([_ria_row(token, 0)])] == ["ria"]
+
+
 def _positive_bundle(tmp_path: Path) -> tuple[Path, dict]:
     reference = "你K-Pop好"
     merged = ctc._merge_reference_english_fragments(
@@ -372,6 +419,18 @@ def test_short_processed_span_is_extended_past_representative_raw_anchor():
         [english, {"word": "hao3", "start": 4.90, "end": 5.0}],  [], [], 5.2)
     assert english["processed_ctc_span"] == [4.65, 4.90]
     assert english["processed_ctc_span"][1] >= english["canonical_span"][1]
+
+
+def test_readable_audio_clamp_cannot_shorten_canonical_span(monkeypatch):
+    english = _canonical_timed_row(4.65, 4.95)
+    monkeypatch.setattr(
+        geometry, "_load_local_rms_profile",
+        lambda _path: {"audio_end": 4.68, "rms": [], "frame_s": 0.005,
+                       "noise_floor": 0.0, "threshold": 0.001},
+    )
+    with pytest.raises(geometry.ProcessedGeometryError,
+                       match="canonical_span_outside_readable_audio"):
+        resolve_processed_english_spans([english], [], [], 5.2, "demo.wav")
 
 
 def test_processed_span_extends_from_raw_60ms_anchor_to_next_lexical_start():

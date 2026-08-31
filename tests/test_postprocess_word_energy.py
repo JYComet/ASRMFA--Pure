@@ -2,6 +2,7 @@ from types import SimpleNamespace
 import wave
 
 import numpy as np
+import pytest
 
 from scripts.postprocess_textgrids import (
     Interval,
@@ -89,6 +90,36 @@ def test_merge_dilution_uses_premerge_lexical_core():
     item = audit["items"][0]
     assert item["classification"] == "silence_merge_dilution"
     assert item["resulting_reason"] is None
+
+
+@pytest.mark.parametrize("operation", [
+    "energy_short_sp_merge",
+    "forced_internal_sp1_merge",
+    "forced_internal_sp1_forward_merge",
+    "short_internal_pause_left",
+    "valid_internal_sp0_forward_merge",
+    "nvv_adjacent_sp0_forward_merge",
+    "nvv_adjacent_sp1_ctc_merge",
+    "unknown_sp0_forward_merge",
+])
+def test_word_energy_audit_recognizes_current_and_new_merge_operations(operation):
+    words = Tier("words", 0.0, 0.3, [
+        Interval(0.0, 0.1, "<sp0>"), Interval(0.1, 0.2, "ni3"),
+        Interval(0.2, 0.3, "<sp0>"),
+    ])
+    words._word_energy_merge_ledger = [{
+        "lexical_ordinal": 0,
+        "operation": operation,
+        "policy": None,
+    }]
+    tg = TextGrid(0.0, 0.3, [words])
+    tg._phone_lineage = _lineage([(0.1, 0.2, "ni3")])
+    audit = _word_energy_audit(
+        words, _args(), np.full(4800, 0.5, dtype=np.float32), 16000,
+        textgrid=tg)
+    item = audit["items"][0]
+    assert item["merge_operation"] == operation
+    assert item["merge_policy"]
 
 
 def test_low_energy_and_lineage_hole_are_distinct_hard_results():

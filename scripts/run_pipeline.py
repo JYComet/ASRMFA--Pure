@@ -45,7 +45,7 @@ DEFAULT_CONFIG = PROJECT_ROOT / "config.yaml"
 sys.path.insert(0, str(SCRIPTS_DIR))
 from pipeline_utils import (
     parse_ctc_normalization_marker,
-    find_mfa_python, get_mfa_env,
+    find_mfa_python, get_mfa_env, resolve_mfa_dither,
     build_ctc_presence, build_file_index, build_flat_file_names,
     count_files_fast, find_wav,
     is_punct, is_word_like, is_english_token,
@@ -59,7 +59,7 @@ from pipeline_utils import (
     validate_pipeline_accounting_receipt,
     read_pipeline_accounting_receipt, write_pipeline_accounting_receipt,
     make_pipeline_resume_fingerprints,
-    compute_model_tree_digest, stable_json_digest,
+    compute_model_tree_digest, stable_json_digest, ensure_mfa_root_dir,
     write_ctc_run_receipt, make_audio_transform_receipt,
     write_audio_transform_receipt, make_mfa_input_axis_receipt,
     make_mfa_alignment_axis_receipt, validate_mfa_axis_receipts,
@@ -191,7 +191,7 @@ def resolve_input_path(raw: str, base: Path = PROJECT_ROOT) -> Path:
 # ---------------------------------------------------------------------------
 
 DEFAULT_CFG: dict = {
-    "mode": "full",               # "full" | "ctc_ready"
+    "mode": "full",               # "full" | "ctc_ready" | "qwen3asr"
     "workspace": "workspace",
     "data_dir": "data_dir",
     "nvme_cache": "",              # NVMe 音频缓存路径 (空=自动检测 /mnt/nvme3/mfa_audio_cache)
@@ -253,6 +253,9 @@ DEFAULT_CFG: dict = {
                                      # set explicitly to avoid oversubscription.
                                      # Shards = min(8, cpu//4, stems//200); ~2 cores/shard for MFCC.
         "single_speaker": True,
+        # Acoustic-model metadata otherwise enables random MFCC noise, which
+        # moves MFA boundaries between identical runs.
+        "dither": 0.0,
         "output_format": "long_textgrid",
         "clean": False,              # keep feature cache for faster re-runs
         "no_tokenization": True,
@@ -276,6 +279,7 @@ DEFAULT_CFG: dict = {
         "output_dir": "en_phones",
         "temp_dir": "temp_en_mfa",
         "num_jobs": 4,
+        "dither": 0.0,
         "normalize_workers": 0,       # 0=auto: min(32, cpu_count)
         "corpus_workers": 0,          # 0=auto: min(16, cpu_count)
         "padding_ms": 75,
@@ -350,6 +354,23 @@ DEFAULT_CFG: dict = {
         "prefetch_buffer": 4,     # max prefetched batches on local NVMe
         "upload_buffer": 4,       # max completed batches awaiting NAS upload
     },
+    "qwen3asr": {
+        "backend": "transformers",
+        "profile": "transcript_only",
+        "model_path": "",
+        "output_dir": "output/qwen3asr",
+        "forced_aligner_model_path": "",
+        "nvasr_model_path": "",
+        "nvv_bias": 4.0,
+        "pause_threshold": 8,
+        "python": "",
+        "device": "cuda:0",
+        "dtype": "bfloat16",
+        "language": None,
+        "context": "",
+        "batch_size": 1,
+        "max_new_tokens": 2048,
+    },
 }
 
 
@@ -419,6 +440,17 @@ def resolve_workspace_namespace(workspace: Path, value: str, label: str) -> Path
     if candidate == root or not candidate.is_relative_to(root):
         raise ValueError(f"{label} escapes workspace: {value!r}")
     return candidate
+
+
+def _configure_mfa_root_dir(workspace: Path) -> int:
+    """Install the run-local MFA root before launching any child process."""
+    try:
+        root = ensure_mfa_root_dir(workspace)
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"ERROR: unable to create isolated MFA root for {workspace}: {exc}")
+        return 1
+    print(f"  MFA root: {root}")
+    return 0
 
 
 def guard_fresh_workspace_targets(workspace: Path, output: Path | None = None,
@@ -1415,6 +1447,7 @@ def step_mfa_validate(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         "--audio_directory", str(ctx["mfa_audio_dir"]),
         "--temporary_directory", str(ctx["temp_dir"]),
         "--num_jobs", str(resolve_num_jobs(mc.get("num_jobs", 0))),
+        "--dither", str(resolve_mfa_dither(mc.get("dither", 0.0))),
         "--overwrite",
     ]
     if mc.get("clean"):
@@ -1456,7 +1489,11 @@ def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                     rc = _load_ctc_accounting(ctx, required=True)
                     if rc:
                         return rc
-                    rc = _ensure_ctc_axis_receipt(ctx)
+                    ctx["_ctc_axis_producer_phase"] = True
+                    try:
+                        rc = _ensure_ctc_axis_receipt(ctx)
+                    finally:
+                        ctx.pop("_ctc_axis_producer_phase", None)
                     return rc if rc else _seal_ctc_raw(ctx)
                 print(f"  CTC .ctc_normalized manifest digest mismatch —"
                       f" re-running (stale marker).")
@@ -1526,7 +1563,11 @@ def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     rc = _load_ctc_accounting(ctx, required=True)
     if rc:
         return rc
-    rc = _ensure_ctc_axis_receipt(ctx)
+    ctx["_ctc_axis_producer_phase"] = True
+    try:
+        rc = _ensure_ctc_axis_receipt(ctx)
+    finally:
+        ctx.pop("_ctc_axis_producer_phase", None)
     return rc if rc else _seal_ctc_raw(ctx)
 
 
@@ -1552,7 +1593,12 @@ def _ensure_ctc_axis_receipt(ctx: dict) -> int:
             bindings = receipt.get("audio_bindings")
             if (isinstance(bindings, list) and expected
                     and len(bindings) == len(expected)):
+                receipt_errors = validate_ctc_run_receipt_v2(
+                    receipt, expected_stems=expected, audio_root=audio_dir)
+                if receipt_errors:
+                    raise ValueError("; ".join(receipt_errors))
                 ctx["ctc_axis_receipt"] = receipt
+                ctx["ctc_axis_receipt_path"] = receipt_path
                 ctx["ctc_raw_manifest"] = raw_manifest_path
                 ctx["ctc_raw_manifest_data"] = manifest
                 return 0
@@ -1630,25 +1676,46 @@ def _ensure_ctc_axis_receipt(ctx: dict) -> int:
         receipt["audio_bindings"] = bindings
         receipt["audio_axis_role"] = "ctc_input_audio"
         receipt_errors = validate_ctc_run_receipt_v2(
-            receipt, expected_stems=stems)
+            receipt, expected_stems=stems, audio_root=audio_dir)
         if receipt_errors:
             raise ValueError("; ".join(receipt_errors))
-        # The producer receipt belongs to the sealed raw CTC bundle.  A
-        # resumed run may need to derive missing physical-audio bindings, but
-        # must never rewrite that raw receipt: doing so changes its producer
-        # hash and invalidates every already-materialized CTC work receipt.
-        # Keep the derived binding in the current context (and in a separate
-        # workspace artifact for inspection) instead.
-        derived_path = Path(ctx.get("workspace", ctc_dir)) / ".ctc_input_axis_receipt.json"
-        try:
+        producer_phase = bool(ctx.get("_ctc_axis_producer_phase"))
+        work_value = ctx.get("ctc_pretg_adj")
+        resume_work = (
+            not producer_phase
+            and work_value is not None
+            and Path(work_value) != ctc_dir
+            and Path(work_value).is_dir()
+        )
+        if not raw_manifest_path.is_file() and not resume_work:
+            # Before sealing, the producer receipt itself is the correctness
+            # boundary.  Commit the complete bindings atomically so the
+            # subsequent raw manifest records this final producer hash.
+            temporary = receipt_path.with_name(
+                f".{receipt_path.name}.tmp-{os.getpid()}"
+            )
+            try:
+                temporary.write_text(
+                    json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8")
+                os.replace(temporary, receipt_path)
+            except OSError:
+                try:
+                    if temporary.is_file() or temporary.is_symlink():
+                        temporary.unlink()
+                except OSError:
+                    pass
+                raise
+            ctx["ctc_axis_receipt_path"] = receipt_path
+        else:
+            # Once sealed, the producer receipt is immutable evidence.  Keep
+            # the rebuilt binding in a separate, required derived artifact.
+            derived_path = (Path(ctx.get("workspace", ctc_dir))
+                             / ".ctc_input_axis_receipt.json")
             derived_path.write_text(
                 json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8")
             ctx["ctc_axis_receipt_path"] = derived_path
-        except OSError:
-            # The in-memory receipt is sufficient for the current process;
-            # failure to write the diagnostic copy must not alter semantics.
-            pass
         ctx["ctc_axis_receipt"] = receipt
         return 0
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -1934,6 +2001,162 @@ def _write_strict_replay_axis_receipts(ctx: dict) -> int:
         return 1
 
 
+def _project_ctc_accounting_to_pre_ctc_scope(
+        ctx: dict, receipt: dict, existing: tuple[str, ...]) -> dict:
+    """Project producer evidence onto the frozen pipeline selection scope.
+
+    ``ctc_prealign`` may deliberately publish a bounded receipt whose source
+    and eligible buckets are only the selected stems.  The pipeline-level
+    denominator is still the physical WAV universe frozen by
+    ``_freeze_pre_ctc_stems``.  Rebuild one formal receipt from that upper
+    scope while retaining stable identity for the producer receipt that was
+    projected.  Every input is checked before any selected-only fallback is
+    possible.
+    """
+    selection = ctx.get("pre_ctc_selection")
+    if not isinstance(selection, dict):
+        raise ValueError("pre-CTC selection metadata is not an object")
+    required_fields = (
+        "accounting_source_stems", "accounting_eligible_stems",
+        "accounting_exclusions",
+    )
+    missing = [field for field in required_fields if field not in ctx]
+    if missing:
+        raise ValueError(
+            "frozen pre-CTC accounting scope is incomplete: "
+            + ", ".join(missing)
+        )
+
+    def strict_stems(value: object, field: str) -> list[str]:
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(f"{field} must be a sorted stem sequence")
+        stems = list(value)
+        if any(not isinstance(stem, str) or not stem
+               or Path(stem).name != stem for stem in stems):
+            raise ValueError(f"{field} contains an invalid stem")
+        if len(stems) != len(set(stems)):
+            raise ValueError(f"{field} contains duplicate stems")
+        if stems != sorted(stems):
+            raise ValueError(f"{field} must be sorted")
+        return stems
+
+    selected = strict_stems(list(existing), "expected_stems")
+    upper_source = strict_stems(
+        ctx["accounting_source_stems"], "accounting_source_stems")
+    upper_eligible = strict_stems(
+        ctx["accounting_eligible_stems"], "accounting_eligible_stems")
+    if upper_eligible != selected:
+        raise ValueError(
+            "frozen pre-CTC eligible stems differ from producer expected stems"
+        )
+    selection_stems = selection.get("stems")
+    if selection_stems is not None and strict_stems(
+            selection_stems, "pre_ctc_selection.stems") != selected:
+        raise ValueError("pre-CTC selection metadata differs from expected stems")
+
+    upper_exclusions = ctx["accounting_exclusions"]
+    if not isinstance(upper_exclusions, (list, tuple, dict)):
+        raise ValueError("accounting_exclusions has an invalid shape")
+
+    # Let the canonical builder enforce the complete upper source partition,
+    # exclusion reason rules, and disjointness without inventing a second
+    # receipt validator here.
+    upper_scope_receipt = make_pipeline_accounting_receipt(
+        upper_source, upper_eligible, upper_exclusions,
+        upper_eligible, [], mode="ctc_prealign")
+    selected_set = set(selected)
+
+    producer_extra = receipt.get("extra", {})
+    if producer_extra is None:
+        producer_extra = {}
+    if not isinstance(producer_extra, dict):
+        raise ValueError("producer accounting extra is not an object")
+    route = receipt.get("route", [])
+    if not isinstance(route, list) or any(not isinstance(step, str) for step in route):
+        raise ValueError("producer accounting route is invalid")
+
+    # A formal projected receipt can be loaded again during resume.  Treat its
+    # marker as a claim that must be proven, not as permission to project the
+    # already projected source scope a second time.  Returning the original
+    # object keeps the on-disk JSON byte-stable as well as preserving the
+    # producer identity captured on the first projection.
+    projection_marker = producer_extra.get("denominator_projection")
+    producer_identity = producer_extra.get("producer_scope_identity")
+    is_marked_projection = (
+        projection_marker is not None
+        or producer_identity is not None
+        or "project_pre_ctc_selection" in route
+    )
+    if is_marked_projection:
+        if projection_marker != "frozen_pre_ctc_selection":
+            raise ValueError("invalid denominator projection marker")
+        if route.count("project_pre_ctc_selection") != 1:
+            raise ValueError("invalid denominator projection route")
+        if not isinstance(producer_identity, dict):
+            raise ValueError("producer scope identity is not an object")
+        identity_keys = {
+            "source_stems_digest", "eligible_stems_digest",
+            "output_stems_digest", "filtered_stems_digest",
+        }
+        if set(producer_identity) != identity_keys:
+            raise ValueError("producer scope identity fields are invalid")
+        if any(not isinstance(value, str) or len(value) != 64
+               or any(char not in "0123456789abcdef" for char in value)
+               for value in producer_identity.values()):
+            raise ValueError("producer scope identity digest is invalid")
+        if (strict_stems(receipt["source"]["stems"], "formal.source")
+                != upper_scope_receipt["source"]["stems"]
+                or strict_stems(receipt["eligible"]["stems"], "formal.eligible")
+                != upper_scope_receipt["eligible"]["stems"]
+                or receipt.get("exclusions") != upper_scope_receipt["exclusions"]):
+            raise ValueError("projected receipt upper scope does not match frozen scope")
+        formal_output = strict_stems(receipt["output"]["stems"], "formal.output")
+        formal_filtered = strict_stems(
+            receipt["filtered"]["stems"], "formal.filtered")
+        if (set(formal_output) & set(formal_filtered)
+                or set(formal_output) | set(formal_filtered) != selected_set):
+            raise ValueError("projected receipt output/filtered scope is invalid")
+        return receipt
+
+    producer_eligible = set(receipt["eligible"]["stems"])
+    if not selected_set <= producer_eligible:
+        raise ValueError("producer eligible stems do not cover expected stems")
+    producer_output = set(receipt["output"]["stems"])
+    producer_filtered = set(receipt["filtered"]["stems"])
+    projected_output = sorted(producer_output & selected_set)
+    projected_filtered = sorted(producer_filtered & selected_set)
+    if (set(projected_output) & set(projected_filtered)
+            or set(projected_output) | set(projected_filtered) != selected_set):
+        raise ValueError("producer output/filtered scope is not an exact selection partition")
+
+    producer_scope_identity = {
+        "source_stems_digest": receipt["source"].get("stems_digest"),
+        "eligible_stems_digest": receipt["eligible"].get("stems_digest"),
+        "output_stems_digest": receipt["output"].get("stems_digest"),
+        "filtered_stems_digest": receipt["filtered"].get("stems_digest"),
+    }
+    if any(not isinstance(value, str) or not value
+           for value in producer_scope_identity.values()):
+        raise ValueError("producer accounting scope identity is incomplete")
+    if "project_pre_ctc_selection" not in route:
+        route = route + ["project_pre_ctc_selection"]
+    projected_extra = dict(producer_extra)
+    projected_extra.update({
+        "denominator_projection": "frozen_pre_ctc_selection",
+        "producer_scope_identity": producer_scope_identity,
+    })
+    return make_pipeline_accounting_receipt(
+        upper_source, upper_eligible, upper_exclusions,
+        projected_output, projected_filtered,
+        run_id=str(receipt.get("run_id", "")),
+        mode=str(receipt.get("mode", "")),
+        route=route,
+        paths=dict(receipt.get("paths", {})),
+        shards=None,
+        extra=projected_extra,
+    )
+
+
 def _load_ctc_accounting(ctx: dict, *, required: bool = False) -> int:
     """Load and pin the frozen v2 CTC denominator for downstream/resume use."""
     receipt_path = ctx.get("accounting_receipt_path")
@@ -1968,48 +2191,32 @@ def _load_ctc_accounting(ctx: dict, *, required: bool = False) -> int:
         return 1
     eligible = tuple(receipt["eligible"]["stems"])
     existing = tuple(ctx.get("expected_stems", ()))
-    if existing and set(existing) != set(eligible):
-        # A resumed nvrasr/full route may have a producer accounting receipt
-        # for the physical eligible universe (for example 55,998 files),
-        # while the frozen pre-CTC selection deliberately contains only the
-        # configured batch (for example 1,000 files).  Project only when the
-        # selection is explicitly frozen and every selected stem is present
-        # in the producer eligible/output evidence.  Arbitrary denominator
-        # changes remain fail-closed.
-        selected = set(existing)
-        source_eligible = set(eligible)
-        source_output = set(receipt["output"]["stems"])
-        if (ctx.get("pre_ctc_selection")
-                and selected <= source_eligible
-                and selected <= source_output):
-            selected_output = sorted(source_output & selected)
-            selected_filtered = sorted(selected - set(selected_output))
-            excluded = list(receipt.get("exclusions", ()))
-            existing_exclusions = {
-                (row.get("stem"), row.get("reason"))
-                for row in excluded if isinstance(row, dict)
-            }
-            excluded.extend(
-                {"stem": stem, "reason": "pre_ctc_limit"}
-                for stem in sorted(source_eligible - selected)
-                if (stem, "pre_ctc_limit") not in existing_exclusions
-            )
-            projected = make_pipeline_accounting_receipt(
-                list(receipt["source"]["stems"]), sorted(selected),
-                excluded, selected_output, selected_filtered,
-                run_id=str(receipt.get("run_id", "")),
-                mode=str(receipt.get("mode", "")),
-                route=list(receipt.get("route", [])) + ["project_pre_ctc_selection"],
-                paths=dict(receipt.get("paths", {})),
-                shards=None,
-                extra={**dict(receipt.get("extra", {})),
-                       "denominator_projection": "frozen_pre_ctc_selection"})
-            write_pipeline_accounting_receipt(receipt_path.parent, projected)
+    if existing:
+        producer_eligible = set(eligible)
+        expected_set = set(existing)
+        if producer_eligible != expected_set:
+            # Preserve compatibility with an older producer that returned its
+            # full physical eligible universe: the same strict projection
+            # below handles both that case and a bounded producer receipt.
+            if (not isinstance(ctx.get("pre_ctc_selection"), dict)
+                    or not expected_set <= producer_eligible):
+                print("  ERROR: frozen v2 eligible stems differ from pipeline denominator")
+                return 1
+        elif isinstance(ctx.get("pre_ctc_selection"), dict):
+            # A bounded producer receipt is not permission to discard the
+            # pipeline-level physical source/exclusion ledger.
+            pass
+        if isinstance(ctx.get("pre_ctc_selection"), dict):
+            try:
+                projected = _project_ctc_accounting_to_pre_ctc_scope(
+                    ctx, receipt, existing)
+            except (TypeError, ValueError, KeyError) as exc:
+                print(f"  ERROR: invalid frozen pre-CTC accounting projection: {exc}")
+                return 1
+            if projected != receipt:
+                write_pipeline_accounting_receipt(receipt_path.parent, projected)
             receipt = projected
             eligible = tuple(projected["eligible"]["stems"])
-        else:
-            print("  ERROR: frozen v2 eligible stems differ from pipeline denominator")
-            return 1
     ctx.update({"accounting_receipt": receipt,
                 "accounting_receipt_path": receipt_path,
                 "accounting_source_stems": tuple(receipt["source"]["stems"]),
@@ -2491,6 +2698,19 @@ def _processed_geometry_cache_complete(ctc_dir: Path,
         except (OSError, UnicodeError, json.JSONDecodeError):
             return False
         for row in rows:
+            if isinstance(row, dict) and row.get("candidate_kind") == "nvv":
+                required = (
+                    "candidate_id", "provenance_schema", "mapping_basis",
+                    "mapping_outcome", "raw_span", "speech_span",
+                    "forced_span", "adjusted_span",
+                )
+                if (any(key not in row for key in required)
+                        or row.get("provenance_schema") !=
+                        "nvasr-candidate-provenance-v1"
+                        or row.get("mapping_basis") !=
+                        "raw_ctc_label_neighbors_forced_overlap-v2"
+                        or row.get("mapping_outcome") != "unique"):
+                    return False
             if not isinstance(row, dict) or not isinstance(
                     row.get("canonical_unit"), dict):
                 continue
@@ -2676,7 +2896,7 @@ def _execute_single_process_mfa_retry(
     acoustic_model: str, mfa_python: Path, models_dir: Path,
     output_format: str, beam: int, retry_beam: int,
     boost_silence: float, single_speaker: bool, no_tokenization: bool,
-    timeout: int | None, attempt_ordinal: int,
+    timeout: int | None, attempt_ordinal: int, dither: float = 0.0,
 ) -> dict:
     """Run one complete, anchor-preserving retry for a fallback MFA run."""
     import json as _json
@@ -2690,6 +2910,7 @@ def _execute_single_process_mfa_retry(
                 "invocation_outcome": "not_started",
                 "exception_type": type(exc).__name__, "exception": str(exc)}
 
+    dither = resolve_mfa_dither(dither)
     command = [
         str(mfa_python), "-m", "montreal_forced_aligner.command_line.mfa",
         "align", str(inputs["corpus"]), str(dict_path), acoustic_model,
@@ -2699,6 +2920,7 @@ def _execute_single_process_mfa_retry(
         "--no_textgrid_cleanup", "--beam", str(beam),
         "--retry_beam", str(retry_beam),
         "--boost_silence", str(boost_silence),
+        "--dither", str(dither),
     ]
     if inputs["anchor"] is not None:
         command += ["--textgrid_directory", str(inputs["anchors"])]
@@ -2752,7 +2974,7 @@ def _execute_single_process_mfa_retry(
         "schema": MFA_ATTEMPT_RECEIPT_SCHEMA,
         "stem": stem, "ordinal": attempt_ordinal,
         "settings": {"beam": beam, "retry_beam": retry_beam,
-                     "num_jobs": 1},
+                     "num_jobs": 1, "dither": dither},
         "isolation": "singleton", "invocation_outcome": invocation_outcome,
         "exception_type": exception_type,
         "exception": exception or (stderr[-500:] or None),
@@ -2801,6 +3023,7 @@ def _run_mfa_sharded(
     beam: int,
     retry_beam: int,
     boost_silence: float,
+    dither: float,
     clean: bool,
     overwrite: bool,
     output_format: str = "long_textgrid",
@@ -2822,6 +3045,8 @@ def _run_mfa_sharded(
     are near-identical to global — negligible alignment impact.
     """
     import multiprocessing as _mp
+
+    dither = resolve_mfa_dither(dither)
 
     _n = len(stems)
     _n_shards = min(8, _mp.cpu_count() // 4, max(1, _n // 200))
@@ -2954,6 +3179,7 @@ def _run_mfa_sharded(
         _mfa_args += ["--beam", str(beam)]
         _mfa_args += ["--retry_beam", str(retry_beam)]
         _mfa_args += ["--boost_silence", str(boost_silence)]
+        _mfa_args += ["--dither", str(dither)]
         for _k, _v in extra_args.items():
             if _v is not None:
                 _mfa_args += [f"--{_k}", str(_v)]
@@ -3148,7 +3374,8 @@ def _run_mfa_sharded(
                     "--temporary_directory", str(_root / "temp"), "--output_format", output_format,
                     "--num_jobs", "1", "--overwrite", "--no_textgrid_cleanup", "--single_speaker",
                     "--no_tokenization", "--beam", str(_beam), "--retry_beam", str(_retry_beam),
-                    "--boost_silence", str(boost_silence)]
+                    "--boost_silence", str(boost_silence),
+                    "--dither", str(dither)]
             if _retry_anchor is not None:
                 _cmd += ["--textgrid_directory", str(_anchors)]
             _retry_env = get_mfa_env(mfa_python, models_dir)
@@ -3210,7 +3437,7 @@ def _run_mfa_sharded(
                 "stem": _stem,
                 "ordinal": _attempt_ordinal,
                 "settings": {"beam": _beam, "retry_beam": _retry_beam,
-                              "num_jobs": 1},
+                              "num_jobs": 1, "dither": dither},
                 "isolation": "singleton",
                 "invocation_outcome": _invocation_outcome,
                 "exception_type": _exception_type,
@@ -3248,7 +3475,8 @@ def _run_mfa_sharded(
             # but can be reached solely after the coordinator's explicit
             # nonzero NoAlignmentsError isolation gate.
             rescue_executor=(lambda stem: _execute_retained_missing(
-                [stem], _beam=200, _retry_beam=800, _attempt_ordinal=2)))
+                [stem], _beam=200, _retry_beam=800, _attempt_ordinal=2)),
+            dither=dither)
         _manifest_path.write_text(_json.dumps({"schema": "mfa-output-manifest-v2", "run_id": _run_id,
             "expected_total": _n, "shards": _manifest_rows}, ensure_ascii=False, indent=2), encoding="utf-8")
         _retry_plan = _log_dir / "mfa_missing_retry_plan.json"
@@ -3456,6 +3684,7 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         "--temporary_directory", str(ctx["temp_dir"]),
         "--output_format", mc.get("output_format", "long_textgrid"),
         "--num_jobs", str(resolve_num_jobs(mc.get("num_jobs", 0))),
+        "--dither", str(resolve_mfa_dither(mc.get("dither", 0.0))),
         "--overwrite", "--no_textgrid_cleanup",
     ]
     if use_anchors:
@@ -3554,6 +3783,7 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         beam=mc.get("beam", 20),
         retry_beam=mc.get("retry_beam", 80),
         boost_silence=mc.get("boost_silence", 1.0),
+        dither=resolve_mfa_dither(mc.get("dither", 0.0)),
         clean=mc.get("clean", False),
         overwrite=args.overwrite,
         output_format=mc.get("output_format", "long_textgrid"),
@@ -3632,14 +3862,16 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                 boost_silence=mc.get("boost_silence", 1.0),
                 single_speaker=mc.get("single_speaker", False),
                 no_tokenization=mc.get("no_tokenization", False),
-                timeout=mc.get("timeout"), attempt_ordinal=_attempt_ordinal)
+                timeout=mc.get("timeout"), attempt_ordinal=_attempt_ordinal,
+                dither=resolve_mfa_dither(mc.get("dither", 0.0)))
 
         _single_retry_state = run_mfa_retry_coordinator(
             _stems, {"return_code": 0, "produced": sorted(_produced),
                      "invalid": [], "exception": "rc0_incomplete"},
             _execute_single_missing,
             rescue_executor=lambda stem: _execute_single_missing(
-                [stem], _beam=200, _retry_beam=800, _attempt_ordinal=2))
+                [stem], _beam=200, _retry_beam=800, _attempt_ordinal=2),
+            dither=resolve_mfa_dither(mc.get("dither", 0.0)))
         for _attempt in _single_retry_state.get("attempts", [])[1:]:
             _retry_output = Path(_attempt.get("output_dir", ""))
             for _grid in _retry_output.glob("*.TextGrid") if _retry_output.is_dir() else ():
@@ -3742,6 +3974,7 @@ def step_mfa_align_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         "--g2p-model", en_g2p,
         "--temp-dir", str(temp_dir),
         "--num-jobs", str(resolve_num_jobs(en_cfg.get("num_jobs", 4))),
+        "--dither", str(resolve_mfa_dither(en_cfg.get("dither", 0.0))),
         "--padding-ms", str(en_cfg.get("padding_ms", 75)),
         "--min-segment-dur-ms", str(en_cfg.get("min_segment_dur_ms", 150)),
         "--max-gap-merge-s", str(en_cfg.get("max_gap_merge_s", 0.35)),
@@ -5906,6 +6139,7 @@ _KNOWN_TOP_KEYS: set[str] = {
     # Legacy top-level keys from DEFAULT_CFG
     "pinyin_dict", "python_path", "txt_suffix",
     "trim", "prepare", "resample",
+    "qwen3asr",
 }
 
 _CONFIG_TYPES: dict[str, type | tuple] = {
@@ -5942,6 +6176,7 @@ _CONFIG_TYPES: dict[str, type | tuple] = {
     "auto_cache": bool,
     "keep_16k_audio": bool,
     "disable_nvme_cache": bool,
+    "qwen3asr": dict,
 }
 
 
@@ -6326,7 +6561,8 @@ def mfa_retry_state_machine(expected_stems, attempts, *, rescue_stem=None) -> di
 
 
 def run_mfa_retry_coordinator(expected_stems, initial_attempt: dict, retry_executor,
-                              *, rescue_stem=None, rescue_executor=None) -> dict:
+                              *, rescue_stem=None, rescue_executor=None,
+                              dither: float = 0.0) -> dict:
     """Execute one isolated recovery attempt per missing stem.
 
     ``retry_executor`` is called once with ``[stem]`` at 20/80.  It is never
@@ -6337,6 +6573,7 @@ def run_mfa_retry_coordinator(expected_stems, initial_attempt: dict, retry_execu
     coordinator compatible with the historical one-argument executor API
     while enforcing the new per-stem policy at the boundary.
     """
+    dither = resolve_mfa_dither(dither)
     expected = set(_filtered_recovery_sorted_unique(list(expected_stems), "MFA expected"))
     attempts = [dict(initial_attempt)]
     receipts = []
@@ -6371,7 +6608,8 @@ def run_mfa_retry_coordinator(expected_stems, initial_attempt: dict, retry_execu
                 "rescue_authorized" if rescue_eligible else "unrecovered")
             first["attempt_receipt"] = _mfa_attempt_receipt(
                 stem, 1, first,
-                settings={"beam": 20, "retry_beam": 80, "num_jobs": 1},
+                settings={"beam": 20, "retry_beam": 80, "num_jobs": 1,
+                          "dither": dither},
                 isolation="singleton",
                 final_disposition=first["final_disposition"])
             receipts.append(first["attempt_receipt"])
@@ -6394,7 +6632,8 @@ def run_mfa_retry_coordinator(expected_stems, initial_attempt: dict, retry_execu
                     "recovered" if rescue_success else "unrecovered")
                 rescue["attempt_receipt"] = _mfa_attempt_receipt(
                     stem, 2, rescue,
-                    settings={"beam": 200, "retry_beam": 800, "num_jobs": 1},
+                    settings={"beam": 200, "retry_beam": 800, "num_jobs": 1,
+                              "dither": dither},
                     isolation="singleton",
                     final_disposition=rescue["final_disposition"])
                 receipts.append(rescue["attempt_receipt"])
@@ -6784,7 +7023,8 @@ def prepare_mfa_retry_packet(parent_root: Path, retry_root: Path, stems: list[st
     command = [str(mfa_bin), "align", str(corpus), str(dictionary), str(model), str(output),
                "--audio_directory", str(audio), "--num_jobs", "12", "--single_speaker",
                "--no_tokenization", "--beam", "20", "--retry_beam", "80",
-               "--boost_silence", "1.0", "--no_fine_tune", "--no_clean",
+               "--boost_silence", "1.0", "--dither", "0.0",
+               "--no_fine_tune", "--no_clean",
                "--output_format", "long_textgrid"]
     receipt = {"schema": MFA_RETRY_SCHEMA, "scope": "exact_missing_mfa_retry",
                "parent_root": str(parent), "stems": stems,
@@ -6804,6 +7044,7 @@ def prepare_mfa_retry_packet(parent_root: Path, retry_root: Path, stems: list[st
                "options": {"num_jobs": _num_jobs, "isolation": "singleton" if _isolated else "batch",
                            "single_speaker": True, "no_tokenization": True,
                            "beam": 20, "retry_beam": 80, "boost_silence": 1.0,
+                           "dither": 0.0,
                            "fine_tune": False, "clean": False, "output_format": "long_textgrid"},
                "environment": {"PATH_prefix": str(mfa_bin_dir),
                                "MFA_ROOT_DIR": str(retry_root / "mfa_root"),
@@ -6879,7 +7120,8 @@ def prepare_mfa_retry_packet(parent_root: Path, retry_root: Path, stems: list[st
             "schema": MFA_ATTEMPT_RECEIPT_SCHEMA,
             "stem": stems[0],
             "ordinal": 1,
-            "settings": {"beam": 20, "retry_beam": 80, "num_jobs": 1},
+            "settings": {"beam": 20, "retry_beam": 80, "num_jobs": 1,
+                         "dither": 0.0},
             "isolation": "singleton",
             "invocation_outcome": _invocation_outcome,
             "exception_type": receipt["execution"].get("exception_type"),
@@ -6998,7 +7240,8 @@ def run_mfa_singleton_rescue(parent_root: Path, rescue_root: Path, stem: str,
         "schema": MFA_ATTEMPT_RECEIPT_SCHEMA,
         "stem": stem,
         "ordinal": 2,
-        "settings": {"beam": 200, "retry_beam": 800, "num_jobs": 1},
+        "settings": {"beam": 200, "retry_beam": 800, "num_jobs": 1,
+                     "dither": 0.0},
         "isolation": "singleton",
         "invocation_outcome": _invocation_outcome,
         "exception_type": receipt["execution"].get("exception_type"),
@@ -8719,10 +8962,10 @@ def main() -> int:
     parser.add_argument("--workspace", type=str, default=None,
                         help="Override workspace root (default: <project>/output/<workspace_name>).")
     parser.add_argument("--python", type=str, default=None,
-                        help="Override Python path from config.")
+                        help="Override runtime Python: MFA for existing modes; isolated qwen3asr interpreter for qwen mode.")
     parser.add_argument("--device", type=str, default=None,
-                        help="GPU device for NVASR CTC pre-alignment (e.g. cuda:0, cuda:1). "
-                             "Overrides ctc_prealign.device in config. "
+                        help="GPU device for NVASR CTC or qwen3asr (e.g. cuda:0, cuda:1). "
+                             "Overrides the active mode's configured device. "
                              "Use with streaming --gpus for multi-GPU scheduling.")
     parser.add_argument("--nvme-cache", type=str, default=None, metavar="DIR",
                         help="Path to NVMe audio cache (default: auto-detect"
@@ -8738,8 +8981,13 @@ def main() -> int:
     parser.add_argument("--validate", action="store_true",
                         help="Validate output structure after each step (uses output_spec in config).")
     parser.add_argument("--mode", type=str, default=None,
-                        choices=["full", "ctc_ready", "batch_ctc_ready", "nvrasr_fallback", "strict_replay", "filtered_recovery", "mfa_retry", "mfa_rescue"],
+                        choices=["full", "ctc_ready", "batch_ctc_ready", "nvrasr_fallback", "strict_replay", "filtered_recovery", "mfa_retry", "mfa_rescue", "qwen3asr"],
                         help="Pipeline mode (default: from config, or 'full').")
+    parser.add_argument("--qwen3asr-check", action="store_true",
+                        help="Check isolated qwen3asr runtime/model capability without creating output.")
+    parser.add_argument("--qwen3asr-profile", type=str,
+                        choices=["transcript_only", "anchored_nvv"], default=None,
+                        help="Explicit qwen3asr profile (default: qwen3asr.profile).")
     parser.add_argument("--strict-replay-manifest", type=str, default=None,
                         help="Canonical 96-slot manifest for strict_replay.")
     parser.add_argument("--strict-replay-source-root", type=str, default=None,
@@ -8854,12 +9102,17 @@ def main() -> int:
 
     # ── Resolve pipeline mode ──
     mode = args.mode or cfg.get("mode", "full")
-    if args.ctc_ready:
+    if args.qwen3asr_check:
+        if args.mode not in (None, "qwen3asr") or cfg.get("mode", "full") not in ("full", "qwen3asr"):
+            print("ERROR: --qwen3asr-check requires mode=qwen3asr")
+            return 1
+        mode = "qwen3asr"
+    if args.ctc_ready and mode != "qwen3asr":
         mode = "ctc_ready"
         cfg.setdefault("ctc_ready", {})["ctc_dir"] = args.ctc_ready
         print(f"ctc_ready mode: CTC dir = {args.ctc_ready}")
 
-    if mode not in ("full", "ctc_ready", "batch_ctc_ready", "nvrasr_fallback", "strict_replay", "filtered_recovery", "mfa_retry", "mfa_rescue"):
+    if mode not in ("full", "ctc_ready", "batch_ctc_ready", "nvrasr_fallback", "strict_replay", "filtered_recovery", "mfa_retry", "mfa_rescue", "qwen3asr"):
         print(f"ERROR: Unknown mode: {mode}")
         sys.exit(1)
     print(f"Pipeline mode: {mode}")
@@ -8873,6 +9126,13 @@ def main() -> int:
         if len(_config_errors) > 20:
             print(f"  ... and {len(_config_errors) - 20} more")
         return 1
+
+    # qwen3asr is a transcript-only route.  Keep this return before MFA
+    # discovery, model probing, workspace creation, cache scanning, and all
+    # ordinary pipeline step setup.
+    if mode == "qwen3asr":
+        from qwen3asr_transcribe import run_cli
+        return run_cli(args, cfg, PROJECT_ROOT, check=args.qwen3asr_check)
     # ─────────────────────────────────────────────────────────────────
 
     # Strict replay is an isolated import route.  It must not probe MFA,
@@ -9050,6 +9310,7 @@ def main() -> int:
         ok_count = 0
         fail_list: list[str] = []
         batch_cache_entries: list[dict] = []  # accumulate cache info per dataset
+        _parent_mfa_root = os.environ.get("MFA_ROOT_DIR")
         for i, ds_name in enumerate(datasets):
             audiodir = audio_root / ds_name / "wavs"
             if not audiodir.exists():
@@ -9115,6 +9376,14 @@ def main() -> int:
                        sub_validate_dir, sub_temp_dir, sub_ctc_pretg,
                        sub_ctc_pretg_adj, sub_workspace]:
                 d.mkdir(parents=True, exist_ok=True)
+            if _parent_mfa_root is None:
+                # This process handles multiple dataset workspaces
+                # sequentially; refresh the default between datasets so a
+                # previous sub-workspace cannot leak its MFA command history.
+                os.environ.pop("MFA_ROOT_DIR", None)
+            if _configure_mfa_root_dir(sub_workspace) != 0:
+                fail_list.append(ds_name)
+                continue
 
             sub_ctx = {
                 "data_dir": sub_data_dir,
@@ -9255,6 +9524,12 @@ def main() -> int:
             print(f"ERROR: {exc}")
             return 1
         workspace.mkdir(parents=True, exist_ok=True)
+
+    # MFA writes mutable command history below MFA_ROOT_DIR.  Install a
+    # workspace-local default before any child process is launched; an
+    # explicit parent value is preserved by ensure_mfa_root_dir().
+    if _configure_mfa_root_dir(workspace) != 0:
+        return 1
 
     # Input: apply UNC->Linux translation, then resolve relative to PROJECT_ROOT
     data_dir = resolve_input_path(args.data_dir) if args.data_dir else resolve_input_path(cfg.get("data_dir", "data_dir"), PROJECT_ROOT)

@@ -276,7 +276,14 @@ def resolve_processed_english_spans(
             continue
         raw_start, raw_end = _raw_span(row)
         if raw_end > readable_audio_end + 1e-6:
-            raise ValueError("canonical English raw span outside readable audio")
+            raise ProcessedGeometryError(
+                "canonical_span_outside_readable_audio",
+                "canonical English raw span extends beyond readable audio",
+                canonical_span=[raw_start, raw_end],
+                readable_audio_end=readable_audio_end,
+                stem_context=(row.get("stem") or row.get("source_stem")
+                              or row.get("reference_identity")),
+            )
         next_start = None
         next_candidate = None
         for candidate_index in lexical_indexes:
@@ -365,10 +372,24 @@ def resolve_processed_english_spans(
                 source = "raw_end_fallback"
 
         assert source is not None
+        # The canonical CTC span is immutable evidence.  Never let the final
+        # readable-audio clamp shorten it: the raw-axis check above already
+        # failed closed when the canonical span was outside the audio.
         processed_end = max(processed_end, raw_end)
+        processed_end = min(processed_end, duration, readable_audio_end)
+        if processed_end + 1e-6 < raw_end:
+            raise ProcessedGeometryError(
+                "processed_span_shorter_than_canonical",
+                "processed English span would be shorter than canonical span",
+                canonical_span=[raw_start, raw_end],
+                processed_end=processed_end,
+                readable_audio_end=readable_audio_end,
+                stem_context=(row.get("stem") or row.get("source_stem")
+                              or row.get("reference_identity")),
+            )
         if processed_end <= raw_start:
             raise ValueError("processed English span has no positive owner interval")
-        processed_span = [raw_start, min(processed_end, duration, readable_audio_end)]
+        processed_span = [raw_start, processed_end]
         row["processed_ctc_span"] = processed_span
         row["processed_ctc_boundary_source"] = source
         row["start"] = processed_span[0]

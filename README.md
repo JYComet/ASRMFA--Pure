@@ -152,7 +152,12 @@ CPU 预算以内。配置或命令行中的较大数值是请求值，不会绕�
 | `streaming.num_gpus` / `--gpus N` | GPU worker 数；未指定或为 `0` 时自动检测。 |
 | `pipelined.cpu_workers` / `--cpu-workers N` | pipelined 模式的 CPU worker 数；`0` 为自动规划。 |
 | `mfa.num_jobs`、`mfa_en.num_jobs` / `--mfa-jobs N`、`--mfa-en-jobs N` | 每个 worker 的 MFA 请求值；资源规划器会按 CPU 预算截断。 |
+| `mfa.dither`、`mfa_en.dither` | MFCC dither；默认 `0.0`，确保相同输入和配置的 MFA 边界可重复。生产与单条恢复都会显式传给 MFA。 |
 | `streaming.prefetch_buffer`、`streaming.upload_buffer` | 两个有界队列的容量；增大可提高吞吐，但需要更多本地 NVMe 空间。 |
+
+MFA 声学模型元数据通常自带 `dither: 1`。随机 dither 会使同一音频的边界在多次运行间漂移，
+甚至影响临界音素 QC；本项目因此把中文、英文、分片和单条恢复命令统一固定为 `0.0`。
+如需实验性地使用非零值，必须显式配置，并接受结果不可作为确定性重放证据。
 
 `scripts/launch_multi_gpu.sh` 可封装同一条批量流水线：`--streaming` 时默认启用
 `--pipelined`，而 `--no-pipelined` 会改走普通批量路径。
@@ -169,6 +174,106 @@ bash scripts/launch_multi_gpu.sh --config configs/batch_all.yaml --streaming --n
 ```bash
 python scripts/launch_8gpu.py --config configs/batch_all.yaml --gpus 0,1,2,3 --dry-run
 ```
+
+## 独立 Qwen3-ASR transcript-only 模式
+
+完整架构、模式兼容矩阵、artifact/resume 契约和真实 smoke 记录见
+[`docs/QWEN3ASR_MODE.md`](docs/QWEN3ASR_MODE.md)。
+
+`profile: transcript_only`（默认）是与 CTC/MFA/streaming 隔离的本地转录模式，只支持
+`qwen-asr==0.0.6` 的官方 `Qwen3ASRModel.from_pretrained` Transformers 后端。
+模型目录必须已存在且不能是符号链接；不会下载模型、调用在线 API、使用 vLLM，
+也不产生时间戳。安装可选依赖时使用独立文件：
+
+```bash
+pip install -r requirements-qwen3asr.txt
+```
+
+配置示例：
+
+```yaml
+mode: qwen3asr
+data_dir: data_dir/my_task
+qwen3asr:
+  profile: transcript_only  # default; use anchored_nvv explicitly for Chinese anchors
+  model_path: /local/models/Qwen3-ASR
+  output_dir: output/qwen3asr
+  python: /home/user/miniconda3/envs/asr/bin/python
+  device: cuda:0
+  dtype: bfloat16
+  language: null  # null、Auto、空字符串均使用官方自动语言检测
+  context: ""
+  batch_size: 1
+  max_new_tokens: 2048
+```
+
+运行前可只做能力检查（不创建输出）：
+
+```bash
+python scripts/run_pipeline.py --config qwen.yaml --mode qwen3asr --qwen3asr-check
+```
+
+`--python` 优先于 `qwen3asr.python`；若它不是当前解释器，入口会使用该可执行文件
+原样重新执行一次 `run_pipeline.py` 命令。`--device` 同样优先于
+`qwen3asr.device`。qwen 模式不接受 `--workspace` 或普通 pipeline step flags。
+
+正式运行会冻结排序后的 WAV stem、相对路径、大小和 SHA-256，并将每个 batch
+原子写入检查点。恢复只跳过身份完全匹配且内容未被篡改的成功文本；失败 stem
+会重试，输入、模型树、版本或运行参数改变时会 fail closed。专用输出根目录只包含：
+
+```text
+transcripts/{stem}_qwen3.txt
+qwen3asr_checkpoint.json
+qwen3asr_manifest.json
+.qwen3asr_run_receipt.json
+```
+
+`COMPLETE` 仅表示全部 stem 成功；推理异常或部分结果会完整记录成功/失败分区，
+生成 `PARTIAL` receipt 并以非零状态退出。空输入会在加载模型及创建输出前直接拒绝。
+`streaming_pipeline.py` 明确拒绝
+`qwen3asr`，该模式必须直接从 `run_pipeline.py` 启动。
+
+### anchored_nvv 中文锚定模式
+
+需要把 Qwen 词序作为 lexical authority、同时保留 NVASR 的 NVV/标点候选时，显式设置
+`qwen3asr.profile: anchored_nvv`。该 profile 只接受 `language: Chinese`，并要求本地的
+Qwen ASR、Qwen ForcedAligner 和 NVASR 模型。阶段严格串行：
+
+```text
+Qwen → release → ForcedAligner → release → NVASR → release → fusion
+```
+
+配置示例：
+
+```yaml
+mode: qwen3asr
+data_dir: data_dir/my_chinese_task
+qwen3asr:
+  profile: anchored_nvv
+  model_path: /local/models/Qwen3-ASR-1.7B
+  forced_aligner_model_path: /local/models/Qwen3-ForcedAligner-0.6B
+  nvasr_model_path: /local/models/Multilingual-NVASR
+  output_dir: output/anchored_nvv
+  python: /home/user/miniconda3/envs/asr/bin/python
+  device: cuda:0
+  dtype: bfloat16
+  language: Chinese
+  nvv_bias: 4.0
+  pause_threshold: 8
+```
+
+Qwen 文本和 ForcedAligner item 共同确定 lexical 锚点，candidate timeline 保留 duration、
+lexical occurrence/邻接、source/kind/token IDs 及 raw/speech frame 坐标。fusion 是全局
+monotonic：允许唯一的 before、overlay、after、inter-anchor 和有效 edge，真正歧义会拒绝，
+并检查 candidate exactly-once conservation。`lexical_timing_source` 固定为
+`qwen3_forced_aligner`；candidate timing source 为 `nvasr_ctc_free_decode` 或
+`nvasr_blank_pause_heuristic`。
+
+anchored_nvv 只生成专用的 `anchors/`、`nvasr_candidates/`、`fused/` 以及 checkpoint、
+manifest、receipt，不生成普通 transcript sidecar、MFA/TextGrid 或 streaming 输出。模型
+树、输入和每个阶段 artifact 都纳入 identity/hash 校验；篡改、schema identity 漂移或额外
+文件会 fail closed，完整 resume 在 provider 加载前完成检查且不加载模型。完整说明和
+LAria 验收记录见 [`docs/QWEN3ASR_MODE.md`](docs/QWEN3ASR_MODE.md)。
 
 旧的独立脚本 `scripts/merge_ria_tokens.py`、`scripts/run_nvasr_batch.py` 和
 `scripts/run_nvasr_batch_v2.py` 已移除；批量运行请使用上述入口。
@@ -424,7 +529,7 @@ mfa:
 # ── Step 8: 后处理 ──
 postprocess:
   merge_silence: true
-  min_sil_merge_sec: 0.2        # 最终 visual words 双向能量 owner 上限；0.5 为硬上限
+  min_sil_merge_sec: 0.2        # 最终 visual words 短静音 owner 上限；0.5 为硬上限
   fix_short_word: true
   short_word_max_sec: 0.25      # 短词检测阈值
   flank_silence_sec: 0.4        # 短词两侧所需静音
@@ -449,21 +554,24 @@ postprocess:
   handle_unexpected_sil: false       # 合并无标点短停顿
 ```
 
-`min_sil_merge_sec`（或 CLI 的 `--merge-max-sil-sec`）控制最终 `words` tier 的一次性
-双向 energy-owner pass：上限为 `min(configured, 0.5)`，并使用严格的
-`duration < effective_max`。默认 `0.2` 保持历史行为；要让普通 `<sp1>` 进入同一能量
-判定需配置到 `0.5`（`0.2 <= duration < 0.5`，恰好 `0.5` 保留）。有效内部
-`lexical–<sp1>–lexical` 另遵循 `forced_internal_sp1_forward` policy；首部/edge、NVV、标点
-owner、`<sp2>/<sp3>` 以及不完整的结构证据不会因配置而吞并。`<sp2>` 保持 preserve，
-由 `mid_sp`/`strict_interior_sp` gate 过滤。决策会记录 label、原始
-duration、effective max 和 preserve/merge reason；phones、hanzi、pinyin_phones 只从
-冻结后的 words 单向重建。所有 visual silence owner 决策提交完成后、processed geometry
-freeze 之前，最终保留的内部纯静音 interval 再按 serialized integer microsecond ticks
-规范化标签：`<200ms` 为 `<sp0>`、`[200,500ms)` 为 `<sp1>`、`[500,1500ms)` 为
-`<sp2>`、`>=1500ms` 为 `<sp3>`。这一步只改标签，不改区间、owner、tier 数量或过滤
-原因，也不重新开启 owner arbitration；leading `<sp1>` convention 保持不变。原始
-owner decision 的 `label`、`expected_label` 和 mismatch reason 保留，最终写入标签与
-normalization status 另行记录在 report/processed geometry operation ledger 中。
+`min_sil_merge_sec`（或 CLI 的 `--merge-max-sil-sec`）只记录 visual owner pass 的诊断
+上下文；canonical 内部 SP0/SP1 的 eligibility 不由 `merge_silence` 或该配置上限短路。
+SP0 语义上限是 `<200ms`，并包含精确 `200000us` 的 stale-SP0 例外；`200001us` 的 stale
+SP0 是 hard veto。SP1 上限为 `<500ms`。owner 优先级固定为 hard structural veto、
+edge/terminal、局部 punctuation、唯一 ordinal CTC 完整包含、accepted energy，最后才是
+`merged_left` fallback。没有方向（缺音频、零/低/歧义能量、phone ambiguity、NVV-adjacent
+SP1 缺失或重复 CTC evidence）统一 `merged_left`；accepted right energy 必须保留
+`merged_right` 和 `energy_owner` provenance。局部标点胜过所有 lexical owner，穿过 lexical
+word 的宽泛 punctuation span 不得保护 gap。leading/terminal、bare/malformed/mixed、SP2/SP3
+仍保持原有 fail-closed 语义。决策会记录 label、原始 duration、effective max、owner
+evidence 和 fallback reason；phones、hanzi、pinyin_phones 只从冻结后的 words 单向重建。
+有效内部 `lexical–<sp0>–lexical` 使用 `valid_internal_sp0_forward`，在无更强 owner 时
+确定性并入左 owner；accepted energy owner 使用 `energy_owner` provenance，no-direction
+case 使用 `merged_left_fallback`。所有 visual silence owner 决策提交完成后、processed
+geometry freeze 之前，最终保留的内部纯静音 interval 再按 serialized integer microsecond
+ticks 规范化标签：`<200ms` 为 `<sp0>`、`[200,500ms)` 为 `<sp1>`、`[500,1500ms)` 为
+`<sp2>`、`>=1500ms` 为 `<sp3>`。这一步只改标签，不改区间、owner、tier 数量或过滤原因，
+也不重新开启 owner arbitration；leading `<sp1>` convention 保持不变。
 
 ### English/reference canonical contract
 
@@ -493,26 +601,36 @@ numeric identifier（如 `OK2`、`ABC1`）不会转换；raw CTC lab/tokens 与 
 最终 visual words 的短静音 owner pass 按结构和 owner 类型处理
 `lexical–<spN>–lexical` 内部 gap。标签语义固定为：
 `<sp0>` `<0.2s`、`<sp1>` `[0.2s, 0.5s)`、`<sp2>` `[0.5s, 1.5s)`、`<sp3>`
-`>=1.5s`；候选总时长必须与 `silence_label(duration)` 一致，并严格小于
-`min(min_sil_merge_sec, 0.5)`. 默认 `0.2` 保持历史行为，只处理 `<sp0>`；如需
-让普通 `<sp1>` 进入双向 5ms RMS energy-owner pass，通常把上限配置为 `0.5`
-（恰好 `0.5s` 的普通 gap 仍保留）。普通 `<sp0>` 先遵循原有配置与能量 gate；有效的
-内部 `lexical–<sp1>–lexical` 则使用 `forced_internal_sp1_forward` policy，
-不因 `merge_silence`、max 配置、phone hole/lineage ambiguity、缺音频或低能量而保留：
-双向能量只保留为诊断，提交方向始终确定性并入左词。首部静音、NVV、edge、sp2/sp3、
-标点/reference/CTC punctuation owner 均不属于该强制候选；lexical CTC overlap 不
-单独 veto。最终 visual snapshot 中已有标点若是最后非静音 owner，且后面直到
-`words_tier.xmax` 只有连续纯静音，则执行 `terminal_punctuation_tail_absorption`；
+`>=1.5s`；候选总时长必须与 `silence_label(duration)` 一致。
+`min(min_sil_merge_sec, 0.5)` 只作为诊断上下文；canonical SP0/SP1 不因 merge 开关或
+configured max 而短路。唯一 ordinal CTC 完整包含 owner 优先，其次是 accepted energy，
+最后才是 `merged_left_fallback`。
+有效内部 `<sp0>` 在无更强 owner 时使用 `valid_internal_sp0_forward` 左合并；accepted
+energy owner 使用 `energy_owner` provenance；缺音频、低/歧义能量、phone ambiguity 或
+NVV-adjacent SP1 缺失/重复 CTC evidence 使用 `merged_left_fallback`。标点胜过 lexical
+owner；宽泛 punctuation span 若穿过 lexical word 不得保护 gap。首部静音、edge、sp2/sp3
+继续保持 fail-closed。NVV 邻接 `<sp0>` 不改写 NVV 身份、顺序或原始 CTC/MFA 证据；NVV
+邻接 `<sp1>` 只有唯一同 ordinal CTC span 完整包含 gap 时才使用
+`nvv_adjacent_sp1_ctc_containing_owner`，否则进入 energy 或左 fallback，不再 preserve。
+最终 visual snapshot 中已有标点若是最后
+非静音 owner，且后面直到 `words_tier.xmax` 只有连续纯静音，则执行
+`terminal_punctuation_tail_absorption`；若结构为末词、纯静音、句末标点，则执行
+`terminal_punctuation_head_absorption` 将静音并入已有标点。轴末 NVV 后仅剩合法且短于
+200ms 的 `<sp0>` 时使用 `terminal_nvv_sp0_absorption`，不扩大到 `<sp1>` 或非末尾 gap；
 没有显式局部静音时不会仅按 reference/CTC-only anchor 合成缺失标点；有局部显式静音
 owner 时会写回对应 punctuation interval。所有 preserve/merge/fallback 原因写入决策
 报告。
 
-对内部 lexical–`<sp0>`–lexical gap，若没有明确且局部的 punctuation owner，能量归属
-不可靠（包括 low/ambiguous、phone hole、缺音频或全零）时使用
-`policy=unknown_sp0_forward` 确定性并入左词。局部 punctuation evidence 与显式静音
-gap 同时存在时，resolver 会把该 gap 写回对应 punctuation interval；宽泛 punctuation
-span 若穿过 gap 两侧已有 lexical owner，不得保护该 gap。没有显式静音 gap 时仍不合成
-标点。
+最终 `raw_text`/`pinyin` 与 `hanzi`/`pinyin_phones` 一样从冻结后的 words owner 事务性
+重建。已知 bare NVV（包括 `Surprise-wa`）先规范为 `<SURPRISE-WA>`，标点审计移除完整
+NVV markup 后再比较正文标点，因此标签内部连字符不再制造 punctuation mismatch；普通
+词内连字符仍按正文标点保留并接受审计。
+
+对内部 lexical–`<sp0>`–lexical gap，局部 punctuation evidence 与显式静音 gap 同时
+存在时，resolver 会把该 gap 写回对应 punctuation interval；宽泛 punctuation span 若
+穿过 gap 两侧已有 lexical owner，不得保护该 gap。没有显式静音 gap 时仍不合成标点。
+`unknown_sp0_forward` 仅作为旧 report/ledger 的兼容 operation 名保留；当前新决策同时
+记录 CTC/energy/fallback owner provenance，不把旧的固定左方向当作 energy 结论。
 
 ### Pre-CTC subset denominator
 

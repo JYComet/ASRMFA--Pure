@@ -15,6 +15,13 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 
+try:
+    from scripts.pipeline_utils import is_pinyin_syllable
+except ImportError:
+    # When run as ``python scripts/audit_textgrids.py``, the scripts directory
+    # is on sys.path but the repository root may not be importable as a package.
+    from pipeline_utils import is_pinyin_syllable
+
 # ── TextGrid Parsing ──────────────────────────────────────────────────────
 
 def parse_textgrid(filepath: str) -> Optional[Dict]:
@@ -84,10 +91,59 @@ def parse_textgrid(filepath: str) -> Optional[Dict]:
 # pinyin sequence from the 'words' tier vs the 'pinyin' tier's sequence.
 
 SP_TOKEN_PAT = re.compile(r'^<sp\d+>$')
+SP_TOKEN_SEARCH_PAT = re.compile(r'<sp\d+>')
 PUNCT_PAT = re.compile(r"""^[-，。！？、；："'…,.!?;:\s]+$""")
 CHINESE_CHAR_PAT = re.compile(r'[一-鿿]')
 ENGLISH_WORD_PAT = re.compile(r'^[A-Za-z0-9]+$')
 RIA_PLACEHOLDER_PAT = re.compile(r'^RIA.*$')
+
+
+def _special_token_leaks(tiers: Dict) -> List[str]:
+    """Return non-canonical special-token occurrences in the audited tiers.
+
+    ``words`` and ``pinyin_phones`` are interval-level tiers: their sole
+    permitted special token is one exact ``<sp1>`` at interval index 0.
+    ``raw_text`` and ``pinyin`` are summary tiers, where the same token may
+    occur once as a sentence-initial prefix (including when attached to the
+    first label).  All other SP labels or positions remain audit findings.
+    """
+    leaks = []
+
+    for tier_name in ("hanzi", "words", "pinyin_phones"):
+        intervals = tiers.get(tier_name, {}).get("intervals", [])
+        for index, interval in enumerate(intervals):
+            text = interval["text"].strip()
+            matches = list(SP_TOKEN_SEARCH_PAT.finditer(text))
+            if not matches:
+                continue
+            legal_prefix = (
+                index == 0
+                and text == "<sp1>"
+                and len(matches) == 1
+                and matches[0].group(0) == "<sp1>"
+            )
+            if not legal_prefix:
+                for match in matches:
+                    leaks.append(f"{tier_name}[{index}]={match.group(0)}")
+
+    for tier_name in ("raw_text", "pinyin"):
+        intervals = tiers.get(tier_name, {}).get("intervals", [])
+        seen = 0
+        for index, interval in enumerate(intervals):
+            text = interval["text"]
+            for match in SP_TOKEN_SEARCH_PAT.finditer(text):
+                token = match.group(0)
+                legal_prefix = (
+                    seen == 0
+                    and index == 0
+                    and token == "<sp1>"
+                    and not text[:match.start()].strip()
+                )
+                if not legal_prefix:
+                    leaks.append(f"{tier_name}[{index}]={token}")
+                seen += 1
+
+    return leaks
 
 # ── Audit Functions ───────────────────────────────────────────────────────
 
@@ -129,20 +185,19 @@ def audit_file(filepath: str) -> List[Issue]:
     pinyin_tier = tiers.get("pinyin", {}).get("intervals", [])
 
     # ─── Check 2: Special token leakage ───
-    sp_count = 0
+    sp_leaks = _special_token_leaks(tiers)
     ria_count = 0
     for tier_name, tier_data in tiers.items():
         for interval in tier_data["intervals"]:
             text = interval["text"].strip()
-            if SP_TOKEN_PAT.match(text):
-                if tier_name in ("words", "pinyin_phones"):
-                    sp_count += 1
             if RIA_PLACEHOLDER_PAT.match(text) and tier_name in ("words", "pinyin_phones"):
                 ria_count += 1
 
-    if sp_count > 0:
+    if sp_leaks:
         issues.append(Issue(fname, "special_token_leak", "warning",
-                           f"{sp_count} <spN> token(s) in words/phones tiers"))
+                           f"{len(sp_leaks)} invalid <spN> token(s): "
+                           f"{', '.join(sp_leaks[:5])}"
+                           f"{'...' if len(sp_leaks) > 5 else ''}"))
     if ria_count > 0:
         issues.append(Issue(fname, "special_token_leak", "warning",
                            f"{ria_count} RIA placeholder(s) in words/phones tiers"))
@@ -338,7 +393,10 @@ def audit_file(filepath: str) -> List[Issue]:
     english_in_words = []
     for w in words:
         txt = w["text"].strip()
-        if ENGLISH_WORD_PAT.match(txt) and len(txt) > 2:  # Skip short pinyin like "he"
+        if (ENGLISH_WORD_PAT.match(txt) and len(txt) > 2
+                and not is_pinyin_syllable(txt)):
+            # Skip canonical tone-marked pinyin such as ``da4``/``jia1``;
+            # genuine English alpha/alnum labels remain auditable.
             # This might be an English word - check its phone representation
             matching_phones = [p for p in phones
                               if p["xmin"] >= w["xmin"] - 0.001

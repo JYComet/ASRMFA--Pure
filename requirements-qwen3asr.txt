@@ -1,0 +1,3 @@
+# Optional, isolated dependency set for scripts/qwen3asr_transcribe.py.
+# Keep this separate from the MFA/CTC environment.
+qwen-asr==0.0.6

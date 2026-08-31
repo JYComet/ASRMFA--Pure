@@ -733,6 +733,7 @@ def test_run_en_mfa_overrides_shared_mutable_environment(
         tmp_path / "run-local" / "mfa_root")
     assert captured["env"]["NUMBA_CACHE_DIR"] == str(
         tmp_path / "run-local" / "numba_cache")
+    assert captured["command"][captured["command"].index("--dither") + 1] == "0.0"
     assert captured["env"]["MFA_ROOT_DIR"] != os.environ["MFA_ROOT_DIR"]
     assert outcome["environment"] == {
         "MFA_ROOT_DIR": captured["env"]["MFA_ROOT_DIR"],

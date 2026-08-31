@@ -34,6 +34,7 @@ import json
 import os
 import queue
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -51,6 +52,7 @@ from pipeline_utils import (
     CTC_SUFFIXES, stable_json_digest, cuda_visible_token,
     CTC_RAW_MANIFEST_NAME, CTC_WORK_RECEIPT_NAME,
     validate_ctc_raw_manifest, validate_ctc_work_receipt,
+    validate_ctc_run_receipt_v2,
     make_pipeline_accounting_receipt, validate_pipeline_accounting_receipt,
 )
 
@@ -118,6 +120,72 @@ def plan_streaming_resources(
         "gpu_queue_size": max(1, int(gpu_queue_size or default_gpu_queue)),
         "cpu_queue_size": max(1, int(cpu_queue_size or default_cpu_queue)),
     }
+
+
+def _shutdown_pipelined_cpu_queue(
+        cpu_queue: queue.Queue, n_cpu_workers: int,
+        stop_event: threading.Event, failure_event: threading.Event,
+        sentinel: object, drain_callback) -> bool:
+    """Finish CPU sentinels or fail closed on a delayed worker error.
+
+    The sentinel path is intentionally bounded.  A CPU failure may race with
+    the first ``put`` while the queue is full; every retry checks both events,
+    then delegates queued-work accounting/preservation to the caller.
+    """
+    if failure_event.is_set() or stop_event.is_set():
+        stop_event.set()
+        drain_callback()
+        return False
+
+    for _ in range(n_cpu_workers):
+        while True:
+            if failure_event.is_set() or stop_event.is_set():
+                stop_event.set()
+                drain_callback()
+                return False
+            try:
+                cpu_queue.put(sentinel, timeout=0.25)
+                break
+            except queue.Full:
+                continue
+
+    if failure_event.is_set() or stop_event.is_set():
+        stop_event.set()
+        drain_callback()
+        return False
+    return True
+
+
+def _collect_pipelined_cpu_futures(
+        cpu_futures, failure_event: threading.Event,
+        stop_event: threading.Event, drain_callback) -> tuple[int, list[str]]:
+    """Collect quiescent CPU workers, then drain work left by delayed failure.
+
+    Sentinel insertion can complete before an active worker reports failure.
+    The executor context has to quiesce every CPU future first; only then is
+    it safe to classify the remaining queue entries as unconsumed.  The
+    caller's accounting callback is idempotent for any entries already
+    handled by the bounded shutdown path.
+    """
+    import concurrent.futures
+
+    ok_count = 0
+    fail_list: list[str] = []
+    try:
+        for fut in concurrent.futures.as_completed(cpu_futures):
+            try:
+                w_ok, w_fails = fut.result()
+            except Exception as exc:
+                print(f"  [CPU] worker exception: {type(exc).__name__}: {exc}")
+                failure_event.set()
+                stop_event.set()
+                continue
+            ok_count += w_ok
+            fail_list.extend(w_fails)
+    finally:
+        if failure_event.is_set() or stop_event.is_set():
+            drain_callback()
+    return ok_count, fail_list
 
 
 def _index_wavs_for_stems(audio_dir: Path, stems: list[str]) -> dict[str, Path]:
@@ -369,6 +437,74 @@ def _preserve_failed_batch(local_dir: Path) -> Path:
     return failed_dir
 
 
+def _complete_ctc_producer_stems(ctc_dir: Path) -> set[str]:
+    """Return stems with every required producer artifact, flat and exact."""
+    ctc_dir = Path(ctc_dir)
+    by_suffix: dict[str, set[str]] = {suffix: set() for suffix in CTC_SUFFIXES}
+    if not ctc_dir.is_dir():
+        return set()
+    for path in ctc_dir.iterdir():
+        if not path.is_file() or path.is_symlink():
+            continue
+        for suffix in CTC_SUFFIXES:
+            if path.name.endswith(suffix):
+                by_suffix[suffix].add(path.name[:-len(suffix)])
+                break
+    producer_stems = set().union(*by_suffix.values()) if by_suffix else set()
+    return {stem for stem in producer_stems
+            if all(stem in by_suffix[suffix] for suffix in CTC_SUFFIXES)}
+
+
+def _ctc_producer_stems(ctc_dir: Path) -> set[str]:
+    """Return every flat stem mentioned by a producer artifact."""
+    ctc_dir = Path(ctc_dir)
+    stems: set[str] = set()
+    if not ctc_dir.is_dir():
+        return stems
+    for path in ctc_dir.iterdir():
+        if not path.is_file() or path.is_symlink():
+            continue
+        for suffix in CTC_SUFFIXES:
+            if path.name.endswith(suffix):
+                stems.add(path.name[:-len(suffix)])
+                break
+    return stems
+
+
+def _validate_exact_ctc_bundle(
+        local_workspace: Path, local_audio: Path, batch_stems: list[str],
+        receipt_override: dict | None = None,
+    ) -> bool:
+    """Require one exact, nonempty producer/receipt/audio axis for a batch."""
+    requested = list(batch_stems)
+    expected = sorted(requested)
+    if not expected or len(set(requested)) != len(requested):
+        return False
+    ctc_dir = Path(local_workspace) / "ctc_pretg"
+    if (_ctc_producer_stems(ctc_dir) != set(expected)
+            or _complete_ctc_producer_stems(ctc_dir) != set(expected)):
+        return False
+    if receipt_override is None:
+        receipt_path = ctc_dir / ".ctc_run_receipt.json"
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+    else:
+        receipt = receipt_override
+    if not isinstance(receipt, dict):
+        return False
+    if (receipt.get("input_stems") != expected
+            or receipt.get("output_stems") != expected):
+        return False
+    rows = receipt.get("audio_bindings")
+    if (not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows)
+            or [row.get("stem") for row in rows] != expected):
+        return False
+    return not validate_ctc_run_receipt_v2(
+        receipt, expected_stems=expected, audio_root=Path(local_audio))
+
+
 def _repair_complete_ctc_receipt(
     local_workspace: Path, local_audio: Path, batch_stems: list[str],
 ) -> bool:
@@ -382,6 +518,12 @@ def _repair_complete_ctc_receipt(
     ctc_dir = local_workspace / "ctc_pretg"
     if not ctc_dir.exists():
         return False
+    requested = list(batch_stems)
+    expected = sorted(requested)
+    if (not expected or len(set(requested)) != len(requested)
+            or _ctc_producer_stems(ctc_dir) != set(expected)
+            or _complete_ctc_producer_stems(ctc_dir) != set(expected)):
+        return False
     try:
         from pipeline_utils import (compute_model_tree_digest,
                                     write_ctc_run_receipt,
@@ -389,76 +531,75 @@ def _repair_complete_ctc_receipt(
         from run_pipeline import _ensure_ctc_axis_receipt
         _existing = ctc_dir / ".ctc_run_receipt.json"
         if _existing.is_file():
-            # Reuse the already recorded model/dictionary provenance.  A full
-            # model-tree digest per partial batch is needlessly expensive and
-            # can make the launcher preserve a usable batch before repair
-            # finishes.  Only the local path bindings and exact subset change.
             receipt = json.loads(_existing.read_text(encoding="utf-8"))
-            if receipt.get("schema") == "ctc-run-receipt-v2":
-                selected = set(batch_stems)
-                ctc_dir = local_workspace / "ctc_pretg"
-                rows = []
-                for row in receipt.get("audio_bindings", []):
-                    stem = row.get("stem") if isinstance(row, dict) else None
-                    if stem not in selected:
-                        continue
-                    row = dict(row)
-                    wav = local_audio / f"{stem}.wav"
-                    if not wav.is_file():
-                        continue
-                    row["path"] = str(wav.resolve())
-                    for field, suffix in (("tokens_sha256", "_tokens.jsonl"),
-                                          ("lab_sha256", ".lab"),
-                                          ("punct_sha256", "_punct.json"),
-                                          ("reference_sha256", "_ref.txt"),
-                                          ("textgrid_sha256", ".TextGrid")):
-                        artifact = ctc_dir / f"{stem}{suffix}"
-                        path_field = field + "_path"
-                        if artifact.is_file():
-                            row[path_field] = str(artifact.resolve())
-                        elif field in row:
-                            row.pop(field, None)
-                            row.pop(path_field, None)
-                    for path_field, suffix in (("tokens_path", "_tokens.jsonl"),
-                                               ("textgrid_path", ".TextGrid")):
-                        artifact = ctc_dir / f"{stem}{suffix}"
-                        if artifact.is_file():
-                            row[path_field] = str(artifact.resolve())
-                        else:
-                            row.pop(path_field, None)
-                    rows.append(row)
-                stems = sorted(row.get("stem") for row in rows)
-                receipt["input_stems"] = stems
-                receipt["input_stems_digest"] = stable_json_digest(stems)
-                receipt["output_stems"] = stems
-                receipt["output_stems_digest"] = stable_json_digest(stems)
-                receipt["audio_bindings"] = sorted(rows, key=lambda r: r.get("stem", ""))
-                errors = validate_ctc_run_receipt_v2(
-                    receipt, expected_stems=stems, audio_root=local_audio)
-                if not errors:
-                    _existing.write_text(
-                        json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
-                        encoding="utf-8")
-                    print(f"  [GPU] Rebound existing CTC receipt for {len(stems)} stems")
-                    return True
-        model_path = Path("/mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR")
-        dict_path = PROJECT_ROOT / "dict" / "mfa_ipa.dict"
-        model_digest, model_manifest = compute_model_tree_digest(model_path)
-        dict_digest = hashlib.sha256(dict_path.read_bytes()).hexdigest()
-        write_ctc_run_receipt(
-            ctc_dir, actual_argv=["repaired-complete-bundle"],
-            asr_python="/home/user/miniconda3/envs/asr/bin/python",
-            model_path=model_path, model_tree_digest=model_digest,
-            model_file_manifest=model_manifest, dict_path=dict_path,
-            dict_digest=dict_digest, input_stems=sorted(batch_stems),
-            output_stems=sorted(batch_stems), audio_bindings=[])
-        rc = _ensure_ctc_axis_receipt({
-            "ctc_pretg": ctc_dir, "audio_dir": local_audio,
-        })
-        if rc == 0:
-            print(f"  [GPU] Repaired and validated CTC receipt for {len(batch_stems)} stems")
+            if (receipt.get("schema") != "ctc-run-receipt-v2"
+                    or receipt.get("input_stems") != expected
+                    or receipt.get("output_stems") != expected):
+                # A producer receipt for a subset is evidence of an invalid
+                # attempt, not permission to redefine this requested batch.
+                return False
+        else:
+            receipt = None
+
+        if receipt is None:
+            model_path = Path("/mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR")
+            dict_path = PROJECT_ROOT / "dict" / "mfa_ipa.dict"
+            model_digest, model_manifest = compute_model_tree_digest(model_path)
+            dict_digest = hashlib.sha256(dict_path.read_bytes()).hexdigest()
+            write_ctc_run_receipt(
+                ctc_dir, actual_argv=["repaired-complete-bundle"],
+                asr_python="/home/user/miniconda3/envs/asr/bin/python",
+                model_path=model_path, model_tree_digest=model_digest,
+                model_file_manifest=model_manifest, dict_path=dict_path,
+                dict_digest=dict_digest, input_stems=expected,
+                output_stems=expected, audio_bindings=[])
+
+        raw_manifest_path = ctc_dir / CTC_RAW_MANIFEST_NAME
+        raw_manifest_before = (
+            raw_manifest_path.read_bytes() if raw_manifest_path.is_file() else None
+        )
+        ctx = {"ctc_pretg": ctc_dir, "audio_dir": local_audio,
+               "workspace": local_workspace}
+        if _ensure_ctc_axis_receipt(ctx) != 0:
+            return False
+        repaired = ctx.get("ctc_axis_receipt")
+        if not isinstance(repaired, dict):
+            return False
+        if (repaired.get("input_stems") != expected
+                or repaired.get("output_stems") != expected):
+            return False
+        if validate_ctc_run_receipt_v2(
+                repaired, expected_stems=expected, audio_root=local_audio):
+            return False
+        if raw_manifest_before is not None:
+            try:
+                raw_manifest_after = raw_manifest_path.read_bytes()
+                manifest = json.loads(raw_manifest_after.decode("utf-8"))
+                if (raw_manifest_after != raw_manifest_before
+                        or validate_ctc_raw_manifest(ctc_dir, manifest)):
+                    return False
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                return False
+            derived_path = Path(ctx.get("ctc_axis_receipt_path", ""))
+            if (not derived_path.is_file()
+                    or derived_path.is_symlink()):
+                return False
+            try:
+                derived = json.loads(derived_path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                return False
+            if derived != repaired:
+                return False
+            exact = _validate_exact_ctc_bundle(
+                local_workspace, local_audio, requested,
+                receipt_override=repaired)
+        else:
+            exact = _validate_exact_ctc_bundle(
+                local_workspace, local_audio, requested)
+        if exact:
+            print(f"  [GPU] Repaired and validated CTC receipt for {len(expected)} stems")
             return True
-        print(f"  [GPU] CTC receipt repair validation returned rc={rc}")
+        return False
     except Exception as exc:
         print(f"  [GPU] CTC receipt repair failed: {exc}")
     return False
@@ -898,8 +1039,10 @@ def run_single_batch(
     mfa_en_num_jobs: int = 0,
     config_sha256: str = "",
     cache_sha256: str = "",
+    implementation_sha256: str = "",
     receipt_mode: str = "streaming",
     receipt_route: list[str] | None = None,
+    require_zero_filtered: bool = False,
 ) -> bool:
     """Process a single batch end-to-end (original streaming behavior).
 
@@ -934,8 +1077,10 @@ def run_single_batch(
     dataset_root = nas_output_root / ds["name"]
     try:
         upload_ok = _publish_batch_to_staging(
-            local_dir, dataset_root, batch_idx, batch_stems,
-            config_sha256=config_sha256, cache_sha256=cache_sha256)
+        local_dir, dataset_root, batch_idx, batch_stems,
+            config_sha256=config_sha256, cache_sha256=cache_sha256,
+            implementation_sha256=implementation_sha256,
+            require_zero_filtered=require_zero_filtered)
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         print(f"  [BATCH {batch_idx:04d}] publication exception: {exc}")
         upload_ok = False
@@ -1007,6 +1152,27 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _implementation_sha256() -> str:
+    """Return the deterministic fingerprint of the runnable pipeline code."""
+    scripts_root = PROJECT_ROOT / "scripts"
+    records: list[tuple[str, str]] = []
+    if scripts_root.is_dir() and not scripts_root.is_symlink():
+        for path in sorted(scripts_root.rglob("*.py")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            records.append((path.relative_to(PROJECT_ROOT).as_posix(),
+                            _sha256_file(path)))
+    if not records:
+        raise ValueError(f"no ordinary pipeline Python files under {scripts_root}")
+    digest = hashlib.sha256()
+    for relative, file_digest in records:
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(file_digest.encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 def _publication_tree(root: Path) -> dict[str, dict[str, object]]:
     """Return a deterministic file/size/hash manifest for a publication tree."""
     if not root.is_dir() or root.is_symlink():
@@ -1023,9 +1189,84 @@ def _publication_tree(root: Path) -> dict[str, dict[str, object]]:
     return result
 
 
+def _publication_policy(require_zero_filtered: bool) -> dict[str, bool]:
+    """Return the private publication policy carried by new evidence."""
+    return {"require_zero_filtered": bool(require_zero_filtered)}
+
+
+def _evidence_policy_matches(evidence: dict, require_zero_filtered: bool) -> bool:
+    """Validate the optional policy without breaking legacy permissive runs."""
+    policy = evidence.get("publication_policy")
+    if policy is None:
+        return not require_zero_filtered
+    if (not isinstance(policy, dict)
+            or not isinstance(policy.get("require_zero_filtered"), bool)):
+        return False
+    # A permissive caller may consume an already stricter zero-filter artifact;
+    # the strict caller must see an explicit strict policy.
+    return (policy["require_zero_filtered"]
+            if require_zero_filtered else True)
+
+
+def _validate_zero_filtered_report_rows(
+        rows: list[object], output_stems: set[str]) -> bool:
+    """Validate the clean-report semantics required by zero-filter policy."""
+    if len(rows) != len(output_stems):
+        return False
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            return False
+        stem = row.get("stem")
+        if not isinstance(stem, str) or stem in seen or stem not in output_stems:
+            return False
+        seen.add(stem)
+        if row.get("status") != "ok":
+            return False
+        if row.get("warnings") != [] or row.get("hard_integrity_reasons") != []:
+            return False
+
+        publication = row.get("publication_contract")
+        if (not isinstance(publication, dict)
+                or publication.get("status") != "verified"
+                or publication.get("reasons") != []):
+            return False
+
+        nvasr = row.get("nvasr_candidate_provenance")
+        if (not isinstance(nvasr, dict)
+                or nvasr.get("status") not in {"verified", "not_applicable"}
+                or nvasr.get("reasons") != []):
+            return False
+
+        english = row.get("english_provenance")
+        if (not isinstance(english, dict)
+                or english.get("status") not in {"verified", "not_required"}
+                or english.get("failed_word_ids") != []):
+            return False
+        required = english.get("required_words")
+        verified = english.get("verified_words")
+        if (isinstance(required, bool) or not isinstance(required, int)
+                or isinstance(verified, bool) or not isinstance(verified, int)
+                or required != verified):
+            return False
+    return seen == output_stems
+
+
+def _validate_zero_filtered_report(report_path: Path,
+                                   output_stems: set[str]) -> bool:
+    try:
+        rows = [json.loads(line) for line in
+                report_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return _validate_zero_filtered_report_rows(rows, output_stems)
+
+
 def _validate_frozen_cache_inventory(cache: dict) -> None:
     """Fail closed when an explicit cache no longer names the source WAV set."""
     for dataset in cache.get("datasets", []):
+        validation_started = time.monotonic()
         stems = dataset.get("stems")
         if not isinstance(stems, list):
             continue  # legacy multi-dataset caches are validated by their CTC scan
@@ -1033,12 +1274,19 @@ def _validate_frozen_cache_inventory(cache: dict) -> None:
         if expected != sorted(expected) or len(expected) != len(set(expected)):
             raise ValueError(f"cache stems are not sorted and unique: {dataset.get('name')}")
         audio_dir = resolve_input_path(str(dataset.get("audio_dir", "")))
-        entries = [path for path in audio_dir.iterdir()
-                   if path.is_file() and path.suffix.lower() == ".wav"]
-        if any(path.is_symlink() for path in audio_dir.iterdir()
-               if path.suffix.lower() == ".wav"):
-            raise ValueError(f"cache source contains symlink WAV: {audio_dir}")
-        actual = sorted(path.stem for path in entries)
+        entries: list[tuple[Path, int]] = []
+        with os.scandir(str(audio_dir)) as directory_entries:
+            for entry in directory_entries:
+                if Path(entry.name).suffix.lower() != ".wav":
+                    continue
+                entry_stat = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(entry_stat.st_mode):
+                    raise ValueError(f"cache source contains symlink WAV: {audio_dir}")
+                if not stat.S_ISREG(entry_stat.st_mode):
+                    continue
+                entries.append((Path(entry.path),
+                                entry_stat.st_size))
+        actual = sorted(path.stem for path, _size in entries)
         if actual != expected:
             raise ValueError(
                 f"cache/source stem mismatch for {dataset.get('name')}: "
@@ -1052,11 +1300,15 @@ def _validate_frozen_cache_inventory(cache: dict) -> None:
         by_stem = {row.get("stem"): row for row in rows if isinstance(row, dict)}
         if set(by_stem) != set(expected) or len(by_stem) != len(rows):
             raise ValueError(f"source inventory stem mismatch: {dataset.get('name')}")
-        for path in entries:
+        for path, size in entries:
             row = by_stem[path.stem]
-            if (row.get("size") != path.stat().st_size
-                    or row.get("sha256") != _sha256_file(path)):
+            actual_sha256 = _sha256_file(path)
+            if (row.get("size") != size
+                    or row.get("sha256") != actual_sha256):
                 raise ValueError(f"source inventory hash mismatch: {path}")
+        print(f"  Frozen source validated: {dataset.get('name')} "
+              f"({len(entries)} WAVs, "
+              f"{time.monotonic() - validation_started:.2f}s)")
 
 
 def _copy_publication_tree(source: Path, target: Path) -> None:
@@ -1124,7 +1376,8 @@ def _batch_evidence_path(dataset_root: Path, batch_idx: int) -> Path:
 def _load_trusted_batch_evidence(
     dataset_root: Path, batch_idx: int, batch_stems: list[str],
     *, config_sha256: str = "", cache_sha256: str = "",
-    evidence_dir: Path | None = None,
+    implementation_sha256: str = "", evidence_dir: Path | None = None,
+    require_zero_filtered: bool = False,
 ) -> dict | None:
     """Trust a resumed batch only when evidence and published files agree."""
     evidence_path = ((evidence_dir / "batch_receipt.json") if evidence_dir is not None
@@ -1142,9 +1395,14 @@ def _load_trusted_batch_evidence(
             return None
         if evidence.get("stems_digest") != stable_json_digest(expected_stems):
             return None
+        if not _evidence_policy_matches(evidence, require_zero_filtered):
+            return None
         if config_sha256 and evidence.get("config_sha256") != config_sha256:
             return None
         if cache_sha256 and evidence.get("cache_sha256") != cache_sha256:
+            return None
+        if (implementation_sha256
+                and evidence.get("implementation_sha256") != implementation_sha256):
             return None
         receipt = evidence.get("receipt")
         if not isinstance(receipt, dict) or validate_pipeline_accounting_receipt(receipt):
@@ -1153,6 +1411,13 @@ def _load_trusted_batch_evidence(
             return None
         report_path = evidence_path.parent / "postprocess_report.jsonl"
         if evidence.get("report_sha256") != _sha256_file(report_path):
+            return None
+        receipt = evidence["receipt"]
+        if require_zero_filtered and set(receipt["filtered"]["stems"]):
+            return None
+        if (require_zero_filtered
+                and not _validate_zero_filtered_report(
+                    report_path, set(receipt["output"]["stems"]))):
             return None
         staging = dataset_root / ".staging" / f"batch_{batch_idx:04d}"
         actual = _publication_tree(staging)
@@ -1197,12 +1462,33 @@ def _replace_batch_path_with_retry(source: Path, target: Path) -> None:
 def _publish_batch_to_staging(
     local_dir: Path, dataset_root: Path, batch_idx: int, batch_stems: list[str],
     *, config_sha256: str = "", cache_sha256: str = "",
+    implementation_sha256: str = "", require_zero_filtered: bool = False,
 ) -> bool:
     """Publish one batch into isolated staging and immutable batch evidence."""
     expected_stems = sorted(str(stem) for stem in batch_stems)
+    # Do the strict local gate before trusted/orphan recovery can rename any
+    # evidence.  This preserves the policy's no-write boundary for a batch
+    # that is visibly filtered or has an invalid clean report.
+    if require_zero_filtered and local_dir.is_dir() and not local_dir.is_symlink():
+        early_output = local_dir / "output"
+        early_filtered = local_dir / "workspace" / "filtered"
+        if any(early_filtered.glob("*.TextGrid")):
+            print(f"    Batch publication rejected: filtered stems are forbidden "
+                  f"by publication policy for batch_{batch_idx:04d}")
+            return False
+        early_report = early_output / "postprocess_report.jsonl"
+        if not early_report.is_file():
+            return False
+        early_output_stems = {path.stem for path in early_output.glob("*.TextGrid")}
+        if not _validate_zero_filtered_report(early_report, early_output_stems):
+            print(f"    Batch publication rejected: clean report policy failed "
+                  f"for batch_{batch_idx:04d}")
+            return False
     trusted = _load_trusted_batch_evidence(
         dataset_root, batch_idx, expected_stems,
-        config_sha256=config_sha256, cache_sha256=cache_sha256)
+        config_sha256=config_sha256, cache_sha256=cache_sha256,
+        implementation_sha256=implementation_sha256,
+        require_zero_filtered=require_zero_filtered)
     if trusted is not None:
         return True
 
@@ -1222,6 +1508,8 @@ def _publish_batch_to_staging(
             orphan_evidence = _load_trusted_batch_evidence(
                 dataset_root, batch_idx, expected_stems,
                 config_sha256=config_sha256, cache_sha256=cache_sha256,
+                implementation_sha256=implementation_sha256,
+                require_zero_filtered=require_zero_filtered,
                 evidence_dir=orphan)
             if orphan_evidence is None:
                 continue
@@ -1233,7 +1521,9 @@ def _publish_batch_to_staging(
             if _load_trusted_batch_evidence(
                     dataset_root, batch_idx, expected_stems,
                     config_sha256=config_sha256,
-                    cache_sha256=cache_sha256) is not None:
+                    cache_sha256=cache_sha256,
+                    implementation_sha256=implementation_sha256,
+                    require_zero_filtered=require_zero_filtered) is not None:
                 print(f"    Recovered committed batch evidence: batch_{batch_idx:04d}")
                 return True
 
@@ -1264,6 +1554,15 @@ def _publish_batch_to_staging(
             print(f"    Batch publication rejected: receipt artifact membership "
                   f"mismatch for batch_{batch_idx:04d}")
             return False
+        if require_zero_filtered:
+            if filtered_stems:
+                print(f"    Batch publication rejected: filtered stems are forbidden "
+                      f"by publication policy for batch_{batch_idx:04d}")
+                return False
+            if not _validate_zero_filtered_report(report, output_stems):
+                print(f"    Batch publication rejected: clean report policy failed "
+                      f"for batch_{batch_idx:04d}")
+                return False
         report_rows = [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()
                        if line.strip()]
         report_stems = [row["stem"] for row in report_rows]
@@ -1312,18 +1611,23 @@ def _publish_batch_to_staging(
             "stems_digest": stable_json_digest(expected_stems),
             "config_sha256": config_sha256,
             "cache_sha256": cache_sha256,
+            "publication_policy": _publication_policy(require_zero_filtered),
             "receipt": receipt_payload,
             "receipt_sha256": stable_json_digest(receipt_payload),
             "report_sha256": _sha256_file(report_target),
             "artifacts": artifacts,
         }
+        if implementation_sha256:
+            evidence["implementation_sha256"] = implementation_sha256
         (evidence_tmp / "batch_receipt.json").write_text(
             json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         _replace_batch_path_with_retry(staging_tmp, staging)
         _replace_batch_path_with_retry(evidence_tmp, evidence_dir)
         if _load_trusted_batch_evidence(
                 dataset_root, batch_idx, expected_stems,
-                config_sha256=config_sha256, cache_sha256=cache_sha256) is None:
+                config_sha256=config_sha256, cache_sha256=cache_sha256,
+                implementation_sha256=implementation_sha256,
+                require_zero_filtered=require_zero_filtered) is None:
             return False
         return True
     except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1334,7 +1638,8 @@ def _publish_batch_to_staging(
 def _load_complete_dataset_receipt(
     dataset_root: Path, dataset_name: str, source_stems: list[str],
     batch_indices: list[int], *, config_sha256: str = "", cache_sha256: str = "",
-    receipt_mode: str = "pipelined",
+    implementation_sha256: str = "", receipt_mode: str = "pipelined",
+    require_zero_filtered: bool = False,
 ) -> dict | None:
     """Accept a dataset resume only when both final receipts are complete."""
     dataset_path = dataset_root / ".streaming_dataset_receipt_v1.json"
@@ -1355,6 +1660,9 @@ def _load_complete_dataset_receipt(
                 != stable_json_digest(expected_source)
                 or dataset_receipt.get("config_sha256") != config_sha256
                 or dataset_receipt.get("cache_sha256") != cache_sha256
+                or (implementation_sha256
+                    and dataset_receipt.get("implementation_sha256")
+                    != implementation_sha256)
                 or dataset_receipt.get("batch_count") != len(expected_indices)
                 or dataset_receipt.get("final_receipt_sha256") != _sha256_file(final_path)
                 or dataset_receipt.get("receipt_mode", receipt_mode) != receipt_mode
@@ -1372,6 +1680,18 @@ def _load_complete_dataset_receipt(
                 or not isinstance(final_filtered_bucket, dict)
                 or final_extra.get("batch_receipts") != batch_hashes):
             return None
+        if (implementation_sha256
+                and final_extra.get("implementation_sha256")
+                != implementation_sha256):
+            return None
+        if (not _evidence_policy_matches(dataset_receipt,
+                                          require_zero_filtered)
+                or not _evidence_policy_matches(
+                    {"publication_policy": final_extra.get(
+                        "publication_policy")}, require_zero_filtered)):
+            return None
+        if require_zero_filtered and final_filtered_bucket.get("stems", []):
+            return None
         for batch_index, expected_hash in zip(expected_indices, batch_hashes):
             evidence_path = _batch_evidence_path(dataset_root, batch_index)
             evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
@@ -1379,7 +1699,9 @@ def _load_complete_dataset_receipt(
                     or _load_trusted_batch_evidence(
                         dataset_root, batch_index, evidence.get("stems", []),
                         config_sha256=config_sha256,
-                        cache_sha256=cache_sha256) is None):
+                        cache_sha256=cache_sha256,
+                        implementation_sha256=implementation_sha256,
+                        require_zero_filtered=require_zero_filtered) is None):
                 return None
         final_output = {p.stem for p in (dataset_root / "output").glob("*.TextGrid")}
         final_filtered = {p.stem for p in (dataset_root / "filtered").glob("*.TextGrid")}
@@ -1393,6 +1715,10 @@ def _load_complete_dataset_receipt(
         if (dataset_receipt.get("outputs", {}).get("report_sha256")
                 != _sha256_file(report_path)):
             return None
+        if (require_zero_filtered
+                and not _validate_zero_filtered_report(
+                    report_path, final_output)):
+            return None
         return dataset_receipt
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
         return None
@@ -1401,12 +1727,15 @@ def _load_complete_dataset_receipt(
 def _verify_complete_dataset_receipt(
     dataset_root: Path, dataset_name: str, source_stems: list[str],
     batch_indices: list[int], *, config_sha256: str = "", cache_sha256: str = "",
-    receipt_mode: str = "pipelined",
+    implementation_sha256: str = "", receipt_mode: str = "pipelined",
+    require_zero_filtered: bool = False,
 ) -> dict:
     receipt = _load_complete_dataset_receipt(
         dataset_root, dataset_name, source_stems, batch_indices,
         config_sha256=config_sha256, cache_sha256=cache_sha256,
-        receipt_mode=receipt_mode)
+        implementation_sha256=implementation_sha256,
+        receipt_mode=receipt_mode,
+        require_zero_filtered=require_zero_filtered)
     if receipt is None:
         raise ValueError(f"dataset publication is not COMPLETE: {dataset_name}")
     return receipt
@@ -1417,6 +1746,7 @@ def _aggregate_dataset_publication(
     batch_indices: list[int], *, config_sha256: str = "", cache_sha256: str = "",
     receipt_mode: str = "pipelined", receipt_route: list[str] | None = None,
     batch_plan: dict[int, list[str]] | None = None,
+    implementation_sha256: str = "", require_zero_filtered: bool = False,
 ) -> dict:
     """Merge verified batches and atomically publish the dataset receipt."""
     expected_source = sorted(str(stem) for stem in source_stems)
@@ -1425,7 +1755,9 @@ def _aggregate_dataset_publication(
     existing = _load_complete_dataset_receipt(
         dataset_root, dataset_name, expected_source, batch_indices,
         config_sha256=config_sha256, cache_sha256=cache_sha256,
-        receipt_mode=receipt_mode)
+        implementation_sha256=implementation_sha256,
+        receipt_mode=receipt_mode,
+        require_zero_filtered=require_zero_filtered)
     if existing is not None:
         return existing
     evidences = []
@@ -1443,7 +1775,9 @@ def _aggregate_dataset_publication(
             evidence_stems = planned
         evidence = _load_trusted_batch_evidence(
             dataset_root, batch_idx, evidence_stems,
-            config_sha256=config_sha256, cache_sha256=cache_sha256)
+            config_sha256=config_sha256, cache_sha256=cache_sha256,
+            implementation_sha256=implementation_sha256,
+            require_zero_filtered=require_zero_filtered)
         if evidence is None:
             raise ValueError(f"untrusted batch evidence: {batch_idx}")
         evidences.append(evidence)
@@ -1475,6 +1809,36 @@ def _aggregate_dataset_publication(
                                 encoding="utf-8").splitlines())
     if source != set(expected_source):
         raise ValueError("source does not equal frozen cache stems")
+    if require_zero_filtered:
+        if filtered:
+            raise ValueError("filtered stems are forbidden by publication policy")
+        try:
+            aggregate_rows = [json.loads(line) for line in report_rows if line.strip()]
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ValueError("dataset clean report is invalid") from exc
+        if not _validate_zero_filtered_report_rows(aggregate_rows, output):
+            raise ValueError("dataset clean report policy failed")
+    final_extra = {
+        "config_sha256": config_sha256,
+        "cache_sha256": cache_sha256,
+        "publication_policy": _publication_policy(require_zero_filtered),
+        "batch_count": len(evidences),
+        "batch_receipts": [e["receipt_sha256"] for e in sorted(
+        evidences, key=lambda row: row["batch_index"])],
+    }
+    if implementation_sha256:
+        final_extra["implementation_sha256"] = implementation_sha256
+    final_path = dataset_root / ".pipeline_run_receipt_v2.json"
+    # Preserve immutable legacy final receipts when a permissive resume is
+    # aggregating old evidence that predates this optional policy marker.
+    if not require_zero_filtered and final_path.is_file() and not final_path.is_symlink():
+        try:
+            old_final_probe = json.loads(final_path.read_text(encoding="utf-8"))
+            if (isinstance(old_final_probe, dict)
+                    and "publication_policy" not in old_final_probe.get("extra", {})):
+                final_extra.pop("publication_policy", None)
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+            pass
     final = make_pipeline_accounting_receipt(
         expected_source, sorted(eligible), exclusions, sorted(output),
         sorted(filtered), run_id=f"streaming-{dataset_name}", mode=receipt_mode,
@@ -1482,11 +1846,7 @@ def _aggregate_dataset_publication(
         paths={"output": str((dataset_root / "output").resolve()),
                "filtered": str((dataset_root / "filtered").resolve()),
                "report": str((dataset_root / "output" / "postprocess_report.jsonl").resolve())},
-        shards=shards,
-        extra={"config_sha256": config_sha256, "cache_sha256": cache_sha256,
-               "batch_count": len(evidences),
-               "batch_receipts": [e["receipt_sha256"] for e in sorted(
-                   evidences, key=lambda row: row["batch_index"])]})
+        shards=shards, extra=final_extra)
 
     for evidence in evidences:
         batch_root = dataset_root / ".staging" / f"batch_{evidence['batch_index']:04d}"
@@ -1499,7 +1859,6 @@ def _aggregate_dataset_publication(
     report_tmp = report_path.with_name(report_path.name + f".tmp.{os.getpid()}")
     report_tmp.write_text(report_text, encoding="utf-8")
     report_tmp.replace(report_path)
-    final_path = dataset_root / ".pipeline_run_receipt_v2.json"
     final_already_valid = False
     if final_path.exists() or final_path.is_symlink():
         try:
@@ -1522,6 +1881,7 @@ def _aggregate_dataset_publication(
                    "stems_digest": stable_json_digest(expected_source)},
         "config_sha256": config_sha256,
         "cache_sha256": cache_sha256,
+        "publication_policy": _publication_policy(require_zero_filtered),
         "batch_count": len(evidences),
         "receipt_mode": receipt_mode,
         "receipt_route": list(receipt_route or ["gpu", "cpu", "dataset_publish"]),
@@ -1531,6 +1891,8 @@ def _aggregate_dataset_publication(
         "outputs": {"output": len(output), "filtered": len(filtered),
                     "report_sha256": _sha256_file(report_path)},
     }
+    if implementation_sha256:
+        dataset_receipt["implementation_sha256"] = implementation_sha256
     dataset_path = dataset_root / ".streaming_dataset_receipt_v1.json"
     if dataset_path.exists() or dataset_path.is_symlink():
         try:
@@ -1542,7 +1904,9 @@ def _aggregate_dataset_publication(
         return _verify_complete_dataset_receipt(
             dataset_root, dataset_name, expected_source, batch_indices,
             config_sha256=config_sha256, cache_sha256=cache_sha256,
-            receipt_mode=receipt_mode)
+            implementation_sha256=implementation_sha256,
+            receipt_mode=receipt_mode,
+            require_zero_filtered=require_zero_filtered)
     dataset_tmp = dataset_path.with_name(dataset_path.name + f".tmp.{os.getpid()}")
     dataset_tmp.write_text(json.dumps(dataset_receipt, ensure_ascii=False, indent=2) + "\n",
                            encoding="utf-8")
@@ -1556,6 +1920,7 @@ def _finalize_dataset_publications(
     completed_set: set[str], failed_set: set[str],
     *, config_sha256: str = "", cache_sha256: str = "",
     receipt_mode: str = "pipelined", receipt_route: list[str] | None = None,
+    implementation_sha256: str = "", require_zero_filtered: bool = False,
 ) -> list[str]:
     """Finalize only datasets whose complete batch plan is trusted."""
     failures: list[str] = []
@@ -1574,12 +1939,16 @@ def _finalize_dataset_publications(
             _aggregate_dataset_publication(
                 dataset_root, dataset_name, source_stems, indices,
                 config_sha256=config_sha256, cache_sha256=cache_sha256,
+                implementation_sha256=implementation_sha256,
                 receipt_mode=receipt_mode, receipt_route=receipt_route,
-                batch_plan=batch_plan)
+                batch_plan=batch_plan,
+                require_zero_filtered=require_zero_filtered)
             _verify_complete_dataset_receipt(
                 dataset_root, dataset_name, source_stems, indices,
                 config_sha256=config_sha256, cache_sha256=cache_sha256,
-                receipt_mode=receipt_mode)
+                implementation_sha256=implementation_sha256,
+                receipt_mode=receipt_mode,
+                require_zero_filtered=require_zero_filtered)
         except (OSError, UnicodeError, json.JSONDecodeError, KeyError,
                 TypeError, ValueError) as exc:
             print(f"  [PUBLISH] {dataset_name} FAILED closed: {exc}")
@@ -2075,16 +2444,20 @@ class StreamingPipeline:
         return get_mfa_env(self.mfa_python, self.models_dir)
 
 
-def _run_direct(args, data_dir: Path, ctc_dir: Path, output_dir: Path | None):
+def _run_direct(args, data_dir: Path, ctc_dir: Path, output_dir: Path | None,
+                mode: str | None = "ctc_ready"):
     """Pass-through to run_pipeline.py — data is local, no streaming needed."""
+    if mode not in {"ctc_ready", "nvrasr_fallback"}:
+        raise ValueError("unsupported direct producer mode")
     cmd = [
         sys.executable,
         str(PROJECT_ROOT / "scripts" / "run_pipeline.py"),
         "--config", str(args.config),
-        "--mode", "ctc_ready",
+        "--mode", mode,
         "--data-dir", str(data_dir),
-        "--ctc-ready", str(ctc_dir),
     ]
+    if mode == "ctc_ready":
+        cmd += ["--ctc-ready", str(ctc_dir)]
     if output_dir:
         cmd += ["--output-dir", str(output_dir)]
     if args.overwrite:
@@ -2134,6 +2507,9 @@ Examples:
                         help="Path to CTC files (.TextGrid, .lab, etc.).")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory.")
+    parser.add_argument("--mode", type=str, default=None,
+                        choices=["full", "ctc_ready", "batch_ctc_ready", "nvrasr_fallback", "qwen3asr"],
+                        help="Pipeline mode; qwen3asr is rejected by the streaming entry point.")
 
     # ── NAS paths (legacy, aliases for --data-dir / --ctc-ready / --output-dir) ──
     parser.add_argument("--nas-ctc", type=str, default=None,
@@ -2213,6 +2589,9 @@ Examples:
     if args.config.exists():
         with open(args.config, 'r', encoding='utf-8') as _f:
             cfg = _yaml.safe_load(_f) or {}
+    if args.mode == "qwen3asr" or cfg.get("mode") == "qwen3asr":
+        print("ERROR: streaming_pipeline.py does not support mode=qwen3asr; use run_pipeline.py")
+        return 1
     streaming_cfg = cfg.get("streaming", {})
     args._config = cfg  # stash for reuse by run_batch
 
@@ -2335,6 +2714,7 @@ Examples:
             mfa_num_jobs=(args.mfa_jobs if args.mfa_jobs is not None
                           else cfg.get("mfa", {}).get("num_jobs", 0)),
             mfa_en_num_jobs=cfg.get("mfa_en", {}).get("num_jobs", 0),
+            mode=_streaming_producer_mode(args.mode, cfg.get("mode")),
         )
         if not ok:
             return 1
@@ -2344,8 +2724,28 @@ Examples:
             print("           Tip: add --local-work /ssd/mfa_work for streaming")
         else:
             print("Mode:      DIRECT (local fs)")
-        _run_direct(args, data_dir, ctc_dir, output_dir)
+        _run_direct(
+            args, data_dir, ctc_dir, output_dir,
+            mode=_streaming_producer_mode(args.mode, cfg.get("mode")))
     return 0
+
+
+def _streaming_producer_mode(
+        requested_mode: str | None, config_mode: str | None = None,
+) -> str | None:
+    """Resolve the producer identity used by the composable batch route.
+
+    Historically this wrapper treated every single-dataset invocation as
+    ``ctc_ready``.  Preserve that compatibility for the legacy ``full`` and
+    ``batch_ctc_ready`` entry modes, but never erase an explicit/configured
+    raw fallback identity.  Unknown producer modes are rejected by callers.
+    """
+    mode = str(requested_mode or config_mode or "ctc_ready").strip()
+    if mode == "nvrasr_fallback":
+        return mode
+    if mode in {"ctc_ready", "batch_ctc_ready", "full"}:
+        return "ctc_ready"
+    return None
 
 
 def run_single_dataset(
@@ -2361,6 +2761,7 @@ def run_single_dataset(
     mfa_en_num_jobs: int = 0,
     device: str = "",
     parallel_batches: int = 4,
+    mode: str | None = None,
 ) -> bool:
     """Run pipeline for a single dataset.  Returns True on success.
 
@@ -2369,6 +2770,24 @@ def run_single_dataset(
                 If False, use streaming (interleaved prefetch/process/upload).
     """
     import concurrent.futures as _cf3
+
+    if mode is None:
+        config_mode = None
+        try:
+            import yaml as _yaml_single
+            payload = _yaml_single.safe_load(
+                Path(config).read_text(encoding="utf-8")) or {}
+            if isinstance(payload, dict):
+                config_mode = payload.get("mode")
+        except (OSError, UnicodeError, TypeError, ValueError):
+            config_mode = None
+        mode = _streaming_producer_mode(None, config_mode)
+    else:
+        mode = _streaming_producer_mode(mode)
+    if mode not in {"ctc_ready", "nvrasr_fallback"}:
+        print("ERROR: single-dataset route requires ctc_ready or "
+              "nvrasr_fallback producer mode")
+        return False
 
     # ── Ensure MFA model is pre-extracted before subprocess starts ──
     _ensure_mfa_model_extracted()
@@ -2382,6 +2801,9 @@ def run_single_dataset(
     # no prior NVASR run).  Create it so the pipeline can write CTC output.
     _has_pre_ctc = nas_ctc_dir.exists()
     if not _has_pre_ctc:
+        if mode != "nvrasr_fallback":
+            print(f"ERROR: CTC-ready input dir not found: {nas_ctc_dir}")
+            return False
         nas_ctc_dir.mkdir(parents=True, exist_ok=True)
         print(f"  Note: CTC dir created (nvrasr_fallback): {nas_ctc_dir}")
     if not nas_audio_dir.exists():
@@ -2396,7 +2818,8 @@ def run_single_dataset(
     # ── Discover stems (single scandir, O(1) set validation) ──
     print("\nDiscovering stems ...")
     if stems_override is not None:
-        stems = list(stems_override)
+        requested_stems = list(stems_override)
+        stems = list(requested_stems)
         layout_map = {s: "nested" for s in stems}
         wav_index = {}
         for s in stems:
@@ -2405,6 +2828,17 @@ def run_single_dataset(
                 wav_index[s] = w
         stems = [s for s in stems if s in wav_index]
         print(f"  Using {len(stems)} stems (override)")
+        if len(stems) != len(requested_stems):
+            print(f"ERROR: stem override resolved {len(stems)}/"
+                  f"{len(requested_stems)} WAV files")
+            return False
+    elif mode == "nvrasr_fallback":
+        wav_index = build_file_index(nas_audio_dir, ".wav")
+        stems = sorted(wav_index)
+        layout_map = {
+            stem: ("flat" if path.parent == nas_audio_dir else "nested")
+            for stem, path in wav_index.items()
+        }
     else:
         stems, _, layout_map, wav_index = discover_stems_separated(
             nas_ctc_dir, nas_audio_dir, require_all=True)
@@ -2450,6 +2884,13 @@ def run_single_dataset(
     mfa_num_jobs = resources["mfa_jobs_per_worker"]
     mfa_en_num_jobs = resources["mfa_en_jobs_per_worker"]
 
+    if not staged and mode == "nvrasr_fallback":
+        # The legacy interleaved class copies a pre-existing CTC bundle and
+        # has no raw-ASR prefetch contract.  Route fallback through the
+        # composable staged operations instead of silently relabeling it.
+        print("  Note: nvrasr_fallback uses the composable staged route")
+        staged = True
+
     if not staged:
         # ── Streaming mode (original behavior) ──
         pipeline = StreamingPipeline(
@@ -2480,6 +2921,8 @@ def run_single_dataset(
     print(f"\n  PHASE 1: Staging {len(batch_mgr)} batches NAS → NVMe ...")
     staged_dirs: dict[int, Path] = {}
     stage_failures: set[int] = set()
+    text_index = (build_file_index(nas_audio_dir, ".txt")
+                  if mode == "nvrasr_fallback" else None)
     t_stage = time.time()
 
     for bi in range(len(batch_mgr)):
@@ -2488,10 +2931,11 @@ def run_single_dataset(
             local_dir, elapsed, missing = _stage_one_batch(
                 ds=ds, batch_idx=bi, batch_stems=bstems,
                 layout_map=layout_map, wav_index=wav_index,
-                local_base=local_work, mode="ctc_ready",
+                local_base=local_work, mode=mode,
+                text_index=text_index,
             )
             if missing:
-                print(f"  [STAGE] FAIL batch {bi}: {missing} missing audio files")
+                print(f"  [STAGE] FAIL batch {bi}: {missing} unavailable inputs")
                 stage_failures.add(bi)
             else:
                 staged_dirs[bi] = local_dir
@@ -2509,6 +2953,7 @@ def run_single_dataset(
     t_proc = time.time()
     proc_ok = 0
     proc_fail = 0
+    processed_batches: set[int] = set()
     proc_lock = threading.Lock()
 
     def _proc_one(bi: int) -> bool:
@@ -2519,7 +2964,7 @@ def run_single_dataset(
             mfa_python=mfa_python, models_dir=models_dir,
             nas_output_root=nas_output_root,
             batch_size=batch_size, python_path=python_path,
-            mode="ctc_ready", device=device,
+            mode=mode, device=device,
             restore_cache=False,
             persist_cache_on_failure=False,
             mfa_num_jobs=mfa_num_jobs,
@@ -2529,9 +2974,14 @@ def run_single_dataset(
     n_proc = min(parallel_batches, len(staged_dirs))
     if n_proc <= 1:
         for bi in sorted(staged_dirs.keys()):
-            ok = _proc_one(bi)
+            try:
+                ok = _proc_one(bi)
+            except Exception as exc:
+                print(f"  [PROC] CRASH batch {bi}: {exc}")
+                ok = False
             if ok:
                 proc_ok += 1
+                processed_batches.add(bi)
             else:
                 proc_fail += 1
     else:
@@ -2542,6 +2992,7 @@ def run_single_dataset(
                     if fut.result():
                         with proc_lock:
                             proc_ok += 1
+                            processed_batches.add(futures[fut])
                     else:
                         with proc_lock:
                             proc_fail += 1
@@ -2560,7 +3011,7 @@ def run_single_dataset(
     up_ok = 0
     up_fail = 0
 
-    for bi in sorted(staged_dirs.keys()):
+    for bi in sorted(processed_batches):
         local_dir = staged_dirs[bi]
         if _upload_one_batch(
             local_dir=local_dir,
@@ -2583,7 +3034,17 @@ def run_single_dataset(
           f"({time.time() - t_up:.0f}s)")
     print(f"  SINGLE DATASET TOTAL: {total_elapsed:.0f}s")
 
-    return proc_fail == 0 and up_fail == 0
+    expected_batches = len(batch_mgr)
+    return (
+        expected_batches > 0
+        and not stage_failures
+        and len(staged_dirs) == expected_batches
+        and proc_fail == 0
+        and proc_ok == expected_batches
+        and len(processed_batches) == expected_batches
+        and up_fail == 0
+        and up_ok == expected_batches
+    )
 
 
 CHECKPOINT_SCHEMA = "streaming-checkpoint-v2"
@@ -2662,6 +3123,9 @@ def _checkpoint_identity(cache: dict, args) -> dict[str, object]:
         stems = dataset.get("stems")
         if not isinstance(stems, list):
             stems = []
+        limit = max(0, int(getattr(args, "limit", 0) or 0))
+        if limit:
+            stems = stems[:limit]
         for batch_index in range(0, len(stems) or 1, batch_size):
             chunk = stems[batch_index:batch_index + batch_size]
             batch_ids.append({
@@ -2671,8 +3135,12 @@ def _checkpoint_identity(cache: dict, args) -> dict[str, object]:
                 "stems_digest": stable_json_digest(chunk),
             })
     config = getattr(args, "_config", {}) or {}
+    implementation_sha256 = getattr(args, "_implementation_sha256", "")
+    if not implementation_sha256:
+        implementation_sha256 = _implementation_sha256()
     cli = {
         "batch_size": batch_size,
+        "limit": max(0, int(getattr(args, "limit", 0) or 0)),
         "parallel_datasets": getattr(args, "parallel_datasets", None),
         "mfa_jobs": getattr(args, "mfa_jobs", None),
         "mfa_en_jobs": getattr(args, "mfa_en_jobs", None),
@@ -2680,6 +3148,7 @@ def _checkpoint_identity(cache: dict, args) -> dict[str, object]:
         "pipelined": bool(getattr(args, "pipelined", False)),
     }
     return {
+        "implementation_sha256": implementation_sha256,
         "input_manifest_digest": stable_json_digest(datasets),
         "batch_identities": batch_ids,
         "resolved_config_digest": stable_json_digest({
@@ -2772,23 +3241,50 @@ def _load_batch_progress(ckpt_path: Path) -> dict[str, dict]:
 
 def _save_batch_progress(ckpt_path: Path, ds_name: str,
                          done: int, fail: int, total: int,
-                         identity: dict[str, object]) -> None:
+                         identity: dict[str, object], *,
+                         reset_on_identity_mismatch: bool = False) -> None:
     """Atomically write identity-bound per-dataset batch progress."""
     progress_path = ckpt_path.with_name(ckpt_path.stem + ".batch_progress.json")
     data = {"schema": BATCH_PROGRESS_SCHEMA,
             "identity": identity, "datasets": {}}
     if progress_path.exists():
-        existing = json.loads(progress_path.read_text(encoding='utf-8'))
+        try:
+            existing = json.loads(progress_path.read_text(encoding='utf-8'))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            if not reset_on_identity_mismatch:
+                raise RuntimeError(
+                    "batch progress is corrupt; recovery required") from exc
+            existing = None
         if (not isinstance(existing, dict)
                 or existing.get("schema") != BATCH_PROGRESS_SCHEMA
                 or existing.get("identity") != identity
                 or not isinstance(existing.get("datasets"), dict)):
-            raise RuntimeError("batch progress identity changed; recovery required")
-        data = existing
+            if not reset_on_identity_mismatch:
+                raise RuntimeError("batch progress identity changed; recovery required")
+        else:
+            data = existing
     data["datasets"][ds_name] = {"done": done, "fail": fail, "total": total}
     tmp = progress_path.with_suffix(progress_path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
     tmp.replace(progress_path)
+
+
+def _limit_stem_partitions(complete_stems: list[str],
+                           incomplete_stems: list[str],
+                           limit: int) -> tuple[list[str], list[str]]:
+    """Apply a per-dataset limit before staged batch construction.
+
+    Staged mode keeps CTC-ready stems ahead of fallback stems, matching its
+    existing enqueue order.  Previously this path ignored ``--limit`` and a
+    bounded validation could launch the entire frozen inventory.
+    """
+    limit = max(0, int(limit or 0))
+    if not limit:
+        return list(complete_stems), list(incomplete_stems)
+    limited_complete = list(complete_stems[:limit])
+    remaining = max(0, limit - len(limited_complete))
+    limited_incomplete = list(incomplete_stems[:remaining])
+    return limited_complete, limited_incomplete
 
 
 def _execute_staged(
@@ -2802,6 +3298,7 @@ def _execute_staged(
     allow_overwrite: bool = True,
     allow_force: bool = True,
     config_sha256: str = "", cache_sha256: str = "",
+    implementation_sha256: str = "", require_zero_filtered: bool = False,
 ) -> tuple[int, list[str]]:
     """Three-phase staged execution: Stage All → Process All → Upload All.
 
@@ -2856,7 +3353,9 @@ def _execute_staged(
                 if _load_trusted_batch_evidence(
                         dataset_root, batch_idx, batch_stems,
                         config_sha256=config_sha256,
-                        cache_sha256=cache_sha256) is not None:
+                        cache_sha256=cache_sha256,
+                        implementation_sha256=implementation_sha256,
+                        require_zero_filtered=require_zero_filtered) is not None:
                     trusted_batches.add(gidx)
                     print(f"  [STAGE] trusted evidence {ds_name}/{batch_idx:04d}; skip processing")
                     with stage_lock:
@@ -2982,7 +3481,9 @@ def _execute_staged(
                     tracker["fail"] += 1
                 _save_batch_progress(ckpt_path, ds_name,
                                      tracker["done"], tracker["fail"], tracker["total"],
-                                     checkpoint_identity)
+                                     checkpoint_identity,
+                                     reset_on_identity_mismatch=bool(
+                                         getattr(args, "no_resume", False)))
                 if tracker["done"] + tracker["fail"] >= tracker["total"]:
                     if tracker["fail"] == 0:
                         w_ok += 1
@@ -3062,7 +3563,9 @@ def _execute_staged(
             try:
                 published = _publish_batch_to_staging(
                     local_dir, nas_output_root / ds_name, batch_idx, batch_stems,
-                    config_sha256=config_sha256, cache_sha256=cache_sha256)
+                    config_sha256=config_sha256, cache_sha256=cache_sha256,
+                    implementation_sha256=implementation_sha256,
+                    require_zero_filtered=require_zero_filtered)
             except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
                 print(f"  [UPLOAD] {ds_name}/{batch_idx:04d} publication exception: {exc}")
             if not published:
@@ -3120,8 +3623,10 @@ def _execute_staged(
         plans.setdefault(ds["name"], []).append((batch_idx, batch_stems))
     publish_failures = _finalize_dataset_publications(
         plans, ds_batch_tracker, nas_output_root, completed_set, failed_set,
-        config_sha256=config_sha256, cache_sha256=cache_sha256,
-        receipt_mode="staged", receipt_route=["stage", "process", "publish"])
+                config_sha256=config_sha256, cache_sha256=cache_sha256,
+                implementation_sha256=implementation_sha256,
+                receipt_mode="staged", receipt_route=["stage", "process", "publish"],
+                require_zero_filtered=require_zero_filtered)
     for name in upload_failures:
         if name not in publish_failures:
             failed_set.add(name)
@@ -3143,6 +3648,30 @@ def _execute_staged(
     return ok_count, fail_list
 
 
+def _apply_batch_output_override(cache: dict, args) -> dict:
+    """Apply an explicit batch output root without mutating the cache file.
+
+    Batch caches freeze the source inventory, but a test/rerun must be able to
+    publish into an isolated destination.  Keep the source and stem contract
+    unchanged while rebinding each dataset's derived CTC/output namespace in
+    memory.
+    """
+    config = getattr(args, "_config", {}) or {}
+    raw_output = (getattr(args, "output_dir", None)
+                  or getattr(args, "nas_output", None)
+                  or config.get("output_dir"))
+    if not raw_output:
+        return cache
+    import copy
+    output_root = resolve_input_path(str(raw_output).rstrip("/"), PROJECT_ROOT)
+    overridden = copy.deepcopy(cache)
+    overridden["output_root"] = str(output_root)
+    for dataset in overridden.get("datasets", []):
+        name = str(dataset.get("name", ""))
+        dataset["ctc_dir"] = str(output_root / name)
+    return overridden
+
+
 def run_batch(args) -> bool:
     """Iterate over all datasets from batch cache with checkpoint/resume support.
 
@@ -3159,8 +3688,16 @@ def run_batch(args) -> bool:
     # Checkpoint file lives next to the cache file
     ckpt_path = cache_path.with_name(cache_path.stem + ".checkpoint.json")
 
-    with open(cache_path, 'r', encoding='utf-8') as f:
-        cache = json.load(f)
+    cached_override = getattr(args, "_batch_cache_data", None)
+    if cached_override is not None:
+        cache = cached_override
+    else:
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            cache = _apply_batch_output_override(json.load(f), args)
+        args._batch_cache_data = cache
+
+    implementation_sha256 = _implementation_sha256()
+    args._implementation_sha256 = implementation_sha256
 
     all_datasets = cache.get("datasets", [])
     if not all_datasets:
@@ -3204,6 +3741,9 @@ def run_batch(args) -> bool:
     # Resolve parallelism: CLI > config > default 1
     parallel = args.parallel_datasets
     _cfg = getattr(args, '_config', {})
+    pipeline_cfg = _cfg.get("pipelined", {}) if _cfg else {}
+    require_zero_filtered = bool(
+        pipeline_cfg.get("require_zero_filtered", False))
     if parallel is None:
         parallel = _cfg.get("streaming", {}).get("parallel", 1) if _cfg else 1
     parallel = max(1, parallel)  # Keep user-specified value for batch-level scheduling
@@ -3311,18 +3851,21 @@ def run_batch(args) -> bool:
     print(f"MFA Python: {mfa_python}")
 
     if args.pipelined:
-        return run_pipelined_batch(args)
-
-    if parallel <= 1:
-        return _run_batch_sequential(
-            args, datasets, cache, ckpt_path, completed_set, failed_set)
+        # ``run_batch`` already proved this exact in-memory cache before any
+        # output/work directory or GPU launch.  Pass the object identity to
+        # the pipelined implementation so it can consume that proof without
+        # repeating a full NAS metadata/hash scan.  Direct callers still take
+        # the validation path below.
+        return run_pipelined_batch(
+            args, validated_frozen_cache=cache)
 
     # ── Batch-level parallel mode ──
     # Pre-discover stems for ALL datasets, split into batches, put ALL
     # individual batches into a shared queue.  Every worker processes
     # whatever batch is available — including batches from the same
-    # dataset.  A 100k-stem dataset with 50 batches gets distributed
-    # across all 8 workers instead of being stuck on 1 worker.
+    # dataset.  Keep this classifier/scheduler even with one worker: the old
+    # dataset shortcut erased mixed/fallback producer identities and treated
+    # WAV-only input as ctc_ready.
     import queue as _queue
 
     # Phase 1: pre-scan all datasets → build batch task list
@@ -3465,6 +4008,13 @@ def run_batch(args) -> bool:
                 if s in wav_index:
                     incomplete_wav_index[s] = wav_index[s]
 
+        original_stem_count = len(complete_stems) + len(incomplete_stems)
+        complete_stems, incomplete_stems = _limit_stem_partitions(
+            complete_stems, incomplete_stems, args.limit)
+        limited_stem_count = len(complete_stems) + len(incomplete_stems)
+        if limited_stem_count < original_stem_count:
+            print(f"  {ds_name}: limited to {limited_stem_count} stems")
+
         batch_size_eff = args.batch_size
 
         # ── Enqueue ctc_ready batches (complete stems) ──
@@ -3563,6 +4113,8 @@ def run_batch(args) -> bool:
             allow_overwrite=getattr(args, '_allow_overwrite', True),
             allow_force=getattr(args, '_allow_force', True),
             config_sha256=config_sha256, cache_sha256=cache_sha256,
+            implementation_sha256=implementation_sha256,
+            require_zero_filtered=require_zero_filtered,
         )
     else:
         # ── STREAMING MODE: interleave prefetch/process/upload per batch ──
@@ -3608,7 +4160,9 @@ def run_batch(args) -> bool:
                 try:
                     trusted = _load_trusted_batch_evidence(
                         nas_output_root / ds_name, batch_idx, batch_stems,
-                        config_sha256=config_sha256, cache_sha256=cache_sha256)
+                        config_sha256=config_sha256, cache_sha256=cache_sha256,
+                        implementation_sha256=implementation_sha256,
+                        require_zero_filtered=require_zero_filtered)
                     if trusted is not None:
                         print(f"  [W{worker_id}] trusted evidence; skipping "
                               f"{batch_label}")
@@ -3626,6 +4180,8 @@ def run_batch(args) -> bool:
                             mfa_num_jobs=getattr(args, '_effective_mfa_jobs', 0),
                             mfa_en_num_jobs=getattr(args, '_effective_mfa_en_jobs', 0),
                             config_sha256=config_sha256, cache_sha256=cache_sha256,
+                            implementation_sha256=implementation_sha256,
+                            require_zero_filtered=require_zero_filtered,
                         )
                 except Exception as _exc:
                     print(f"  [W{worker_id}] CRASH processing {batch_label}: {_exc}")
@@ -3641,7 +4197,9 @@ def run_batch(args) -> bool:
                         tracker["fail"] += 1
                     _save_batch_progress(ckpt_path, ds_name,
                                          tracker["done"], tracker["fail"], tracker["total"],
-                                         checkpoint_identity)
+                                         checkpoint_identity,
+                                         reset_on_identity_mismatch=bool(
+                                             getattr(args, "no_resume", False)))
                     if tracker["done"] + tracker["fail"] >= tracker["total"]:
                         if tracker["fail"] == 0:
                             w_ok += 1
@@ -3679,8 +4237,11 @@ def run_batch(args) -> bool:
             plans, ds_batch_tracker,
             resolve_input_path(cache.get("output_root", "").rstrip("/"), PROJECT_ROOT),
             completed_set, failed_set, config_sha256=config_sha256,
-            cache_sha256=cache_sha256, receipt_mode="streaming",
-            receipt_route=["stage", "process", "publish"])
+            cache_sha256=cache_sha256,
+            implementation_sha256=implementation_sha256,
+            receipt_mode="streaming",
+            receipt_route=["stage", "process", "publish"],
+            require_zero_filtered=require_zero_filtered)
         _save_checkpoint(ckpt_path, completed_set, failed_set, checkpoint_identity)
         fail_list = list(set(fail_list) | set(publish_failures))
 
@@ -3710,7 +4271,7 @@ def _save_progress(cache_path: Path, cache: dict, ds_name: str, ok: bool):
 def _run_batch_sequential(args, datasets: list, cache: dict,
                          ckpt_path: Path, completed_set: set[str],
                          failed_set: set[str]) -> bool:
-    """Sequential dataset loop with checkpoint after each dataset (used when parallel=1)."""
+    """Compatibility dataset loop with checkpoint after each dataset."""
     ok_count = 0
     fail_list: list[str] = []
     checkpoint_identity = _checkpoint_identity(cache, args)
@@ -3732,24 +4293,34 @@ def _run_batch_sequential(args, datasets: list, cache: dict,
         print(f"{'='*60}")
 
         stems_ov = ds.get("stems", None)
-        ok = run_single_dataset(
-            nas_ctc=nas_ctc, nas_audio=nas_audio,
-            nas_output=nas_output, config=args.config,
-            local_work=ds_local, batch_size=args.batch_size,
-            limit=args.limit, python_path=args.python,
-            stems_override=stems_ov,
-            prefetch_buffer=args.prefetch_buffer,
-            upload_buffer=args.upload_buffer,
-            staged=getattr(args, 'stage_all', True),
-            parallel_batches=1,  # sequential batch mode
-        )
+        config_mode = (getattr(args, "_config", {}) or {}).get("mode")
+        producer_mode = _streaming_producer_mode(
+            ds.get("mode", cache.get("mode")), config_mode)
+        if producer_mode is None:
+            print(f"ERROR: {ds_name}: unsupported producer mode")
+            ok = False
+        else:
+            ok = run_single_dataset(
+                nas_ctc=nas_ctc, nas_audio=nas_audio,
+                nas_output=nas_output, config=args.config,
+                local_work=ds_local, batch_size=args.batch_size,
+                limit=args.limit, python_path=args.python,
+                stems_override=stems_ov,
+                prefetch_buffer=args.prefetch_buffer,
+                upload_buffer=args.upload_buffer,
+                staged=getattr(args, 'stage_all', True),
+                parallel_batches=1,  # sequential batch mode
+                mode=producer_mode,
+            )
 
         if ok:
             ok_count += 1
+            failed_set.discard(ds_name)
             completed_set.add(ds_name)
             if ds_local.exists():
                 shutil.rmtree(ds_local, ignore_errors=True)
         else:
+            completed_set.discard(ds_name)
             failed_set.add(ds_name)
             fail_list.append(ds_name)
         _save_checkpoint(ckpt_path, completed_set, failed_set, checkpoint_identity)
@@ -3901,71 +4472,50 @@ def _run_gpu_phase(
         if gpu_idx.isdigit():
             env["CUDA_VISIBLE_DEVICES"] = cuda_visible_token(int(gpu_idx), env)
 
-    try:
-        rc = subprocess.run(cmd, env=env, timeout=7200, capture_output=False).returncode
-    except subprocess.TimeoutExpired:
-        rc = 1
+    # Producer success is a strict batch contract.  A complete-looking
+    # subset is never promoted to CPU; retry the same requested batch instead.
+    requested = list(batch_stems)
+    expected = sorted(requested)
+    last_rc = 1
+    for attempt in range(1, 4):
+        if attempt > 1:
+            # Do not let artifacts from a failed attempt satisfy the next
+            # attempt's exact-set check.  Quarantine them for forensics.
+            for producer_dir in (local_workspace / "ctc_pretg",
+                                  local_workspace / "ctc_pretg_adj"):
+                if producer_dir.exists() or producer_dir.is_symlink():
+                    _quarantine_existing_path(producer_dir,
+                                               label=f"ATTEMPT{attempt - 1}")
+        try:
+            last_rc = subprocess.run(
+                cmd, env=env, timeout=7200, capture_output=False).returncode
+        except subprocess.TimeoutExpired:
+            last_rc = 1
 
-    if rc != 0:
-        # NVASR can return a non-zero wrapper status after writing a complete
-        # CTC bundle (for example, a late verification warning).  Do not
-        # discard a batch whose complete CTC subset is large enough for the
-        # no-reference partial-accounting contract; the missing stems are
-        # explicitly carried into ctc_ready/filtered instead of failing the
-        # whole batch.
-        _ctc_dir = local_workspace / "ctc_pretg"
-        _suffixes = (".TextGrid", ".lab", "_tokens.jsonl", "_punct.json",
-                     "_text_cn.txt", "_text_raw.txt")
-        _complete_stems = _flatten_ctc_shards(
-            _ctc_dir, set(batch_stems), _suffixes)
-        # Also accept a complete flat bundle (the common fast path).
-        if not _complete_stems:
-            _complete_stems = set(batch_stems)
-            for _suffix in _suffixes:
-                _complete_stems &= {
-                    p.name[:-len(_suffix)]
-                    for p in _ctc_dir.glob("*" + _suffix)
-                }
-            _complete_stems &= set(batch_stems)
-        _min_complete = max(1, int(len(batch_stems) * 0.90))
-        if len(_complete_stems) >= _min_complete:
-            print(f"  [GPU] Warning: NVASR returned rc={rc}, but CTC bundle is"
-                  f" usable ({len(_complete_stems)}/{len(batch_stems)}); continuing")
-            # A producer receipt may exist but still bind the pre-move batch
-            # path (the launcher preserves failed batches as ``*.FAILED``).
-            # For a partial bundle always rebuild it against the current local
-            # audio axis; this also projects the receipt to the complete stem
-            # subset.
-            if (len(_complete_stems) < len(batch_stems)
-                    or not (local_workspace / "ctc_pretg" / ".ctc_run_receipt.json").is_file()):
-                if not _repair_complete_ctc_receipt(
-                        local_workspace, local_audio, sorted(_complete_stems)):
-                    print("  [GPU] Complete CTC bundle has no valid receipt; preserving batch")
-                    rc = 1
-                    _complete_stems = set()
-            if not _complete_stems:
-                pass
-            else:
-                if persist_cache:
-                    _persist_ctc_adj_cache(local_workspace,
-                                           resolve_input_path(ds.get("ctc_dir", "")))
-                    if nas_output_dir:
-                        _persist_ctc_adj_cache(local_workspace, nas_output_dir)
-                return True
-        # Preserve failed batch directory for forensic analysis
-        _failed_dir = _preserve_failed_batch(local_dir)
-        print(f"  [GPU] Preserved: {_failed_dir}")
-        return False
+        _flatten_ctc_shards(
+            local_workspace / "ctc_pretg", set(expected), CTC_SUFFIXES)
+        exact = _validate_exact_ctc_bundle(
+            local_workspace, local_audio, requested)
+        if not exact:
+            # A receipt with exact input/output stems but missing bindings can
+            # be repaired once the producer artifacts themselves are exact.
+            exact = _repair_complete_ctc_receipt(
+                local_workspace, local_audio, requested)
+        if exact:
+            if persist_cache:
+                _persist_ctc_adj_cache(local_workspace,
+                                       resolve_input_path(ds.get("ctc_dir", "")))
+                if nas_output_dir:
+                    _persist_ctc_adj_cache(local_workspace, nas_output_dir)
+            return True
+        print(f"  [GPU] Attempt {attempt}/3 rejected: rc={last_rc}; "
+              f"producer/receipt is not exact for {len(expected)} requested stems")
 
-    # Persist CTC output to NAS for caching.
-    # Save to BOTH ctc_dir (GPU phase default) and nas_output_dir (CPU phase reads from here),
-    # so the restore in _run_cpu_phase always finds the cache regardless of which path it checks.
-    if persist_cache:
-        _persist_ctc_adj_cache(local_workspace,
-                               resolve_input_path(ds.get("ctc_dir", "")))
-        if nas_output_dir:
-            _persist_ctc_adj_cache(local_workspace, nas_output_dir)
-    return True
+    # Preserve failed batch directory for forensic analysis, including all
+    # quarantined attempt directories and the final producer state.
+    _failed_dir = _preserve_failed_batch(local_dir)
+    print(f"  [GPU] Preserved: {_failed_dir}")
+    return False
 
 
 def _ctc_ready_overwrite_args(*, allow_overwrite: bool,
@@ -4038,13 +4588,17 @@ def _run_cpu_phase(
     restore_cache: bool = True,
     config_sha256: str = "",
     cache_sha256: str = "",
+    implementation_sha256: str = "",
     upload_lock=None,
     producer_mode: str = "ctc_ready",
+    preserve_successful_workspaces: bool = False,
+    require_zero_filtered: bool = False,
 ) -> bool:
     """CPU phase: read CTC from local workspace + run MFA align + postprocess.
 
     The local workspace must already contain CTC output from the GPU phase.
-    Uploads final output to NAS and cleans up the local directory.
+    Uploads final output to NAS and cleans up the local directory unless the
+    pipelined retention setting explicitly preserves a successful workspace.
     """
     local_dir = _batch_local_dir(local_base, batch_idx, ds.get("name"))
     local_audio = local_dir / "audio"        # where GPU phase put WAVs
@@ -4173,7 +4727,9 @@ def _run_cpu_phase(
     try:
         if not _publish_batch_to_staging(
                 local_dir, nas_output, batch_idx, batch_stems,
-                config_sha256=config_sha256, cache_sha256=cache_sha256):
+                config_sha256=config_sha256, cache_sha256=cache_sha256,
+                implementation_sha256=implementation_sha256,
+                require_zero_filtered=require_zero_filtered):
             print(f"  [CPU] Batch publication failed — preserving {local_dir}")
             _preserve_failed_batch(local_dir)
             return False
@@ -4183,11 +4739,17 @@ def _run_cpu_phase(
         return False
 
     # Cleanup is allowed only after staging file set/size/hash validation.
-    shutil.rmtree(local_dir, ignore_errors=True)
+    # Failed publication and all earlier failure paths return before this
+    # opt-in branch, so their forensic-preservation behavior is unchanged.
+    if preserve_successful_workspaces:
+        print(f"  [CPU] Successful workspace retained: {local_dir}")
+    else:
+        shutil.rmtree(local_dir, ignore_errors=True)
     return True
 
 
-def run_pipelined_batch(args) -> bool:
+def run_pipelined_batch(
+        args, *, validated_frozen_cache: dict | None = None) -> bool:
     """Pipelined GPU/CPU mode: NVASR and MFA run in parallel stages.
 
     GPU workers:  prefetch WAVs → NVASR prealign + normalize → CTC output
@@ -4206,17 +4768,25 @@ def run_pipelined_batch(args) -> bool:
         print(f"ERROR: Batch cache not found: {cache_path}")
         sys.exit(1)
 
-    with open(cache_path, 'r', encoding='utf-8') as f:
-        cache = json.load(f)
+    cached_override = getattr(args, "_batch_cache_data", None)
+    if cached_override is not None:
+        cache = cached_override
+    else:
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            cache = _apply_batch_output_override(json.load(f), args)
 
-    # Validate the frozen source inventory before checkpoint/config probing,
-    # output resolution, directory creation, or any GPU work.  A changed,
-    # missing, symlinked, or hash-mismatched source fails closed at launch.
-    try:
-        _validate_frozen_cache_inventory(cache)
-    except (OSError, TypeError, ValueError) as exc:
-        print(f"ERROR: frozen cache inventory validation failed: {exc}")
-        return False
+    implementation_sha256 = _implementation_sha256()
+    args._implementation_sha256 = implementation_sha256
+
+    # A direct pipelined call must validate for itself.  The ordinary entry
+    # point may hand off only the same cache object it already validated; an
+    # arbitrary boolean or stale digest is deliberately insufficient.
+    if validated_frozen_cache is not cache:
+        try:
+            _validate_frozen_cache_inventory(cache)
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"ERROR: frozen cache inventory validation failed: {exc}")
+            return False
 
     config_sha256 = _sha256_file(args.config)
     cache_sha256 = _sha256_file(cache_path)
@@ -4229,17 +4799,24 @@ def run_pipelined_batch(args) -> bool:
     # ── Config ──
     _cfg = getattr(args, '_config', {})
     pipeline_cfg = _cfg.get("pipelined", {}) if _cfg else {}
+    require_zero_filtered = bool(
+        pipeline_cfg.get("require_zero_filtered", False))
+    preserve_successful_workspaces = bool(
+        pipeline_cfg.get("preserve_successful_workspaces", False))
     n_gpu_workers = args.gpus  # 1 GPU per GPU worker; bounded after scanning.
     requested_cpu_workers = args.cpu_workers or pipeline_cfg.get("cpu_workers", 0)
 
     # ── Resume ──
     ckpt_path = cache_path.with_name(cache_path.stem + ".checkpoint.json")
     checkpoint_identity = _checkpoint_identity(cache, args)
-    try:
-        completed_set = _load_checkpoint(ckpt_path, checkpoint_identity)
-    except RuntimeError as exc:
-        print(f"ERROR: {exc}")
-        return False
+    if getattr(args, "no_resume", False):
+        completed_set = set()
+    else:
+        try:
+            completed_set = _load_checkpoint(ckpt_path, checkpoint_identity)
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}")
+            return False
     failed_set: set[str] = set()
 
     # ── Resolve drives ──
@@ -4371,6 +4948,7 @@ def run_pipelined_batch(args) -> bool:
 
     # ── Tracking ──
     ok_count = 0
+    trusted_ok_count = 0
     fail_list: list[str] = []
     ckpt_lock = threading.Lock()
     ds_tracker: dict[str, dict] = {}  # {ds_name: {total, done, fail}}
@@ -4381,9 +4959,76 @@ def run_pipelined_batch(args) -> bool:
         ds_tracker[ds_name]["total"] += 1
 
     upload_lock = threading.Lock()
+    active_cpu_batches: set[tuple[str, str, int]] = set()
+    accounted_cpu_failures: set[tuple[str, str, int]] = set()
+    accounted_gpu_failures: set[tuple[str, str, int]] = set()
+
+    def cpu_batch_key(item: tuple) -> tuple[str, str, int]:
+        ds, batch_idx, _batch_stems, local_base, _producer_mode = item
+        return (str(Path(local_base).resolve()), str(ds["name"]), int(batch_idx))
+
+    def preserve_worker_failure_workspace(
+            local_base: Path, batch_idx: int, dataset_name: str, *,
+            reason: str = "unexpected failure") -> None:
+        """Move one failed/aborted workspace without replacing evidence."""
+        local_dir = _batch_local_dir(local_base, batch_idx, dataset_name)
+        if not (local_dir.exists() or local_dir.is_symlink()):
+            return
+        try:
+            failed_dir = _preserve_failed_batch(local_dir)
+            print(f"  [PIPELINE] Preserved {reason}: {failed_dir}")
+        except Exception as preserve_exc:
+            # The original exception remains the batch failure.  Keep the
+            # worker alive long enough to account and signal the pipeline even
+            # if a filesystem error prevents an additional preservation move.
+            print(f"  [PIPELINE] Could not preserve {local_dir}: "
+                  f"{type(preserve_exc).__name__}: {preserve_exc}")
+
+    def account_gpu_batch_failure(
+            ds: dict, batch_idx: int, local_base: Path) -> None:
+        key = (str(Path(local_base).resolve()), str(ds["name"]), int(batch_idx))
+        with ckpt_lock:
+            if key in accounted_gpu_failures:
+                return
+            accounted_gpu_failures.add(key)
+            tracker = ds_tracker[ds["name"]]
+            tracker["fail"] += 1
+            if tracker["done"] + tracker["fail"] >= tracker["total"]:
+                failed_set.add(ds["name"])
+
+    def account_unconsumed_cpu_batch(item: tuple) -> None:
+        """Fail and preserve one queued batch that no CPU worker consumed."""
+        if item is _CPU_SENTINEL or not isinstance(item, tuple):
+            return
+        ds, batch_idx, _batch_stems, local_base, _producer_mode = item
+        key = cpu_batch_key(item)
+        with ckpt_lock:
+            if key in accounted_cpu_failures:
+                return
+            accounted_cpu_failures.add(key)
+            tracker = ds_tracker[ds["name"]]
+            tracker["fail"] += 1
+            if tracker["done"] + tracker["fail"] >= tracker["total"]:
+                failed_set.add(ds["name"])
+            active = key in active_cpu_batches
+        # A queued item is not owned by a running CPU worker.  Preserve only
+        # those workspaces here; an active worker owns its own failure cleanup.
+        if not active:
+            local_dir = _batch_local_dir(local_base, batch_idx, ds["name"])
+            if local_dir.exists() or local_dir.is_symlink():
+                _preserve_failed_batch(local_dir)
+
+    def drain_unconsumed_cpu_queue() -> None:
+        while True:
+            try:
+                item = cpu_queue.get_nowait()
+            except _queue.Empty:
+                return
+            account_unconsumed_cpu_batch(item)
 
     # ── GPU worker ──
     def gpu_worker(wid: int) -> None:
+        nonlocal trusted_ok_count
         drive = usable_drives[wid % len(usable_drives)]
         local_base = drive / f"gpu_{wid}"
         gpu_id = wid % n_gpu_workers
@@ -4403,44 +5048,62 @@ def run_pipelined_batch(args) -> bool:
             remaining = gpu_queue.qsize()
             print(f"\n  [GPU{device_str}] [{total_batches - remaining}/{total_batches}]"
                   f" {ds_name}/{batch_idx:04d} ({len(batch_stems)} stems)")
+            try:
+                if _load_trusted_batch_evidence(
+                        nas_output_root / ds_name, batch_idx, batch_stems,
+                        config_sha256=config_sha256,
+                        cache_sha256=cache_sha256,
+                        implementation_sha256=implementation_sha256,
+                        require_zero_filtered=require_zero_filtered) is not None:
+                    with ckpt_lock:
+                        ds_tracker[ds_name]["done"] += 1
+                        trusted_ok_count += 1
+                    print(f"  [GPU{device_str}] trusted evidence; skip "
+                          f"{ds_name}/{batch_idx:04d}")
+                    continue
 
-            if _load_trusted_batch_evidence(
-                    nas_output_root / ds_name, batch_idx, batch_stems,
-                    config_sha256=config_sha256,
-                    cache_sha256=cache_sha256) is not None:
-                with ckpt_lock:
-                    ds_tracker[ds_name]["done"] += 1
-                print(f"  [GPU{device_str}] trusted evidence; skip "
-                      f"{ds_name}/{batch_idx:04d}")
-                continue
-
-            ok = _run_gpu_phase(
-                ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
-                layout_map=layout_map, wav_index=wav_index, text_index=text_index,
-                local_base=local_base, config=args.config,
-                mfa_python=mfa_python, models_dir=models_dir,
-                batch_size=args.batch_size, python_path=args.python,
-                device=device_str,
-                nas_output_dir=nas_output_root / ds_name,
-                persist_cache=bool(pipeline_cfg.get("restore_ctc_cache", True)),
-                allow_overwrite=getattr(args, '_allow_overwrite', True),
-                allow_force=getattr(args, '_allow_force', True),
-            )
-            if ok:
-                if put_with_stop(cpu_queue, (
-                        ds, batch_idx, batch_stems, local_base, producer_mode)):
-                    print(f"  [GPU{device_str}] {ds_name}/{batch_idx:04d} → CPU queue")
+                ok = _run_gpu_phase(
+                    ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
+                    layout_map=layout_map, wav_index=wav_index, text_index=text_index,
+                    local_base=local_base, config=args.config,
+                    mfa_python=mfa_python, models_dir=models_dir,
+                    batch_size=args.batch_size, python_path=args.python,
+                    device=device_str,
+                    nas_output_dir=nas_output_root / ds_name,
+                    persist_cache=bool(pipeline_cfg.get("restore_ctc_cache", True)),
+                    allow_overwrite=getattr(args, '_allow_overwrite', True),
+                    allow_force=getattr(args, '_allow_force', True),
+                )
+                if ok:
+                    cpu_item = (ds, batch_idx, batch_stems,
+                                local_base, producer_mode)
+                    if put_with_stop(cpu_queue, cpu_item):
+                        print(f"  [GPU{device_str}] {ds_name}/{batch_idx:04d} → CPU queue")
+                    else:
+                        # A downstream failure may arrive after this GPU phase
+                        # completed but before its CPU item was enqueued.  It
+                        # is still one failed batch and must not be lost.
+                        preserve_worker_failure_workspace(
+                            local_base, batch_idx, ds_name,
+                            reason="downstream-stop GPU result")
+                        account_gpu_batch_failure(ds, batch_idx, local_base)
+                        failure_event.set()
+                        stop_event.set()
+                        break
                 else:
+                    account_gpu_batch_failure(ds, batch_idx, local_base)
                     failure_event.set()
-                    break
-            else:
+                    stop_event.set()
+            except Exception as exc:
+                print(f"  [GPU{device_str}] unexpected batch exception "
+                      f"{ds_name}/{batch_idx:04d}: {type(exc).__name__}: {exc}")
+                preserve_worker_failure_workspace(
+                    local_base, batch_idx, ds_name,
+                    reason="unexpected GPU failure")
+                account_gpu_batch_failure(ds, batch_idx, local_base)
                 failure_event.set()
                 stop_event.set()
-                with ckpt_lock:
-                    tracker = ds_tracker[ds_name]
-                    tracker["fail"] += 1
-                    if tracker["done"] + tracker["fail"] >= tracker["total"]:
-                        failed_set.add(ds_name)
+                break
 
     _GPU_SENTINEL = object()
     _CPU_SENTINEL = object()  # signals CPU worker to exit
@@ -4470,33 +5133,59 @@ def run_pipelined_batch(args) -> bool:
                 break
             ds, batch_idx, batch_stems, local_base, producer_mode = item
             ds_name = ds["name"]
+            batch_key = cpu_batch_key(item)
+            with ckpt_lock:
+                active_cpu_batches.add(batch_key)
             nas_output = nas_output_root / ds_name
             remaining = cpu_queue.qsize()
             print(f"\n  [CPU{ wid}] [q:{remaining}]"
                   f" {ds_name}/{batch_idx:04d} ({len(batch_stems)} stems)")
 
-            ok = _run_cpu_phase(
-                ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
-                local_base=local_base, config=args.config,
-                mfa_python=mfa_python, models_dir=models_dir,
-                nas_output=nas_output,
-                batch_size=args.batch_size, python_path=args.python,
-                mfa_num_jobs=resource_plan["mfa_jobs_per_worker"],
-                mfa_en_num_jobs=resource_plan["mfa_en_jobs_per_worker"],
-                allow_overwrite=getattr(args, '_allow_overwrite', True),
-                allow_force=getattr(args, '_allow_force', True),
-                restore_cache=bool(pipeline_cfg.get("restore_ctc_cache", True)),
-                config_sha256=config_sha256,
-                cache_sha256=cache_sha256,
-                upload_lock=upload_lock,
-                producer_mode=producer_mode,
-            )
+            unexpected_error = None
+            try:
+                ok = _run_cpu_phase(
+                    ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
+                    local_base=local_base, config=args.config,
+                    mfa_python=mfa_python, models_dir=models_dir,
+                    nas_output=nas_output,
+                    batch_size=args.batch_size, python_path=args.python,
+                    mfa_num_jobs=resource_plan["mfa_jobs_per_worker"],
+                    mfa_en_num_jobs=resource_plan["mfa_en_jobs_per_worker"],
+                    allow_overwrite=getattr(args, '_allow_overwrite', True),
+                    allow_force=getattr(args, '_allow_force', True),
+                    restore_cache=bool(pipeline_cfg.get("restore_ctc_cache", True)),
+                    config_sha256=config_sha256,
+                    cache_sha256=cache_sha256,
+                    implementation_sha256=implementation_sha256,
+                    upload_lock=upload_lock,
+                    producer_mode=producer_mode,
+                    preserve_successful_workspaces=preserve_successful_workspaces,
+                    require_zero_filtered=require_zero_filtered,
+                )
+            except Exception as exc:
+                unexpected_error = exc
+                ok = False
+                print(f"  [CPU{wid}] unexpected batch exception "
+                      f"{ds_name}/{batch_idx:04d}: {type(exc).__name__}: {exc}")
+                preserve_worker_failure_workspace(
+                    local_base, batch_idx, ds_name,
+                    reason="unexpected CPU failure")
+            finally:
+                with ckpt_lock:
+                    active_cpu_batches.discard(batch_key)
             with ckpt_lock:
                 tracker = ds_tracker[ds_name]
                 if ok:
+                    # Count successful batch consumers for the summary.  The
+                    # dataset-level COMPLETE receipt is finalized below;
+                    # keeping both counters separate avoids reporting 0/1
+                    # after all per-batch CPU phases succeeded.
+                    w_ok += 1
                     tracker["done"] += 1
                 else:
-                    tracker["fail"] += 1
+                    if batch_key not in accounted_cpu_failures:
+                        accounted_cpu_failures.add(batch_key)
+                        tracker["fail"] += 1
                 if tracker["done"] + tracker["fail"] >= tracker["total"]:
                     if tracker["fail"] != 0:
                         w_fails.append(ds_name)
@@ -4504,7 +5193,7 @@ def run_pipelined_batch(args) -> bool:
                     status = "DONE" if tracker["fail"] == 0 else "FAIL"
                     print(f"  [CPU{wid}] {ds_name} — {status} "
                           f"({tracker['done']}/{tracker['total']} batches)")
-            if not ok:
+            if unexpected_error is not None or not ok:
                 failure_event.set()
                 stop_event.set()
                 break
@@ -4518,36 +5207,37 @@ def run_pipelined_batch(args) -> bool:
         gpu_futures = [gpu_pool.submit(gpu_worker, wid) for wid in range(n_gpu_workers)]
         cpu_futures = [cpu_pool.submit(cpu_worker, wid) for wid in range(n_cpu_workers)]
 
-        # Wait for GPU workers to finish producing
+        # Wait for GPU workers to finish producing.  A worker catches all
+        # per-batch exceptions, but the root collector remains defensive so a
+        # residual worker failure cannot cause premature CPU sentinel writes.
         try:
             for fut in concurrent.futures.as_completed(gpu_futures):
-                fut.result()  # propagate exceptions
+                try:
+                    fut.result()
+                except Exception as exc:
+                    print(f"  [GPU] worker exception: {type(exc).__name__}: {exc}")
+                    failure_event.set()
+                    stop_event.set()
         finally:
+            # Sentinel insertion is valid only after every producer future is
+            # quiescent.  This wait is also the guard for an exception raised
+            # by the root future collector itself.
+            concurrent.futures.wait(gpu_futures)
             # Wake CPU workers after GPU production is complete.  On success
             # do not set stop_event: queued CPU work must drain before its
             # sentinels.  On failure, timed queue operations let everybody
             # exit even if a queue is full.
-            if failure_event.is_set():
-                stop_event.set()
-                for _ in range(n_cpu_workers):
-                    try:
-                        cpu_queue.put_nowait(_CPU_SENTINEL)
-                    except _queue.Full:
-                        break
-            else:
-                for _ in range(n_cpu_workers):
-                    while True:
-                        try:
-                            cpu_queue.put(_CPU_SENTINEL, timeout=0.25)
-                            break
-                        except _queue.Full:
-                            continue
+            _shutdown_pipelined_cpu_queue(
+                cpu_queue, n_cpu_workers, stop_event, failure_event,
+                _CPU_SENTINEL, drain_unconsumed_cpu_queue)
             feeder.join(timeout=5)
 
-    for fut in concurrent.futures.as_completed(cpu_futures):
-            w_ok, w_fails = fut.result()
-            ok_count += w_ok
-            fail_list.extend(w_fails)
+    ok_count, fail_list = _collect_pipelined_cpu_futures(
+        cpu_futures, failure_event, stop_event, drain_unconsumed_cpu_queue)
+    # Trusted evidence is a completed batch success even though it never
+    # reaches a CPU future.  Count only explicit trusted skips and successful
+    # CPU results; failed or unconsumed work remains outside this denominator.
+    ok_count += trusted_ok_count
 
     # Dataset publication is the only point at which a dataset becomes
     # complete.  Batch success alone is insufficient: aggregate all evidence,
@@ -4558,8 +5248,10 @@ def run_pipelined_batch(args) -> bool:
     publish_failures = _finalize_dataset_publications(
         plans, ds_tracker, nas_output_root, completed_set, failed_set,
         config_sha256=config_sha256, cache_sha256=cache_sha256,
+        implementation_sha256=implementation_sha256,
         receipt_mode="pipelined",
-        receipt_route=["gpu", "cpu", "dataset_publish"])
+        receipt_route=["gpu", "cpu", "dataset_publish"],
+        require_zero_filtered=require_zero_filtered)
     for name in publish_failures:
         if name not in fail_list:
             fail_list.append(name)
@@ -4568,7 +5260,9 @@ def run_pipelined_batch(args) -> bool:
     all_ok = (len(fail_list) == 0 and not failure_event.is_set()
               and all(name in completed_set for name in ds_tracker))
     print(f"\n{'#'*60}")
-    print(f"  PIPELINED BATCH COMPLETE: {ok_count}/{len(all_datasets)} OK"
+    dataset_ok_count = sum(1 for name in ds_tracker if name in completed_set)
+    print(f"  PIPELINED BATCH COMPLETE: {dataset_ok_count}/{len(ds_tracker)} datasets OK; "
+          f"{ok_count}/{len(all_gpu_batches)} batches OK"
           f"{' — ALL OK' if all_ok else ' — WITH FAILURES'}")
     if fail_list:
         print(f"  Failed: {', '.join(fail_list)}")
@@ -4577,4 +5271,4 @@ def run_pipelined_batch(args) -> bool:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

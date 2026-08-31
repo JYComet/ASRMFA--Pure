@@ -76,7 +76,8 @@ def _fixture(tmp_path: Path) -> tuple[Path, dict, dict, Path, Path, Path, Path]:
         "command": [str(fake_exe), "align", "proof-corpus", str(dictionary), str(model),
                     "proof-output", "--audio_directory", "proof-audio",
                     "--temporary_directory", "proof-temp", "--beam", "20",
-                    "--retry_beam", "80", "--no_fine_tune", "--no_clean"],
+                    "--retry_beam", "80", "--dither", "0.0",
+                    "--no_fine_tune", "--no_clean"],
         "mfa_executable": {"path": str(fake_exe), "sha256": tool.sha_file(fake_exe)},
         "dictionary": {"path": str(dictionary), "sha256": tool.sha_file(dictionary)},
         "model": {"path": str(model), "sha256": tool.sha_tree(model)},
@@ -136,6 +137,7 @@ def test_singleton_rc0_valid_grid_success_once(tmp_path: Path):
     assert argv[1:2] == ["align"] and argv[3] == str(dictionary) and argv[4] == str(model)
     assert "--beam" in argv and argv[argv.index("--beam") + 1] == "20"
     assert "--retry_beam" in argv and argv[argv.index("--retry_beam") + 1] == "80"
+    assert argv[argv.index("--dither") + 1] == "0.0"
     assert "--no_fine_tune" in argv and "--no_clean" in argv
     assert kwargs["env"]["MFA_ROOT_DIR"] != proof["environment"]["MFA_ROOT_DIR"]
     assert kwargs["env"]["NUMBA_CACHE_DIR"] != proof["environment"]["NUMBA_CACHE_DIR"]
@@ -197,6 +199,27 @@ def test_retry_argv_preserves_options_and_rebinds_only_namespaces(tmp_path: Path
     assert transformed[transformed.index("--audio_directory") + 1].endswith("/audio")
     assert transformed[transformed.index("--temporary_directory") + 1].endswith("/temp")
     assert transformed[-2:] == command[-2:]
+
+
+def test_retry_argv_rejects_implicit_or_nonzero_dither(tmp_path: Path):
+    root, _, proof, *_ = _fixture(tmp_path)
+    for value in (None, "1.0"):
+        command = list(proof["command"])
+        index = command.index("--dither")
+        if value is None:
+            del command[index:index + 2]
+        else:
+            command[index + 1] = value
+        try:
+            tool._transform_retry_command(
+                command, corpus=root / "workspace" / "corpus",
+                audio=root / "workspace" / "audio",
+                output=root / "workspace" / "output",
+                temp=root / "workspace" / "temp", proof=proof)
+        except tool.SafetyError as exc:
+            assert "dither" in str(exc)
+        else:
+            raise AssertionError("nondeterministic MFA retry command was accepted")
 
 
 def main() -> int:

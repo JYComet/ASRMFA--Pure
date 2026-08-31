@@ -68,6 +68,7 @@
 #   num_jobs: 0             # 0 = auto (os.cpu_count()), 大核机器建议显式设置
 #                           # shard 数 = min(8, cpu//4, stems//200), ~2 核/shard
 #   single_speaker: true
+#   dither: 0.0             # 必须为 0 才能让相同输入的 MFA 边界可重复
 #   output_format: long_textgrid
 #   clean: false            # keep feature cache for faster re-runs
 #   no_tokenization: true
@@ -79,6 +80,7 @@
 # mfa_en:
 #   enabled: true           # set to false to skip English MFA entirely
 #   num_jobs: 4             # parallel MFA jobs for English segments
+#   dither: 0.0             # disable random MFCC noise for reproducible boundaries
 #   normalize_workers: 0    # parallel workers for English token normalisation (0=auto)
 #   corpus_workers: 0       # parallel workers for English corpus building (0=auto)
 #   padding_ms: 75          # audio padding around English segments
@@ -136,3 +138,37 @@
 #
 # pipelined:
 #   cpu_workers: 0           # 0 = auto (CPU budget // 8); planner caps MFA jobs/worker
+
+# ── Qwen3-ASR 模式（transcript_only 默认；anchored_nvv 须显式启用） ────────
+# mode: qwen3asr
+# qwen3asr:
+#   profile: transcript_only    # default; anchored_nvv is explicit Chinese-only mode
+#   backend: transformers       # v1 only; no vLLM/online API/download
+#   model_path: /local/Qwen3-ASR # existing local non-symlink model directory
+#   output_dir: output/qwen3asr  # dedicated root; never ordinary MFA output
+#   python: /home/user/miniconda3/envs/asr/bin/python  # isolated qwen runtime
+#   device: cuda:0
+#   dtype: bfloat16
+#   language: null            # null/Auto/empty = official auto detection
+#   context: ""
+#   batch_size: 1
+#   max_new_tokens: 2048
+#
+# Check without creating output:
+#   python scripts/run_pipeline.py --config qwen.yaml --mode qwen3asr --qwen3asr-check
+# Run/resume:
+#   python scripts/run_pipeline.py --config qwen.yaml --mode qwen3asr
+# The mode writes only output/qwen3asr/transcripts/*_qwen3.txt plus its
+# qwen3asr_checkpoint.json, qwen3asr_manifest.json and run receipt.  It does
+# not read/reuse CTC, MFA, TextGrid, postprocess, or ordinary pipeline receipts.
+#
+# Explicit anchored_nvv (requires local Qwen ASR + ForcedAligner + NVASR trees):
+#   profile: anchored_nvv
+#   language: Chinese
+#   forced_aligner_model_path: /local/Qwen3-ForcedAligner-0.6B
+#   nvasr_model_path: /local/Multilingual-NVASR
+#   output_dir: output/anchored_nvv
+#   nvv_bias: 4.0
+#   pause_threshold: 8
+# The serial route writes only anchors/, nvasr_candidates/, fused/ and its
+# anchored_nvv checkpoint/manifest/receipt; transcript_only remains unchanged.

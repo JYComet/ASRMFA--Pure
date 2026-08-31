@@ -45,7 +45,9 @@ def test_single_process_retry_command_keeps_anchor(tmp_path: Path, monkeypatch):
         timeout=30, attempt_ordinal=2)
 
     assert "--textgrid_directory" in seen["command"]
+    assert seen["command"][seen["command"].index("--dither") + 1] == "0.0"
     assert result["produced"] == ["demo"]
+    assert result["attempt_receipt"]["settings"]["dither"] == 0.0
     assert result["attempt_receipt"]["inputs"]["anchor_sha256"]
 
 
@@ -127,11 +129,13 @@ def test_laria_recovery_is_per_stem_and_rescues_only_explicit_noalignments():
     assert all(row["schema"] == MFA_ATTEMPT_RECEIPT_SCHEMA
                for row in state["receipts"])
     assert all(row["isolation"] == "singleton" for row in state["receipts"])
-    assert all(row["settings"] == {"beam": 20, "retry_beam": 80, "num_jobs": 1}
+    assert all(row["settings"] == {"beam": 20, "retry_beam": 80,
+                                    "num_jobs": 1, "dither": 0.0}
                for row in state["receipts"] if row["ordinal"] == 1)
     assert [row["settings"] for row in state["receipts"]
             if row["stem"] == "noalign" and row["ordinal"] == 2] == [
-                {"beam": 200, "retry_beam": 800, "num_jobs": 1}]
+                {"beam": 200, "retry_beam": 800,
+                 "num_jobs": 1, "dither": 0.0}]
 
 
 def test_laria_no_fabricated_output_on_failed_rescue():

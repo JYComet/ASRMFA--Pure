@@ -44,7 +44,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from pipeline_utils import (
     is_english_token, is_nvv_token, is_silence, SILENCE_LABELS,
-    find_mfa_python, get_mfa_env,
+    find_mfa_python, get_mfa_env, resolve_mfa_dither,
     is_english_phone as is_arpabet_phone,
     report_en_ipa_mappings, load_ctc_token_entries,
     CTC_PROCESSED_BOUNDARY_SOURCES,
@@ -1515,7 +1515,7 @@ def run_en_mfa(corpus_dir: Path, dict_path: Path, acoustic_model: str,
                models_dir: Path, num_jobs: int = 4,
                beam: int = 10, retry_beam: int = 40,
                fine_tune: bool = False, timeout: int = 1800,
-               strict: bool = False) -> dict:
+               strict: bool = False, dither: float = 0.0) -> dict:
     """Run MFA align and retain an exception-safe, auditable outcome."""
     output_dir.mkdir(parents=True, exist_ok=True)
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -1523,6 +1523,7 @@ def run_en_mfa(corpus_dir: Path, dict_path: Path, acoustic_model: str,
     # Use extracted model if available
     acoustic_arg = str(_resolve_acoustic_model(acoustic_model, models_dir))
 
+    dither = resolve_mfa_dither(dither)
     mfa_args = [
         "align", str(corpus_dir), str(dict_path),
         acoustic_arg, str(output_dir),
@@ -1533,6 +1534,7 @@ def run_en_mfa(corpus_dir: Path, dict_path: Path, acoustic_model: str,
         "--no_tokenization",
         "--beam", str(beam),
         "--retry_beam", str(retry_beam),
+        "--dither", str(dither),
     ]
     if not strict:
         mfa_args.append("--clean")
@@ -1603,7 +1605,8 @@ def retry_missing_en_segments(
         aligned_dir: Path, dict_path: Path, acoustic_model: str,
         temp_dir: Path, mfa_python: Path, models_dir: Path, *,
         beam: int = 100, retry_beam: int = 1000,
-        timeout: int = 600, limit: int = 16) -> list[dict]:
+        timeout: int = 600, limit: int = 16,
+        dither: float = 0.0) -> list[dict]:
     """Retry bounded utterance-level decoder misses in isolated MFA roots.
 
     MFA can return process success while omitting one or more utterances.  A
@@ -1659,7 +1662,7 @@ def retry_missing_en_segments(
                 retry_corpus, dict_path, acoustic_model,
                 retry_aligned, retry_work, mfa_python, models_dir, 1,
                 beam=beam, retry_beam=retry_beam, fine_tune=False,
-                timeout=timeout, strict=True)
+                timeout=timeout, strict=True, dither=dither)
             record["mfa"] = result
             if result.get("return_code") != 0:
                 record.update({"status": "mfa_failed",
@@ -1947,6 +1950,8 @@ def main():
                         help="Temporary directory for MFA working files")
     parser.add_argument("--num-jobs", type=int, default=4,
                         help="Number of parallel MFA jobs")
+    parser.add_argument("--dither", type=float, default=0.0,
+                        help="MFCC dither; zero gives deterministic alignment")
     parser.add_argument("--padding-ms", type=float, default=75.0,
                         help="Padding around English segments (ms)")
     parser.add_argument("--min-segment-dur-ms", type=float, default=150.0,
@@ -2159,7 +2164,8 @@ def main():
         en_aligned_dir, en_work_dir,
         mfa_python, models_dir, args.num_jobs,
         beam=args.beam, retry_beam=args.retry_beam,
-        fine_tune=args.fine_tune, timeout=args.timeout, strict=args.strict_provenance,
+        fine_tune=args.fine_tune, timeout=args.timeout,
+        strict=args.strict_provenance, dither=args.dither,
     )
     if args.strict_provenance:
         outcome["acoustic_model_sha256"] = strict_preflight["acoustic_model_sha256"]
@@ -2181,7 +2187,7 @@ def main():
             beam=args.singleton_retry_beam,
             retry_beam=args.singleton_retry_retry_beam,
             timeout=args.singleton_retry_timeout,
-            limit=args.singleton_retry_limit)
+            limit=args.singleton_retry_limit, dither=args.dither)
 
     # Step 5: Collect results
     if args.strict_provenance:

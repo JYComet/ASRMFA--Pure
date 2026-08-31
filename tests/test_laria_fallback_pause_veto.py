@@ -6,6 +6,8 @@ import copy
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts import postprocess_textgrids as post
@@ -60,7 +62,7 @@ def _publication(fixture, *, reference_mode="fallback", authoritative=False,
     return reasons, details
 
 
-def test_qualified_fallback_pause_keeps_evidence_but_removes_three_vetoes():
+def test_fallback_pause_correspondence_never_redeems_pause_vetoes():
     for pause in ("<sp0>", "<sp1>", "<sp2>"):
         fixture = _fixture("ni3", pause, "hao3")
         gate = post._fallback_pause_qualification(
@@ -70,7 +72,7 @@ def test_qualified_fallback_pause_keeps_evidence_but_removes_three_vetoes():
         assert gate["details"][0]["qualified"] is True
 
         reasons, details = _publication(fixture)
-        assert "strict_interior_sp" not in reasons
+        assert "strict_interior_sp" in reasons
         assert details["strict_interior_sp"]
         assert details["fallback_pause_qualification"]["pause_count"] == 1
 
@@ -78,7 +80,8 @@ def test_qualified_fallback_pause_keeps_evidence_but_removes_three_vetoes():
             ["mid_sp", "strict_interior_sp", "unexpected_silence", "bgm_suspect"],
             gate,
         )
-        assert filtered == ["bgm_suspect"]
+        assert filtered == ["mid_sp", "strict_interior_sp",
+                            "unexpected_silence", "bgm_suspect"]
 
 
 def test_leading_sp1_reindex_does_not_invalidate_exact_lexical_ledger():
@@ -129,7 +132,7 @@ def test_authority_equivalent_pause_is_not_redeemed():
     assert "reference_mode_not_fallback" in gate["details"][0]["qualification_reasons"]
 
 
-def test_sp3_is_redeemed_only_when_exact_ctc_gap_supports_it():
+def test_sp3_remains_a_veto_even_with_exact_ctc_gap_support():
     fixture = _fixture("ni3", "<sp3>", "hao3")
     gate = post._fallback_pause_qualification(
         fixture[0], "fallback", fixture[6], fixture[4], fixture[5])
@@ -137,7 +140,7 @@ def test_sp3_is_redeemed_only_when_exact_ctc_gap_supports_it():
     assert gate["details"][0]["ctc_gap_evidence"]["pause_coverage"] == 1.0
     assert post._apply_fallback_pause_veto_qualification(
         ["mid_sp", "strict_interior_sp", "unexpected_silence", "sp3"], gate
-    ) == []
+    ) == ["mid_sp", "strict_interior_sp", "unexpected_silence", "sp3"]
 
     unsupported = _fixture("ni3", "<sp3>", "hao3")
     unsupported[5][0]["end_s"] = 1.8
@@ -165,10 +168,43 @@ def test_missing_unsafe_and_malformed_ledgers_fail_closed():
     assert "digest_mismatch" in details["fallback_pause_qualification"]["ledger"]["reasons"]
 
 
+def test_nonleading_pure_silence_is_a_final_publication_veto():
+    words = post.Tier("words", 0.0, 1.0, [
+        post.Interval(0.0, 0.2, "ni3"),
+        post.Interval(0.2, 0.8, "<sp2>"),
+        post.Interval(0.8, 1.0, "hao3"),
+    ])
+    details = post._published_nonleading_silence_details(words)
+    assert len(details) == 1
+    assert details[0]["label"] == "<sp2>"
+
+    leading = post.Tier("words", 0.0, 1.0, [
+        post.Interval(0.0, 0.1, "<sp1>"),
+        post.Interval(0.1, 0.5, "ni3"),
+        post.Interval(0.5, 1.0, "hao3"),
+    ])
+    assert post._published_nonleading_silence_details(leading) == []
+
+
+@pytest.mark.parametrize("label", ("<SP0>", "<sP1>", "<Sp2>", "<SP3>",
+                                    "sp0", "sp1", "sp2", "sp3"))
+def test_uppercase_canonical_and_bare_sp_are_final_nonleading_vetoes(label):
+    words = post.Tier("words", 0.0, 1.0, [
+        post.Interval(0.0, 0.2, "ni3"),
+        post.Interval(0.2, 0.8, label),
+        post.Interval(0.8, 1.0, "hao3"),
+    ])
+
+    details = post._published_nonleading_silence_details(words)
+    assert len(details) == 1
+    assert details[0]["label"] == label
+    assert details[0]["reason"] == "nonleading_pure_silence_owner"
+
+
 def test_unqualified_silence_and_mixed_pause_do_not_get_global_redemption():
     fixture = _fixture("ni3", "<sp2>", "hao3", "<sil>", "ma1")
-    # This intentionally proves that one qualified-looking pause cannot redeem
-    # another unqualified retained interval.
+    # Qualification is retained as evidence, but cannot redeem any retained
+    # substantive pause or silence veto.
     words = fixture[0]
     gate = post._fallback_pause_qualification(
         words, "fallback", fixture[6], fixture[4], fixture[5])
@@ -178,7 +214,7 @@ def test_unqualified_silence_and_mixed_pause_do_not_get_global_redemption():
     assert gate["reason_qualification"]["strict_interior_sp"] is False
     assert post._apply_fallback_pause_veto_qualification(
         ["mid_sp", "strict_interior_sp", "unexpected_silence", "short_word"], gate
-    ) == ["mid_sp", "strict_interior_sp", "short_word"]
+    ) == ["mid_sp", "strict_interior_sp", "unexpected_silence", "short_word"]
 
 
 def test_laria_expectation_is_static_only():

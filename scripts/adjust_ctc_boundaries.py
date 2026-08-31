@@ -309,6 +309,24 @@ def _protect_processed_english_geometry(tokens: list[dict]) -> None:
                 token.get("processed_ctc_boundary_source") or "canonical_end_floor")
 
 
+def _record_adjusted_candidate_spans(tokens: list[dict],
+                                     punct: list[dict]) -> None:
+    """Seal adjusted spans while leaving candidate raw coordinates untouched."""
+    for row in [*tokens, *punct]:
+        if row.get("provenance_schema") != "nvasr-candidate-provenance-v1":
+            continue
+        start = row.get("start_s")
+        end = row.get("end_s")
+        if not isinstance(start, (int, float)) or isinstance(start, bool):
+            continue
+        if not isinstance(end, (int, float)) or isinstance(end, bool):
+            continue
+        if not math.isfinite(float(start)) or not math.isfinite(float(end)):
+            continue
+        row["adjusted_span"] = [float(start), float(end)]
+        row["adjusted_mapping_outcome"] = "unique"
+
+
 def _processed_geometry_cache_complete(ctc_dir: Path,
                                        stems: set[str]) -> bool:
     """Return whether an adjusted cache has derived spans for all authority rows."""
@@ -404,7 +422,8 @@ def rebuild_textgrid(orig_tg: Path, out_tg: Path,
             pending_end = float(line.split('=', 1)[1].strip())
         elif in_interval and line.startswith('text = '):
             label = line.split('=', 1)[1].strip().strip('"')
-            if (current_name == "pauses" and pending_start is not None
+            if (current_name == "pauses" and label.strip()
+                    and pending_start is not None
                     and pending_end is not None and pending_end > pending_start):
                 pause_intervals.append((pending_start, pending_end, label))
             in_interval = False
@@ -520,6 +539,7 @@ def process_one(stem: str, ctc_dir: Path, audio_dir: Path,
         adj_tokens, adj_punct = tokens, punct
         stats = {"start_adj": 0, "end_extend": 0, "end_shorten": 0, "punct_adj": 0}
     _protect_processed_english_geometry(adj_tokens)
+    _record_adjusted_candidate_spans(adj_tokens, adj_punct)
 
     # Guard: fix invalid intervals where Part 1 and Part 2 independently
     # adjusted punct start_s / end_s into a crossing state (NVV between

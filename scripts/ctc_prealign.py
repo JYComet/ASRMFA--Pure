@@ -55,6 +55,23 @@ _SINGLE_LETTER_LOWERCASE_NAMES: frozenset[str] = frozenset({
 ALLOWED_PUNCT_CJK = "，。！？、；：…"
 ALLOWED_PUNCT_ASCII = ",.!?;:"
 ALLOWED_PUNCT = set(ALLOWED_PUNCT_CJK + ALLOWED_PUNCT_ASCII)
+PUNCTUATION_EVIDENCE_SCHEMA = "ctc-punctuation-evidence-v2"
+NVASR_CANDIDATE_PROVENANCE_SCHEMA = "nvasr-candidate-provenance-v1"
+NVASR_MAPPING_BASIS = "raw_ctc_label_neighbors_forced_overlap-v2"
+CTC_TOKEN_SIDECAR_PASSTHROUGH_FIELDS = (
+    "surface_text", "source_ctc_ordinals", "canonical_span",
+    "canonical_unit", "canonical_unit_sha256", "reference_identity",
+    "reference_ordinal", "hyphen_separator_omitted", "processed_ctc_span",
+    "processed_ctc_boundary_source", "provenance_schema", "candidate_id",
+    "candidate_kind", "candidate_surface", "candidate_token_id",
+    "candidate_token_ids", "raw_span", "speech_span", "raw_start_frame",
+    "raw_end_frame", "speech_start_frame", "speech_end_frame",
+    "raw_start_s", "raw_end_s", "speech_start_s", "speech_end_s",
+    "raw_frame_count", "speech_frame_count", "frame_ms",
+    "mapping_basis", "mapping_key", "mapping_outcome", "forced_span",
+    "mapping_selection", "mapping_forced_speech_overlap_s",
+    "nvv_deduplication",
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -74,10 +91,12 @@ def validate_shard_accounting_receipt(path: Path, expected: set[str],
                                       eligible_universe: set[str]) -> None:
     """Validate a child receipt before quarantining it during all-GPU merge.
 
-    A child sees the complete input directory, so its source/eligible buckets
-    describe the parent universe while its output/processed buckets must be
-    exactly the stems assigned to that shard.  The child receipt is evidence,
-    not a merge artifact: the parent writes the sole authoritative receipt.
+    A child sees the complete input directory, but its operator-bounded
+    accounting universe is exactly the shard assigned to it.  The parent
+    universe is only an allow-list for the expected shard; the child receipt
+    itself must have source == eligible == expected and no exclusions.  The
+    child receipt is evidence, not a merge artifact: the parent writes the
+    sole authoritative receipt.
     """
     path = Path(path)
     if path.is_symlink() or not path.is_file():
@@ -93,8 +112,14 @@ def validate_shard_accounting_receipt(path: Path, expected: set[str],
         )
     if receipt.get("mode") != "ctc_prealign":
         raise ValueError(f"shard accounting mode mismatch: {path}")
-    if set(receipt["eligible"]["stems"]) != set(eligible_universe):
-        raise ValueError(f"shard accounting eligible universe mismatch: {path}")
+    if not set(expected) <= set(eligible_universe):
+        raise ValueError(f"shard accounting expected stems outside parent universe: {path}")
+    if set(receipt["source"]["stems"]) != set(expected):
+        raise ValueError(f"shard accounting source mismatch: {path}")
+    if set(receipt["eligible"]["stems"]) != set(expected):
+        raise ValueError(f"shard accounting eligible shard mismatch: {path}")
+    if receipt.get("exclusions") != []:
+        raise ValueError(f"shard accounting exclusions are not empty: {path}")
     if set(receipt["output"]["stems"]) != set(expected):
         raise ValueError(f"shard accounting output mismatch: {path}")
     processed = receipt.get("extra", {}).get("processed_stems")
@@ -242,6 +267,61 @@ def _source_inventory(wav_files: list[Path], data_dir: Path,
     return [by_stem[stem] for stem in sorted(by_stem)], optional_refs, {}
 
 
+def _operator_bounded_accounting_universe(
+    source_stems: list[str],
+    eligible_stems: list[str],
+    source_exclusions: dict[str, str],
+    selected_stems: list[str] | None = None,
+) -> tuple[list[str], list[str], dict[str, str]]:
+    """Return the v2 accounting universe for one operator invocation.
+
+    ``selected_stems is None`` means the invocation is unbounded and the
+    frozen source/eligible/exclusion partition is retained.  Any explicit
+    stems-file or offset/limit selection passes the actual selected eligible
+    stems and receives an exact, exclusion-free shard universe.  The helper
+    validates its inputs rather than normalizing away duplicate or malformed
+    evidence.
+    """
+    def canonical_stems(value: object, field: str) -> list[str]:
+        if not isinstance(value, list):
+            raise ValueError(f"{field} must be a list")
+        if any(not isinstance(stem, str) or not stem or Path(stem).name != stem
+               for stem in value):
+            raise ValueError(f"{field} contains invalid stem")
+        if len(value) != len(set(value)):
+            raise ValueError(f"{field} contains duplicate stems")
+        if value != sorted(value):
+            raise ValueError(f"{field} must be sorted")
+        return list(value)
+
+    source = canonical_stems(source_stems, "source_stems")
+    eligible = canonical_stems(eligible_stems, "eligible_stems")
+    if not isinstance(source_exclusions, dict):
+        raise ValueError("source_exclusions must be a mapping")
+    exclusion_stems = canonical_stems(list(source_exclusions), "exclusion_stems")
+    if any(not isinstance(reason, str) or not reason.strip()
+           for reason in source_exclusions.values()):
+        raise ValueError("source_exclusions contains an invalid reason")
+    source_set = set(source)
+    eligible_set = set(eligible)
+    exclusion_set = set(exclusion_stems)
+    if eligible_set & exclusion_set:
+        raise ValueError("eligible and excluded stems overlap")
+    if not eligible_set <= source_set or not exclusion_set <= source_set:
+        raise ValueError("eligible/excluded stem is outside source universe")
+    if source_set != eligible_set | exclusion_set:
+        raise ValueError("source is not the exact eligible/exclusion partition")
+
+    if selected_stems is None:
+        return source, eligible, dict(source_exclusions)
+    selected = canonical_stems(selected_stems, "selected_stems")
+    if not selected:
+        raise ValueError("selected accounting universe is empty")
+    if not set(selected) <= eligible_set:
+        raise ValueError("selected stem is outside eligible universe")
+    return selected, selected.copy(), {}
+
+
 def load_mfa_word_set(dict_path: Path | None) -> set[str] | None:
     """加载 MFA 词典词条集合 (若提供)."""
     if not dict_path or not dict_path.exists():
@@ -304,6 +384,856 @@ def _free_decode_logits(logits: torch.Tensor, *, reference_only: bool,
         is_blank = top_pred == blank_id
         decoded[is_blank, NVV_START:NVV_END + 1] += bias_value
     return decoded
+
+
+def _decode_candidate_surface(token_id: int, token_decoder) -> str:
+    """Decode one CTC token without importing or constructing an ASR provider."""
+    if token_decoder is None:
+        return ""
+    if callable(token_decoder):
+        value = token_decoder(token_id)
+    else:
+        value = token_decoder[token_id]
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _candidate_coordinates(start_frame: int, end_frame: int, *,
+                           query_frames: int, frame_ms: int) -> dict:
+    """Return immutable raw and speech-relative coordinates for one occurrence."""
+    raw_start_s = start_frame * frame_ms / 1000
+    raw_end_s = end_frame * frame_ms / 1000
+    speech_start_frame = start_frame - query_frames
+    speech_end_frame = end_frame - query_frames
+    return {
+        "raw_start_frame": start_frame,
+        "raw_end_frame": end_frame,
+        "speech_start_frame": speech_start_frame,
+        "speech_end_frame": speech_end_frame,
+        "raw_start_s": round(raw_start_s, 6),
+        "raw_end_s": round(raw_end_s, 6),
+        "speech_start_s": round(speech_start_frame * frame_ms / 1000, 6),
+        "speech_end_s": round(speech_end_frame * frame_ms / 1000, 6),
+    }
+
+
+def extract_nvasr_candidate_timeline(
+    frame_token_ids,
+    diagnostic_text: str = "",
+    *,
+    token_decoder=None,
+    token_surfaces=None,
+    stem: str | None = None,
+    query_frames: int = QUERY_FRAMES,
+    frame_ms: int = FRAME_MS,
+    blank_id: int = BLANK_ID,
+    ellipsis_id: int = ELLIPSIS_ID,
+    pause_threshold: int = PAUSE_FRAMES_DEFAULT,
+) -> dict:
+    """Extract lexical and NVV/punctuation evidence without a provider.
+
+    ``frame_token_ids`` are encoder-frame CTC argmax IDs, so their coordinates
+    are the raw encoder axis.  Every non-blank lexical CTC run becomes one
+    ordered lexical occurrence; separated duplicate surfaces remain separate
+    occurrences.  NVV/punctuation candidates are emitted once per run and
+    carry neighboring lexical ordinals.  Long speech-only blank runs add one
+    synthetic ellipsis occurrence at the same midpoint used by the normal CTC
+    path.  Raw coordinates are never rewritten; speech coordinates are the
+    raw coordinates translated by ``query_frames``.
+
+    ``token_decoder`` may be a callable accepting one token ID, or
+    ``token_surfaces`` may map IDs to already-decoded surfaces.  Neither seam
+    imports, loads, or constructs an ASR provider.
+    """
+    if not isinstance(diagnostic_text, str):
+        raise TypeError("diagnostic_text must be a string")
+    if query_frames != QUERY_FRAMES:
+        raise ValueError(f"query_frames must be exactly {QUERY_FRAMES}")
+    if frame_ms != FRAME_MS:
+        raise ValueError(f"frame_ms must be exactly {FRAME_MS}")
+    if not isinstance(pause_threshold, int) or pause_threshold <= 0:
+        raise ValueError("pause_threshold must be a positive integer")
+    if token_decoder is not None and token_surfaces is not None:
+        raise ValueError("pass token_decoder or token_surfaces, not both")
+
+    if hasattr(frame_token_ids, "tolist"):
+        frame_token_ids = frame_token_ids.tolist()
+    frame_token_ids = [int(token_id) for token_id in frame_token_ids]
+    decoder = token_decoder if token_decoder is not None else token_surfaces
+
+    def surface_for(token_id: int) -> str:
+        try:
+            return _decode_candidate_surface(token_id, decoder)
+        except (KeyError, IndexError, TypeError, ValueError):
+            # Unknown IDs are not lexical candidates, but must not disturb the
+            # diagnostic timeline or the ordinary CTC path.
+            return ""
+
+    def candidate_kind(surface: str, token_id: int) -> str | None:
+        stripped = surface.strip()
+        if token_id == ellipsis_id or stripped == "…":
+            return "punctuation"
+        if NVV_START <= token_id <= NVV_END:
+            return "nvv"
+        if re.fullmatch(r"\[[A-Za-z][^\]]*\]", stripped):
+            return "nvv"
+        if is_nvv_token(stripped):
+            return "nvv"
+        if len(stripped) == 1 and stripped in ALLOWED_PUNCT:
+            return "punctuation"
+        return None
+
+    raw_events: list[dict] = []
+    index = 0
+    while index < len(frame_token_ids):
+        token_id = frame_token_ids[index]
+        end = index + 1
+        while end < len(frame_token_ids) and frame_token_ids[end] == token_id:
+            end += 1
+        if token_id != blank_id:
+            surface = surface_for(token_id)
+            kind = candidate_kind(surface, token_id)
+            raw_events.append({
+                "start": index,
+                "end": end,
+                "token_id": token_id,
+                "token_ids": [token_id] * (end - index),
+                "surface": surface,
+                "candidate_kind": kind,
+                "source": "ctc",
+            })
+        index = end
+
+    # Keep the synthetic ellipsis provenance separate from the CTC token run.
+    blank_start = 0
+    while blank_start < len(frame_token_ids):
+        if frame_token_ids[blank_start] != blank_id:
+            blank_start += 1
+            continue
+        blank_end = blank_start + 1
+        while (blank_end < len(frame_token_ids)
+               and frame_token_ids[blank_end] == blank_id):
+            blank_end += 1
+        if (blank_start >= query_frames
+                and blank_end - blank_start >= pause_threshold):
+            midpoint = blank_start + (blank_end - blank_start) // 2
+            raw_events.append({
+                "start": midpoint,
+                "end": midpoint + 1,
+                "token_id": ellipsis_id,
+                "token_ids": [ellipsis_id],
+                "surface": "…",
+                "candidate_kind": "punctuation",
+                "source": "blank_run",
+            })
+        blank_start = blank_end
+
+    # Query-only occurrences are encoder metadata, not speech candidates.  A
+    # candidate or lexical group crossing the prefix is likewise excluded: the
+    # locked fusion envelope requires every published raw span to begin on the
+    # speech axis.
+    raw_events = [event for event in raw_events
+                  if event["start"] >= query_frames]
+    raw_events.sort(key=lambda event: (
+        event["start"], event["end"], event["token_id"]))
+
+    def is_lexical_surface(surface: str, kind: str | None) -> bool:
+        stripped = surface.strip()
+        return bool(
+            stripped
+            and kind is None
+            and not re.fullmatch(r"<\|[^|]+\|>", stripped)
+            and not is_punct(stripped)
+        )
+
+    lexical_events = [
+        event for event in raw_events
+        if is_lexical_surface(event["surface"], event["candidate_kind"])
+    ]
+    lexical_event_ids = {id(event) for event in lexical_events}
+    lexical_occurrences = []
+    surface_occurrences: dict[str, int] = {}
+    for lexical_ordinal, event in enumerate(lexical_events):
+        surface = event["surface"]
+        surface_occurrence = surface_occurrences.get(surface, 0)
+        surface_occurrences[surface] = surface_occurrence + 1
+        lexical_id = f"nvasr-lexical-{lexical_ordinal:04d}"
+        lexical_row = {
+            "lexical_ordinal": lexical_ordinal,
+            "lexical_occurrence_id": lexical_id,
+            "occurrence_id": lexical_id,
+            "surface": surface,
+            "source": event["source"],
+            "kind": "lexical",
+            "token_id": event["token_id"],
+            "token_ids": list(event["token_ids"]),
+            "surface_occurrence": surface_occurrence,
+            "surface_occurrence_index": surface_occurrence,
+            "surface_occurrence_id": f"{surface}#{surface_occurrence}",
+        }
+        lexical_row.update(_candidate_coordinates(
+            event["start"], event["end"],
+            query_frames=query_frames, frame_ms=frame_ms))
+        lexical_occurrences.append(lexical_row)
+
+    lexical_by_event_id = {
+        id(event): row["lexical_ordinal"]
+        for event, row in zip(lexical_events, lexical_occurrences)
+    }
+    right_lexical_by_event_id: dict[int, int | None] = {}
+    next_lexical_ordinal: int | None = None
+    for event in reversed(raw_events):
+        right_lexical_by_event_id[id(event)] = next_lexical_ordinal
+        if id(event) in lexical_event_ids:
+            next_lexical_ordinal = lexical_by_event_id[id(event)]
+
+    candidates = []
+    left_lexical_ordinal: int | None = None
+    for ordinal, event in enumerate(raw_events):
+        if id(event) in lexical_event_ids:
+            left_lexical_ordinal = lexical_by_event_id[id(event)]
+            continue
+        kind = event["candidate_kind"]
+        if kind is None:
+            continue
+        start = event["start"]
+        end = event["end"]
+        surface = event["surface"]
+        candidate = {
+            "candidate_id": f"nvasr-candidate-{len(candidates):04d}",
+            "occurrence": len(candidates),
+            "label": surface,
+            "surface": surface,
+            "kind": kind,
+            "source": event["source"],
+            "mapping_basis": NVASR_MAPPING_BASIS,
+            "token_id": event["token_id"],
+            "token_ids": list(event["token_ids"]),
+            "diagnostic": diagnostic_text,
+            "left_lexical_ordinal": left_lexical_ordinal,
+            "right_lexical_ordinal": right_lexical_by_event_id[id(event)],
+        }
+        candidate.update(_candidate_coordinates(
+            start, end, query_frames=query_frames, frame_ms=frame_ms))
+        candidates.append(candidate)
+
+    timeline = {
+        "schema": "nvasr-candidate-timeline-v1",
+        "duration_s": round(
+            max(0, len(frame_token_ids) - query_frames) * frame_ms / 1000,
+            6,
+        ),
+        "query_frames": query_frames,
+        "frame_ms": frame_ms,
+        "diagnostic": diagnostic_text,
+        "diagnostic_text": diagnostic_text,
+        "lexical_occurrences": lexical_occurrences,
+        "candidates": candidates,
+    }
+    if stem is not None:
+        if not isinstance(stem, str) or not stem:
+            raise ValueError("stem must be a non-empty string or null")
+        timeline["stem"] = stem
+    return timeline
+
+
+# Descriptive alias retained for callers that use the envelope's verb.
+build_nvasr_candidate_timeline = extract_nvasr_candidate_timeline
+
+
+def _nvasr_candidate_provenance(candidate: dict, *, forced_span=None) -> dict:
+    """Project one immutable timeline candidate onto a durable CTC row."""
+    raw_span = [float(candidate["raw_start_s"]),
+                float(candidate["raw_end_s"])]
+    speech_span = [float(candidate["speech_start_s"]),
+                   float(candidate["speech_end_s"])]
+    result = {
+        "provenance_schema": NVASR_CANDIDATE_PROVENANCE_SCHEMA,
+        "candidate_id": str(candidate["candidate_id"]),
+        "candidate_kind": str(candidate["kind"]),
+        "candidate_surface": str(candidate["surface"]),
+        "candidate_token_id": int(candidate["token_id"]),
+        "candidate_token_ids": list(candidate["token_ids"]),
+        "raw_span": raw_span,
+        "speech_span": speech_span,
+        "raw_start_frame": int(candidate["raw_start_frame"]),
+        "raw_end_frame": int(candidate["raw_end_frame"]),
+        "speech_start_frame": int(candidate["speech_start_frame"]),
+        "speech_end_frame": int(candidate["speech_end_frame"]),
+        "raw_start_s": raw_span[0],
+        "raw_end_s": raw_span[1],
+        "speech_start_s": speech_span[0],
+        "speech_end_s": speech_span[1],
+        "raw_frame_count": (int(candidate["raw_end_frame"])
+                            - int(candidate["raw_start_frame"])),
+        "speech_frame_count": (int(candidate["speech_end_frame"])
+                               - int(candidate["speech_start_frame"])),
+        "frame_ms": FRAME_MS,
+        "mapping_basis": NVASR_MAPPING_BASIS,
+        "mapping_key": {
+            "left_lexical_ordinal": candidate.get("left_lexical_ordinal"),
+            "right_lexical_ordinal": candidate.get("right_lexical_ordinal"),
+        },
+        "mapping_outcome": "unique",
+    }
+    if forced_span is not None:
+        result["forced_span"] = [float(forced_span[0]), float(forced_span[1])]
+    return result
+
+
+def _deduplicate_adjacent_nvv_rows(words_pinyin: list[dict]) -> list[dict]:
+    """Collapse decoder-duplicate NVV targets before candidate binding.
+
+    SentencePiece preserves ``[Laughter][Laughter]`` as two forced targets.
+    The user-facing surface intentionally owns one adjacent event, but that
+    contraction must happen before provenance is attached.  Contracting bound
+    rows afterwards used to construct a bare ``word/start/end`` dictionary and
+    silently discard both acoustic candidate ledgers.
+
+    The merged forced envelope remains explicit.  Candidate binding then has
+    to select one unique raw candidate for that final output row; a tie remains
+    a hard mapping error instead of being hidden by the deduplication.
+    """
+    result: list[dict] = []
+    index = 0
+    while index < len(words_pinyin):
+        first = words_pinyin[index]
+        label = str(first.get("word", ""))
+        if not is_nvv_token(label):
+            result.append(first)
+            index += 1
+            continue
+
+        end = index + 1
+        while (end < len(words_pinyin)
+               and str(words_pinyin[end].get("word", "")) == label):
+            end += 1
+        group = words_pinyin[index:end]
+        if len(group) == 1:
+            result.append(first)
+            index = end
+            continue
+        if any("candidate_kind" in row or "candidate_id" in row for row in group):
+            raise ValueError("adjacent NVV deduplication must precede candidate binding")
+
+        spans: list[list[float]] = []
+        source_ordinals: list[int] = []
+        source_ordinals_complete = True
+        for row in group:
+            try:
+                start = float(row["start"])
+                stop = float(row["end"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("adjacent NVV row has malformed forced span") from exc
+            if (not math.isfinite(start) or not math.isfinite(stop)
+                    or stop <= start):
+                raise ValueError("adjacent NVV row has malformed forced span")
+            spans.append([start, stop])
+            ordinals = row.get("source_ctc_ordinals")
+            if ordinals is None and "source_ctc_ordinal" in row:
+                ordinals = [row["source_ctc_ordinal"]]
+            if ordinals is None:
+                source_ordinals_complete = False
+            elif (not isinstance(ordinals, (list, tuple))
+                  or any(not isinstance(value, int) or isinstance(value, bool)
+                         or value < 0 for value in ordinals)):
+                raise ValueError("adjacent NVV row has malformed source CTC ordinal")
+            else:
+                source_ordinals.extend(ordinals)
+
+        if any(right[0] < left[0] or right[1] <= left[1]
+               for left, right in zip(spans, spans[1:])):
+            raise ValueError("adjacent NVV forced spans are not monotonic")
+        if (source_ordinals_complete
+                and source_ordinals != sorted(set(source_ordinals))):
+            raise ValueError("adjacent NVV source CTC ordinals are not unique/monotonic")
+
+        merged = dict(first)
+        merged["end"] = spans[-1][1]
+        merged.pop("source_ctc_ordinal", None)
+        if source_ordinals_complete:
+            merged["source_ctc_ordinals"] = source_ordinals
+        merged["nvv_deduplication"] = {
+            "schema": "nvv-adjacent-deduplication-v1",
+            "label": label,
+            "occurrence_count": len(group),
+            "forced_occurrence_spans": spans,
+        }
+        result.append(merged)
+        index = end
+    return result
+
+
+def _validate_emitted_nvasr_provenance(words_pinyin: list[dict]) -> list[str]:
+    """Verify the final free-decode rows immediately before serialization."""
+    required = (
+        "provenance_schema", "candidate_id", "candidate_kind",
+        "candidate_surface", "raw_span", "speech_span", "forced_span",
+        "mapping_basis", "mapping_outcome",
+    )
+    errors: list[str] = []
+    candidate_ids: set[str] = set()
+
+    def valid_span(value: object) -> bool:
+        return (isinstance(value, (list, tuple)) and len(value) == 2
+                and all(isinstance(point, (int, float))
+                        and not isinstance(point, bool)
+                        and math.isfinite(float(point)) for point in value)
+                and 0 <= float(value[0]) < float(value[1]))
+
+    for index, row in enumerate(words_pinyin):
+        label = str(row.get("word", ""))
+        nvv = is_nvv_token(label)
+        has_nvv_provenance = (
+            row.get("candidate_kind") == "nvv"
+            or row.get("provenance_schema") == NVASR_CANDIDATE_PROVENANCE_SCHEMA)
+        if not nvv:
+            if has_nvv_provenance:
+                errors.append(f"row {index}: NVV provenance attached to non-NVV {label!r}")
+            continue
+        missing = [key for key in required if key not in row]
+        if missing:
+            errors.append(
+                f"row {index}: output NVV {label!r} missing provenance fields "
+                f"{','.join(missing)}")
+            continue
+        candidate_id = row.get("candidate_id")
+        if (not isinstance(candidate_id, str) or not candidate_id
+                or candidate_id in candidate_ids):
+            errors.append(f"row {index}: output NVV {label!r} has invalid candidate identity")
+        else:
+            candidate_ids.add(candidate_id)
+        if (row.get("provenance_schema") != NVASR_CANDIDATE_PROVENANCE_SCHEMA
+                or row.get("candidate_kind") != "nvv"
+                or row.get("mapping_basis") != NVASR_MAPPING_BASIS
+                or row.get("mapping_outcome") != "unique"):
+            errors.append(f"row {index}: output NVV {label!r} has invalid provenance contract")
+        if nvv_to_mfa(str(row.get("candidate_surface", ""))) != label:
+            errors.append(f"row {index}: output NVV {label!r} candidate label mismatch")
+        for span_key in ("raw_span", "speech_span", "forced_span"):
+            if not valid_span(row.get(span_key)):
+                errors.append(f"row {index}: output NVV {label!r} invalid {span_key}")
+        forced = row.get("forced_span")
+        if valid_span(forced):
+            try:
+                row_span = [float(row["start"]), float(row["end"])]
+            except (KeyError, TypeError, ValueError):
+                row_span = []
+            if (len(row_span) != 2
+                    or any(not math.isclose(float(forced[pos]), row_span[pos],
+                                            abs_tol=1e-9)
+                           for pos in range(2))):
+                errors.append(f"row {index}: output NVV {label!r} forced span is stale")
+
+        deduplication = row.get("nvv_deduplication")
+        if deduplication is not None:
+            spans = (deduplication.get("forced_occurrence_spans")
+                     if isinstance(deduplication, dict) else None)
+            count = (deduplication.get("occurrence_count")
+                     if isinstance(deduplication, dict) else None)
+            if (not isinstance(deduplication, dict)
+                    or deduplication.get("schema") !=
+                    "nvv-adjacent-deduplication-v1"
+                    or deduplication.get("label") != label
+                    or not isinstance(count, int) or isinstance(count, bool)
+                    or count < 2 or not isinstance(spans, list)
+                    or len(spans) != count
+                    or any(not valid_span(span) for span in spans)
+                    or not valid_span(forced)
+                    or not math.isclose(float(spans[0][0]), float(forced[0]), abs_tol=1e-9)
+                    or not math.isclose(float(spans[-1][1]), float(forced[1]), abs_tol=1e-9)):
+                errors.append(f"row {index}: output NVV {label!r} invalid deduplication ledger")
+    return errors
+
+
+def attach_nvasr_candidate_provenance(
+        words_pinyin: list[dict], punct_entries: list[dict],
+        timeline: dict) -> list[str]:
+    """Bind NVASR candidates to CTC rows by label and lexical neighbor ordinals.
+
+    The candidate's raw encoder coordinates are copied verbatim.  Matching is
+    occurrence-aware: two equal labels with the same lexical-neighbor key are
+    not distinguishable and therefore reject the bundle.  This helper mutates
+    only the in-memory producer rows and returns hard mapping errors for the
+    caller to quarantine before writing any artifact.
+    """
+    candidates = list(timeline.get("candidates", ()))
+    nvv_candidates = [row for row in candidates if row.get("kind") == "nvv"]
+    nvv_candidate_positions = [index for index, row in enumerate(candidates)
+                               if row.get("kind") == "nvv"]
+    nvv_rows = [(index, row) for index, row in enumerate(words_pinyin)
+                if is_nvv_token(row.get("word", ""))]
+
+    def row_key(row: dict, rows: list[dict], index: int) -> tuple[int | None, int | None]:
+        explicit = explicit_neighbor_key(row)
+        if explicit is not None:
+            return explicit
+        lexical_before = sum(
+            1 for prior in rows[:index]
+            if not is_nvv_token(prior.get("word", "")))
+        lexical_after = sum(
+            1 for later in rows[index + 1:]
+            if not is_nvv_token(later.get("word", "")))
+        return (lexical_before - 1 if lexical_before else None,
+                lexical_before if lexical_after else None)
+
+    def valid_span(value) -> bool:
+        if (not isinstance(value, (list, tuple)) or len(value) != 2
+                or any(isinstance(point, bool)
+                       or not isinstance(point, (int, float))
+                       or not math.isfinite(float(point)) for point in value)):
+            return False
+        return 0 <= float(value[0]) < float(value[1])
+
+    def valid_candidate(candidate: dict) -> bool:
+        frame_keys = (
+            "raw_start_frame", "raw_end_frame",
+            "speech_start_frame", "speech_end_frame")
+        frames_valid = all(
+            isinstance(candidate.get(key), int)
+            and not isinstance(candidate.get(key), bool)
+            for key in frame_keys)
+        return (
+            isinstance(candidate.get("candidate_id"), str)
+            and bool(candidate.get("candidate_id"))
+            and isinstance(candidate.get("kind"), str)
+            and isinstance(candidate.get("surface"), str)
+            and isinstance(candidate.get("token_id"), int)
+            and isinstance(candidate.get("token_ids"), list)
+            and valid_span([candidate.get("raw_start_s"), candidate.get("raw_end_s")])
+            and valid_span([candidate.get("speech_start_s"),
+                            candidate.get("speech_end_s")])
+            and frames_valid
+            and candidate["raw_start_frame"] < candidate["raw_end_frame"]
+            and candidate["speech_start_frame"] < candidate["speech_end_frame"])
+
+    def explicit_neighbor_key(row: dict):
+        mapping_key = row.get("mapping_key")
+        if isinstance(mapping_key, dict):
+            left = mapping_key.get("left_lexical_ordinal")
+            right = mapping_key.get("right_lexical_ordinal")
+            if (isinstance(left, int) or left is None) and \
+                    (isinstance(right, int) or right is None):
+                return left, right
+        left = row.get("left_lexical_ordinal")
+        right = row.get("right_lexical_ordinal")
+        if ((isinstance(left, int) or left is None)
+                and (isinstance(right, int) or right is None)
+                and ("left_lexical_ordinal" in row
+                     or "right_lexical_ordinal" in row)):
+            return left, right
+        return None
+
+    # Punctuation is emitted outside ``words_pinyin``.  Keep a read-only
+    # merged event view so topology can identify immediate neighbours and
+    # derive their lexical-neighbour key without changing punctuation rows.
+    emitted_events = [
+        ("word", index, row) for index, row in enumerate(words_pinyin)
+    ] + [
+        ("punct", index, row) for index, row in enumerate(punct_entries)
+    ]
+    event_spans: dict[tuple[str, int], tuple[float, float]] = {}
+    malformed_event = False
+    for event_kind, event_index, event in emitted_events:
+        try:
+            start = float(event["start"])
+            end = float(event["end"])
+            if (not math.isfinite(start) or not math.isfinite(end)
+                    or start >= end):
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            malformed_event = True
+            continue
+        event_spans[(event_kind, event_index)] = (start, end)
+    emitted_events = [event for event in emitted_events
+                      if (event[0], event[1]) in event_spans]
+    emitted_events.sort(key=lambda event: (
+        event_spans[(event[0], event[1])][0],
+        event_spans[(event[0], event[1])][1],
+        0 if event[0] == "word" else 1,
+        event[1],
+    ))
+    event_positions = {
+        (event_kind, event_index): position
+        for position, (event_kind, event_index, _event) in
+        enumerate(emitted_events)
+    }
+
+    def event_neighbor_key(position: int):
+        _kind, _index, event = emitted_events[position]
+        explicit = explicit_neighbor_key(event)
+        if explicit is not None:
+            return explicit
+        lexical_before = sum(
+            1 for prior_kind, _prior_index, prior in emitted_events[:position]
+            if prior_kind == "word" and not is_nvv_token(prior.get("word", ""))
+        )
+        lexical_after = sum(
+            1 for later_kind, _later_index, later in emitted_events[position + 1:]
+            if later_kind == "word" and not is_nvv_token(later.get("word", ""))
+        )
+        return (lexical_before - 1 if lexical_before else None,
+                lexical_before if lexical_after else None)
+
+    def bind_punctuation_entry(entry_index: int, target_key,
+                               used_punctuation: set[int]):
+        """Return one uniquely speech-overlapping timeline punctuation row."""
+        entry = punct_entries[entry_index]
+        if entry.get("source") != "ctc":
+            return None
+        event_position = event_positions.get(("punct", entry_index))
+        if event_position is None or event_neighbor_key(event_position) != target_key:
+            return None
+        try:
+            forced_start = float(entry["start"])
+            forced_end = float(entry["end"])
+            if (not math.isfinite(forced_start)
+                    or not math.isfinite(forced_end)
+                    or forced_start >= forced_end):
+                return None
+        except (KeyError, TypeError, ValueError):
+            return None
+        matches = [
+            (index, candidate) for index, candidate in enumerate(candidates)
+            if index not in used_punctuation
+            and candidate.get("kind") == "punctuation"
+            and candidate.get("source") == "ctc"
+            and candidate.get("surface") == entry.get("word")
+            and (candidate.get("left_lexical_ordinal"),
+                 candidate.get("right_lexical_ordinal")) == target_key
+        ]
+        if not matches or any(not valid_candidate(candidate)
+                              for _index, candidate in matches):
+            return None
+        scored = []
+        for candidate_index, candidate in matches:
+            try:
+                speech_start = float(candidate["speech_start_s"])
+                speech_end = float(candidate["speech_end_s"])
+                overlap = max(
+                    0.0,
+                    min(forced_end, speech_end)
+                    - max(forced_start, speech_start),
+                )
+                if not math.isfinite(overlap):
+                    return None
+            except (KeyError, TypeError, ValueError):
+                return None
+            scored.append((overlap, candidate_index, candidate))
+        positive = [item for item in scored if item[0] > 1e-9]
+        if not positive:
+            return None
+        best_overlap = max(item[0] for item in positive)
+        best = [item for item in positive
+                if math.isclose(item[0], best_overlap, abs_tol=1e-9)]
+        if len(best) != 1:
+            return None
+        return best[0]
+
+    def punctuation_topology_selection(
+            row_index: int, full_index: int, row: dict, target_key,
+            matches: list[tuple[int, dict]], used_candidates: set[int]):
+        if malformed_event:
+            return None
+        word_position = event_positions.get(("word", full_index))
+        if word_position is None or word_position == 0 \
+                or word_position + 1 >= len(emitted_events):
+            return None
+        before_kind, before_index, before = emitted_events[word_position - 1]
+        after_kind, after_index, after = emitted_events[word_position + 1]
+        if (before_kind != "punct" or after_kind != "punct"
+                or before.get("source") != "ctc"
+                or after.get("source") != "ctc"):
+            return None
+        try:
+            forced = row.get("forced_span") or [row["start"], row["end"]]
+            forced_start = float(forced[0])
+            forced_end = float(forced[1])
+            before_start, before_end = event_spans[("punct", before_index)]
+            after_start, _after_end = event_spans[("punct", after_index)]
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (before_end > forced_start or after_start < forced_end):
+            return None
+        before_bound = bind_punctuation_entry(
+            before_index, target_key, set())
+        if before_bound is None:
+            return None
+        before_overlap, before_candidate_index, _before_candidate = before_bound
+        after_bound = bind_punctuation_entry(
+            after_index, target_key, {before_candidate_index})
+        if after_bound is None:
+            return None
+        after_overlap, after_candidate_index, _after_candidate = after_bound
+        if before_candidate_index >= after_candidate_index:
+            return None
+        inside = [
+            (candidate_index, candidate)
+            for candidate_index, candidate in matches
+            if candidate_index not in used_candidates
+            and before_candidate_index
+            < nvv_candidate_positions[candidate_index]
+            < after_candidate_index
+        ]
+        if len(inside) != 1:
+            return None
+        candidate_index, candidate = inside[0]
+        return candidate_index, candidate
+
+    errors: list[str] = []
+    used_candidates: set[int] = set()
+    pending_nvv_bindings: list[tuple[dict, dict, str, float | None]] = []
+    # Output rows are authoritative for whether an NVV was emitted.  Free
+    # logits can contain additional biased NVV runs that the decoder did not
+    # select into ``text_asr``; requiring every such diagnostic candidate to
+    # become a row falsely rejects otherwise complete utterances.  Bind in the
+    # opposite direction instead: every emitted row must have exactly one raw
+    # candidate, while unused candidates remain diagnostic timeline evidence.
+    for row_index, (full_index, row) in enumerate(nvv_rows):
+        label = str(row.get("word", ""))
+        key = row_key(row, words_pinyin, full_index)
+        forced = row.get("forced_span")
+        if forced is None:
+            forced = [row.get("start"), row.get("end")]
+        if not valid_span(forced):
+            errors.append(
+                f"output NVV row {row_index}: malformed forced span "
+                f"for {label!r}")
+            continue
+        matches = [
+            (index, candidate) for index, candidate in enumerate(nvv_candidates)
+            if index not in used_candidates
+            and nvv_to_mfa(str(candidate.get("surface", ""))) == label
+            and (candidate.get("left_lexical_ordinal"),
+                 candidate.get("right_lexical_ordinal")) == key
+        ]
+        selection = "label_neighbors"
+        selected_overlap = None
+        topology_eligible = False
+        if len(matches) > 1:
+            # An ambiguous key is only rankable when every matching candidate
+            # is structurally trustworthy.  Do this before either coordinate
+            # axis is scored: treating a malformed competitor as zero would
+            # let an unknowable candidate lose by construction.
+            malformed = [candidate for _index, candidate in matches
+                         if not valid_candidate(candidate)]
+            if malformed:
+                errors.append(
+                    f"output NVV row {row_index}: malformed candidate mapping "
+                    f"for {label!r} at neighbors {key!r}")
+                continue
+            forced_start, forced_end = float(forced[0]), float(forced[1])
+            scored = []
+            for candidate_index, candidate in matches:
+                try:
+                    speech_start = float(candidate["speech_start_s"])
+                    speech_end = float(candidate["speech_end_s"])
+                    overlap = max(
+                        0.0,
+                        min(forced_end, speech_end) - max(forced_start, speech_start),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    overlap = 0.0
+                scored.append((overlap, candidate_index, candidate))
+            positive = [item for item in scored if item[0] > 1e-9]
+            if positive:
+                best_overlap = max(item[0] for item in positive)
+                best = [item for item in positive
+                        if math.isclose(item[0], best_overlap, abs_tol=1e-9)]
+                if len(best) == 1:
+                    selected_overlap, candidate_index, candidate = best[0]
+                    matches = [(candidate_index, candidate)]
+                    selection = "unique_max_forced_speech_overlap"
+            else:
+                # The free-decode speech axis is shifted by the immutable
+                # query prefix.  When it cannot distinguish same-key
+                # candidates, use the candidate's untouched raw encoder span
+                # against the forced row.  This is deliberately a separate
+                # basis: never store this score in the speech-overlap field.
+                scored_raw = []
+                malformed_raw = False
+                for candidate_index, candidate in matches:
+                    try:
+                        raw_start = float(candidate["raw_start_s"])
+                        raw_end = float(candidate["raw_end_s"])
+                        if (not math.isfinite(raw_start)
+                                or not math.isfinite(raw_end)
+                                or raw_end <= raw_start):
+                            raise ValueError("malformed raw candidate span")
+                        overlap = max(
+                            0.0,
+                            min(forced_end, raw_end) - max(forced_start, raw_start),
+                        )
+                        if not math.isfinite(overlap):
+                            raise ValueError("malformed forced/raw overlap")
+                    except (KeyError, TypeError, ValueError):
+                        malformed_raw = True
+                        continue
+                    scored_raw.append((overlap, candidate_index, candidate))
+                if malformed_raw:
+                    errors.append(
+                        f"output NVV row {row_index}: malformed raw candidate "
+                        f"mapping for {label!r} at neighbors {key!r}")
+                    continue
+                positive_raw = [item for item in scored_raw if item[0] > 1e-9]
+                if positive_raw:
+                    best_raw_overlap = max(item[0] for item in positive_raw)
+                    best_raw = [item for item in positive_raw
+                                if math.isclose(item[0], best_raw_overlap,
+                                                abs_tol=1e-9)]
+                    if len(best_raw) == 1:
+                        _unused_overlap, candidate_index, candidate = best_raw[0]
+                        matches = [(candidate_index, candidate)]
+                        selection = "unique_max_forced_raw_overlap"
+                else:
+                    # Topology is a last-resort disambiguator only when both
+                    # coordinate axes are entirely non-positive.  A positive
+                    # tie on either axis is evidence of ambiguity, never an
+                    # invitation to use surrounding punctuation.
+                    topology_eligible = True
+            if topology_eligible and len(matches) > 1:
+                topology = punctuation_topology_selection(
+                    row_index, full_index, row, key, matches, used_candidates)
+                if topology is not None:
+                    candidate_index, candidate = topology
+                    matches = [(candidate_index, candidate)]
+                    selection = "unique_punctuation_topology_bound"
+        if len(matches) != 1:
+            outcome = "missing" if not matches else "ambiguous"
+            errors.append(
+                f"output NVV row {row_index}: {outcome} candidate mapping "
+                f"for {label!r} at neighbors {key!r}")
+            continue
+        candidate_index, candidate = matches[0]
+        if not valid_candidate(candidate):
+            errors.append(
+                f"output NVV row {row_index}: malformed candidate mapping "
+                f"for {label!r} at neighbors {key!r}")
+            continue
+        used_candidates.add(candidate_index)
+        pending_nvv_bindings.append(
+            (row, candidate, selection, selected_overlap))
+
+    # Commit atomically.  A rejected bundle must not expose a mixture of
+    # bound and unbound rows to later diagnostics or retry logic.
+    if errors:
+        return errors
+    for row, candidate, selection, selected_overlap in pending_nvv_bindings:
+        row.update(_nvasr_candidate_provenance(
+            candidate, forced_span=(row.get("forced_span") or
+                                    [row["start"], row["end"]])))
+        row["mapping_selection"] = selection
+        if selected_overlap is not None:
+            row["mapping_forced_speech_overlap_s"] = round(selected_overlap, 6)
+
+    # Punctuation already has its own ``ctc-punctuation-evidence-v2``
+    # coordinate contract.  In particular, its ``raw_start_s`` means the
+    # forced punctuation anchor, not the free-decode encoder axis used by
+    # NVASR candidates.  Never project NVASR provenance onto these rows: doing
+    # so moves punctuation and can then lengthen the preceding NVV token.
+    return errors
+
 
 def make_patched_inference(ref_texts: dict[str, str],
                            bias_value: float = NVV_BIAS_DEFAULT,
@@ -441,6 +1371,26 @@ def make_patched_inference(ref_texts: dict[str, str],
             _raw_key_stem = str(key[i])
             stem = (_raw_key_stem if _raw_key_stem in ref_texts
                     else Path(_raw_key_stem).stem)
+            candidate_timeline = extract_nvasr_candidate_timeline(
+                raw_y,
+                asr_final,
+                token_decoder=lambda token_id: tokenizer.decode([token_id]),
+                stem=stem,
+                query_frames=QUERY_FRAMES,
+                frame_ms=FRAME_MS,
+                blank_id=self.blank_id,
+                ellipsis_id=ELLIPSIS_ID,
+                pause_threshold=pause_threshold,
+            )
+            expected_timeline_duration = max(0.0, duration_s)
+            if not math.isclose(
+                    candidate_timeline["duration_s"],
+                    expected_timeline_duration,
+                    rel_tol=0.0,
+                    abs_tol=1e-6):
+                raise ValueError(
+                    "NVASR candidate timeline duration does not match "
+                    "the encoder speech-axis duration")
             if stem in ref_texts:
                 # 使用参考文本 (ground truth) → 更准确的 CJK 字符级强制对齐
                 align_text = ref_texts[stem].strip()
@@ -586,6 +1536,7 @@ def make_patched_inference(ref_texts: dict[str, str],
                 "key": key[i],
                 "text_asr": asr_final,
                 "text_asr_clean": asr_clean,
+                "nvasr_candidate_timeline": candidate_timeline,
                 "reference_text": ref_texts.get(stem),
                 "reference_only": reference_only,
                 "duration_s": round(duration_s, 3),
@@ -618,6 +1569,23 @@ def _atomic_write_text(path: Path, text: str) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def _ctc_token_sidecar_row(word_row: dict, start_s: float,
+                           end_s: float) -> dict:
+    """Serialize one durable token row without dropping provenance fields."""
+    line = {
+        "word": word_row["word"],
+        "start_ms": round(start_s * 1000, 1),
+        "end_ms": round(end_s * 1000, 1),
+        "start_s": start_s,
+        "end_s": end_s,
+        "type": "word",
+    }
+    for key in CTC_TOKEN_SIDECAR_PASSTHROUGH_FIELDS:
+        if key in word_row:
+            line[key] = word_row[key]
+    return line
 
 def write_textgrid(words_pinyin: list[dict], duration_s: float,
                    out_path: Path, pauses: list[dict] | None = None) -> None:
@@ -918,8 +1886,12 @@ def _normalize_punct(ctc_dir: Path) -> int:
                 first = punct_entries[first_seq]
                 last = punct_entries[last_seq]
                 first["word"] = "，"
-                first["end_ms"] = last["end_ms"]
-                first["end_s"] = last["end_s"]
+                # Keep the first candidate's raw CTC span immutable.  The
+                # merged display envelope is separate processed evidence.
+                first["processed_end_ms"] = last.get(
+                    "processed_end_ms", last["end_ms"])
+                first["processed_end_s"] = last.get(
+                    "processed_end_s", last["end_s"])
                 for k in range(first_seq + 1, last_seq + 1):
                     if k < len(punct_entries):
                         punct_entries[k]["_merge_del"] = True
@@ -1093,15 +2065,22 @@ def _protect_ria(words_pinyin: list[dict]) -> list[dict]:
       - "RIA"             (already merged but uppercase)
       - "rui4" + "ya4"    (pinyin phonetic — also handled by _normalize_ria)
 
-    This function scans for ANY adjacent tokens whose lowercase letters
-    form "ria" and merges them into a single lowercase "ria" token.
-    It also normalises standalone "RIA"/"Ria" → "ria".
+    This function scans for adjacent pure-ASCII alphabetic fragments whose
+    ordered case-folded concatenation is exactly ``ria``.  It also normalises
+    standalone ``RIA``/``Ria`` → ``ria``.  Digits and punctuation are never
+    ignored while deciding whether a fragment is eligible: ``a5`` is a
+    pinyin syllable, not an ``a`` fragment.
     """
     if not words_pinyin:
         return words_pinyin
 
     _RIA_TARGET = "ria"
     _RIA_LETTERS = frozenset(_RIA_TARGET)  # {'r', 'i', 'a'}
+
+    def is_fragment(token: object) -> bool:
+        return (isinstance(token, str) and 0 < len(token) <= 4
+                and token.isascii() and token.isalpha()
+                and all(char.casefold() in _RIA_LETTERS for char in token))
 
     result: list[dict] = []
     i = 0
@@ -1122,33 +2101,40 @@ def _protect_ria(words_pinyin: list[dict]) -> list[dict]:
             i += 1
             continue
 
-        # Fragment detection: collect consecutive fragments whose
-        # letters are a subset of "ria"'s letter set.
-        if (len(token) <= 4 and token.isascii()
-                and all(c.lower() in _RIA_LETTERS for c in token if c.isalpha())):
+        # Fragment detection: collect only pure ASCII alphabetic fragments
+        # whose letters are a subset of "ria"'s letter set.
+        if is_fragment(token):
             fragments = [w]
             j = i + 1
             while j < len(words_pinyin):
                 nt = words_pinyin[j]
                 nt_word = nt["word"]
-                if (len(nt_word) <= 4 and nt_word.isascii()
-                        and all(c.lower() in _RIA_LETTERS for c in nt_word if c.isalpha())):
+                if is_fragment(nt_word):
                     fragments.append(nt)
                     j += 1
                 else:
                     break
 
-            # Check whether the collected fragments form "ria"
-            combined = "".join(f["word"] for f in fragments).lower()
-            if combined == _RIA_TARGET or all(
-                    c in _RIA_LETTERS for c in combined if c.isalpha()):
+            # Stop at the shortest exact match.  Any later fragment remains
+            # available to the outer scan (e.g. ``r i a ria`` -> two tokens).
+            combined = ""
+            match_end = None
+            for fragment_index, fragment in enumerate(fragments, start=1):
+                combined += fragment["word"].casefold()
+                if combined == _RIA_TARGET:
+                    match_end = fragment_index
+                    break
+                if not _RIA_TARGET.startswith(combined):
+                    break
+            if match_end is not None:
+                matched = fragments[:match_end]
                 # Merge: one "ria" token spanning the full time range
                 result.append({
                     "word": _RIA_TARGET,
-                    "start": fragments[0]["start"],
-                    "end": fragments[-1]["end"],
+                    "start": matched[0]["start"],
+                    "end": matched[-1]["end"],
                 })
-                i = j
+                i += match_end
                 continue
 
         result.append(w)
@@ -1643,15 +2629,50 @@ def main():
             except ValueError as _exc:
                 print(f"ERROR: {_exc}", file=sys.stderr)
                 return 2
+            _all_source_stems = sorted(p.stem for p in _source_wavs)
+            _all_eligible_stems = sorted(p.stem for p in all_wavs)
             if _all_exclusions:
                 print(f"  Frozen source: {len(_source_wavs)} WAVs; "
                       f"eligible={len(all_wavs)}, exclusions={len(_all_exclusions)}")
-            # Apply operator offset/limit to the frozen eligible denominator
-            # before shard construction, never inside each child.
+            # Apply explicit operator selection before shard construction,
+            # never inside each child.  A parent stems file is authoritative
+            # for this bounded invocation just as it is for a child.
+            if args.stems_file:
+                try:
+                    _selected = [
+                        line.strip() for line in args.stems_file.read_text(
+                            encoding="utf-8").splitlines()
+                    ]
+                    if not _selected or _selected != sorted(set(_selected)):
+                        raise ValueError("stems file must be sorted and unique")
+                    _available = {p.stem: p for p in all_wavs}
+                    _missing = [stem for stem in _selected if stem not in _available]
+                    if _missing:
+                        raise ValueError(
+                            f"stems file contains unavailable stems: {_missing[:5]}"
+                        )
+                    all_wavs = [_available[stem] for stem in _selected]
+                except (OSError, ValueError) as _exc:
+                    print(f"ERROR: invalid --stems-file: {_exc}", file=sys.stderr)
+                    return 2
             if args.offset > 0:
                 all_wavs = all_wavs[args.offset:]
             if args.limit > 0:
                 all_wavs = all_wavs[:args.limit]
+            _selected_accounting_stems = (
+                sorted(p.stem for p in all_wavs)
+                if args.stems_file or args.offset > 0 or args.limit > 0
+                else None
+            )
+            try:
+                (_accounting_source_stems, _accounting_eligible_stems,
+                 _accounting_exclusions) = _operator_bounded_accounting_universe(
+                    _all_source_stems, _all_eligible_stems, _all_exclusions,
+                    _selected_accounting_stems,
+                )
+            except ValueError as _exc:
+                print(f"ERROR: invalid accounting universe: {_exc}", file=sys.stderr)
+                return 2
             total = len(all_wavs)
             if total == 0:
                 print("ERROR: no eligible WAVs with authoritative references", file=sys.stderr)
@@ -1990,7 +3011,6 @@ def main():
                 # _all_stems would make ctc_ready reject a valid partial
                 # reference run because its audio_bindings cannot match the
                 # eligible CTC output set.
-                _all_stems = sorted({p.stem for p in _source_wavs})
                 _output_stems_v2 = sorted(p.stem for p in _merge_output_dir.glob("*.lab"))
                 from pipeline_utils import _axis_audio_metadata, _textgrid_global_bounds
                 _audio_bindings_v2 = []
@@ -2017,8 +3037,9 @@ def main():
                     output_stems=_output_stems_v2,
                     audio_bindings=_audio_bindings_v2,
                 )
-                _eligible_stems = sorted(p.stem for p in all_wavs)
-                _filtered_stems_v2 = sorted(set(_eligible_stems) - set(_output_stems_v2))
+                _filtered_stems_v2 = sorted(
+                    set(_accounting_eligible_stems) - set(_output_stems_v2)
+                )
                 _shard_rows = [
                     {"shard_id": f"gpu{_gpu_id}", "stems": sorted(
                         p.stem for p in all_wavs[_gpu_id * per_gpu:
@@ -2026,9 +3047,9 @@ def main():
                     for _gpu_id, _, _ in _procs
                 ]
                 _accounting = make_pipeline_accounting_receipt(
-                    source_stems=_all_stems,
-                    eligible_stems=_eligible_stems,
-                    exclusions=_all_exclusions,
+                    source_stems=_accounting_source_stems,
+                    eligible_stems=_accounting_eligible_stems,
+                    exclusions=_accounting_exclusions,
                     output_stems=_output_stems_v2,
                     filtered_stems=_filtered_stems_v2,
                     run_id=make_pipeline_run_id(), mode="ctc_prealign",
@@ -2087,6 +3108,8 @@ def main():
     if source_exclusions:
         print(f"  冻结来源: {len(source_wav_files)} WAV; "
               f"eligible={len(wav_files)}, exclusions={len(source_exclusions)}")
+    _accounting_source_input = sorted(p.stem for p in source_wav_files)
+    _accounting_eligible_input = sorted(p.stem for p in wav_files)
 
     if args.reference_mode == "authority":
         # Reference text is the semantic authority.  Normalize Arabic
@@ -2140,6 +3163,22 @@ def main():
         wav_files = wav_files[args.offset:]
     if args.limit > 0:
         wav_files = wav_files[:args.limit]
+    _selected_accounting_stems = (
+        sorted(p.stem for p in wav_files)
+        if args.stems_file or args.offset > 0 or args.limit > 0
+        else None
+    )
+    try:
+        (_accounting_source_stems, _accounting_eligible_stems,
+         _accounting_exclusions) = _operator_bounded_accounting_universe(
+            _accounting_source_input,
+            _accounting_eligible_input,
+            source_exclusions,
+            _selected_accounting_stems,
+        )
+    except ValueError as exc:
+        print(f"ERROR: invalid accounting universe: {exc}", file=sys.stderr)
+        return 2
     print(f"  已索引 {len(ref_texts)} 个参考文本, 共 {len(wav_files)} 个音频")
 
     # ── 加载 NVASR 模型 ──
@@ -2348,7 +3387,36 @@ def main():
                     "word": word_cjk,
                     "start": w["start"],
                     "end": w["end"],
+                    # These are immutable raw CTC coordinates.  A later
+                    # display owner may cover a larger silence gap, but it
+                    # must never overwrite this evidence span.
+                    "raw_start_s": float(w["start"]),
+                    "raw_end_s": float(w["end"]),
+                    "candidate_id": f"ctc-punct-{len(punct_entries):04d}",
+                    "source": "ctc",
                 })
+
+        # Collapse adjacent decoder duplicates before binding.  The merged
+        # forced envelope still has to select one unique raw occurrence; a tie
+        # remains a hard error.  Binding continues to precede English/RIA
+        # normalization so lexical-neighbour ordinals retain their raw meaning.
+        if words_pinyin and not args.no_nvv:
+            try:
+                words_pinyin = _deduplicate_adjacent_nvv_rows(words_pinyin)
+            except ValueError as exc:
+                print(f"  FAIL {stem}: NVASR deduplication - {exc}")
+                skipped.setdefault("nvasr_candidate_mapping", []).append(stem)
+                fail += 1
+                continue
+
+        _candidate_mapping_errors = attach_nvasr_candidate_provenance(
+            words_pinyin, punct_entries, r.get("nvasr_candidate_timeline", {}))
+        if _candidate_mapping_errors:
+            print(f"  FAIL {stem}: NVASR candidate mapping - "
+                  f"{'; '.join(_candidate_mapping_errors[:5])}")
+            skipped.setdefault("nvasr_candidate_mapping", []).append(stem)
+            fail += 1
+            continue
 
         # Canonicalize reference English before any generic CTC token merge.
         # The shared authority validator must see raw source rows so source
@@ -2398,36 +3466,6 @@ def main():
                     i += 1
             words_pinyin = merged_pinyin
 
-        # ── Dedup adjacent identical NVV tokens ──
-        # NVASR can produce [Breathing][Breathing] from reference text or
-        # ASR output where punctuation between two identical NVV tags is
-        # stripped.  Keep the first token, extend its end to cover the
-        # last duplicate so the time span encompasses the full event.
-        if words_pinyin and not args.no_nvv:
-            deduped_pinyin = []
-            i = 0
-            while i < len(words_pinyin):
-                w = words_pinyin[i]
-                token = w["word"]
-                if is_nvv_token(token):
-                    j = i + 1
-                    while j < len(words_pinyin) and words_pinyin[j]["word"] == token:
-                        j += 1
-                    if j > i + 1:
-                        deduped_pinyin.append({
-                            "word": token,
-                            "start": w["start"],
-                            "end": words_pinyin[j - 1]["end"],
-                        })
-                        i = j
-                    else:
-                        deduped_pinyin.append(w)
-                        i += 1
-                else:
-                    deduped_pinyin.append(w)
-                    i += 1
-            words_pinyin = deduped_pinyin
-
         # ── ria name integrity protection ──
         # Merge any remaining ria fragments that survived single-letter
         # merge (e.g. "R"+"ia"), normalise case ("RIA"→"ria").
@@ -2436,6 +3474,15 @@ def main():
             words_pinyin = _protect_ria(words_pinyin)
 
         words_pinyin = _clamp_words_to_wav_axis(words_pinyin, duration_s)
+        if not args.no_nvv:
+            _final_provenance_errors = _validate_emitted_nvasr_provenance(
+                words_pinyin)
+            if _final_provenance_errors:
+                print(f"  FAIL {stem}: final NVASR provenance - "
+                      f"{'; '.join(_final_provenance_errors[:5])}")
+                skipped.setdefault("nvasr_candidate_mapping", []).append(stem)
+                fail += 1
+                continue
 
         # 写 TextGrid — 含 pauses tier
         try:
@@ -2499,8 +3546,6 @@ def main():
                 for p in punct_entries:
                     all_seq.append({"text": p["word"], "start": p["start"], "kind": "p"})
                 all_seq.sort(key=lambda x: x["start"])
-                # 最後标点: end = max(start, duration - 0.5s), 尾部留给静音
-                last_punct = max(punct_entries, key=lambda x: x["start"]) if punct_entries else None
                 # Pre-extract sorted start times for O(P+T) monotonic lookup
                 seq_starts = [t["start"] for t in all_seq]
                 punct_data = []
@@ -2511,22 +3556,40 @@ def main():
                         next_idx += 1
                     if next_idx < len(seq_starts):
                         next_start = seq_starts[next_idx]
-                    if p is last_punct:
-                        # 最后标点直接延续到音频结束
-                        end_s = duration_s
-                    else:
-                        end_s = next_start if next_start is not None else p["end"]
+                    # Keep the actual CTC frame span.  The old last-mark
+                    # extension mixed raw evidence with processed display
+                    # ownership and made stale punctuation look authoritative.
+                    end_s = float(p.get("raw_end_s", p["end"]))
                     # Guard: CTC overlap (e.g. NVV inside word) can make
                     # end_s < start_s, producing invalid intervals.
                     if end_s <= p["start"]:
                         end_s = p["start"] + 0.060  # min 1 frame width
                     punct_data.append({
+                        "schema": PUNCTUATION_EVIDENCE_SCHEMA,
                         "word": p["word"],
                         "start_ms": round(p["start"] * 1000, 1),
                         "end_ms": round(end_s * 1000, 1),
-                        "start_s": p["start"],
+                        "start_s": float(p.get("raw_start_s", p["start"])),
                         "end_s": end_s,
+                        "raw_start_s": float(p.get("raw_start_s", p["start"])),
+                        "raw_end_s": end_s,
+                        "candidate_id": p["candidate_id"],
+                        "source": p.get("source", "ctc"),
                     })
+
+                # Bind each candidate to lexical neighbors on the raw CTC
+                # sequence.  Ordinals are computed from the post-tokenization
+                # lexical stream and are never changed by display ownership.
+                ordered_words = sorted(words_pinyin,
+                                       key=lambda row: (row["start"], row["end"]))
+                for candidate in punct_data:
+                    start = candidate["raw_start_s"]
+                    left = [row for row in ordered_words
+                            if row["end"] <= start + 0.001]
+                    right = [row for row in ordered_words
+                             if row["start"] >= candidate["raw_end_s"] - 0.001]
+                    candidate["left_lexical_ordinal"] = len(left) - 1 if left else None
+                    candidate["right_lexical_ordinal"] = len(left) if right else None
                 # Dedup: remove … if it overlaps with a real punctuation mark
                 # (comma, period, etc.) — the punct mark already serves the
                 # pause-marking function.  NVV tokens must be preserved.
@@ -2725,25 +3788,11 @@ def main():
                         next_start = t["start"]
                         break
                 end_s = next_start if next_start is not None else w["end"]
-            line = {
-                "word": w["word"],
-                "start_ms": round(start_s * 1000, 1),
-                "end_ms": round(end_s * 1000, 1),
-                "start_s": start_s,
-                "end_s": end_s,
-                "type": "word",
-            }
-            # Authority English rows carry the immutable Wave 1 unit
-            # ledger into the CTC bundle.  Keep the ordinary rows
-            # byte-compatible apart from their timing/source metadata.
-            for key in (
-                    "surface_text", "source_ctc_ordinals", "canonical_span",
-                    "canonical_unit", "canonical_unit_sha256",
-                    "reference_identity", "reference_ordinal",
-                    "hyphen_separator_omitted", "processed_ctc_span",
-                    "processed_ctc_boundary_source"):
-                if key in w:
-                    line[key] = w[key]
+            # Authority English and NVV rows carry their immutable evidence
+            # ledgers into the sidecar.  Centralizing the passthrough list
+            # prevents a successful in-memory binding from disappearing at
+            # the producer serialization boundary.
+            line = _ctc_token_sidecar_row(w, start_s, end_s)
             token_lines.append(json.dumps(line, ensure_ascii=False))
         _atomic_write_text(tokens_path, "\n".join(token_lines) + "\n")
 
@@ -2820,19 +3869,20 @@ def main():
             # v2 source-denominator receipt: the source universe was frozen
             # before filtering, and skipped eligible stems are explicit
             # filtered evidence rather than silent loss.
-            _eligible_all = sorted(stems) if args.allow_missing_reference else sorted(ref_texts)
             _output_v2 = sorted(_all_output_stems)
-            _filtered_v2 = sorted(set(_eligible_all) - set(_output_v2))
+            _filtered_v2 = sorted(
+                set(_accounting_eligible_stems) - set(_output_v2)
+            )
             _accounting = make_pipeline_accounting_receipt(
-                source_stems=sorted(p.stem for p in source_wav_files),
-                eligible_stems=_eligible_all,
-                exclusions=source_exclusions,
+                source_stems=_accounting_source_stems,
+                eligible_stems=_accounting_eligible_stems,
+                exclusions=_accounting_exclusions,
                 output_stems=_output_v2,
                 filtered_stems=_filtered_v2,
                 run_id=make_pipeline_run_id(), mode="ctc_prealign",
                 route=["ctc_prealign"],
                 paths={"output": str(args.output_dir), "filtered": str(args.output_dir)},
-                shards=[{"shard_id": "single", "stems": _eligible_all}],
+                shards=[{"shard_id": "single", "stems": _accounting_eligible_stems}],
                 extra={"source_frozen": True,
                        "reference_only": not args.allow_missing_reference,
                        "reference_mode": args.reference_mode,

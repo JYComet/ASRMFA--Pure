@@ -103,3 +103,28 @@ def test_missing_or_unsafe_proof_keeps_legacy_full_final_silence_scan():
         assert item["ctc_gap"] is None
         assert item["excluded_duration"] == 0.0
         assert selection["validation"]["status"] == "rejected"
+
+
+def test_lexical_evidence_narrows_ctc_gap_before_bgm_scan():
+    words = post.Tier("words", 0.0, 1.2, [
+        post.Interval(0.0, 0.75, "<sp1>"),
+        post.Interval(0.75, 1.2, "ni3"),
+    ])
+    source = [
+        {"ordinal": 0, "start": 0.49, "end": 0.70, "text": "ni3"},
+    ]
+    ctc = [{"ordinal": 0, "word": "ni3", "start_s": 0.75,
+            "end_s": 0.95, "type": "word"}]
+    # The final silence is leading, so CTC alone would scan [0, 0.75].
+    # Source MFA evidence proves lexical onset at 0.49 and excludes the
+    # source-MFA/CTC disagreement from the BGM evidence window.
+    ledger = post._fallback_lexical_correspondence_ledger(source, ctc, words)
+    selection = post._fallback_bgm_ctc_gap_selection(
+        words, source, ctc, ledger, (0.0, 1.2))
+
+    item = selection["evaluated_intervals"][0]
+    assert item["ctc_gap"] == [0.0, 0.75]
+    assert item["lexical_evidence_gap"] == [0.0, 0.49]
+    assert item["evaluated_intersection"] == [0.0, 0.49]
+    assert item["lexical_exclusions"] == [[0.49, 0.75]]
+    assert item["narrowing_basis"] == "lexical_evidence_gap"

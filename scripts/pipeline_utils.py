@@ -19,6 +19,34 @@ from typing import Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# MFA acoustic models commonly carry ``dither=1`` in their training feature
+# metadata.  At alignment time that value injects fresh random noise before
+# every MFCC extraction, so identical audio/anchors can produce different
+# frame boundaries on consecutive runs.  Inference must opt out explicitly;
+# MFA's model metadata otherwise wins over FeatureConfigMixin's zero default.
+DETERMINISTIC_MFA_DITHER = 0.0
+
+
+def resolve_mfa_dither(value: object = DETERMINISTIC_MFA_DITHER) -> float:
+    """Return a finite, non-negative MFA MFCC dither value.
+
+    The pipeline defaults to zero for reproducible alignment.  Keeping the
+    conversion in one shared helper ensures Chinese, English, and retry paths
+    serialize the same explicit ``--dither`` contract.
+    """
+    if value is None:
+        value = DETERMINISTIC_MFA_DITHER
+    if isinstance(value, bool):
+        raise ValueError("MFA dither must be a finite non-negative number")
+    try:
+        resolved = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "MFA dither must be a finite non-negative number") from exc
+    if not math.isfinite(resolved) or resolved < 0:
+        raise ValueError("MFA dither must be a finite non-negative number")
+    return resolved
+
 # ═══════════════════════════════════════════════════════════════
 # UNC -> Linux 路径翻译
 # ═══════════════════════════════════════════════════════════════
@@ -191,6 +219,29 @@ def find_mfa_python(cfg_python: str = "") -> Optional[Path]:
     return None
 
 
+def ensure_mfa_root_dir(workspace: Path) -> Path:
+    """Return the default per-run MFA root without overriding the parent.
+
+    ``MFA_ROOT_DIR`` is inherited by subprocesses.  An explicitly supplied
+    value remains authoritative (streaming workers use this contract), while
+    an ordinary run gets a root below its already-selected workspace.  The
+    default directory is created here so a failure cannot fall back to the
+    shared model tree later in :func:`get_mfa_env`.
+    """
+    explicit = os.environ.get("MFA_ROOT_DIR")
+    if explicit:
+        return Path(explicit)
+    workspace = Path(workspace).resolve(strict=False)
+    root = workspace / "mfa_root"
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        raise OSError(f"MFA workspace root is not an ordinary directory: {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    if root.is_symlink() or not root.is_dir():
+        raise OSError(f"MFA workspace root was not created as a directory: {root}")
+    os.environ["MFA_ROOT_DIR"] = str(root)
+    return root
+
+
 def get_mfa_env(mfa_python: Path, models_dir: Path,
                  blas_num_threads: str = "1") -> dict[str, str]:
     """Build environment dict for MFA subprocess calls.
@@ -203,9 +254,9 @@ def get_mfa_env(mfa_python: Path, models_dir: Path,
     (MFA's ``--num_jobs``) gives near-linear scaling.
     """
     env = os.environ.copy()
-    # Allow each batch/shard process to provide an isolated MFA root.  MFA
-    # writes command_history.yaml below this directory; forcing every
-    # concurrent batch to share models/mfa corrupts that YAML during retries.
+    # A run-level setup installs the workspace root before this function is
+    # called.  Keep an explicitly supplied parent/streaming root unchanged;
+    # the models directory is only the legacy direct-caller fallback.
     env.setdefault("MFA_ROOT_DIR", str(models_dir))
     # Pin BLAS threads per worker — critical for multi-core scaling
     for ev in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
@@ -1197,7 +1248,20 @@ CTC_PROCESSED_BOUNDARY_SOURCES = frozenset({
 def is_silence(text: str) -> bool:
     """Check if *text* is a silence / pause token."""
     t = text.strip()
-    return t in SILENCE_LABELS or t.startswith("<sp") or t in ("", "<eps>")
+    if t in SILENCE_LABELS or t in ("", "<eps>"):
+        return True
+    # Canonical bracketed SP labels are case-insensitive, but only when the
+    # complete token matches.  Keep malformed lowercase ``<sp...>`` handling
+    # below for compatibility; mixed/uppercase malformed legacy tokens must
+    # remain non-silence.
+    if t.casefold() in {"<sp0>", "<sp1>", "<sp2>", "<sp3>"}:
+        return True
+    # Bare SP labels are recognized only in their exact lowercase form.  They
+    # are intentionally outside SILENCE_LABELS and _pure_silence_label's
+    # canonical-owner contract.
+    if t in {"sp0", "sp1", "sp2", "sp3"}:
+        return True
+    return t.startswith("<sp")
 
 
 # ── English phone prefix for mixed-language tier output ──────────
@@ -2542,6 +2606,16 @@ def _axis_audio_metadata(path: Path) -> dict:
     return {"sha256": _axis_sha256(path), "duration_s": frames / sample_rate,
             "sample_rate": sample_rate, "frames": frames,
             "channels": channels, "sample_width": sample_width}
+
+
+def read_wav_metadata(path: Path) -> dict:
+    """Public provider-neutral PCM/IEEE-float WAV metadata contract.
+
+    Transcript producers need the same physical-input validation as axis
+    receipts, but must not depend on CTC/MFA artifact semantics.  Keep the
+    format handling and content hash in one implementation.
+    """
+    return _axis_audio_metadata(path)
 
 
 def _textgrid_global_bounds(path: Path) -> tuple[float, float]:

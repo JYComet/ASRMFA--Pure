@@ -89,7 +89,7 @@ def _store_preflight(root: Path, scope: Path) -> None:
     current_wav = root / "workspace" / "mfa_shards" / "run" / "retry_missing" / f"{stem}.wav"
     lab.write_text(current_lab.read_text(encoding="utf-8"), encoding="utf-8")
     wav.write_bytes(current_wav.read_bytes())
-    proof = root / "proof.json"; proof.write_text(json.dumps({"schema": "mfa-retry-evidence-v1", "command": [str(exe), "align", "corpus", str(dictionary), str(model), "output", "--beam", "20", "--retry_beam", "80"],
+    proof = root / "proof.json"; proof.write_text(json.dumps({"schema": "mfa-retry-evidence-v1", "command": [str(exe), "align", "corpus", str(dictionary), str(model), "output", "--beam", "20", "--retry_beam", "80", "--dither", "0.0"],
         "mfa_executable": {"path": str(exe), "sha256": tool.sha_file(exe)}, "mfa_dependency": {"path": str(dep), "sha256": tool.sha_file(dep)},
         "dictionary": {"path": str(dictionary), "sha256": tool.sha_file(dictionary)}, "model": {"path": str(model), "sha256": tool.sha_file(model)},
         "environment": {"MFA_ROOT_DIR": str(env_root), "NUMBA_CACHE_DIR": str(cache)},
@@ -181,9 +181,9 @@ def _prepare_downstream_resume(root: Path, scope: Path, *, valid_grids: bool = F
     tool.continue_after_mfa(root, scope)
     attempts = {"schema": "gpu1000-singleton-attempts-v1", "attempts": [
         {"attempt": "20_80", "returncode": 1, "stderr": "NoAlignmentsError: no path",
-         "argv": ["mfa", "align", "corpus", "dict", "model", "out", "--beam", "20", "--retry_beam", "80"]},
+         "argv": ["mfa", "align", "corpus", "dict", "model", "out", "--beam", "20", "--retry_beam", "80", "--dither", "0.0"]},
         {"attempt": "200_800", "returncode": 0, "stderr": "",
-         "argv": ["mfa", "align", "corpus", "dict", "model", "out", "--beam", "200", "--retry_beam", "800"]},
+         "argv": ["mfa", "align", "corpus", "dict", "model", "out", "--beam", "200", "--retry_beam", "800", "--dither", "0.0"]},
     ]}
     (root / "workspace" / "continuation_singleton_attempts.json").write_text(json.dumps(attempts), encoding="utf-8")
     historical = root / "workspace" / "strict_ok_runs" / "historical" / "output"
