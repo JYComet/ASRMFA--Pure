@@ -23,6 +23,9 @@ from scripts.postprocess_textgrids import (
     _rebuild_phones_from_lineage,
     _reassert_ctc_word_authority_tier,
     _snap_to_ctc,
+    _contain_nvasr_frame_support,
+    _nvasr_candidate_provenance_audit,
+    _nvasr_frame_support,
     _reconcile_publication_geometry,
     _find_internal_pp_gaps,
     _fix_overlapping_boundaries,
@@ -45,6 +48,7 @@ from scripts.postprocess_textgrids import (
     _strict_semantic_tokens,
     detect_issues,
     is_silence,
+    is_nvv_token,
     tier_by_name,
 )
 
@@ -63,6 +67,7 @@ def _qc_args(**overrides):
         filter_short_phone_sec=0.015,
         filter_long_consonant_sec=999.0,
         filter_long_vowel_sec=999.0,
+        filter_suspicious=True,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -147,6 +152,433 @@ def test_detect_issues_uses_serialized_ticks_for_adjacent_15ms_chinese_phones():
         "rule": "short_phone", "text": "u4",
         "phone_idx": 2, "duration": 0.014999,
     }]
+
+
+def _nvv_frame_row(*, raw_start_frame=11, frame_count=1,
+                   candidate_id="nvv-0", word="BREATHING", **overrides):
+    raw_end_frame = raw_start_frame + frame_count
+    speech_start_frame = raw_start_frame - 4
+    speech_end_frame = raw_end_frame - 4
+    raw_start = raw_start_frame * 0.06
+    raw_end = raw_end_frame * 0.06
+    speech_start = speech_start_frame * 0.06
+    speech_end = speech_end_frame * 0.06
+    support = [speech_start - 0.03, speech_end - 0.03]
+    row = {
+        "candidate_kind": "nvv",
+        "candidate_id": candidate_id,
+        "word": word,
+        "start_s": support[0],
+        "end_s": support[1],
+        "raw_start_s": raw_start,
+        "raw_end_s": raw_end,
+        "raw_start_frame": raw_start_frame,
+        "raw_end_frame": raw_end_frame,
+        "raw_frame_count": frame_count,
+        "speech_start_frame": speech_start_frame,
+        "speech_end_frame": speech_end_frame,
+        "speech_frame_count": frame_count,
+        "frame_ms": 60,
+        "raw_span": [raw_start, raw_end],
+        "speech_span": [speech_start, speech_end],
+        "forced_span": list(support),
+        "adjusted_span": list(support),
+        "provenance_schema": "nvasr-candidate-provenance-v1",
+        "mapping_basis": "raw_ctc_label_neighbors_forced_overlap-v2",
+        "mapping_outcome": "unique",
+        "mapping_selection": "label_neighbors",
+        "mapping_key": {"left_lexical_ordinal": 0,
+                        "right_lexical_ordinal": 1},
+    }
+    row.update(overrides)
+    return row
+
+
+def _nvv_containment_fixture(row, *, nvv_span=(0.30, 0.36), axis=(0.0, 1.0)):
+    nvv_label = row.get("word", "BREATHING")
+    words = Tier("words", axis[0], axis[1], [
+        Interval(axis[0], nvv_span[0], "ni3"),
+        Interval(nvv_span[0], nvv_span[1], f"<{nvv_label}>"),
+        Interval(nvv_span[1], axis[1], "hao3"),
+    ])
+    ctc = [
+        {"type": "word", "word": "ni3", "start_s": axis[0],
+         "end_s": nvv_span[0]},
+        row,
+        {"type": "word", "word": "hao3", "start_s": nvv_span[1],
+         "end_s": axis[1]},
+    ]
+    return words, ctc
+
+
+@pytest.mark.parametrize("frame_count,expected_duration", [
+    (1, 0.06), (2, 0.12), (3, 0.18),
+])
+def test_nvasr_frame_support_is_exactly_one_two_or_three_physical_frames(
+        frame_count, expected_duration):
+    row = _nvv_frame_row(frame_count=frame_count)
+    support, source, frame_limited, reasons = _nvasr_frame_support(row)
+
+    assert support == pytest.approx([0.39, 0.39 + expected_duration])
+    assert source == "raw_ctc_frames_shifted_to_speech_axis"
+    assert frame_limited is (frame_count == 1)
+    assert reasons == []
+
+
+@pytest.mark.parametrize("mapping_selection", [None, "unknown-selection"])
+def test_nvasr_frame_support_direct_call_rejects_unknown_mapping_selection(
+        mapping_selection):
+    row = _nvv_frame_row()
+    if mapping_selection is None:
+        row.pop("mapping_selection")
+    else:
+        row["mapping_selection"] = mapping_selection
+
+    support, source, _, reasons = _nvasr_frame_support(row)
+
+    assert support is None
+    assert source is None
+    assert "mapping_selection_unknown" in reasons
+
+
+@pytest.mark.parametrize("frame_count", [1, 2, 3])
+def test_containment_repairs_short_or_disjoint_display_owner_without_filtering(
+        frame_count):
+    row = _nvv_frame_row(frame_count=frame_count)
+    words, ctc = _nvv_containment_fixture(row)
+    result = _contain_nvasr_frame_support(words, ctc, wav_duration_s=1.0)
+
+    assert result["status"] == "verified"
+    assert result["reasons"] == []
+    assert result["candidates"][0]["frame_support_span"] == pytest.approx(
+        [0.39, 0.39 + frame_count * 0.06])
+    assert result["candidates"][0]["final_contains_frame_support"] is True
+    assert result["candidates"][0]["frame_limited"] is (frame_count == 1)
+    contained = result["_contained_tier"]
+    owner = next(iv for iv in contained.intervals if is_nvv_token(iv.text))
+    assert owner.xmin <= 0.39 + 1e-9
+    assert owner.xmax >= 0.39 + frame_count * 0.06 - 1e-9
+    if frame_count > 1:
+        assert owner.duration != pytest.approx(0.06)
+
+
+def test_containment_repartitions_colliding_display_owners_and_is_idempotent():
+    row = _nvv_frame_row()
+    words, ctc = _nvv_containment_fixture(row, nvv_span=(0.42, 0.45))
+    first = _contain_nvasr_frame_support(words, ctc, wav_duration_s=1.0)
+    contained = first["_contained_tier"]
+
+    assert first["status"] == "verified"
+    assert first["repartitioned_intervals"] >= 2
+    assert [iv.text for iv in contained.intervals] == [
+        "ni3", "<BREATHING>", "hao3"]
+    assert all(left.xmax <= right.xmin + 1e-9
+               for left, right in zip(contained.intervals,
+                                      contained.intervals[1:]))
+    owner = contained.intervals[1]
+    assert owner.xmin <= 0.39 + 1e-9 and owner.xmax >= 0.45 - 1e-9
+
+    before_second = [(iv.xmin, iv.xmax, iv.text)
+                     for iv in contained.intervals]
+    second = _contain_nvasr_frame_support(contained, ctc, wav_duration_s=1.0)
+    assert second["status"] == "verified"
+    assert second["changed"] == 0
+    assert second["repartitioned_intervals"] == 0
+    assert [(iv.xmin, iv.xmax, iv.text) for iv in contained.intervals] == \
+        before_second
+
+
+def test_nvasr_malformed_forced_mapping_and_axis_evidence_fail_closed():
+    malformed = _nvv_frame_row(frame_count=2)
+    malformed["raw_frame_count"] = 1
+    support, source, _, reasons = _nvasr_frame_support(malformed)
+    assert support is None and source is None
+    assert "raw_frame_count_mismatch" in reasons
+
+    forced_outside = _nvv_frame_row(
+        forced_span=[0.30, 0.50], adjusted_span=[0.39, 0.45])
+    words, ctc = _nvv_containment_fixture(forced_outside)
+    rejected = _contain_nvasr_frame_support(words, ctc, wav_duration_s=1.0)
+    assert rejected["status"] == "rejected"
+    assert "forced_span_outside_selected_support:0" in rejected["reasons"]
+    assert "_contained_tier" not in rejected
+
+    wrong_mapping = _nvv_frame_row(
+        mapping_key={"left_lexical_ordinal": 7, "right_lexical_ordinal": 8})
+    words, ctc = _nvv_containment_fixture(wrong_mapping)
+    rejected = _contain_nvasr_frame_support(words, ctc, wav_duration_s=1.0)
+    assert rejected["status"] == "rejected"
+    assert "frame_support_mapping_key_mismatch:0" in rejected["reasons"]
+
+    clamped = _nvv_frame_row(
+        raw_start_frame=21, start_s=0.99, end_s=1.0,
+        forced_span=[0.99, 1.0], adjusted_span=[0.99, 1.0])
+    support, source, _, reasons = _nvasr_frame_support(
+        clamped, wav_duration_s=1.0)
+    assert support == pytest.approx([0.99, 1.0])
+    assert source == "raw_ctc_frames_shifted_to_speech_axis_wav_axis_clamp"
+    assert reasons == []
+
+    words, ctc = _nvv_containment_fixture(
+        clamped, axis=(0.0, 0.98))
+    rejected = _contain_nvasr_frame_support(words, ctc, wav_duration_s=1.0)
+    assert rejected["status"] == "rejected"
+    assert "frame_support_out_of_textgrid_axis:0" in rejected["reasons"]
+
+
+def test_raw_selection_rejects_forced_span_that_only_fits_centered_speech_axis():
+    row = _nvv_frame_row(
+        raw_start_frame=16,
+        mapping_selection="unique_max_forced_raw_overlap",
+        forced_span=[0.69, 0.75], adjusted_span=[0.69, 0.75],
+        start_s=0.69, end_s=0.75,
+    )
+    words, ctc = _nvv_containment_fixture(row, nvv_span=(0.69, 0.75),
+                                           axis=(0.0, 1.2))
+    rejected = _contain_nvasr_frame_support(words, ctc, wav_duration_s=1.2)
+    assert rejected["status"] == "rejected"
+    assert "mapping_raw_selection_forced_raw_overlap_nonpositive:0" in \
+        rejected["reasons"]
+    assert "mapping_raw_selection_forced_speech_overlap_positive:0" in \
+        rejected["reasons"]
+
+
+def test_raw_selection_rejects_positive_forced_speech_overlap_even_with_raw_overlap():
+    row = _nvv_frame_row(
+        raw_start_frame=16,
+        frame_count=5,
+        mapping_selection="unique_max_forced_raw_overlap",
+        forced_span=[0.97, 1.01], adjusted_span=[0.97, 1.01],
+        start_s=0.97, end_s=1.01,
+    )
+
+    support, source, _, reasons = _nvasr_frame_support(row)
+
+    assert support is None
+    assert source is None
+    assert "mapping_raw_selection_forced_raw_overlap_nonpositive" not in reasons
+    assert "mapping_raw_selection_forced_speech_overlap_positive" in reasons
+
+
+def test_unique_raw_overlap_uses_centered_raw_support_not_raw_span():
+    row = _nvv_frame_row(
+        raw_start_frame=16,
+        start_s=0.93,
+        end_s=0.99,
+        forced_span=[0.93, 0.99],
+        adjusted_span=[0.93, 0.99],
+        mapping_selection="unique_max_forced_raw_overlap",
+    )
+    words, ctc = _nvv_containment_fixture(row, nvv_span=(0.93, 0.99),
+                                           axis=(0.0, 1.2))
+    result = _contain_nvasr_frame_support(words, ctc, wav_duration_s=1.2)
+
+    assert result["status"] == "verified"
+    candidate = result["candidates"][0]
+    assert candidate["mapping_selection"] == "unique_max_forced_raw_overlap"
+    assert candidate["frame_support_span"] == pytest.approx([0.93, 0.99])
+    assert candidate["frame_support_span"] != pytest.approx([0.96, 1.02])
+
+
+@pytest.mark.parametrize(
+    ("mapping_selection", "forced_span", "frame_count", "expected_reason"),
+    [
+        ("unknown_selection", [0.39, 0.45], 1,
+         "mapping_selection_unknown:0"),
+        ("unique_punctuation_topology_bound", [0.39, 0.51], 2,
+         "topology_frame_count_invalid:0"),
+        ("unique_punctuation_topology_bound", [0.39, 0.45], 2,
+         "topology_frame_count_invalid:0"),
+        ("unique_punctuation_topology_bound", [0.39, 0.51], 1,
+         "topology_duration_invalid:0"),
+    ],
+)
+def test_selection_and_topology_invariants_fail_closed(
+        mapping_selection, forced_span, frame_count, expected_reason):
+    row = _nvv_frame_row(
+        frame_count=frame_count,
+        mapping_selection=mapping_selection,
+        forced_span=forced_span,
+        adjusted_span=list(forced_span),
+        start_s=forced_span[0],
+        end_s=forced_span[1],
+    )
+    words, ctc = _nvv_containment_fixture(row, nvv_span=(0.39, 0.45),
+                                           axis=(0.0, 1.0))
+    result = _contain_nvasr_frame_support(words, ctc, wav_duration_s=1.0)
+    assert result["status"] == "rejected"
+    assert expected_reason in result["reasons"]
+
+
+def test_dedup_owner_requirements_protect_occurrence_envelope_and_validate_schema():
+    row = _nvv_frame_row(
+        start_s=0.39, end_s=0.57,
+        forced_span=[0.39, 0.57], adjusted_span=[0.39, 0.57],
+        nvv_deduplication={
+            "schema": "nvv-adjacent-deduplication-v1",
+            "label": "BREATHING",
+            "occurrence_count": 2,
+            "forced_occurrence_spans": [[0.39, 0.45], [0.51, 0.57]],
+        })
+    words, ctc = _nvv_containment_fixture(row, nvv_span=(0.30, 0.36))
+    result = _contain_nvasr_frame_support(words, ctc, wav_duration_s=1.0)
+    assert result["status"] == "verified"
+    candidate = result["candidates"][0]
+    assert [point for segment in candidate["owner_required_segments"]
+            for point in segment] == pytest.approx(
+                [0.39, 0.45, 0.39, 0.45, 0.51, 0.57])
+    assert candidate["owner_required_span"] == pytest.approx([0.39, 0.57])
+    assert [point for segment in candidate["dedup_forced_occurrence_spans"]
+            for point in segment] == pytest.approx(
+                [0.39, 0.45, 0.51, 0.57])
+    assert candidate["final_contains_frame_support"] is True
+    assert candidate["final_contains_owner_required_segments"] is True
+
+    malformed = dict(row)
+    malformed["nvv_deduplication"] = {
+        "schema": "nvv-adjacent-deduplication-v1",
+        "label": "BREATHING",
+        "occurrence_count": 2,
+        "forced_occurrence_spans": [[0.39, 0.51], [0.48, 0.57]],
+    }
+    words, ctc = _nvv_containment_fixture(malformed, nvv_span=(0.30, 0.36))
+    rejected = _contain_nvasr_frame_support(words, ctc, wav_duration_s=1.0)
+    assert rejected["status"] == "rejected"
+    assert any(reason.startswith("dedup_occurrence_overlap:0")
+               for reason in rejected["reasons"])
+
+    for ledger, expected in [
+        ({"schema": "wrong", "label": "BREATHING",
+          "occurrence_count": 2,
+          "forced_occurrence_spans": [[0.39, 0.45], [0.51, 0.57]]},
+         "dedup_schema_mismatch"),
+        ({"schema": "nvv-adjacent-deduplication-v1", "label": "BREATHING",
+          "occurrence_count": 3,
+          "forced_occurrence_spans": [[0.39, 0.45], [0.51, 0.57]]},
+         "dedup_occurrence_count_mismatch"),
+        ({"schema": "nvv-adjacent-deduplication-v1", "label": "BREATHING",
+          "occurrence_count": 2,
+          "forced_occurrence_spans": [[0.39, 0.45], [0.51, 0.56]]},
+         "dedup_forced_span_not_occurrence_envelope"),
+    ]:
+        malformed = dict(row)
+        malformed["nvv_deduplication"] = ledger
+        words, ctc = _nvv_containment_fixture(
+            malformed, nvv_span=(0.30, 0.36))
+        rejected = _contain_nvasr_frame_support(
+            words, ctc, wav_duration_s=1.0)
+        assert rejected["status"] == "rejected"
+        assert any(reason.startswith(expected)
+                   for reason in rejected["reasons"])
+
+
+def test_real_shaped_00137_laughter_dedup_binds_first_physical_occurrence():
+    row = _nvv_frame_row(
+        raw_start_frame=137,
+        start_s=7.95, end_s=8.19,
+        forced_span=[7.95, 8.19], adjusted_span=[7.95, 8.19],
+        mapping_selection="unique_max_forced_speech_overlap",
+        mapping_forced_speech_overlap_s=0.06,
+        nvv_deduplication={
+            "schema": "nvv-adjacent-deduplication-v1",
+            "label": "LAUGHTER",
+            "occurrence_count": 2,
+            "forced_occurrence_spans": [[7.95, 8.01], [8.13, 8.19]],
+        },
+        word="LAUGHTER",
+    )
+    words, ctc = _nvv_containment_fixture(
+        row, nvv_span=(7.95, 8.19), axis=(0.0, 9.0))
+    result = _contain_nvasr_frame_support(words, ctc, wav_duration_s=9.0)
+    assert result["status"] == "verified"
+    candidate = result["candidates"][0]
+    assert candidate["frame_support_span"] == pytest.approx([7.95, 8.01])
+    assert candidate["dedup_forced_occurrence_spans"] == [
+        [7.95, 8.01], [8.13, 8.19]]
+    assert candidate["owner_required_span"] == pytest.approx([7.95, 8.19])
+    assert candidate["final_contains_frame_support"] is True
+    assert candidate["final_contains_owner_required_segments"] is True
+
+
+def test_nvasr_physical_support_conflict_rejects_without_reassigning_owners():
+    first = _nvv_frame_row(candidate_id="nvv-0")
+    second = _nvv_frame_row(candidate_id="nvv-1")
+    words = Tier("words", 0.0, 1.0, [
+        Interval(0.0, 0.30, "ni3"),
+        Interval(0.30, 0.42, "<BREATHING>"),
+        Interval(0.42, 0.54, "<BREATHING>"),
+        Interval(0.54, 1.0, "hao3"),
+    ])
+    ctc = [
+        {"type": "word", "word": "ni3", "start_s": 0.0, "end_s": 0.30},
+        first, second,
+        {"type": "word", "word": "hao3", "start_s": 0.54, "end_s": 1.0},
+    ]
+    before = [(iv.xmin, iv.xmax, iv.text) for iv in words.intervals]
+    result = _contain_nvasr_frame_support(words, ctc, wav_duration_s=1.0)
+
+    assert result["status"] == "rejected"
+    assert any(reason.startswith("frame_support_physical_conflict:")
+               for reason in result["reasons"])
+    assert result["changed"] == 0
+    assert [(iv.xmin, iv.xmax, iv.text) for iv in words.intervals] == before
+
+
+def test_nvasr_provenance_separates_physical_support_from_wider_display_owner():
+    row = _nvv_frame_row()
+    row["ctc_lexical_ordinal"] = 1
+    row["adjusted_span"] = [0.39, 0.45]
+    row["start_s"], row["end_s"] = row["adjusted_span"]
+    words = Tier("words", 0.0, 1.0, [
+        Interval(0.0, 0.30, "ni3"),
+        Interval(0.30, 0.60, "<BREATHING>"),
+        Interval(0.60, 1.0, "hao3"),
+    ])
+    words._ctc_word_authority = [
+        {"ctc_lexical_ordinal": 0, "text": "ni3"},
+        {"ctc_lexical_ordinal": 1, "text": "BREATHING",
+         "ctc_span": [0.39, 0.45], "published_span": [0.30, 0.60],
+         "boundary_source": "ctc"},
+        {"ctc_lexical_ordinal": 2, "text": "hao3"},
+    ]
+    audit = _nvasr_candidate_provenance_audit(
+        [
+            {"type": "word", "word": "ni3", "start_s": 0.0, "end_s": 0.30},
+            row,
+            {"type": "word", "word": "hao3", "start_s": 0.60, "end_s": 1.0},
+        ], words, wav_duration_s=1.0)
+
+    assert audit["status"] == "verified"
+    assert audit["reasons"] == []
+    candidate = audit["candidates"][0]
+    assert candidate["frame_support_span"] == pytest.approx([0.39, 0.45])
+    assert candidate["final_span"] == pytest.approx([0.30, 0.60])
+    assert candidate["display_owner"] == "words_tier_final"
+    assert candidate["display_is_acoustic_evidence"] is False
+    assert candidate["final_contains_frame_support"] is True
+
+    untrusted_words = Tier("words", 0.0, 1.0, [
+        Interval(0.0, 0.30, "ni3"),
+        Interval(0.30, 0.60, "<BREATHING>"),
+        Interval(0.60, 1.0, "hao3"),
+    ])
+    rejected = _nvasr_candidate_provenance_audit(
+        [{"type": "word", "word": "ni3", "start_s": 0.0, "end_s": 0.30},
+         row,
+         {"type": "word", "word": "hao3", "start_s": 0.60, "end_s": 1.0}],
+        untrusted_words, wav_duration_s=1.0)
+    assert rejected["status"] == "rejected"
+    assert "unauthorized_final_ctc_divergence:0" in rejected["reasons"]
+
+
+def test_canary_00047_frame_support_is_the_243_to_249ms_physical_span():
+    row = _nvv_frame_row(raw_start_frame=45)
+    support, source, frame_limited, reasons = _nvasr_frame_support(row)
+
+    assert support == pytest.approx([2.43, 2.49])
+    assert source == "raw_ctc_frames_shifted_to_speech_axis"
+    assert frame_limited is True
+    assert reasons == []
 
 
 def _split_fixture(word_duration: float, initial_duration: float) -> Tier:
@@ -1840,6 +2272,7 @@ def test_nvasr_audit_reports_all_spans_and_rejects_final_ctc_divergence():
         "candidate_id": "nvasr-candidate-0004",
         "mapping_basis": "raw_ctc_label_neighbors_forced_overlap-v2",
         "mapping_outcome": "unique",
+        "mapping_selection": "label_neighbors",
         "mapping_key": {"left_lexical_ordinal": 6,
                         "right_lexical_ordinal": 7},
         "raw_span": [3.66, 3.72],
@@ -1902,6 +2335,9 @@ def test_nvasr_audit_allows_only_frozen_full_ctc_bound_divergence():
         "candidate_id": "nvasr-candidate-0065",
         "mapping_basis": "raw_ctc_label_neighbors_forced_overlap-v2",
         "mapping_outcome": "unique",
+        "mapping_selection": "unique_punctuation_topology_bound",
+        "mapping_key": {"left_lexical_ordinal": 0,
+                        "right_lexical_ordinal": 1},
         "ctc_lexical_ordinal": 0,
         "raw_span": [1.26, 1.32], "raw_start_s": 1.26,
         "raw_end_s": 1.32, "raw_start_frame": 21,
@@ -1917,6 +2353,13 @@ def test_nvasr_audit_allows_only_frozen_full_ctc_bound_divergence():
     }]
 
     assert _nvasr_candidate_provenance_audit([candidate], words)["status"] == "verified"
+
+    ordinal_only = dict(candidate)
+    ordinal_only.pop("mapping_key")
+    ordinal_only_audit = _nvasr_candidate_provenance_audit(
+        [ordinal_only], words)
+    assert ordinal_only_audit["status"] == "rejected"
+    assert "mapping_key_malformed:0" in ordinal_only_audit["reasons"]
 
     unbound = Tier("words", 0.0, 2.0, [Interval(1.30, 1.36, "BREATHING")])
     assert _nvasr_candidate_provenance_audit(

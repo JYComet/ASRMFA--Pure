@@ -232,10 +232,12 @@
 | 221 | 2026-08-31 | scripts/postprocess_textgrids.py, scripts/streaming_pipeline.py, tests/test_postprocess_geometry.py, configs/laria_v5_no_reference_strict_8gpu_20260831_logic_audit_r19_300.yaml | 精确 15ms 音素被二进制浮点误过滤；中英文 phone QC 统一到序列化微秒轴 |
 | 222 | 2026-08-31 | scripts/ctc_prealign.py, scripts/postprocess_textgrids.py, tests/test_nvasr_candidate_timeline.py, tests/test_postprocess_geometry.py, configs/laria_v5_no_reference_strict_8gpu_20260831_logic_audit_r20_300.yaml | 相邻同标签 NVV 去重擦除 provenance，consumer 又把零候选 final NVV 当作 not_applicable |
 | 223 | 2026-08-31 | scripts/pipeline_utils.py, scripts/run_pipeline.py, scripts/align_english_mfa.py, scripts/gpu1000_orchestrate.py, config.yaml, README.md, tests/test_run_pipeline_mfa_root.py, tests/test_mfa_retry.py, tests/test_laria_mfa_retry_contract.py, tests/test_align_english_mfa_canonical_units.py, tests/test_gpu1000_singleton_mfa.py, tests/test_gpu1000_continuation.py, configs/laria_v5_no_reference_strict_8gpu_20260831_logic_audit_r21_300.yaml | MFA 模型默认随机 MFCC dither 导致同输入边界波动；全路径固定 dither=0 并完成 r21 300 条确定性闭环 |
+| 224 | 2026-08-31 | scripts/postprocess_textgrids.py, scripts/run_pipeline.py, config.yaml, README.md, ANALYSIS_LONG_PHONE_FIX.md, tests/test_postprocess_geometry.py | r21 long-phone/source-acoustic QC 实验经 U1=0/3、U2=0/13 审核拒绝并撤回；保留短音素整数 tick 与既有 structural/breathing gates |
+| 225 | 2026-08-31 | scripts/ctc_prealign.py, scripts/postprocess_textgrids.py, README.md, tests/test_postprocess_geometry.py, tests/test_boundary_punctuation_display_regressions.py | BREATHING 60ms 误读/2–3 帧压缩修复；分离 physical frame support 与非声学 display/owner-required span，并完成 strict 真实 300 回放与审计 |
 
 ### 索引完整性与非 Case 章节
 
-截至 2026-08-31，Case 索引已覆盖 Case 1–223，每个编号各出现一次；Case 标题与正文
+截至 2026-08-31，Case 索引已覆盖 Case 1–225，每个编号各出现一次；Case 标题与正文
 均可按同一编号定位。除 Case 条目外，文档还包含以下纳入索引范围的专题章节：
 
 | 章节 | 内容 |
@@ -12258,3 +12260,107 @@ ledger 已将 MFA 的错误 rc 封闭起来。
 dither 相关定向扩展集为 83 passed，GPU1000/main 子集为 33 passed；本轮代码阶段全套
 回归为 859 passed，`compileall` 与 `git diff --check` 通过。r21 因而同时完成零过滤、
 provenance、SP/标点、音素阈值和可重复性闭环。
+
+## Case 224: r21 long-phone/source-acoustic QC 实验拒绝与撤回
+
+**日期**：2026-08-31
+**状态**：rejected / withdrawn
+**撤回范围**：`phone_duration_qc` 模块、source-acoustic import/audit/report/filter 传播、
+owner-aware collector、中文 long-phone 默认阈值与 single-vowel 参数，以及仅服务于该实验的
+测试和文档声明。
+
+本 Case 最初试图把 pre-affine MFA source atom/member 当作最终 long-phone 过滤 authority。
+复核结果未达到发布门槛：`U1=0/3`（三个目标缺陷中确认捕获为 0），`U2=0/13`（十三个
+候选过滤中可证明安全为 0）。因此实验整体拒绝，不存在可交付、可启用或可推断的
+source-acoustic authority；旧 shadow receipt 只保留为反例证据，不能作为生产过滤依据。
+
+五个重点样本进一步说明 final display/composite duration 不是 atomic acoustic duration：
+
+| stem | source atoms/member durations | final display | 旧诊断 | 撤回后状态 |
+|---|---|---|---|---|
+| `00006` | `ɕ=0.030s` | `x=0.315s` | `display_affine_overage` | 不过滤 |
+| `00067` | `a˥˩=0.510s`, `j=0.380s` | `ai4=0.890s` | `composite_pinyin_overage` | 不过滤 |
+| `00077` | `a˥˩=0.580s`, `j=0.390s` | `ai4=0.970s` | `composite_pinyin_overage` | 不过滤 |
+| `00159` | `j=0.180s`, `e˥˩=0.720s` | `ie4=0.900s` | `composite_pinyin_overage` | 不过滤 |
+| `00225` | `a˥=0.030s`, `n=0.070s` | `an1=1.165s` | `zero_initial_composite_overage` | 不过滤 |
+
+旧 scanner 另产生 13 个 `composite_source_member_overage` 候选；审核无法证明这些 raw
+member overage 可安全转换为最终 artifact 过滤，故全部归类为 unsafe raw filters：
+
+| stem | 旧候选 source member | duration | 撤回结论 |
+|---|---|---:|---|
+| `00040` | `ɻ` | 0.400s | unsafe；不传播、不过滤 |
+| `00059` | `l` | 0.370s | unsafe；不传播、不过滤 |
+| `00084` | `m` | 0.400s | unsafe；不传播、不过滤 |
+| `00112` | `ʂ` | 0.330s | unsafe；不传播、不过滤 |
+| `00113` | `p` | 0.350s | unsafe；不传播、不过滤 |
+| `00120` | `ɕ` | 0.330s | unsafe；不传播、不过滤 |
+| `00138` | `tɕʰ` | 0.380s | unsafe；不传播、不过滤 |
+| `00192` | `ɕ` | 0.330s | unsafe；不传播、不过滤 |
+| `00199` | `l` | 0.310s | unsafe；不传播、不过滤 |
+| `00252` | `x` | 0.330s | unsafe；不传播、不过滤 |
+| `00256` | `ɕ` | 0.370s | unsafe；不传播、不过滤 |
+| `00272` | `t` | 0.310s | unsafe；不传播、不过滤 |
+| `00298` | `n` | 0.440s | unsafe；不传播、不过滤 |
+
+撤回恢复中文 long consonant/vowel 的 CLI、pipeline serialization 与 config 默认禁用值；
+single-vowel 参数删除。Case 221 的 15ms short-phone 六位小数整数 tick 判断、English
+既有阈值、word/coverage/SP/标点/publication/provenance，以及 breathing physical-frame
+support 均保留。此记录描述的是一次被拒绝的实验及其反例，不构成 shippable
+acoustic-authority claim；未执行 CTC/MFA rerun，也未写入 production r21。
+
+## Case 225: BREATHING 60ms 误读、帧支持与非声学 owner 显示分离
+
+**日期**：2026-08-31
+**涉及文件**：`scripts/ctc_prealign.py`、`scripts/postprocess_textgrids.py`、`README.md`、
+`tests/test_postprocess_geometry.py`、`tests/test_boundary_punctuation_display_regressions.py`
+**状态**：已修复；fresh shadow strict 回放与审计通过
+
+### 问题与真实原因
+
+CTC frame width 固定为 60ms。旧 r21 的 227 个 `BREATHING` 中有 51 个最终时长恰为
+60ms，其中 23 个实际来自 2–3 帧证据被错误压缩为单个 60ms 显示 span；另有 37 个最终
+span 短于其帧支持，1 个与帧支持零重叠。问题不是 CTC 单帧宽度本身，而是旧流程把
+physical frame support 与最终 display/owner 几何混作同一证据：多帧 candidate 可能被
+压成 60ms，显示 owner 也可能未覆盖完整物理支持。相邻 NVV 去重、mapping 选择和
+candidate identity 的宽松路径进一步使这类证据边界不够封闭。
+
+因此，60ms 只有在 `raw_frame_count=1` 且 `frame_limited=true` 时才是完整的帧级模型
+证据；它不证明生理呼吸真实包络恰好是 60ms。当前实现也不声称检测到了完整的生理呼吸
+边界，只保证 CTC 模型帧支持及其发布 owner 的覆盖关系。
+
+### 修复与不变量
+
+实现从持久化 raw/speech frame 坐标严格推导不可变的 `physical frame_support`，其时长
+必须等于 `raw_frame_count * 60ms`。最终 `display_span` 是非声学显示几何，
+`display_is_acoustic_evidence=false`；`owner_required_segments` 与
+`owner_required_span` 则表达 frame support 及 dedup occurrence envelope 必须被最终
+owner 覆盖的要求。显示冲突只允许在保持标签、顺序、物理支持和 owner-required segments
+的前提下 repartition，不得把显示 span 当成声学或生理边界。
+
+`mapping_selection` 现在使用严格 allowlist/schema/outcome/唯一性/轴校验；删除了以
+`candidate_id` 前缀为依据的 fail-open 路径。`nvv-adjacent-deduplication-v1` ledger
+按 occurrence 顺序、数量、envelope 及 frame-support 归属校验，缺失或不一致即
+fail-closed。每个最终 NVV 必须有唯一 `candidate_id`、唯一 mapping、完整 raw/speech/
+forced/adjusted geometry，并同时通过 physical support 和 owner-required containment。
+未知或缺失 `mapping_selection` 在 helper 直调和 publication 路径均不得回退到另一坐标轴；
+`unique_max_forced_raw_overlap` 还必须从持久化 spans 重算并证明 forced/raw overlap 为正、
+forced/speech overlap 非正。缺失 `mapping_key` 不能再由 ordinal-only authority 例外赎回。
+
+### fresh shadow `/tmp/breathing-frame-support-v4-shadow/replay300-strict-v2`
+
+真实 300 条 strict 回放结果为：`300 reports / 300 ok / 0 filtered / 300 TextGrid`。
+共 409 个 NVV candidate，mapping 分布为 `356 label_neighbors / 51 speech_overlap /
+1 raw_overlap / 1 topology`；frame 分布为 `287 / 99 / 18 / 5`（1/2/3/4 帧）。其中
+`227 BREATHING` 来自 156 个 stems。最终恰 60ms 的 BREATHING 为 31 个，全部同时满足
+`raw_frame_count=1 + frame_limited=true`；multi-frame 60ms 为 0。
+
+409/409 个 candidate 均包含 physical support 和 owner-required segments，且
+`display_is_acoustic_evidence=false`。其中 252 个有 NVV 报告并为 `verified`，48 个无
+NVV 报告并为 `not_applicable`；后者是正确状态，失败状态为 0。五层审计为 300/300，
+nonleading SP 为 0，publication contract 为 300/300 `verified`。记录 `00137` 的
+dedup ledger 与 `00283` 的 axis/topology canaries 均通过。
+
+本轮定向测试为 211 passed，全套回归为 882 passed；`compileall` 与 `git diff --check`
+通过。生产树只读内容 hash 为
+`569edc4c58472fefc71d3805b35e1475ada408d8e88007312282507b0720f45a`。

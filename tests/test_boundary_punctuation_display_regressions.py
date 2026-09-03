@@ -57,6 +57,35 @@ def _clone_tier(tier: post.Tier) -> post.Tier:
     )
 
 
+def _fallback_display_frame_row():
+    return {
+        "candidate_kind": "nvv",
+        "candidate_id": "fallback-nvv-0",
+        "word": "BREATHING",
+        "start_s": 0.39,
+        "end_s": 0.45,
+        "raw_start_s": 0.66,
+        "raw_end_s": 0.72,
+        "raw_start_frame": 11,
+        "raw_end_frame": 12,
+        "raw_frame_count": 1,
+        "speech_start_frame": 7,
+        "speech_end_frame": 8,
+        "speech_frame_count": 1,
+        "frame_ms": 60,
+        "raw_span": [0.66, 0.72],
+        "speech_span": [0.42, 0.48],
+        "forced_span": [0.39, 0.45],
+        "adjusted_span": [0.39, 0.45],
+        "provenance_schema": "nvasr-candidate-provenance-v1",
+        "mapping_basis": "raw_ctc_label_neighbors_forced_overlap-v2",
+        "mapping_outcome": "unique",
+        "mapping_selection": "label_neighbors",
+        "mapping_key": {"left_lexical_ordinal": 0,
+                        "right_lexical_ordinal": 1},
+    }
+
+
 def _fixture_52697() -> GeometryFixture:
     # The reference ends at 欢.  CTC's extra period reaches the audio end,
     # while the explicit tail silence remains the axis-closing display owner.
@@ -1342,6 +1371,44 @@ def test_repeated_identity_inside_one_anchor_interval_fails_closed():
     assert not any(item["anchor_kind"] ==
                    "bounded_repeated_non_cjk_identity"
                    for item in projection["mapped"])
+
+
+def test_fallback_punctuation_owners_survive_physical_nvv_owner_carving():
+    # Fallback surface punctuation is display evidence only.  A frame-backed
+    # NVV may carve the neighbouring display block, but may not consume or
+    # relabel either punctuation owner.
+    source = "你，Breathing，好"
+    surface = post._fallback_punctuation_surface_ledger(source)
+    assert [item["label"] for item in surface["punctuation"]] == ["，", "，"]
+
+    words = post.Tier("words", 0.0, 1.0, [
+        post.Interval(0.0, 0.30, "ni3"),
+        post.Interval(0.30, 0.35, "，"),
+        post.Interval(0.35, 0.38, "<BREATHING>"),
+        post.Interval(0.38, 0.50, "，"),
+        post.Interval(0.50, 1.0, "hao3"),
+    ])
+    nvv = _fallback_display_frame_row()
+    ctc = [
+        {"type": "word", "word": "ni3", "start_s": 0.0, "end_s": 0.30},
+        {"type": "punct", "word": "，", "start_s": 0.30, "end_s": 0.35},
+        nvv,
+        {"type": "punct", "word": "，", "start_s": 0.38, "end_s": 0.50},
+        {"type": "word", "word": "hao3", "start_s": 0.50, "end_s": 1.0},
+    ]
+    result = post._contain_nvasr_frame_support(
+        words, ctc, wav_duration_s=1.0)
+
+    assert result["status"] == "verified"
+    carved = result["_contained_tier"]
+    assert [iv.text for iv in carved.intervals] == [
+        "ni3", "，", "<BREATHING>", "，", "hao3"]
+    assert [iv.text for iv in carved.intervals if post.is_punct(iv.text)] == [
+        item["label"] for item in surface["punctuation"]]
+    owner = carved.intervals[2]
+    assert owner.xmin <= 0.39 + 1e-9
+    assert owner.xmax >= 0.45 - 1e-9
+    assert result["repartitioned_intervals"] >= 2
 
 
 @pytest.mark.parametrize(

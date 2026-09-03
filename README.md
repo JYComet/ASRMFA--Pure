@@ -446,13 +446,25 @@ NVV (如 LAUGHTER, BREATHING) 后的省略号 `...` 如果包含可听能量 (>=
 
 这些标签在 MFA 词典中作为自指词条 (self-referential，如 `BREATHING: B R EA TH I NG`)，不在 MFA 声学模型中，因此 `_snap_to_ctc` 会直接用 CTC 锚点时间戳。
 
+### 如何理解 BREATHING 的 60ms 与报告字段
+
+CTC 的单帧宽度是 60ms。报告中的 60ms 只有在
+`raw_frame_count=1` 且 `frame_limited=true` 时，才表示完整的一帧级模型支持；它不证明
+生理呼吸的真实包络恰好为 60ms，也不表示管线检测到了完整的生理呼吸边界。核读 NVV
+报告时，以 `frame_support_span` 和 `raw_frame_count` 判断模型帧支持，以
+`owner_required_segments`/`owner_required_span` 检查最终 owner 是否覆盖所需证据；
+`display_span` 是非声学显示几何，`display_is_acoustic_evidence=false` 必须保持不变。
+`mapping_selection`、`candidate_id` 与 `nvv_deduplication` 用于确认唯一映射和相邻 NVV
+去重 provenance；字段缺失、未知或不一致时应按 rejected/fail-closed 理解，而不是把
+显示时长当成声学或生理边界。
+
 ## 质检与过滤
 
 后处理阶段对每个 TextGrid 做自动质检，不通过的放入 `filtered/`:
 
 | 规则 | 默认阈值 | 说明 |
 |------|----------|------|
-| `short_phone` | < 0.005s | 音素过短 (对齐失败) |
+| `short_phone` | < 0.015s | 中文音素过短 (对齐失败) |
 | `long_word` | > 1.5s | 音节过长 (可能漏标点) |
 | `word_too_short` | < 0.02s | 词过短 (错位) |
 | `word_in_silence` | 能量 < 噪声底 x 2.0 | 词标在静音区域 |

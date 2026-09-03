@@ -65,7 +65,6 @@ from english_units import (
     resolve_processed_english_token,
     validate_processed_english_token_binding,
 )
-
 SHORT_PAUSE_PUNCT = set("，、：；,")
 LONG_PAUSE_PUNCT = set("。？！…!?.")
 SHORT_PAUSE_TOKEN = "[PAUSE]"
@@ -88,6 +87,8 @@ AXIS_EPS = 0.003
 CTC_FRAME_MS = 60
 CTC_QUERY_FRAMES = 4
 CTC_FRAME_SUPPORT_SCHEMA = "ctc-frame-support-v1"
+_FRAME_SUPPORT_EPS = 1e-6
+_FRAME_SUPPORT_DISPLAY_MIN_S = 1e-6
 _EVIDENCE_REPAIR_FLOOR_S = 0.030
 _EVIDENCE_REPAIR_SCHEMA = "evidence-constrained-repair-v1"
 _UNKNOWN_REPAIR_PROOF_SCHEMA = "mfa-unknown-recovery-proof-v1"
@@ -815,8 +816,100 @@ def _ctc_authority_entries(words_tier: Tier | None) -> list[dict] | None:
     return entries if isinstance(entries, list) else None
 
 
-def _nvasr_frame_support(row: dict, *, wav_duration_s: float | None = None
-                         ) -> tuple[list[float] | None, str | None, bool, list[str]]:
+def _nvasr_nvv_identity(value: object) -> str:
+    return str(value or "").strip().strip("<>").strip("[]").upper().replace(
+        " ", "-")
+
+
+def _nvasr_valid_span(value: object) -> list[float] | None:
+    if (not isinstance(value, (list, tuple)) or len(value) != 2
+            or any(isinstance(item, bool)
+                   or not isinstance(item, (int, float))
+                   or not math.isfinite(float(item)) for item in value)):
+        return None
+    start, end = float(value[0]), float(value[1])
+    if start < 0 or end <= start:
+        return None
+    return [start, end]
+
+
+def _nvasr_owner_requirements(
+        row: dict, frame_support: list[float] | None,
+        *, frame_ms: int = CTC_FRAME_MS) -> tuple[
+            list[list[float]] | None, list[float] | None,
+            list[list[float]] | None, list[str]]:
+    """Validate the dedup ledger and derive the protected owner envelope."""
+    errors: list[str] = []
+    if frame_support is None:
+        return None, None, None, errors
+    ledger = row.get("nvv_deduplication")
+    if ledger is None:
+        forced = _nvasr_valid_span(row.get("forced_span"))
+        if forced is None:
+            errors.append("forced_span_malformed")
+            return None, None, None, errors
+        if (forced[0] < frame_support[0] - _FRAME_SUPPORT_EPS
+                or forced[1] > frame_support[1] + _FRAME_SUPPORT_EPS):
+            errors.append("forced_span_outside_selected_support")
+            return None, None, None, errors
+        return [list(frame_support)], list(frame_support), None, errors
+
+    if not isinstance(ledger, dict):
+        errors.append("dedup_ledger_malformed")
+        return None, None, None, errors
+    if ledger.get("schema") != "nvv-adjacent-deduplication-v1":
+        errors.append("dedup_schema_mismatch")
+    if _nvasr_nvv_identity(ledger.get("label")) != _nvasr_nvv_identity(
+            row.get("word")):
+        errors.append("dedup_label_mismatch")
+    count = ledger.get("occurrence_count")
+    spans_value = ledger.get("forced_occurrence_spans")
+    if (not isinstance(count, int) or isinstance(count, bool) or count < 2):
+        errors.append("dedup_occurrence_count_invalid")
+    if not isinstance(spans_value, list):
+        errors.append("dedup_occurrence_spans_malformed")
+        spans_value = []
+    if isinstance(count, int) and not isinstance(count, bool) \
+            and len(spans_value) != count:
+        errors.append("dedup_occurrence_count_mismatch")
+    spans: list[list[float]] = []
+    for index, value in enumerate(spans_value):
+        span = _nvasr_valid_span(value)
+        if span is None:
+            errors.append(f"dedup_occurrence_span_malformed:{index}")
+        else:
+            spans.append(span)
+    if len(spans) == len(spans_value):
+        for index, (left, right) in enumerate(zip(spans, spans[1:])):
+            if right[0] < left[0] - _FRAME_SUPPORT_EPS:
+                errors.append(f"dedup_occurrence_order_invalid:{index}")
+            if right[0] < left[1] - _FRAME_SUPPORT_EPS:
+                errors.append(f"dedup_occurrence_overlap:{index}")
+    forced = _nvasr_valid_span(row.get("forced_span"))
+    if forced is None:
+        errors.append("forced_span_malformed")
+    elif spans:
+        envelope = [spans[0][0], spans[-1][1]]
+        if any(not math.isclose(forced[pos], envelope[pos], abs_tol=1e-9)
+               for pos in range(2)):
+            errors.append("dedup_forced_span_not_occurrence_envelope")
+    containing = [span for span in spans
+                  if span[0] <= frame_support[0] + _FRAME_SUPPORT_EPS
+                  and span[1] >= frame_support[1] - _FRAME_SUPPORT_EPS]
+    if len(containing) != 1:
+        errors.append("dedup_frame_support_occurrence_binding_invalid")
+    if errors:
+        return None, None, spans or None, errors
+    required = [list(frame_support), *[list(span) for span in spans]]
+    owner_span = [min(span[0] for span in required),
+                  max(span[1] for span in required)]
+    return required, owner_span, spans, errors
+
+
+def _nvasr_frame_support(
+        row: dict, *, wav_duration_s: float | None = None,
+        validate_forced: bool = False, require_mapping: bool = False
+        ) -> tuple[list[float] | None, str | None, bool, list[str]]:
     """Derive immutable physical support from the persisted CTC frame row.
 
     ``raw_span`` lives on the encoder axis.  The speech-axis support is the
@@ -890,9 +983,7 @@ def _nvasr_frame_support(row: dict, *, wav_duration_s: float | None = None
         reasons.append("speech_frame_query_offset_mismatch")
 
     def valid_span(value: object) -> bool:
-        return (isinstance(value, (list, tuple)) and len(value) == 2
-                and all(finite(item) for item in value)
-                and 0 <= float(value[0]) < float(value[1]))
+        return _nvasr_valid_span(value) is not None
 
     if not valid_span(raw_span):
         reasons.append("raw_span_malformed")
@@ -902,33 +993,52 @@ def _nvasr_frame_support(row: dict, *, wav_duration_s: float | None = None
         reasons.append("forced_span_malformed")
     if not valid_span(adjusted_span):
         reasons.append("adjusted_span_malformed")
+    mapping_selection = row.get("mapping_selection")
+
+    if (require_mapping
+            and mapping_selection == "unique_max_forced_speech_overlap"
+            and valid_span(forced_span) and valid_span(speech_span)):
+        expected_overlap = max(
+            0.0,
+            min(float(forced_span[1]), float(speech_span[1]))
+            - max(float(forced_span[0]), float(speech_span[0])),
+        )
+        overlap_score = row.get("mapping_forced_speech_overlap_s")
+        if (not finite(overlap_score)
+                or not math.isclose(float(overlap_score), expected_overlap,
+                                     abs_tol=1e-6)):
+            reasons.append("mapping_speech_overlap_score_mismatch")
 
     if valid_span(raw_span):
-        expected_raw = [float(raw_start_frame) * CTC_FRAME_MS / 1000.0,
-                        float(raw_end_frame) * CTC_FRAME_MS / 1000.0]
-        if (not integer(raw_start_frame) or not integer(raw_end_frame)
-                or any(not math.isclose(float(raw_span[index]), expected,
-                                        abs_tol=1e-9)
-                       for index, expected in enumerate(expected_raw))):
+        if not integer(raw_start_frame) or not integer(raw_end_frame):
             reasons.append("raw_span_frame_binding_invalid")
-        elif not math.isclose(
-                float(raw_span[1]) - float(raw_span[0]),
-                float(raw_frame_count) * CTC_FRAME_MS / 1000.0,
-                abs_tol=1e-9):
-            reasons.append("raw_span_duration_mismatch")
+        else:
+            expected_raw = [float(raw_start_frame) * CTC_FRAME_MS / 1000.0,
+                            float(raw_end_frame) * CTC_FRAME_MS / 1000.0]
+            if any(not math.isclose(float(raw_span[index]), expected,
+                                    abs_tol=1e-9)
+                   for index, expected in enumerate(expected_raw)):
+                reasons.append("raw_span_frame_binding_invalid")
+            elif integer(raw_frame_count) and not math.isclose(
+                    float(raw_span[1]) - float(raw_span[0]),
+                    float(raw_frame_count) * CTC_FRAME_MS / 1000.0,
+                    abs_tol=1e-9):
+                reasons.append("raw_span_duration_mismatch")
     if valid_span(speech_span):
-        expected_speech = [float(speech_start_frame) * CTC_FRAME_MS / 1000.0,
-                           float(speech_end_frame) * CTC_FRAME_MS / 1000.0]
-        if (not integer(speech_start_frame) or not integer(speech_end_frame)
-                or any(not math.isclose(float(speech_span[index]), expected,
-                                        abs_tol=1e-9)
-                       for index, expected in enumerate(expected_speech))):
+        if not integer(speech_start_frame) or not integer(speech_end_frame):
             reasons.append("speech_span_frame_binding_invalid")
-        elif not math.isclose(
-                float(speech_span[1]) - float(speech_span[0]),
-                float(speech_frame_count) * CTC_FRAME_MS / 1000.0,
-                abs_tol=1e-9):
-            reasons.append("speech_span_duration_mismatch")
+        else:
+            expected_speech = [float(speech_start_frame) * CTC_FRAME_MS / 1000.0,
+                               float(speech_end_frame) * CTC_FRAME_MS / 1000.0]
+            if any(not math.isclose(float(speech_span[index]), expected,
+                                    abs_tol=1e-9)
+                   for index, expected in enumerate(expected_speech)):
+                reasons.append("speech_span_frame_binding_invalid")
+            elif integer(speech_frame_count) and not math.isclose(
+                    float(speech_span[1]) - float(speech_span[0]),
+                    float(speech_frame_count) * CTC_FRAME_MS / 1000.0,
+                    abs_tol=1e-9):
+                reasons.append("speech_span_duration_mismatch")
     if (valid_span(adjusted_span) and isinstance(row.get("start_s"), (int, float))
             and isinstance(row.get("end_s"), (int, float))):
         if any(not math.isclose(float(adjusted_span[index]), float(value),
@@ -939,36 +1049,100 @@ def _nvasr_frame_support(row: dict, *, wav_duration_s: float | None = None
     support: list[float] | None = None
     source: str | None = None
     frame_limited = raw_frame_count == 1
+    valid_selections = {
+        "label_neighbors", "unique_max_forced_speech_overlap",
+        "unique_max_forced_raw_overlap", "unique_punctuation_topology_bound",
+    }
+    if mapping_selection not in valid_selections:
+        reasons.append("mapping_selection_unknown")
+    if require_mapping:
+        if row.get("provenance_schema") != NVASR_CANDIDATE_PROVENANCE_SCHEMA:
+            reasons.append("mapping_provenance_invalid")
+        if (row.get("mapping_basis") != NVASR_MAPPING_BASIS
+                or row.get("mapping_outcome") != "unique"):
+            reasons.append("mapping_outcome_invalid")
+        if mapping_selection == "unique_max_forced_speech_overlap":
+            overlap_score = row.get("mapping_forced_speech_overlap_s")
+            if (not finite(overlap_score) or float(overlap_score) <= 0):
+                reasons.append("mapping_speech_overlap_score_invalid")
+
+    if (mapping_selection == "unique_max_forced_raw_overlap"
+            and valid_span(forced_span) and valid_span(raw_span)
+            and valid_span(speech_span)):
+        forced_raw_overlap = (
+            min(float(forced_span[1]), float(raw_span[1]))
+            - max(float(forced_span[0]), float(raw_span[0])))
+        if forced_raw_overlap <= 1e-9:
+            reasons.append(
+                "mapping_raw_selection_forced_raw_overlap_nonpositive")
+        forced_speech_overlap = (
+            min(float(forced_span[1]), float(speech_span[1]))
+            - max(float(forced_span[0]), float(speech_span[0])))
+        if forced_speech_overlap > 1e-9:
+            reasons.append(
+                "mapping_raw_selection_forced_speech_overlap_positive")
+
     if (not reasons and valid_span(speech_span)
             and integer(raw_frame_count)):
-        half_frame_s = CTC_FRAME_MS / 2000.0
-        unclamped = [float(speech_span[0]) - half_frame_s,
-                     float(speech_span[1]) - half_frame_s]
+        if mapping_selection == "unique_max_forced_raw_overlap":
+            half_frame_s = CTC_FRAME_MS / 2000.0
+            selected = [float(raw_span[0]) - half_frame_s,
+                        float(raw_span[1]) - half_frame_s]
+            source = "raw_ctc_frame_span_centered"
+        elif mapping_selection == "unique_punctuation_topology_bound":
+            selected = [float(forced_span[0]), float(forced_span[1])]
+            source = "forced_span_punctuation_topology"
+        else:
+            half_frame_s = CTC_FRAME_MS / 2000.0
+            selected = [float(speech_span[0]) - half_frame_s,
+                        float(speech_span[1]) - half_frame_s]
+            source = "raw_ctc_frames_shifted_to_speech_axis"
         expected_duration = raw_frame_count * CTC_FRAME_MS / 1000.0
-        if not math.isclose(unclamped[1] - unclamped[0], expected_duration,
+        if not math.isclose(selected[1] - selected[0], expected_duration,
                             abs_tol=1e-9):
             reasons.append("frame_support_duration_mismatch")
+        if mapping_selection == "unique_punctuation_topology_bound":
+            if raw_frame_count != 1:
+                reasons.append("topology_frame_count_invalid")
+            if not math.isclose(float(forced_span[1]) - float(forced_span[0]),
+                                CTC_FRAME_MS / 1000.0, abs_tol=1e-9):
+                reasons.append("topology_duration_invalid")
+        if require_mapping:
+            if selected[0] < -_FRAME_SUPPORT_EPS:
+                reasons.append("frame_support_out_of_axis")
+            if wav_duration_s is not None:
+                if (not finite(wav_duration_s)
+                        or float(wav_duration_s) <= 0):
+                    reasons.append("wav_axis_malformed")
+                elif selected[1] > float(wav_duration_s) + _FRAME_SUPPORT_EPS:
+                    reasons.append("frame_support_out_of_axis")
+            if not reasons:
+                support = selected
         elif wav_duration_s is not None:
             if (not finite(wav_duration_s) or float(wav_duration_s) <= 0):
                 reasons.append("wav_axis_malformed")
             else:
                 wav_end = float(wav_duration_s)
-                support = [max(0.0, unclamped[0]),
-                           min(wav_end, unclamped[1])]
-                source = ("raw_ctc_frames_shifted_to_speech_axis_wav_axis_clamp"
-                          if support != unclamped else
-                          "raw_ctc_frames_shifted_to_speech_axis")
+                support = [max(0.0, selected[0]), min(wav_end, selected[1])]
+                source = (f"{source}_wav_axis_clamp" if support != selected
+                          else source)
                 if support[1] <= support[0] + AXIS_EPS:
                     reasons.append("frame_support_out_of_wav_axis")
                     support = None
                     source = None
         else:
-            support = unclamped
-            source = "raw_ctc_frames_shifted_to_speech_axis"
+            support = selected
             if support[0] < -AXIS_EPS:
                 reasons.append("frame_support_before_wav_axis_without_clamp")
                 support = None
                 source = None
+    if (validate_forced or require_mapping) and support is not None:
+        _required, _owner_span, _dedup_spans, owner_reasons = (
+            _nvasr_owner_requirements(row, support))
+        reasons.extend(owner_reasons)
+        if owner_reasons:
+            support = None
+            source = None
     return support, source, frame_limited, list(dict.fromkeys(reasons))
 
 
@@ -977,10 +1151,12 @@ def _contain_nvasr_frame_support(
         wav_duration_s: float | None = None) -> dict:
     """Contain every final NVV owner around its physical frame support.
 
-    Expansion is allowed only into an unowned gap.  If another final owner
-    intersects the protected support, this function leaves geometry intact
-    and returns a dedicated rejection; later publication filtering then
-    prevents a misleading 60 ms (or otherwise truncated) NVV from escaping.
+    Persisted frame support outranks the neighbouring words-tier display
+    geometry.  A support/display collision is reconciled transactionally by
+    repartitioning only the affected ordered display block; labels, interval
+    count, and the physical support itself never change.  Only malformed or
+    ambiguous mapping, incompatible physical supports, or insufficient axis
+    capacity reject publication.
     """
     rows = [row for row in (ctc_tokens or [])
             if isinstance(row, dict) and row.get("candidate_kind") == "nvv"]
@@ -990,7 +1166,8 @@ def _contain_nvasr_frame_support(
     result = {
         "schema": CTC_FRAME_SUPPORT_SCHEMA,
         "status": "not_applicable" if not rows else "rejected",
-        "reasons": [], "changed": 0, "candidates": [],
+        "reasons": [], "changed": 0, "repartitioned_intervals": 0,
+        "reconciliations": [], "candidates": [],
     }
     if not rows:
         if final_rows:
@@ -998,7 +1175,11 @@ def _contain_nvasr_frame_support(
             result["candidates"] = [{
                 "frame_support_span": None,
                 "frame_support_source": "missing",
+                "owner_required_segments": [],
+                "owner_required_span": None,
+                "dedup_forced_occurrence_spans": None,
                 "final_contains_frame_support": False,
+                "final_contains_owner_required_segments": False,
                 "frame_limited": False,
             } for _ in final_rows]
             result["status"] = "rejected"
@@ -1010,70 +1191,346 @@ def _contain_nvasr_frame_support(
     intervals = list(words_tier.intervals)
     final_indices = [index for index, interval in enumerate(intervals)
                      if is_nvv_token(interval.text.strip())]
-    supports: list[tuple[int, list[float]]] = []
+
+    # Reconstruct the persisted neighbour mapping on the same compact
+    # non-NVV lexical axis used by the producer.  Object identity is safe
+    # here because ``rows`` is a filtered view of this exact in-memory list.
+    lexical_ctc_rows: list[dict] = []
+    for row in ctc_tokens or []:
+        if not isinstance(row, dict):
+            continue
+        text = str(row.get("word", row.get("text", ""))).strip()
+        if text and not is_silence(text) and not is_punct(text):
+            lexical_ctc_rows.append(row)
+    ordinary_count = sum(
+        1 for row in lexical_ctc_rows
+        if row.get("candidate_kind") != "nvv")
+    ordinary_before = 0
+    expected_neighbours: dict[int, tuple[int | None, int | None]] = {}
+    ctc_ordinals: dict[int, int] = {}
+    for ordinal, row in enumerate(lexical_ctc_rows):
+        ctc_ordinals[id(row)] = ordinal
+        if row.get("candidate_kind") == "nvv":
+            expected_neighbours[id(row)] = (
+                ordinary_before - 1 if ordinary_before else None,
+                ordinary_before if ordinary_before < ordinary_count else None,
+            )
+        else:
+            ordinary_before += 1
+
+    lexical_indices = [
+        index for index, interval in enumerate(intervals)
+        if interval.text.strip() and not is_silence(interval.text)
+        and not is_punct(interval.text)]
+    lexical_ordinals = {index: ordinal
+                        for ordinal, index in enumerate(lexical_indices)}
+    authority_entries = _ctc_authority_entries(words_tier)
+    candidate_ids: set[str] = set()
+    supports: list[dict] = []
     for index, row in enumerate(rows):
         support, source, frame_limited, reasons = _nvasr_frame_support(
-            row, wav_duration_s=wav_duration_s)
+            row, wav_duration_s=wav_duration_s, require_mapping=True)
+        required_segments, owner_required_span, dedup_spans, owner_reasons = (
+            _nvasr_owner_requirements(row, support))
+        reasons = list(reasons) + list(owner_reasons)
         item = {
             "candidate_id": row.get("candidate_id"),
             "label": row.get("word"),
+            "mapping_selection": row.get("mapping_selection"),
             "frame_support_span": support,
             "frame_support_source": source or "rejected",
+            "owner_required_segments": required_segments or [],
+            "owner_required_span": owner_required_span,
+            "dedup_forced_occurrence_spans": dedup_spans,
             "final_contains_frame_support": False,
+            "final_contains_owner_required_segments": False,
             "frame_limited": frame_limited,
         }
         result["candidates"].append(item)
         for reason in reasons:
             result["reasons"].append(f"{reason}:{index}")
+            if reason == "frame_support_out_of_axis":
+                result["reasons"].append(
+                    f"frame_support_out_of_textgrid_axis:{index}")
+
+        candidate_id = row.get("candidate_id")
+        if (not isinstance(candidate_id, str) or not candidate_id
+                or candidate_id in candidate_ids):
+            result["reasons"].append(
+                f"frame_support_mapping_identity_invalid:{index}")
+        else:
+            candidate_ids.add(candidate_id)
+        if row.get("provenance_schema") != NVASR_CANDIDATE_PROVENANCE_SCHEMA:
+            result["reasons"].append(
+                f"frame_support_mapping_schema_mismatch:{index}")
+        if (row.get("mapping_basis") != NVASR_MAPPING_BASIS
+                or row.get("mapping_outcome") != "unique"):
+            result["reasons"].append(
+                f"frame_support_mapping_not_unique:{index}")
+        mapping_key = row.get("mapping_key")
+        expected = expected_neighbours.get(id(row))
+        if not isinstance(mapping_key, dict) or expected is None:
+            result["reasons"].append(
+                f"frame_support_mapping_key_malformed:{index}")
+        else:
+            neighbours = (mapping_key.get("left_lexical_ordinal"),
+                          mapping_key.get("right_lexical_ordinal"))
+            if (neighbours != expected or any(
+                    value is not None
+                    and (not isinstance(value, int) or isinstance(value, bool)
+                         or value < 0)
+                    for value in neighbours)):
+                result["reasons"].append(
+                    f"frame_support_mapping_key_mismatch:{index}")
+
+        owner_index = final_indices[index]
+        owner = intervals[owner_index]
+        if _nvasr_nvv_identity(owner.text) != _nvasr_nvv_identity(
+                row.get("word")):
+            result["reasons"].append(
+                f"frame_support_mapping_label_mismatch:{index}")
+        ctc_ordinal = ctc_ordinals.get(id(row))
+        owner_lexical_ordinal = lexical_ordinals.get(owner_index)
+        if authority_entries is not None:
+            authority = (
+                authority_entries[owner_lexical_ordinal]
+                if isinstance(owner_lexical_ordinal, int)
+                and owner_lexical_ordinal < len(authority_entries)
+                and isinstance(authority_entries[owner_lexical_ordinal], dict)
+                else None)
+            authority_ordinal = (
+                authority.get("ctc_lexical_ordinal")
+                if isinstance(authority, dict) else None)
+            authority_identity = (
+                _nvasr_nvv_identity(authority.get(
+                    "text", authority.get("word", "")))
+                if isinstance(authority, dict) else "")
+            if (not isinstance(ctc_ordinal, int)
+                    or authority_ordinal != ctc_ordinal
+                    or authority_identity != _nvasr_nvv_identity(
+                        row.get("word"))):
+                result["reasons"].append(
+                    f"frame_support_authority_mapping_conflict:{index}")
         if support is not None and not reasons:
-            supports.append((index, support))
+            supports.append({
+                "candidate_index": index,
+                "owner_index": owner_index,
+                "support": support,
+                "source": source,
+                "frame_limited": frame_limited,
+                "owner_required_segments": required_segments,
+                "owner_required_span": owner_required_span,
+            })
 
     if result["reasons"]:
         result["reasons"] = list(dict.fromkeys(result["reasons"]))
         return result
 
-    for candidate_index, support in supports:
-        owner_index = final_indices[candidate_index]
-        owner = intervals[owner_index]
-        contains = (owner.xmin <= support[0] + AXIS_EPS
-                    and owner.xmax >= support[1] - AXIS_EPS)
-        if contains:
-            result["candidates"][candidate_index][
-                "final_contains_frame_support"] = True
-            continue
-        conflicts = []
-        for index, interval in enumerate(intervals):
-            if index == owner_index or interval.xmax <= interval.xmin:
-                continue
-            overlap = min(interval.xmax, support[1]) - max(interval.xmin, support[0])
-            if overlap > AXIS_EPS:
-                conflicts.append({"index": index, "label": interval.text.strip(),
-                                  "overlap_s": round(overlap, 6)})
-        if conflicts:
-            result["reasons"].append(
-                f"frame_support_owner_conflict:{candidate_index}")
-            result["candidates"][candidate_index]["owner_conflicts"] = conflicts
-            continue
-        if (support[0] < words_tier.xmin - AXIS_EPS
-                or support[1] > words_tier.xmax + AXIS_EPS):
+    # Attributable supports are immutable and must retain the same lexical
+    # order.  Positive overlap between two such supports cannot be repaired
+    # by moving display ownership and is therefore a dedicated hard failure.
+    for position, current in enumerate(supports):
+        candidate_index = current["candidate_index"]
+        support = current["support"]
+        if (support[0] < words_tier.xmin - _FRAME_SUPPORT_EPS
+                or support[1] > words_tier.xmax + _FRAME_SUPPORT_EPS):
             result["reasons"].append(
                 f"frame_support_out_of_textgrid_axis:{candidate_index}")
-            continue
-        intervals[owner_index] = Interval(
-            min(owner.xmin, support[0]), max(owner.xmax, support[1]), owner.text)
+        if position:
+            previous = supports[position - 1]
+            previous_support = previous["support"]
+            if support[0] < previous_support[0] - _FRAME_SUPPORT_EPS:
+                result["reasons"].append(
+                    "frame_support_physical_order_conflict:"
+                    f"{previous['candidate_index']}:{candidate_index}")
+            overlap = (min(previous_support[1], support[1])
+                       - max(previous_support[0], support[0]))
+            if overlap > _FRAME_SUPPORT_EPS:
+                result["reasons"].append(
+                    "frame_support_physical_conflict:"
+                    f"{previous['candidate_index']}:{candidate_index}")
+    if result["reasons"]:
+        result["reasons"] = list(dict.fromkeys(result["reasons"]))
+        return result
+
+    original = list(intervals)
+    tentative = list(intervals)
+    # Repartitioning must preserve the complete owner envelope.  Physical
+    # ordering/conflict checks above intentionally remain frame-support-only.
+    protected = {entry["owner_index"]: entry["owner_required_span"]
+                 for entry in supports}
+    expanded: set[int] = set()
+    for entry in supports:
+        candidate_index = entry["candidate_index"]
+        owner_index = entry["owner_index"]
+        support = entry["owner_required_span"]
+        owner = tentative[owner_index]
+        reconciled = Interval(min(owner.xmin, support[0]),
+                              max(owner.xmax, support[1]), owner.text)
+        if (not math.isclose(owner.xmin, reconciled.xmin, abs_tol=1e-12)
+                or not math.isclose(owner.xmax, reconciled.xmax,
+                                    abs_tol=1e-12)):
+            expanded.add(owner_index)
+            result["changed"] += 1
+        tentative[owner_index] = reconciled
         result["candidates"][candidate_index][
             "final_contains_frame_support"] = True
-        result["changed"] += 1
+        result["candidates"][candidate_index][
+            "final_contains_owner_required_segments"] = True
 
-    result["reasons"] = list(dict.fromkeys(result["reasons"]))
-    if result["changed"]:
+    # A widened owner can cross more than its immediate neighbour.  Form
+    # complete index ranges from every resulting collision so intervening
+    # display labels can be squeezed/repositioned without being deleted.
+    conflict_ranges: list[tuple[int, int]] = []
+    for left in range(len(tentative)):
+        for right in range(left + 1, len(tentative)):
+            if left not in expanded and right not in expanded:
+                continue
+            overlap = (min(tentative[left].xmax, tentative[right].xmax)
+                       - max(tentative[left].xmin, tentative[right].xmin))
+            if overlap > _FRAME_SUPPORT_EPS:
+                conflict_ranges.append((left, right))
+
+    components: list[list[int]] = []
+    for left, right in sorted(conflict_ranges):
+        if not components or left > components[-1][1]:
+            components.append([left, right])
+        else:
+            components[-1][1] = max(components[-1][1], right)
+
+    for left, right in components:
+        block = tentative[left:right + 1]
+        outer_start = min(interval.xmin for interval in block)
+        outer_end = max(interval.xmax for interval in block)
+        interval_count = right - left + 1
+        if (outer_start < words_tier.xmin - _FRAME_SUPPORT_EPS
+                or outer_end > words_tier.xmax + _FRAME_SUPPORT_EPS
+                or (outer_end - outer_start
+                    < interval_count * _FRAME_SUPPORT_DISPLAY_MIN_S
+                    - 1e-12)):
+            result["reasons"].append(
+                f"frame_support_axis_capacity_conflict:{left}:{right}")
+            continue
+
+        boundary_count = interval_count - 1
+        desired: list[float] = []
+        lower: list[float] = []
+        upper: list[float] = []
+        for offset in range(boundary_count):
+            global_index = left + offset
+            desired.append((original[global_index].xmax
+                            + original[global_index + 1].xmin) / 2.0)
+            support_ends = [
+                support[1] for owner_index, support in protected.items()
+                if left <= owner_index <= global_index]
+            support_starts = [
+                support[0] for owner_index, support in protected.items()
+                if global_index < owner_index <= right]
+            lower.append(max(
+                [outer_start
+                 + (offset + 1) * _FRAME_SUPPORT_DISPLAY_MIN_S]
+                + support_ends))
+            upper.append(min(
+                [outer_end
+                 - (boundary_count - offset) * _FRAME_SUPPORT_DISPLAY_MIN_S]
+                + support_starts))
+
+        earliest: list[float] = []
+        for offset, value in enumerate(lower):
+            if offset:
+                value = max(
+                    value,
+                    earliest[-1] + _FRAME_SUPPORT_DISPLAY_MIN_S)
+            earliest.append(value)
+        latest = [0.0] * boundary_count
+        for offset in range(boundary_count - 1, -1, -1):
+            value = upper[offset]
+            if offset < boundary_count - 1:
+                value = min(
+                    value,
+                    latest[offset + 1] - _FRAME_SUPPORT_DISPLAY_MIN_S)
+            latest[offset] = value
+        if any(earliest[offset] > latest[offset] + 1e-12
+               for offset in range(boundary_count)):
+            result["reasons"].append(
+                f"frame_support_axis_capacity_conflict:{left}:{right}")
+            continue
+
+        boundaries: list[float] = []
+        for offset in range(boundary_count):
+            minimum = earliest[offset]
+            if boundaries:
+                minimum = max(
+                    minimum,
+                    boundaries[-1] + _FRAME_SUPPORT_DISPLAY_MIN_S)
+            boundary = min(max(desired[offset], minimum), latest[offset])
+            boundaries.append(boundary)
+        points = [outer_start, *boundaries, outer_end]
+        for offset, interval in enumerate(block):
+            tentative[left + offset] = Interval(
+                points[offset], points[offset + 1], interval.text)
+
+    if result["reasons"]:
+        result["reasons"] = list(dict.fromkeys(result["reasons"]))
+        result["changed"] = 0
+        for item in result["candidates"]:
+            item["final_contains_frame_support"] = False
+            item["final_contains_owner_required_segments"] = False
+        return result
+
+    for index, interval in enumerate(tentative):
+        if (not math.isfinite(interval.xmin) or not math.isfinite(interval.xmax)
+                or interval.xmax - interval.xmin
+                < _FRAME_SUPPORT_DISPLAY_MIN_S - 1e-12):
+            result["reasons"].append(
+                f"frame_support_axis_capacity_conflict:{index}:{index}")
+        if (index and tentative[index - 1].xmax
+                > interval.xmin + _FRAME_SUPPORT_EPS):
+            result["reasons"].append(
+                f"frame_support_axis_capacity_conflict:{index - 1}:{index}")
+    for entry in supports:
+        owner = tentative[entry["owner_index"]]
+        support = entry["support"]
+        if (owner.xmin > support[0] + _FRAME_SUPPORT_EPS
+                or owner.xmax < support[1] - _FRAME_SUPPORT_EPS):
+            result["reasons"].append(
+                "frame_support_axis_capacity_conflict:"
+                f"{entry['owner_index']}:{entry['owner_index']}")
+        required_span = entry["owner_required_span"]
+        if (required_span is None
+                or owner.xmin > required_span[0] + _FRAME_SUPPORT_EPS
+                or owner.xmax < required_span[1] - _FRAME_SUPPORT_EPS):
+            result["reasons"].append(
+                "frame_support_owner_required_containment_conflict:"
+                f"{entry['owner_index']}:{entry['owner_index']}")
+    if result["reasons"]:
+        result["reasons"] = list(dict.fromkeys(result["reasons"]))
+        result["changed"] = 0
+        for item in result["candidates"]:
+            item["final_contains_frame_support"] = False
+            item["final_contains_owner_required_segments"] = False
+        return result
+
+    for index, (before, after) in enumerate(zip(original, tentative)):
+        if (math.isclose(before.xmin, after.xmin, abs_tol=1e-12)
+                and math.isclose(before.xmax, after.xmax, abs_tol=1e-12)):
+            continue
+        result["reconciliations"].append({
+            "index": index,
+            "label": before.text.strip(),
+            "before": [float(before.xmin), float(before.xmax)],
+            "after": [float(after.xmin), float(after.xmax)],
+            "source": "physical_frame_support_display_repartition",
+        })
+    result["repartitioned_intervals"] = len(result["reconciliations"])
+    if result["reconciliations"]:
         contained = _copy_tier_metadata(
             words_tier, Tier(words_tier.name, words_tier.xmin,
-                             words_tier.xmax, intervals))
+                             words_tier.xmax, tentative))
         # The caller owns TextGrid replacement.  Return the tier in a private
         # field so this helper remains convenient for direct audit tests.
-        result["tier"] = contained
-    result["status"] = "verified" if not result["reasons"] else "rejected"
+        result["_contained_tier"] = contained
+    result["status"] = "verified"
     return result
 
 
@@ -1212,6 +1669,24 @@ def _nvasr_candidate_provenance_audit(
             reasons.append(f"mapping_basis_mismatch:{index}")
         if row.get("mapping_outcome") != "unique":
             reasons.append(f"mapping_not_unique:{index}")
+        mapping_selection = row.get("mapping_selection")
+        if mapping_selection not in {
+                "label_neighbors", "unique_max_forced_speech_overlap",
+                "unique_max_forced_raw_overlap",
+                "unique_punctuation_topology_bound"}:
+            reasons.append(f"mapping_selection_unknown:{index}")
+        mapping_key = row.get("mapping_key")
+        if not isinstance(mapping_key, dict):
+            reasons.append(f"mapping_key_malformed:{index}")
+        else:
+            neighbors = (mapping_key.get("left_lexical_ordinal"),
+                         mapping_key.get("right_lexical_ordinal"))
+            if (neighbors[0] is None and neighbors[1] is None) or any(
+                    value is not None
+                    and (not isinstance(value, int) or isinstance(value, bool)
+                         or value < 0)
+                    for value in neighbors):
+                reasons.append(f"mapping_key_malformed:{index}")
         if "ctc_lexical_ordinal" in row:
             ordinal = row.get("ctc_lexical_ordinal")
             if (not isinstance(ordinal, int) or isinstance(ordinal, bool)
@@ -1226,8 +1701,12 @@ def _nvasr_candidate_provenance_audit(
         forced = span(row, "forced_span")
         adjusted = span(row, "adjusted_span")
         frame_support, frame_support_source, frame_limited, frame_reasons = (
-            _nvasr_frame_support(row, wav_duration_s=wav_duration_s))
+            _nvasr_frame_support(row, wav_duration_s=wav_duration_s,
+                                 require_mapping=True))
         reasons.extend(f"{reason}:{index}" for reason in frame_reasons)
+        owner_required_segments, owner_required_span, dedup_spans, owner_reasons = (
+            _nvasr_owner_requirements(row, frame_support))
+        reasons.extend(f"{reason}:{index}" for reason in owner_reasons)
         if raw is None:
             reasons.append(f"raw_span_missing:{index}")
         if speech is None:
@@ -1273,15 +1752,27 @@ def _nvasr_candidate_provenance_audit(
                 row_identity = nvv_identity(row.get("word"))
                 ctc_span = span(authority, "ctc_span")
                 published_span = span(authority, "published_span")
-                authority_ok = (
+                common_authority = (
                     isinstance(ctc_ordinal, int)
                     and authority_ordinal == ctc_ordinal
                     and authority_ordinal_counts.get(ctc_ordinal, 0) == 1
-                    and authority.get("boundary_source") == "ctc"
                     and authority_identity == row_identity
                     and spans_equal(ctc_span, adjusted)
                     and spans_equal(published_span, final)
                 )
+                ctc_authority_ok = (
+                    common_authority
+                    and authority.get("boundary_source") == "ctc")
+                # Physical frame support is narrower authority than a CTC
+                # display decision.  It may justify only the frozen display
+                # divergence that contains this exact candidate's immutable
+                # support; it never turns the wider display into evidence.
+                frame_support_authority_ok = (
+                    common_authority
+                    and frame_support is not None
+                    and final[0] <= frame_support[0] + _FRAME_SUPPORT_EPS
+                    and final[1] >= frame_support[1] - _FRAME_SUPPORT_EPS)
+                authority_ok = ctc_authority_ok or frame_support_authority_ok
                 if not authority_ok:
                     reasons.append(f"unauthorized_final_ctc_divergence:{index}")
         base["candidates"].append({
@@ -1289,6 +1780,7 @@ def _nvasr_candidate_provenance_audit(
             "label": row.get("word"),
             "mapping_basis": row.get("mapping_basis"),
             "mapping_outcome": row.get("mapping_outcome"),
+            "mapping_selection": mapping_selection,
             "mapping_key": row.get("mapping_key"),
             "raw_span": raw,
             "raw_frames": [row.get("raw_start_frame"), row.get("raw_end_frame")],
@@ -1300,14 +1792,22 @@ def _nvasr_candidate_provenance_audit(
             "adjusted_span": adjusted,
             "frame_support_span": frame_support,
             "frame_support_source": frame_support_source or "rejected",
+            "owner_required_segments": owner_required_segments or [],
+            "owner_required_span": owner_required_span,
+            "dedup_forced_occurrence_spans": dedup_spans,
             "final_span": final,
             "display_span": final,
             "display_owner": "words_tier_final",
             "display_is_acoustic_evidence": False,
             "final_contains_frame_support": (
                 frame_support is not None and final is not None
-                and final[0] <= frame_support[0] + AXIS_EPS
-                and final[1] >= frame_support[1] - AXIS_EPS),
+                and final[0] <= frame_support[0] + _FRAME_SUPPORT_EPS
+                and final[1] >= frame_support[1] - _FRAME_SUPPORT_EPS),
+            "final_contains_owner_required_segments": (
+                owner_required_segments is not None and final is not None
+                and all(final[0] <= segment[0] + _FRAME_SUPPORT_EPS
+                        and final[1] >= segment[1] - _FRAME_SUPPORT_EPS
+                        for segment in owner_required_segments)),
             "frame_limited": frame_limited,
         })
     base["reasons"] = list(dict.fromkeys(reasons))
@@ -15246,6 +15746,22 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # publication authority.  In particular, never reassert ``resolved_span``
     # or a raw CTC span here: doing so resurrects the pre-processed boundary
     # after ``handle_unexpected_silences`` merged an internal <sp0>.
+    # NVV frame support is the narrow exception: it is immutable physical
+    # evidence and may locally repartition conflicting display ownership,
+    # while remaining distinct from the wider non-acoustic display span.
+    _wav_axis_duration = (len(wav_audio) / float(wav_sr)
+                          if wav_audio is not None and wav_sr else None)
+    _frame_support_result = _contain_nvasr_frame_support(
+        tier_by_name(new_tg, "words"), ctc_token_list,
+        wav_duration_s=_wav_axis_duration)
+    report["nvasr_frame_support"] = _frame_support_result
+    _frame_support_rejected = _frame_support_result.get("status") == "rejected"
+    _contained_words = _frame_support_result.pop("_contained_tier", None)
+    if _contained_words is not None:
+        for _index, _tier in enumerate(new_tg.tiers):
+            if _tier.name == "words":
+                new_tg.tiers[_index] = _contained_words
+                break
     _final_words_before_ctc = tier_by_name(new_tg, "words")
     _final_words_after_ctc = _final_words_before_ctc
     _ctc_reasserted = 0
@@ -15491,6 +16007,8 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # 最终筛选: 所有处理完成后再统一判断 (用最终的边界和静音结构)
     # ================================================================
     filter_reasons = []
+    if _frame_support_rejected:
+        filter_reasons.append("nvasr_frame_support_rejected")
     if (getattr(args, "filter_suspicious", True)
             and _word_energy_enabled(args)):
         for _energy_reason in {
@@ -16516,7 +17034,8 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # missing/ambiguous raw, forced, or adjusted candidate span.
     _nvasr_provenance = _nvasr_candidate_provenance_audit(
         ctc_token_list, _final_words,
-        required=not reference_text_authoritative)
+        required=not reference_text_authoritative,
+        wav_duration_s=_wav_axis_duration)
     report["nvasr_candidate_provenance"] = _nvasr_provenance
     if _nvasr_provenance["status"] == "rejected":
         filter_reasons.append("nvasr_candidate_provenance_rejected")
