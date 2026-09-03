@@ -12364,3 +12364,58 @@ dedup ledger 与 `00283` 的 axis/topology canaries 均通过。
 本轮定向测试为 211 passed，全套回归为 882 passed；`compileall` 与 `git diff --check`
 通过。生产树只读内容 hash 为
 `569edc4c58472fefc71d3805b35e1475ada408d8e88007312282507b0720f45a`。
+
+## Case 226: 移除疑问/惊讶/确认语气词 NVV 标签，仅保留生理发声类
+
+**日期**：2026-09-03
+**涉及文件**：`scripts/pipeline_utils.py`、`scripts/ctc_prealign.py`、
+`dict/mfa_ipa.dict`、`dict/fullpinyin_enword.dict`、
+`scripts/verify_hecheng_english_ctc_ready_v4.py`、`scripts/verify_reference_authority.py`、
+`tests/test_english_units.py`、`tests/test_ctc_english_units.py`、
+`tests/test_laria_fallback_mapping.py`、`tests/test_gpu1000_postprocess_audit.py`、
+`tests/test_boundary_punctuation_display_regressions.py`
+**状态**：已修复；全量 pytest 1019 passed + 无 GPU 校验脚本通过
+
+### 问题与真实原因
+
+NVASR（SenseVoice 系）把中文语气词（哎/咦/嗯/啊 等）转写为语义 NVV 标签：
+`[Question-yi]`、`[Surprise-oh]`、`[Confirmation-en]`、`[Dissatisfaction-hnn]` 等，
+随后经 `nvv_to_mfa` 大写化为 `QUESTION-YI`/`SURPRISE-OH` 等 MFA token，既覆盖了原文
+（"替换"），又被当作合法 NVV 进入对齐序列（"添加"）。这类标签不是生理非言语发声，而是
+带有语义的语气词，应由 Qwen 正常转写为 CJK 原词（哎/咦），而非被 NVV 吞掉。
+
+根因链（按步骤）：
+1. NVASR CTC vocab 在 `NVV_START..NVV_END`（25025–25054）内共 30 个 NVV token，
+   其中 12 个是语义语气词（Question/Surprise/Confirmation/Dissatisfaction）。
+2. `_free_decode_logits` 对整段 NVV 区间统一施加 blank-frame bias，把这些语气词也
+   一并解码为 NVV。
+3. `NVV_NAMES`（pipeline_utils）与 `NVV_TO_MFA`、两个 dict 文件、独立 verifier 四处
+   一致收录这些标签，使它们成为 MFA 合法 token，完成"添加"。
+
+### 修复与不变量
+
+- `pipeline_utils.NVV_NAMES` 只保留 17 个 vegetative 生理发声类（BREATHING/LAUGHTER/
+  COUGH/CRYING/GROAN/HISS/HUM/SHH/SIGH/SNEEZE/SNIFF/SNORE/TSK/UHM/WHISTLE/YAWN/
+  BURP）；`NVV_TO_MFA` 保留这 17 项 + `PAUSE`（停顿标记，非语气词，保留）。
+- `ctc_prealign` 新增 `NVV_SUPPRESSED_IDS: frozenset`（12 个被移除语气词的 token id）：
+  `_free_decode_logits` 在 bias 之后对这批 id 强制置 `-inf`（reference_only 分支已整段
+  屏蔽 NVV，enable_nvv 分支补一次 suppression 防 bias 复活）；`candidate_kind` 对
+  被屏蔽 id 返回 `None` 作安全网。
+- 两个 dict 文件（`mfa_ipa.dict`/`fullpinyin_enword.dict`）删除 12 个语气词标签行，
+  彻底去除"添加"。
+
+被移除的 12 个 id（由 sentencepiece 解码 `paralingustic_tokenizer.model` 确认）：
+`25036 [Question-huh]`、`25038 [Confirmation-en]`、`25041 [Surprise-ah]`、
+`25042 [Surprise-oh]`、`25044 [Dissatisfaction-hnn]`、`25045 [Surprise-wa]`、
+`25046 [Question-yi]`、`25047 [Question-ei]`、`25049 [Question-ah]`、
+`25050 [Question-oh]`、`25051 [Surprise-yo]`、`25052 [Question-en]`。
+
+### 验证
+
+1. sentencepiece 解码 25025–25054，确认 `NVV_SUPPRESSED_IDS` 与"30 个 NVV 去掉 17 个
+   vegetative + PAUSE 后"的 12 个 id 完全一致（`MATCH: True`）。
+2. `python scripts/verify_reference_only_ctc.py` → OK。
+3. `python -m pytest tests/ -q` → 1019 passed。
+4. `verify_reference_authority.py` 中 `_case_reference_only_masks_nvv_ids_in_free_decode`
+   的 enable_nvv 断言已改为"保留槽位 bias / 被删槽位 -inf"，并通过对 `NVV_SUPPRESSED_IDS`
+   的导入引用。

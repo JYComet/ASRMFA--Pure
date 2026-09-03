@@ -1,0 +1,89 @@
+# Fresh 1000-item, 8-GPU run with schema-v3 CTC anchor/owner evidence.
+# Successful workspaces are retained for independent lifecycle inspection.
+mode: nvrasr_fallback
+reference_mode: fallback
+
+data_dir: /mnt/Raw/v5_0707/LAria/wavs
+output_dir: /mnt/Raw/0825/laria-v5-no-reference-full1000-20260901-r23
+output_staging: true
+keep_16k_audio: true
+workspace: /mnt/nvme3/mfa_workspace_laria_full1000_20260901_r23
+
+pad_silence:
+  enabled: false
+
+streaming:
+  batch_cache: /tmp/laria-full1000-20260901-r23.cache.json
+  batch_size: 13
+  parallel: 8
+  num_gpus: 8
+  prefetch_buffer: 8
+  upload_buffer: 8
+  local_work:
+    - /mnt/nvme0/mfa_work_laria_full1000_20260901_r23
+    - /mnt/nvme1/mfa_work_laria_full1000_20260901_r23
+    - /mnt/nvme3/mfa_work_laria_full1000_20260901_r23
+    - /mnt/nvme4/mfa_work_laria_full1000_20260901_r23
+
+pipelined:
+  cpu_workers: 8
+  # Fresh validation: never restore adjusted CTC produced by an older build.
+  restore_ctc_cache: false
+  preserve_successful_workspaces: true
+  require_zero_filtered: true
+
+ctc_prealign:
+  enabled: true
+  python: /home/user/miniconda3/envs/asr/bin/python
+  model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
+  device: cuda:0
+  all_gpus: false
+  limit: 0
+  timeout: 7200
+  nvv_enabled: true
+  allow_missing_reference: true
+
+ctc_adjust:
+  enabled: true
+  limit: 0
+
+ctc_ready:
+  allow_missing_reference: true
+
+mfa:
+  num_jobs: 8
+  single_speaker: true
+  dither: 0.0
+  output_format: long_textgrid
+  clean: false
+  fine_tune: false
+  skip_validate: true
+  beam: 20
+  retry_beam: 80
+  allow_partial: true
+  min_output_ratio: 0.90
+
+mfa_en:
+  enabled: true
+  strict_provenance: true
+  num_jobs: 4
+  dither: 0.0
+  padding_ms: 75
+  beam: 10
+  retry_beam: 40
+  fine_tune: false
+
+postprocess:
+  strict_ok: false
+  allow_filtered_integrity_failures: true
+  merge_silence: true
+  min_sil_merge_sec: 0.2
+  fix_short_word: true
+  short_word_max_sec: 0.25
+  flank_silence_sec: 0.4
+  detect_bgm: true
+  filter_suspicious: true
+  filter_min_phone_coverage: 0.35
+  enable_text_correction: true
+  handle_unexpected_sil: true
+  workers: 0

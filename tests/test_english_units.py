@@ -42,8 +42,8 @@ def test_hyphenated_units_preserve_surface_and_have_stable_distinct_ids():
     assert units[3].canonical_span == (17, 22)
 
 
-def test_nvv_precedence_skips_hyphenated_nvv_and_keeps_other_units():
-    units = parse_english_units("<QUESTION-YI> QUESTION-YI K-Pop")
+def test_nvv_precedence_skips_nvv_and_keeps_other_units():
+    units = parse_english_units("<LAUGHTER> LAUGHTER K-Pop")
 
     assert [unit.surface_text for unit in units] == ["K-Pop"]
 
@@ -88,7 +88,7 @@ def test_exact_contiguous_authority_merge_uses_source_ordinals_and_span():
         ([fragment("Pop", 8), fragment("K", 7)], "noncontiguous_source_ctc_ordinals"),
         ([fragment("K", 7), fragment(",", 8), fragment("Pop", 9)], "punctuation_fragment"),
         ([fragment("K", 7), fragment("中", 8), fragment("Pop", 9)], "cjk_crossing"),
-        ([fragment("K", 7), fragment("QUESTION-YI", 8), fragment("Pop", 9)], "nvv_crossing"),
+        ([fragment("K", 7), fragment("LAUGHTER", 8), fragment("Pop", 9)], "nvv_crossing"),
     ],
 )
 def test_authority_merge_rejects_non_exact_groups(fragments, code):

@@ -1,0 +1,89 @@
+# GAMEDATA / 白荆回廊 — 无参考文本模式 (reference_mode: fallback)
+# 输入已落地到 NVMe (扁平 wav, 无参考 txt): /mnt/nvme3/gamedata_20260903/baijing/
+# 无参考文本: 用 NVASR ASR 输出作为文本。
+#
+# 执行模型: ASR(NVASR/CTC) 只用 2 张 GPU (streaming.num_gpus=2);
+#           MFA/English MFA 全 CPU 执行 (pipelined.cpu_workers)。
+#
+# 运行 (streaming pipelined):
+#   /home/user/miniconda3/envs/mfa-dev/bin/python scripts/streaming_pipeline.py \
+#       --config configs/gamedata_baijing_noref_20260903.yaml --pipelined
+mode: nvrasr_fallback
+reference_mode: fallback
+
+data_dir: /mnt/nvme3/gamedata_20260903/baijing
+output_dir: /mnt/Raw/GAMEDATA_对齐_20260903/baijing
+output_staging: true
+keep_16k_audio: true
+workspace: /mnt/nvme3/mfa_work_gamedata_baijing_20260903
+
+pad_silence:
+  enabled: false
+
+streaming:
+  batch_cache: cache/gamedata_baijing_noref_20260903.cache.json
+  batch_size: 132
+  parallel: 2
+  num_gpus: 2
+  prefetch_buffer: 4
+  upload_buffer: 4
+  local_work:
+    - /mnt/nvme0/mfa_work_gamedata_baijing_20260903
+    - /mnt/nvme3/mfa_work_gamedata_baijing_20260903
+
+pipelined:
+  cpu_workers: 8
+  restore_ctc_cache: false
+
+ctc_prealign:
+  enabled: true
+  python: /home/user/miniconda3/envs/asr/bin/python
+  model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
+  device: cuda:0
+  all_gpus: false
+  limit: 0
+  timeout: 7200
+  nvv_enabled: true
+  allow_missing_reference: true
+
+ctc_adjust:
+  enabled: true
+  limit: 0
+
+ctc_ready:
+  allow_missing_reference: true
+
+mfa:
+  num_jobs: 8
+  single_speaker: true
+  output_format: long_textgrid
+  clean: false
+  fine_tune: false
+  skip_validate: true
+  beam: 20
+  retry_beam: 80
+  allow_partial: true
+  min_output_ratio: 0.90
+
+mfa_en:
+  enabled: true
+  strict_provenance: true
+  num_jobs: 4
+  beam: 10
+  retry_beam: 40
+  fine_tune: false
+
+postprocess:
+  strict_ok: false
+  allow_filtered_integrity_failures: true
+  merge_silence: true
+  min_sil_merge_sec: 0.2
+  fix_short_word: true
+  short_word_max_sec: 0.25
+  flank_silence_sec: 0.4
+  detect_bgm: true
+  filter_suspicious: true
+  filter_min_phone_coverage: 0.35
+  enable_text_correction: true
+  handle_unexpected_sil: true
+  workers: 0

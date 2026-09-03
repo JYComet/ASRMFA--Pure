@@ -142,7 +142,7 @@ def test_authority_kpop_is_one_canonical_ctc_word_and_lexical_interval(tmp_path)
         (("K", "Pop", "extra"), "extra"),
         (("op", "KP"), "mismatch"),
         (("K", "中", "Pop"), "cjk"),
-        (("K", "QUESTION-YI", "Pop"), "nvv"),
+        (("K", "LAUGHTER", "Pop"), "nvv"),
         (("K", ",", "Pop"), "punctuation"),
     ],
 )

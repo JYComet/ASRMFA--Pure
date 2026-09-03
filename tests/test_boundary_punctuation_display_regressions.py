@@ -743,13 +743,13 @@ def test_final_publication_transaction_preserves_fallback_source_surface():
 
 
 def test_final_publication_normalizes_bare_nvv_and_audits_its_punctuation():
-    # This models the r1 surface defect: the recognized bare label contains a
-    # lexical hyphen, but the final raw_text owner must publish canonical NVV
-    # markup so that the hyphen cannot enter punctuation accounting.
+    # This models the r1 surface defect: the recognized bare NVV label must be
+    # published as canonical bracketed markup so it cannot enter punctuation
+    # accounting (an adjacent English hyphen stays punctuation).
     words = post.Tier("words", 0.0, 1.0, [
         post.Interval(0.0, 0.20, "da4"),
         post.Interval(0.20, 0.30, "？"),
-        post.Interval(0.30, 0.65, "SURPRISE-WA"),
+        post.Interval(0.30, 0.65, "LAUGHTER"),
         post.Interval(0.65, 0.90, "hao3"),
         post.Interval(0.90, 1.00, "。"),
     ])
@@ -762,20 +762,20 @@ def test_final_publication_normalizes_bare_nvv_and_audits_its_punctuation():
     frozen, freeze_reasons = post._freeze_processed_geometry(grid)
     assert frozen is not None and freeze_reasons == []
     post._rebuild_derived_from_frozen_words(
-        grid, {}, {}, "大家？Surprise-wa好。",
+        grid, {}, {}, "大家？Laughter好。",
         reference_authoritative=True,
-        pinyin_text="da4 ? Surprise-wa hao3 .")
+        pinyin_text="da4 ? Laughter hao3 .")
 
-    assert raw.intervals[0].text == "<sp1>大家？<SURPRISE-WA>好。"
+    assert raw.intervals[0].text == "<sp1>大家？<LAUGHTER>好。"
     reasons, details = post._publication_contract_audit(
         words, post.tier_by_name(grid, "hanzi"), None, None,
-        "大家？Surprise-wa好。", None, None, True,
+        "大家？Laughter好。", None, None, True,
         raw_text_tier=raw, pinyin_tier=pinyin)
     assert "raw_text_punctuation_sequence_mismatch" not in reasons
     assert "pinyin_punctuation_sequence_mismatch" not in reasons
     assert post._surface_punctuation(raw) == ["？", "。"]
     lexical_hyphen = post.Tier("raw_text", 0.0, 1.0, [
-        post.Interval(0.0, 1.0, "open-ai<SURPRISE-WA>")])
+        post.Interval(0.0, 1.0, "open-ai<LAUGHTER>")])
     assert post._surface_punctuation(lexical_hyphen) == ["-"]
 
     # The r1 path is fallback-mode: raw_text is rebuilt from the derived
@@ -783,7 +783,7 @@ def test_final_publication_normalizes_bare_nvv_and_audits_its_punctuation():
     fallback_words = post.Tier("words", 0.0, 1.0, [
         post.Interval(0.0, 0.20, "da4"),
         post.Interval(0.20, 0.30, "？"),
-        post.Interval(0.30, 0.65, "Surprise-wa"),
+        post.Interval(0.30, 0.65, "Laughter"),
         post.Interval(0.65, 0.90, "hao3"),
         post.Interval(0.90, 1.00, "。"),
     ])
@@ -798,9 +798,9 @@ def test_final_publication_normalizes_bare_nvv_and_audits_its_punctuation():
     frozen, freeze_reasons = post._freeze_processed_geometry(fallback_grid)
     assert frozen is not None and freeze_reasons == []
     post._rebuild_derived_from_frozen_words(
-        fallback_grid, {}, {}, "大？Surprise-wa好。",
+        fallback_grid, {}, {}, "大？Laughter好。",
         reference_authoritative=False)
-    assert fallback_raw.intervals[0].text == "<sp1>大？<SURPRISE-WA>好。"
+    assert fallback_raw.intervals[0].text == "<sp1>大？<LAUGHTER>好。"
 
 
 def test_nvv_markup_is_not_counted_as_surface_punctuation():
@@ -919,11 +919,11 @@ def _laria_r9_projection_fixture(stem: str):
     """Return the real 00394/00395 lexical topology with local gap owners."""
     fixtures = {
         "LAria_00394": (
-            "Surprise-wa，今天大赛也太给力了吧！狗在耍可爱！哎我都不好意思了！"
+            "Laughter，今天大赛也太给力了吧！狗在耍可爱！哎我都不好意思了！"
             "看到你们这么热情，我超级开心的！",
             11.202,
             [
-                (0.51, 0.99, "<SURPRISE-WA>"),
+                (0.51, 0.99, "<LAUGHTER>"),
                 (0.99, 1.11, "jin1"), (1.11, 1.29, "tian1"),
                 (1.29, 1.44, "da4"), (1.44, 1.60, "sai4"),
                 (1.60, 1.68, "ye3"), (1.68, 1.93, "tai4"),
@@ -946,11 +946,11 @@ def _laria_r9_projection_fixture(stem: str):
             ],
         ),
         "LAria_00395": (
-            "SURPRISE-WA ！怎么突然来了这么多人啊！欢迎大家， BREATHING "
+            "LAUGHTER ！怎么突然来了这么多人啊！欢迎大家， BREATHING "
             "欢迎所有新来的朋友们，谢谢大家的礼物，还有弹幕！",
             10.094,
             [
-                (1.35, 1.59, "<SURPRISE-WA>"),
+                (1.35, 1.59, "<LAUGHTER>"),
                 (2.07, 2.13, "zen3"), (2.13, 2.30, "me5"),
                 (2.30, 2.49, "tu1"), (2.49, 2.67, "ran2"),
                 (2.67, 2.79, "lai2"), (2.79, 2.97, "le5"),
@@ -1018,7 +1018,7 @@ def test_laria_00394_r9_projection_with_ria_is_exact_and_publishable():
     assert projection["unanchored_final_lexical_ordinals"] == [15]
     assert not any(item["final_text"] == "RIA"
                    for item in projection["mapped"])
-    assert projection["mapped"][0]["final_text"] == "SURPRISE-WA"
+    assert projection["mapped"][0]["final_text"] == "LAUGHTER"
     omitted_interval = projection["entries"][2]
     assert omitted_interval["candidate_final_boundaries"] == [15, 16]
     assert omitted_interval["positive_owner_candidates"] == [16]
@@ -1077,7 +1077,7 @@ def test_laria_00395_r9_ria_boundary_and_boundary_zero_are_separate():
     assert projection["unanchored_final_lexical_ordinals"] == [11]
     assert not any(item["final_text"] == "RIA"
                    for item in projection["mapped"])
-    assert projection["mapped"][0]["final_text"] == "SURPRISE-WA"
+    assert projection["mapped"][0]["final_text"] == "LAUGHTER"
     valid, authority = post._validate_fallback_punctuation_projection(
         projection, source_text, words, ctc)
     assert valid is True
@@ -1417,8 +1417,8 @@ def test_fallback_punctuation_owners_survive_physical_nvv_owner_carving():
         ("source_lexical_ordinal", 1),
         ("final_lexical_ordinal", 1),
         ("anchor_kind", "forged_anchor"),
-        ("source_text", "SURPRISE-OH"),
-        ("final_text", "SURPRISE-OH"),
+        ("source_text", "SNEEZE"),
+        ("final_text", "SNEEZE"),
     ],
 )
 def test_display_invariant_projection_keeps_mapped_authority_strict(

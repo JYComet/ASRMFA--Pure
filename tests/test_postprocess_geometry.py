@@ -298,10 +298,11 @@ def test_nvasr_malformed_forced_mapping_and_axis_evidence_fail_closed():
     forced_outside = _nvv_frame_row(
         forced_span=[0.30, 0.50], adjusted_span=[0.39, 0.45])
     words, ctc = _nvv_containment_fixture(forced_outside)
-    rejected = _contain_nvasr_frame_support(words, ctc, wav_duration_s=1.0)
-    assert rejected["status"] == "rejected"
-    assert "forced_span_outside_selected_support:0" in rejected["reasons"]
-    assert "_contained_tier" not in rejected
+    correspondence_only = _contain_nvasr_frame_support(
+        words, ctc, wav_duration_s=1.0)
+    assert correspondence_only["status"] == "verified"
+    assert "forced_span_outside_selected_support:0" not in correspondence_only["reasons"]
+    assert "_contained_tier" in correspondence_only
 
     wrong_mapping = _nvv_frame_row(
         mapping_key={"left_lexical_ordinal": 7, "right_lexical_ordinal": 8})

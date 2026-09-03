@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 from scripts import audit_strict_ok as audit  # noqa: E402
 from scripts import adjust_ctc_boundaries as adjust  # noqa: E402
 from scripts import ctc_prealign as ctc  # noqa: E402
+from scripts import normalize_english_tokens as normalize_en  # noqa: E402
 from scripts import postprocess_textgrids as post  # noqa: E402
 from scripts import run_pipeline  # noqa: E402
 from scripts import streaming_pipeline as streaming  # noqa: E402
@@ -34,6 +35,7 @@ from scripts.pipeline_utils import (  # noqa: E402
     make_pipeline_resume_fingerprints,
     validate_pipeline_resume_receipt,
     write_ctc_raw_manifest,
+    write_ctc_work_receipt,
 )
 
 
@@ -45,14 +47,470 @@ def _raw_fixture(root: Path, stem: str = "demo") -> tuple[Path, Path, dict]:
     raw = root / "raw"
     raw.mkdir(parents=True)
     for index, suffix in enumerate(CTC_SUFFIXES):
-        (raw / f"{stem}{suffix}").write_text(
-            f"{stem}:{suffix}:{index}\n", encoding="utf-8")
+        payload = f"{stem}:{suffix}:{index}\n"
+        if suffix == "_tokens.jsonl":
+            payload = json.dumps({
+                "word": "ni3", "start_s": 0.0, "end_s": 0.06,
+                "ctc_raw_token_row": {
+                    "schema": "ctc_raw_token_row_v1",
+                    "stem": stem,
+                    "sidecar": f"{stem}_tokens.jsonl",
+                    "row_ordinal": 0,
+                },
+            }, ensure_ascii=False) + "\n"
+        (raw / f"{stem}{suffix}").write_text(payload, encoding="utf-8")
     producer = raw / ".ctc_run_receipt.json"
     producer.write_text(json.dumps({"schema": "ctc-run-receipt-v2", "stem": stem}),
                         encoding="utf-8")
     (raw / f"{stem}_ref.txt").write_text("你，好\n", encoding="utf-8")
     manifest = write_ctc_raw_manifest(raw, producer_receipt=producer, stems=[stem])
     return raw, raw / CTC_RAW_MANIFEST_NAME, manifest
+
+
+def _fresh_nvasr_authority_fixture(
+        root: Path, stem: str = "demo") -> dict:
+    """Create one real schema-v3 producer→sealed-raw→work lifecycle."""
+    raw = root / "raw"
+    raw.mkdir(parents=True)
+    timeline = ctc.extract_nvasr_candidate_timeline(
+        [0, 0, 0, 0, 31, 11, 32], "你[Breathing]好",
+        token_surfaces={31: "你", 11: "[Breathing]", 32: "好"},
+        stem=stem)
+    words = [
+        {"word": "ni3", "start": 0.0, "end": 0.06},
+        {"word": "BREATHING", "start": 0.06, "end": 0.12},
+        {"word": "hao3", "start": 0.12, "end": 0.18},
+    ]
+    assert ctc.attach_nvasr_candidate_provenance(
+        words, [], timeline, strict_schema_v3=True) == []
+    ctc._finalize_nvasr_canonical_neighbors(words)
+    assert ctc._validate_emitted_nvasr_provenance(words) == []
+
+    token_rows = [
+        ctc._ctc_token_sidecar_row(
+            row, float(row["start"]), float(row["end"]), stem=stem,
+            row_ordinal=ordinal)
+        for ordinal, row in enumerate(words)
+    ]
+    assert [row["ctc_raw_token_row"]["row_ordinal"]
+            for row in token_rows] == list(range(len(token_rows)))
+    (raw / f"{stem}_tokens.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n"
+                for row in token_rows), encoding="utf-8")
+    ctc.write_textgrid(words, 0.5, raw / f"{stem}.TextGrid")
+    (raw / f"{stem}.lab").write_text(
+        "ni3 BREATHING hao3\n", encoding="utf-8")
+    (raw / f"{stem}_punct.json").write_text("[]\n", encoding="utf-8")
+    (raw / f"{stem}_text_cn.txt").write_text(
+        "你[Breathing]好\n", encoding="utf-8")
+    (raw / f"{stem}_text_raw.txt").write_text(
+        "你[Breathing]好\n", encoding="utf-8")
+    (raw / f"{stem}_ref.txt").write_text("你好\n", encoding="utf-8")
+    producer = raw / ".ctc_run_receipt.json"
+    producer.write_text(json.dumps({
+        "schema": "ctc-run-receipt-v2", "stem": stem,
+        "nvasr_candidate_schema_version": 3,
+    }) + "\n", encoding="utf-8")
+    manifest = write_ctc_raw_manifest(
+        raw, producer_receipt=producer, stems=[stem])
+    manifest_path = raw / CTC_RAW_MANIFEST_NAME
+
+    work = root / "work"
+    initial_receipt = materialize_ctc_work(
+        raw, work, raw_manifest_path=manifest_path)
+    work_rows = [json.loads(line) for line in
+                 (work / f"{stem}_tokens.jsonl").read_text(
+                     encoding="utf-8").splitlines()]
+    for row in work_rows:
+        if row.get("candidate_kind") == "nvv":
+            anchor = post._nvasr_anchor_span(row)
+            current = [row["start_s"], row["end_s"]]
+            forced = row["forced_span"]
+            row["adjusted_span"] = [
+                min(current[0], forced[0], anchor[0]),
+                max(current[1], forced[1], anchor[1]),
+            ]
+            row["adjusted_span_basis"] = adjust.ADJUSTED_SPAN_BASIS
+            row["adjusted_span_is_acoustic_evidence"] = False
+    (work / f"{stem}_tokens.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n"
+                for row in work_rows), encoding="utf-8")
+    work_receipt = write_ctc_work_receipt(
+        work, manifest_path,
+        transform_ledger=list(initial_receipt["transform_ledger"]) + [{
+            "stage": "test_adjust", "operation": "adjusted_geometry_only",
+        }])
+    assert validate_ctc_raw_manifest(raw) == []
+    assert validate_ctc_work_receipt(
+        work, manifest_path, work_receipt) == []
+    return {
+        "stem": stem,
+        "raw": raw,
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "work": work,
+        "work_receipt": work_receipt,
+        "work_receipt_path": work / CTC_WORK_RECEIPT_NAME,
+    }
+
+
+def _bind_nvasr_lifecycle(monkeypatch, fixture: dict) -> None:
+    monkeypatch.setenv("CTC_RAW_MANIFEST", str(fixture["manifest_path"]))
+    monkeypatch.setenv(
+        "CTC_WORK_RECEIPT", str(fixture["work_receipt_path"]))
+
+
+def _fresh_nvasr_owner_inputs(fixture: dict):
+    stem = fixture["stem"]
+    rows = [json.loads(line) for line in
+            (fixture["work"] / f"{stem}_tokens.jsonl").read_text(
+                encoding="utf-8").splitlines()]
+    words = post.Tier("words", 0.0, 0.5, [
+        post.Interval(0.0, 0.03, "ni3"),
+        post.Interval(0.06, 0.12, "<BREATHING>"),
+        post.Interval(0.09, 0.5, "hao3"),
+    ])
+    source_words = [
+        {"ordinal": 0, "ctc_lexical_ordinal": 0,
+         "start": 0.0, "end": 0.03, "text": "ni3"},
+        {"ordinal": 1, "ctc_lexical_ordinal": 1,
+         "start": 0.03, "end": 0.09, "text": "spn"},
+        {"ordinal": 2, "ctc_lexical_ordinal": 2,
+         "start": 0.09, "end": 0.5, "text": "hao3"},
+    ]
+    return rows, words, source_words
+
+
+def test_fresh_schema_v3_lifecycle_builds_manifest_authority_before_owner(
+        monkeypatch, tmp_path):
+    fixture = _fresh_nvasr_authority_fixture(tmp_path)
+    _bind_nvasr_lifecycle(monkeypatch, fixture)
+
+    lifecycle = post._load_ctc_lifecycle(fixture["work"], fixture["stem"])
+    authority = lifecycle["_nvasr_producer_authority"]
+    summary = authority["summary"]
+    assert summary == {
+        "schema": "nvasr-producer-authority-v1",
+        "status": "verified",
+        "raw_manifest_identity": fixture["manifest"]["identity"],
+        "raw_tokens_sha256": next(
+            row["sha256"] for row in fixture["manifest"]["files"]
+            if row["suffix"] == "_tokens.jsonl"),
+        "work_receipt_identity": fixture["work_receipt"]["identity"],
+        "candidate_count": 1,
+        "ordered_projection_sha256": summary[
+            "ordered_projection_sha256"],
+        "reasons": [],
+    }
+    assert "path" not in json.dumps(summary, ensure_ascii=False)
+
+    rows, words, source_words = _fresh_nvasr_owner_inputs(fixture)
+    owner = post._contain_nvasr_frame_support(
+        words, rows, wav_duration_s=0.5, source_words=source_words,
+        source_phone_lineage={"owners": {}},
+        producer_authority=authority, strict_schema_v3=True)
+    assert owner["status"] == "verified"
+    assert owner["candidates"][0]["owner_branch"] == \
+        "compatible_source_mfa"
+    assert owner["candidates"][0]["owner_selected_span"] == \
+        pytest.approx([0.03, 0.09])
+
+    provenance = post._nvasr_candidate_provenance_audit(
+        rows, owner["_contained_tier"], required=True, wav_duration_s=0.5,
+        source_words=source_words, source_phone_lineage={"owners": {}},
+        producer_authority=authority, strict_schema_v3=True)
+    assert provenance["status"] == "verified"
+
+
+def test_english_merge_retains_left_row_and_unions_source_ordinals(tmp_path):
+    (tmp_path / "demo_ref.txt").write_text("hello\n", encoding="utf-8")
+    (tmp_path / "demo.lab").write_text("hel lo\n", encoding="utf-8")
+    (tmp_path / "demo_tokens.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in [
+            {"word": "hel", "start_s": 0.0, "end_s": 0.1,
+             "start_ms": 0, "end_ms": 100, "type": "word",
+             "left_evidence": "preserve-me", "source_ctc_ordinals": [4]},
+            {"word": "lo", "start_s": 0.1, "end_s": 0.2,
+             "start_ms": 100, "end_ms": 200, "type": "word",
+             "source_ctc_ordinals": [5]},
+        ]), encoding="utf-8")
+
+    assert normalize_en.normalize_stem(tmp_path, "demo") is True
+    rows = [json.loads(line) for line in
+            (tmp_path / "demo_tokens.jsonl").read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["word"] == "hello"
+    assert rows[0]["left_evidence"] == "preserve-me"
+    assert rows[0]["source_ctc_ordinals"] == [4, 5]
+    assert rows[0]["start_s"] == 0.0
+    assert rows[0]["end_s"] == 0.2
+    assert "ctc_lexical_ordinal" not in rows[0]
+
+
+def test_standalone_normalize_en_rebases_before_bundle_validation(
+        monkeypatch, tmp_path):
+    (tmp_path / "demo.lab").write_text("hello\n", encoding="utf-8")
+    events = []
+    fake_ctc_module = SimpleNamespace(
+        _rebase_final_token_sidecars=lambda path: (
+            events.append(("rebase", path)), 1)[1])
+    monkeypatch.setitem(sys.modules, "ctc_prealign", fake_ctc_module)
+    monkeypatch.setattr(run_pipeline, "_ensure_ctc_work",
+                        lambda *_args, **_kwargs: tmp_path)
+    monkeypatch.setattr(run_pipeline, "_skip_if_ctc_normalized",
+                        lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(run_pipeline, "run_python",
+                        lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(
+        run_pipeline, "validate_ctc_transcript_bundle",
+        lambda *_args, **_kwargs: events.append(("validate", tmp_path)) or [])
+    monkeypatch.setattr(run_pipeline, "_record_ctc_work_stage",
+                        lambda *_args, **_kwargs: 0)
+
+    rc = run_pipeline.step_normalize_en(
+        SimpleNamespace(overwrite=False), {"mfa_en": {}},
+        Path(sys.executable), {"models_dir": tmp_path, "mfa_dict": None})
+
+    assert rc == 0
+    assert events == [("rebase", tmp_path), ("validate", tmp_path)]
+
+
+def test_final_sidecar_rebase_rolls_back_earlier_files_on_late_replace_failure(
+        monkeypatch, tmp_path):
+    paths = [tmp_path / "a_tokens.jsonl", tmp_path / "b_tokens.jsonl"]
+    for index, path in enumerate(paths):
+        path.write_text(json.dumps({
+            "word": f"word{index}", "start_s": 0.0, "end_s": 0.1,
+        }) + "\n", encoding="utf-8")
+    originals = {path: path.read_text(encoding="utf-8") for path in paths}
+    real_atomic_write = ctc._atomic_write_text
+    calls = 0
+
+    def fail_second_publish(path, text):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected second replace failure")
+        real_atomic_write(path, text)
+
+    monkeypatch.setattr(ctc, "_atomic_write_text", fail_second_publish)
+
+    with pytest.raises(OSError, match="rollback complete"):
+        ctc._rebase_final_token_sidecars(tmp_path)
+
+    assert {path: path.read_text(encoding="utf-8") for path in paths} == \
+        originals
+
+
+def test_valid_work_receipt_cannot_bless_rehashed_raw_neighbor_tamper(
+        monkeypatch, tmp_path):
+    fixture = _fresh_nvasr_authority_fixture(tmp_path)
+    token_path = fixture["work"] / f"{fixture['stem']}_tokens.jsonl"
+    rows = [json.loads(line) for line in token_path.read_text(
+        encoding="utf-8").splitlines()]
+    candidate = next(row for row in rows
+                     if row.get("candidate_kind") == "nvv")
+    candidate["raw_timeline_neighbors"]["left"]["surface"] = "fabricated"
+    candidate["raw_timeline_evidence_sha256"] = \
+        ctc._nvasr_raw_timeline_evidence_sha256(candidate)
+    token_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8")
+    receipt = write_ctc_work_receipt(
+        fixture["work"], fixture["manifest_path"],
+        transform_ledger=list(fixture["work_receipt"][
+            "transform_ledger"]) + [{
+                "stage": "tamper_fixture",
+                "operation": "self_consistent_row_digest",
+            }])
+    fixture["work_receipt"] = receipt
+    assert validate_ctc_work_receipt(
+        fixture["work"], fixture["manifest_path"], receipt) == []
+    _bind_nvasr_lifecycle(monkeypatch, fixture)
+
+    lifecycle = post._load_ctc_lifecycle(fixture["work"], fixture["stem"])
+    authority = lifecycle["_nvasr_producer_authority"]
+    assert authority["summary"]["status"] == "rejected"
+    assert any("sealed_raw_candidate_projection_mismatch" in reason
+               for reason in authority["summary"]["reasons"])
+    assert post._nvasr_producer_authority_reasons(rows, authority) == [
+        "nvasr_producer_authority_not_verified"]
+
+
+@pytest.mark.parametrize("mutation", [
+    "locator_duplicate", "candidate_drop", "candidate_id_tamper",
+])
+def test_valid_work_receipt_cannot_bless_locator_or_candidate_sequence_change(
+        mutation, monkeypatch, tmp_path):
+    fixture = _fresh_nvasr_authority_fixture(tmp_path)
+    token_path = fixture["work"] / f"{fixture['stem']}_tokens.jsonl"
+    rows = [json.loads(line) for line in token_path.read_text(
+        encoding="utf-8").splitlines()]
+    candidate_index = next(
+        index for index, row in enumerate(rows)
+        if row.get("candidate_kind") == "nvv")
+    if mutation == "locator_duplicate":
+        rows[-1]["ctc_raw_token_row"] = dict(
+            rows[candidate_index]["ctc_raw_token_row"])
+    elif mutation == "candidate_drop":
+        del rows[candidate_index]
+    else:
+        rows[candidate_index]["candidate_id"] = "nvasr-candidate-tampered"
+        rows[candidate_index]["raw_timeline_evidence_sha256"] = \
+            ctc._nvasr_raw_timeline_evidence_sha256(rows[candidate_index])
+    token_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8")
+    receipt = write_ctc_work_receipt(
+        fixture["work"], fixture["manifest_path"],
+        transform_ledger=list(fixture["work_receipt"][
+            "transform_ledger"]) + [{
+                "stage": "sequence_tamper_fixture", "operation": mutation,
+            }])
+    fixture["work_receipt"] = receipt
+    assert validate_ctc_work_receipt(
+        fixture["work"], fixture["manifest_path"], receipt) == []
+    _bind_nvasr_lifecycle(monkeypatch, fixture)
+
+    authority = post._load_ctc_lifecycle(
+        fixture["work"], fixture["stem"])[
+            "_nvasr_producer_authority"]
+    assert authority["summary"]["status"] == "rejected"
+    assert any(
+        marker in reason
+        for reason in authority["summary"]["reasons"]
+        for marker in (
+            "ctc_raw_token_row", "nvasr_candidate_identity_sequence",
+            "nvasr_candidate_count", "sealed_raw_candidate_projection"))
+
+
+@pytest.mark.parametrize("mode", ["alter_raw_token", "substitute_manifest"])
+def test_bound_work_receipt_rejects_changed_or_substituted_raw_authority_first(
+        mode, monkeypatch, tmp_path):
+    fixture = _fresh_nvasr_authority_fixture(tmp_path / "primary")
+    manifest_path = fixture["manifest_path"]
+    if mode == "alter_raw_token":
+        token_path = fixture["raw"] / f"{fixture['stem']}_tokens.jsonl"
+        token_path.write_text(
+            token_path.read_text(encoding="utf-8") + "{}\n",
+            encoding="utf-8")
+    else:
+        substitute = _fresh_nvasr_authority_fixture(
+            tmp_path / "substitute", fixture["stem"])
+        manifest_path = substitute["manifest_path"]
+    monkeypatch.setenv("CTC_RAW_MANIFEST", str(manifest_path))
+    monkeypatch.setenv(
+        "CTC_WORK_RECEIPT", str(fixture["work_receipt_path"]))
+
+    with pytest.raises(ValueError, match="invalid CTC raw/work lifecycle"):
+        post._load_ctc_lifecycle(fixture["work"], fixture["stem"])
+
+
+def test_strict_audit_rebuilds_and_binds_public_nvasr_authority_summary(
+        monkeypatch, tmp_path):
+    fixture = _fresh_nvasr_authority_fixture(tmp_path)
+    _bind_nvasr_lifecycle(monkeypatch, fixture)
+    post_lifecycle = post._load_ctc_lifecycle(
+        fixture["work"], fixture["stem"])
+    args = SimpleNamespace(
+        ctc_dir=fixture["work"],
+        ctc_raw_manifest=fixture["manifest_path"],
+        ctc_work_receipt=fixture["work_receipt_path"],
+    )
+    lifecycle_reasons, audit_lifecycle = audit._ctc_lifecycle_reasons(
+        args, {fixture["stem"]})
+    assert lifecycle_reasons == []
+    expected_summary = audit_lifecycle["_nvasr_producer_authority"][
+        fixture["stem"]]
+    assert expected_summary == post_lifecycle[
+        "_nvasr_producer_authority"]["summary"]
+
+    words = post.Tier("words", 0.0, 1.0, [
+        post.Interval(0.0, 0.5, "ni3"),
+        post.Interval(0.5, 1.0, "hao3"),
+    ])
+    grid = post.TextGrid(0.0, 1.0, [words])
+    _frozen, freeze_reasons = post._freeze_processed_geometry(grid)
+    assert freeze_reasons == []
+    ledger = list(words._processed_geometry_ledger)
+    report = {
+        "stem": fixture["stem"], "status": "ok",
+        "ctc_lifecycle": {
+            key: value for key, value in post_lifecycle.items()
+            if not key.startswith("_")
+        },
+        "nvasr_producer_authority": post_lifecycle[
+            "_nvasr_producer_authority"]["summary"],
+        "nvasr_owner_selection": {
+            "status": "verified", "reasons": [], "candidates": [{}]},
+        "nvasr_frame_support": {
+            "status": "verified", "reasons": [], "candidates": [{}]},
+        "nvasr_candidate_provenance": {
+            "status": "verified", "reasons": [], "candidate_count": 1,
+            "candidates": [{}]},
+        "processed_geometry_digest": words._processed_geometry_digest,
+        "processed_operation_ledger": ledger,
+        "processed_geometry": {
+            "schema": "processed-words-geometry-v1", "frozen": True,
+            "digest": words._processed_geometry_digest, "ledger": ledger,
+        },
+        "publication_contract": {
+            "status": "verified", "details": {
+                "ctc_lexical_evidence_proof": [
+                    {"published_span": [0.0, 0.5]},
+                    {"published_span": [0.5, 1.0]},
+                ],
+            },
+        },
+    }
+    assert audit._postprocess_contract_reasons(
+        report, grid, audit_lifecycle) == []
+    assert "report_positive:nvasr_producer_authority" not in \
+        audit._report_reasons(report)
+
+    # A candidate-bearing producer cannot be audited away by replacing all
+    # three candidate reports with empty/stale payloads.  Exercise both the
+    # lifecycle-bound contract and the independent row-level veto.
+    for status in ("not_applicable", "verified"):
+        empty = json.loads(json.dumps(report))
+        for key in ("nvasr_owner_selection", "nvasr_frame_support",
+                    "nvasr_candidate_provenance"):
+            empty[key] = {
+                "status": status, "reasons": [], "candidates": []}
+        empty["nvasr_candidate_provenance"]["candidate_count"] = 0
+        post_reasons = audit._postprocess_contract_reasons(
+            empty, grid, audit_lifecycle)
+        row_reasons = audit._report_reasons(empty)
+        assert "postprocess_nvasr_owner_selection_candidate_count_mismatch" \
+            in post_reasons
+        assert "postprocess_nvasr_candidate_provenance_declared_candidate_count_mismatch" \
+            in post_reasons
+        assert "report_nvasr_owner_selection_candidate_count_mismatch" \
+            in row_reasons
+        assert "report_nvasr_candidate_provenance_declared_candidate_count_mismatch" \
+            in row_reasons
+        if status == "not_applicable":
+            assert "postprocess_nvasr_owner_selection_not_verified" \
+                in post_reasons
+            assert "report_nvasr_owner_selection_not_verified" in row_reasons
+
+    mismatched = json.loads(json.dumps(report))
+    for key in ("nvasr_owner_selection", "nvasr_frame_support",
+                "nvasr_candidate_provenance"):
+        mismatched[key]["candidates"] = [{}, {}]
+    mismatched["nvasr_candidate_provenance"]["candidate_count"] = 2
+    assert "postprocess_nvasr_frame_support_candidate_count_mismatch" in \
+        audit._postprocess_contract_reasons(
+            mismatched, grid, audit_lifecycle)
+    assert "report_nvasr_candidate_provenance_declared_candidate_count_mismatch" in \
+        audit._report_reasons(mismatched)
+
+    tampered = json.loads(json.dumps(report))
+    tampered["nvasr_producer_authority"][
+        "ordered_projection_sha256"] = "0" * 64
+    assert "postprocess_nvasr_producer_authority_mismatch" in \
+        audit._postprocess_contract_reasons(
+            tampered, grid, audit_lifecycle)
 
 
 def test_raw_manifest_is_immutable_and_work_is_physical_six_artifact_copy(tmp_path):
@@ -529,10 +987,17 @@ def test_report_lifecycle_fields_and_legacy_authority_fields_are_compatible(
 
     lifecycle = post._load_ctc_lifecycle(work, "demo")
     assert lifecycle["schema"] == "ctc-processed-input-lifecycle-v1"
-    assert set(lifecycle) == {"schema", "raw_manifest", "work_receipt", "stem"}
+    assert set(lifecycle) == {
+        "schema", "raw_manifest", "work_receipt", "stem",
+        "_nvasr_producer_authority",
+    }
     assert set(lifecycle["raw_manifest"]) == {"path", "sha256", "identity"}
     assert set(lifecycle["work_receipt"]) == {
         "path", "sha256", "identity", "lineage_entries"}
+    assert lifecycle["_nvasr_producer_authority"]["summary"]["status"] == \
+        "verified"
+    assert lifecycle["_nvasr_producer_authority"]["summary"][
+        "candidate_count"] == 0
 
     # These are historical report/authority fields.  They remain accepted as
     # bookkeeping while the new lifecycle contract is independently checked.

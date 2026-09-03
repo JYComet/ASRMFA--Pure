@@ -18,7 +18,7 @@ Also generates tone_mapping.json — bidirectional IPA↔pinyin tone reference t
 
 import argparse
 import array
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from functools import lru_cache
 import hashlib
 import json
@@ -80,6 +80,7 @@ SOS_PRONUNCIATION_POLICY_ID = "sos-exact-override-v1"
 SOS_EXPECTED_PRONUNCIATION = ("EH2", "S", "OW2", "EH1", "S")
 APP_EXPECTED_PRONUNCIATION = ("AE1", "P")
 _STRICT_EN_SILENCE = {"sil", "sp", "spn", "<eps>"}
+NVASR_NONLEXICAL_MFA_LABELS = frozenset(_STRICT_EN_SILENCE)
 MFA_INPUT_AXIS_SCHEMA = "mfa-input-axis-receipt-v1"
 MFA_ALIGNMENT_AXIS_SCHEMA = "mfa-alignment-axis-receipt-v1"
 MFA_ALIGNMENT_AXIS_V2_SCHEMA = "mfa-alignment-axis-receipt-v2"
@@ -89,6 +90,16 @@ CTC_QUERY_FRAMES = 4
 CTC_FRAME_SUPPORT_SCHEMA = "ctc-frame-support-v1"
 _FRAME_SUPPORT_EPS = 1e-6
 _FRAME_SUPPORT_DISPLAY_MIN_S = 1e-6
+NVASR_CANDIDATE_SCHEMA_VERSION = 3
+NVASR_MAPPING_AXIS = "non_nvv_compact_v1"
+NVASR_RAW_TIMELINE_NEIGHBORS_SCHEMA = "nvasr-raw-timeline-neighbors-v1"
+NVASR_SPIKE_ANCHOR_SCHEMA = "ctc_spike_anchor_v2"
+CTC_RAW_TOKEN_ROW_SCHEMA = "ctc_raw_token_row_v1"
+NVASR_PRODUCER_AUTHORITY_SCHEMA = "nvasr-producer-authority-v1"
+NVASR_IMMUTABLE_PROJECTION_SCHEMA = "nvasr-immutable-projection-v1"
+NVASR_ENDPOINT_TOLERANCE_S = 0.030
+NVASR_ANCHOR_COORDINATE_SYSTEM = "speech_seconds_from_ctc_encoder_frames"
+NVASR_ANCHOR_QUANTIZATION = "half_open_60ms_frames_centered_30ms_round_half_up"
 _EVIDENCE_REPAIR_FLOOR_S = 0.030
 _EVIDENCE_REPAIR_SCHEMA = "evidence-constrained-repair-v1"
 _UNKNOWN_REPAIR_PROOF_SCHEMA = "mfa-unknown-recovery-proof-v1"
@@ -96,6 +107,9 @@ FALLBACK_CORRESPONDENCE_SCHEMA = "fallback-lexical-correspondence-v2"
 PUNCTUATION_EVIDENCE_SCHEMA = "ctc-punctuation-evidence-v2"
 NVASR_CANDIDATE_PROVENANCE_SCHEMA = "nvasr-candidate-provenance-v1"
 NVASR_MAPPING_BASIS = "raw_ctc_label_neighbors_forced_overlap-v2"
+NVASR_SEMANTIC_AXIS_SCHEMA = NVASR_MAPPING_AXIS
+ADJUSTED_SPAN_BASIS = (
+    "ctc_spike_anchor_forced_correspondence_envelope_v1")
 PUBLICATION_TRANSACTION_SCHEMA = "derived-publication-transaction-v2"
 FALLBACK_SURFACE_SCHEMA = "fallback-punctuation-surface-v1"
 FALLBACK_PUNCTUATION_PROJECTION_SCHEMA = "fallback-punctuation-projection-v1"
@@ -179,8 +193,18 @@ def _axis_digest(value: object) -> str:
 
 
 def _evidence_digest(value: object) -> str:
-    """Digest a proof value without depending on whitespace or key order."""
-    return _axis_digest(value)
+    """Digest the exact JSON-persisted form of an evidence payload.
+
+    Evidence is routinely resealed after a transactional update.  Exclude an
+    older top-level digest instead of accidentally hashing the previous seal,
+    and round-trip through JSON before hashing so integer mapping keys have
+    the same representation before and after publication.
+    """
+    payload = ({key: item for key, item in value.items() if key != "digest"}
+               if isinstance(value, dict) else value)
+    canonical = json.loads(json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    return _axis_digest(canonical)
 
 
 def _axis_sha(path: Path) -> str:
@@ -548,7 +572,365 @@ def _copy_tier_metadata(source: Tier, target: Tier) -> Tier:
                  "_fallback_unknown_projection", "_punctuation_evidence_ledger"):
         if hasattr(source, name):
             setattr(target, name, getattr(source, name))
+    for name in ("_nvasr_source_mfa", "_nvasr_source_phones",
+                 "_source_phone_lineage"):
+        if hasattr(source, name):
+            setattr(target, name, getattr(source, name))
     return target
+
+
+def _nvasr_json_copy(value):
+    return json.loads(json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+
+def _nvasr_stable_json_digest(value) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _nvasr_candidate_immutable_projection(row: dict) -> dict:
+    """Project only producer-owned candidate evidence for sealed comparison."""
+    projection = {
+        "schema": NVASR_IMMUTABLE_PROJECTION_SCHEMA,
+        "candidate_schema": {
+            "nvasr_candidate_schema_version": row.get(
+                "nvasr_candidate_schema_version"),
+            "provenance_schema": row.get("provenance_schema"),
+        },
+        "candidate_identity": {
+            "candidate_id": row.get("candidate_id"),
+            "candidate_kind": row.get("candidate_kind"),
+            "word": row.get("word"),
+            "candidate_surface": row.get("candidate_surface"),
+            "candidate_source": row.get("candidate_source"),
+            "candidate_token_id": row.get("candidate_token_id"),
+            "candidate_token_ids": row.get("candidate_token_ids"),
+            "ctc_lexical_ordinal": row.get("ctc_lexical_ordinal"),
+        },
+        "frame_coordinates": {
+            "raw_start_frame": row.get("raw_start_frame"),
+            "raw_end_frame": row.get("raw_end_frame"),
+            "raw_frame_count": row.get("raw_frame_count"),
+            "raw_start_s": row.get("raw_start_s"),
+            "raw_end_s": row.get("raw_end_s"),
+            "raw_span": row.get("raw_span"),
+            "speech_start_frame": row.get("speech_start_frame"),
+            "speech_end_frame": row.get("speech_end_frame"),
+            "speech_frame_count": row.get("speech_frame_count"),
+            "speech_start_s": row.get("speech_start_s"),
+            "speech_end_s": row.get("speech_end_s"),
+            "speech_span": row.get("speech_span"),
+            "query_frames": row.get("query_frames"),
+            "frame_ms": row.get("frame_ms"),
+        },
+        "ctc_spike_anchor": row.get("ctc_spike_anchor"),
+        "mapping": {
+            "mapping_basis": row.get("mapping_basis"),
+            "mapping_axis": row.get("mapping_axis"),
+            # Both coordinate systems are producer-owned once all token
+            # normalizers and the final sidecar rebase have completed.  The
+            # canonical fields bind the final semantic axis; the raw key
+            # independently binds the immutable decoder-timeline digest.
+            "mapping_key": row.get("mapping_key"),
+            "raw_timeline_mapping_key": row.get(
+                "raw_timeline_mapping_key"),
+            "ordered_semantic_neighbors": row.get(
+                "ordered_semantic_neighbors"),
+            "mapping_outcome": row.get("mapping_outcome"),
+        },
+        "raw_timeline": {
+            "raw_timeline_neighbors_schema": row.get(
+                "raw_timeline_neighbors_schema"),
+            "raw_timeline_index": row.get("raw_timeline_index"),
+            "raw_timeline_event_count": row.get(
+                "raw_timeline_event_count"),
+            "raw_timeline_neighbors": row.get("raw_timeline_neighbors"),
+            "raw_timeline_evidence_sha256": row.get(
+                "raw_timeline_evidence_sha256"),
+        },
+        "forced_correspondence": {
+            "forced_span": row.get("forced_span"),
+            "mapping_selection": row.get("mapping_selection"),
+            "mapping_forced_speech_overlap_s": row.get(
+                "mapping_forced_speech_overlap_s"),
+            "mapping_forced_ctc_anchor_overlap_s": row.get(
+                "mapping_forced_ctc_anchor_overlap_s"),
+            "nvv_deduplication": row.get("nvv_deduplication"),
+        },
+        "producer_locator": row.get("ctc_raw_token_row"),
+    }
+    # The authority object can outlive and be compared against the mutable
+    # work-sidecar rows.  Never retain nested references into those rows.
+    return _nvasr_json_copy(projection)
+
+
+def _nvasr_locator_reasons(
+        row: dict, *, stem: str, sidecar: str, ordinal: int) -> list[str]:
+    locator = row.get("ctc_raw_token_row")
+    if not isinstance(locator, dict) or set(locator) != {
+            "schema", "stem", "sidecar", "row_ordinal"}:
+        return [f"ctc_raw_token_row_locator_malformed:{ordinal}"]
+    reasons = []
+    if locator.get("schema") != CTC_RAW_TOKEN_ROW_SCHEMA:
+        reasons.append(f"ctc_raw_token_row_schema_mismatch:{ordinal}")
+    if locator.get("stem") != stem:
+        reasons.append(f"ctc_raw_token_row_stem_mismatch:{ordinal}")
+    if locator.get("sidecar") != sidecar:
+        reasons.append(f"ctc_raw_token_row_sidecar_mismatch:{ordinal}")
+    if locator.get("row_ordinal") != ordinal:
+        reasons.append(f"ctc_raw_token_row_ordinal_mismatch:{ordinal}")
+    return reasons
+
+
+def _nvasr_authority_candidate_reasons(row: dict) -> list[str]:
+    reasons: list[str] = []
+    if row.get("nvasr_candidate_schema_version") != NVASR_CANDIDATE_SCHEMA_VERSION:
+        reasons.append("nvasr_candidate_schema_version_3_required")
+    if row.get("provenance_schema") != NVASR_CANDIDATE_PROVENANCE_SCHEMA:
+        reasons.append("nvasr_candidate_provenance_schema_mismatch")
+    if row.get("candidate_kind") != "nvv":
+        reasons.append("nvasr_candidate_kind_mismatch")
+    if row.get("mapping_axis") != NVASR_MAPPING_AXIS:
+        reasons.append("nvasr_candidate_mapping_axis_mismatch")
+    if (row.get("mapping_basis") != NVASR_MAPPING_BASIS
+            or row.get("mapping_outcome") != "unique"):
+        reasons.append("nvasr_candidate_mapping_contract_invalid")
+    mapping_key = row.get("mapping_key")
+    if (not isinstance(mapping_key, dict)
+            or set(mapping_key) != {
+                "left_lexical_ordinal", "right_lexical_ordinal"}
+            or any(value is not None and (
+                not isinstance(value, int) or isinstance(value, bool)
+                or value < 0) for value in mapping_key.values())):
+        reasons.append("nvasr_candidate_mapping_key_invalid")
+        mapping_key = None
+    if (row.get("nvasr_candidate_schema_version") ==
+            NVASR_CANDIDATE_SCHEMA_VERSION
+            and "raw_timeline_mapping_key" not in row):
+        reasons.append("raw_timeline_mapping_key_required")
+    raw_mapping_key = row.get("raw_timeline_mapping_key")
+    if (not isinstance(raw_mapping_key, dict)
+            or set(raw_mapping_key) != {
+                "left_lexical_ordinal", "right_lexical_ordinal"}
+            or any(value is not None and (
+                not isinstance(value, int) or isinstance(value, bool)
+                or value < 0) for value in raw_mapping_key.values())):
+        reasons.append("raw_timeline_mapping_key_invalid")
+    neighbors = row.get("ordered_semantic_neighbors")
+    expected_neighbor_order = []
+    if isinstance(mapping_key, dict):
+        expected_neighbor_order = [
+            (side, mapping_key.get(f"{side}_lexical_ordinal"))
+            for side in ("left", "right")
+            if mapping_key.get(f"{side}_lexical_ordinal") is not None
+        ]
+    if (not isinstance(neighbors, list)
+            or any(not _nvasr_neighbor_item_valid(item) for item in neighbors)
+            or any(set(item) != {
+                "side", "lexical_ordinal", "occurrence_id", "surface",
+                "surface_occurrence"} for item in neighbors)
+            or [item.get("side") for item in neighbors]
+            != sorted([item.get("side") for item in neighbors],
+                      key=("left", "right").index)
+            or [(item.get("side"), item.get("lexical_ordinal"))
+                for item in neighbors] != expected_neighbor_order):
+        reasons.append("nvasr_candidate_semantic_neighbors_invalid")
+    reasons.extend(_nvasr_raw_timeline_contract_reasons(row))
+    reasons.extend(_nvasr_anchor_binding_reasons(row))
+    if _nvasr_valid_span(row.get("forced_span")) is None:
+        reasons.append("nvasr_candidate_forced_correspondence_invalid")
+    raw_start = row.get("raw_start_frame")
+    raw_end = row.get("raw_end_frame")
+    speech_start = row.get("speech_start_frame")
+    speech_end = row.get("speech_end_frame")
+    if (isinstance(raw_start, int) and not isinstance(raw_start, bool)
+            and isinstance(raw_end, int) and not isinstance(raw_end, bool)
+            and isinstance(speech_start, int) and not isinstance(speech_start, bool)
+            and isinstance(speech_end, int) and not isinstance(speech_end, bool)):
+        frame_count = raw_end - raw_start
+        if (raw_start < 0 or raw_end <= raw_start
+                or row.get("raw_frame_count") != frame_count
+                or row.get("speech_frame_count") != frame_count
+                or row.get("query_frames") != CTC_QUERY_FRAMES
+                or row.get("frame_ms") != CTC_FRAME_MS
+                or speech_start != raw_start - CTC_QUERY_FRAMES
+                or speech_end != raw_end - CTC_QUERY_FRAMES):
+            reasons.append("nvasr_candidate_frame_count_or_offset_invalid")
+        expected_raw = [raw_start * CTC_FRAME_MS / 1000.0,
+                        raw_end * CTC_FRAME_MS / 1000.0]
+        expected_speech = [speech_start * CTC_FRAME_MS / 1000.0,
+                           speech_end * CTC_FRAME_MS / 1000.0]
+        for values, expected, label in (
+                ((row.get("raw_start_s"), row.get("raw_end_s")),
+                 expected_raw, "raw_coordinates"),
+                (row.get("raw_span"), expected_raw, "raw_span"),
+                ((row.get("speech_start_s"), row.get("speech_end_s")),
+                 expected_speech, "speech_coordinates"),
+                (row.get("speech_span"), expected_speech, "speech_span")):
+            if (not isinstance(values, (list, tuple)) or len(values) != 2
+                    or any(not isinstance(value, (int, float))
+                           or isinstance(value, bool)
+                           or not math.isclose(float(value), expected[index],
+                                               abs_tol=1e-9)
+                           for index, value in enumerate(values))):
+                reasons.append(f"nvasr_candidate_{label}_binding_invalid")
+    else:
+        reasons.append("nvasr_candidate_frame_coordinates_invalid")
+    return list(dict.fromkeys(reasons))
+
+
+def _nvasr_read_jsonl(path: Path, label: str) -> list[dict]:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} is missing/unsafe")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not lines or any(not line.strip() for line in lines):
+        raise ValueError(f"{label} has empty or blank JSONL rows")
+    rows = [json.loads(line) for line in lines]
+    if any(not isinstance(row, dict) for row in rows):
+        raise ValueError(f"{label} contains a non-object row")
+    return rows
+
+
+def _nvasr_build_producer_authority(
+        raw_manifest: dict, work_receipt: dict, raw_dir: Path,
+        work_dir: Path, stem: str) -> dict:
+    """Build a private sealed-raw projection and compare the work candidates."""
+    reasons: list[str] = []
+    sidecar = f"{stem}_tokens.jsonl"
+    if (not isinstance(stem, str) or not stem or Path(stem).name != stem
+            or Path(sidecar).name != sidecar):
+        reasons.append("nvasr_token_sidecar_stem_invalid")
+    raw_entries = [row for row in raw_manifest.get("files", [])
+                   if isinstance(row, dict) and row.get("stem") == stem
+                   and row.get("suffix") == "_tokens.jsonl"]
+    work_entries = [row for row in work_receipt.get("files", [])
+                    if isinstance(row, dict) and row.get("stem") == stem
+                    and row.get("suffix") == "_tokens.jsonl"]
+    if len(raw_entries) != 1 or raw_entries[0].get("name") != sidecar:
+        reasons.append("raw_manifest_token_sidecar_resolution_invalid")
+    if len(work_entries) != 1 or work_entries[0].get("name") != sidecar:
+        reasons.append("work_receipt_token_sidecar_resolution_invalid")
+
+    raw_rows: list[dict] = []
+    work_rows: list[dict] = []
+    if not reasons:
+        try:
+            raw_rows = _nvasr_read_jsonl(
+                raw_dir / sidecar, "manifest-sealed raw token sidecar")
+            work_rows = _nvasr_read_jsonl(
+                work_dir / sidecar, "receipt-bound work token sidecar")
+        except (OSError, UnicodeError, TypeError, ValueError,
+                json.JSONDecodeError) as exc:
+            reasons.append(f"nvasr_token_sidecar_unreadable:{exc}")
+
+    for ordinal, row in enumerate(raw_rows):
+        reasons.extend(_nvasr_locator_reasons(
+            row, stem=stem, sidecar=sidecar, ordinal=ordinal))
+    for ordinal, row in enumerate(work_rows):
+        reasons.extend(_nvasr_locator_reasons(
+            row, stem=stem, sidecar=sidecar, ordinal=ordinal))
+    raw_locators = [row.get("ctc_raw_token_row") for row in raw_rows]
+    work_locators = [row.get("ctc_raw_token_row") for row in work_rows]
+    if len(raw_rows) != len(work_rows) or raw_locators != work_locators:
+        reasons.append("ctc_raw_token_row_sequence_mismatch")
+    if len({_nvasr_stable_json_digest(value) for value in raw_locators}) != len(
+            raw_locators):
+        reasons.append("ctc_raw_token_row_locator_duplicate")
+
+    raw_candidates = [row for row in raw_rows
+                      if row.get("candidate_kind") == "nvv"]
+    work_candidates = [row for row in work_rows
+                       if row.get("candidate_kind") == "nvv"]
+    raw_ids = [row.get("candidate_id") for row in raw_candidates]
+    work_ids = [row.get("candidate_id") for row in work_candidates]
+    if (any(is_nvv_token(str(row.get("word", "")).strip())
+            and row.get("candidate_kind") != "nvv" for row in raw_rows)
+            or any(is_nvv_token(str(row.get("word", "")).strip())
+                   and row.get("candidate_kind") != "nvv"
+                   for row in work_rows)):
+        reasons.append("legacy_or_unprovenanced_nvasr_row")
+    if (not all(isinstance(value, str) and value for value in raw_ids)
+            or raw_ids != sorted(raw_ids)
+            or len(raw_ids) != len(set(raw_ids))
+            or work_ids != raw_ids):
+        reasons.append("nvasr_candidate_identity_sequence_mismatch")
+
+    raw_projections: list[dict] = []
+    for candidate_index, raw_row in enumerate(raw_candidates):
+        locator = raw_row.get("ctc_raw_token_row")
+        ordinal = (locator.get("row_ordinal")
+                   if isinstance(locator, dict) else candidate_index)
+        for reason in _nvasr_authority_candidate_reasons(raw_row):
+            reasons.append(f"sealed_raw_candidate:{ordinal}:{reason}")
+        projection = _nvasr_candidate_immutable_projection(raw_row)
+        raw_projections.append(projection)
+        if candidate_index >= len(work_candidates):
+            continue
+        work_row = work_candidates[candidate_index]
+        for reason in _nvasr_authority_candidate_reasons(work_row):
+            reasons.append(f"work_candidate:{ordinal}:{reason}")
+        if _nvasr_candidate_immutable_projection(work_row) != projection:
+            reasons.append(
+                f"sealed_raw_candidate_projection_mismatch:{ordinal}:"
+                f"{raw_row.get('candidate_id')}")
+    if len(raw_candidates) != len(work_candidates):
+        reasons.append("nvasr_candidate_count_mismatch")
+
+    ordered_projection_sha256 = _nvasr_stable_json_digest({
+        "schema": NVASR_IMMUTABLE_PROJECTION_SCHEMA,
+        "stem": stem,
+        "candidates": raw_projections,
+    })
+    summary = {
+        "schema": NVASR_PRODUCER_AUTHORITY_SCHEMA,
+        "status": "verified" if not reasons else "rejected",
+        "raw_manifest_identity": raw_manifest.get("identity"),
+        "raw_tokens_sha256": (raw_entries[0].get("sha256")
+                              if len(raw_entries) == 1 else None),
+        "work_receipt_identity": work_receipt.get("identity"),
+        "candidate_count": len(raw_candidates),
+        "ordered_projection_sha256": ordered_projection_sha256,
+        "reasons": list(dict.fromkeys(reasons)),
+    }
+    return {
+        "summary": summary,
+        "ordered_raw_projections": raw_projections,
+    }
+
+
+def _nvasr_producer_authority_reasons(
+        ctc_tokens: list[dict] | None, authority: dict | None, *,
+        required: bool = False) -> list[str]:
+    if authority is None:
+        return (["nvasr_manifest_anchored_producer_authority_required"]
+                if required else [])
+    if not isinstance(authority, dict):
+        return ["nvasr_producer_authority_private_invalid"]
+    summary = authority.get("summary")
+    expected = authority.get("ordered_raw_projections")
+    if (not isinstance(summary, dict)
+            or summary.get("schema") != NVASR_PRODUCER_AUTHORITY_SCHEMA
+            or summary.get("status") != "verified"
+            or summary.get("reasons") != []
+            or not isinstance(expected, list)):
+        return ["nvasr_producer_authority_not_verified"]
+    candidates = [row for row in (ctc_tokens or [])
+                  if isinstance(row, dict) and row.get("candidate_kind") == "nvv"]
+    actual = [_nvasr_candidate_immutable_projection(row) for row in candidates]
+    reasons = []
+    if len(actual) != summary.get("candidate_count") or actual != expected:
+        reasons.append("nvasr_manifest_anchored_projection_mismatch")
+    digest = _nvasr_stable_json_digest({
+        "schema": NVASR_IMMUTABLE_PROJECTION_SCHEMA,
+        "stem": (candidates[0].get("ctc_raw_token_row", {}).get("stem")
+                 if candidates else None),
+        "candidates": actual,
+    })
+    if candidates and digest != summary.get("ordered_projection_sha256"):
+        reasons.append("nvasr_ordered_projection_digest_mismatch")
+    return reasons
 
 
 def _load_ctc_lifecycle(txt_dir: Path, stem: str) -> dict | None:
@@ -586,6 +968,9 @@ def _load_ctc_lifecycle(txt_dir: Path, stem: str) -> dict | None:
     stems = raw_manifest.get("stems") if isinstance(raw_manifest, dict) else None
     if not isinstance(stems, list) or stem not in stems:
         errors.append(f"CTC lifecycle stem missing from raw manifest:{stem}")
+    if (not isinstance(raw_manifest, dict)
+            or raw_manifest.get("raw_root") != str(raw_dir.resolve())):
+        errors.append("CTC raw manifest root binding mismatch")
     if (not isinstance(work_receipt, dict)
             or work_receipt.get("work_root") != str(Path(txt_dir).resolve())):
         errors.append("CTC work receipt lineage root mismatch")
@@ -594,6 +979,8 @@ def _load_ctc_lifecycle(txt_dir: Path, stem: str) -> dict | None:
         errors.append("CTC work receipt lineage missing")
     if errors:
         raise ValueError("invalid CTC raw/work lifecycle: " + "; ".join(errors))
+    authority = _nvasr_build_producer_authority(
+        raw_manifest, work_receipt, raw_dir, work_dir, stem)
     return {
         "schema": "ctc-processed-input-lifecycle-v1",
         "raw_manifest": {
@@ -608,6 +995,7 @@ def _load_ctc_lifecycle(txt_dir: Path, stem: str) -> dict | None:
             "lineage_entries": len(ledger),
         },
         "stem": stem,
+        "_nvasr_producer_authority": authority,
     }
 
 
@@ -821,6 +1209,12 @@ def _nvasr_nvv_identity(value: object) -> str:
         " ", "-")
 
 
+def _nvasr_is_nonlexical_mfa_label(value: object) -> bool:
+    """Recognize every MFA pause label, including ``sp``/``spn`` aliases."""
+    text = str(value or "").strip().casefold()
+    return text in NVASR_NONLEXICAL_MFA_LABELS or is_silence(text)
+
+
 def _nvasr_valid_span(value: object) -> list[float] | None:
     if (not isinstance(value, (list, tuple)) or len(value) != 2
             or any(isinstance(item, bool)
@@ -831,6 +1225,755 @@ def _nvasr_valid_span(value: object) -> list[float] | None:
     if start < 0 or end <= start:
         return None
     return [start, end]
+
+
+def _nvasr_valid_evidence_span(value: object) -> list[float] | None:
+    """Validate an evidence envelope without treating it as an owner span."""
+    if (not isinstance(value, (list, tuple)) or len(value) != 2
+            or any(isinstance(item, bool)
+                   or not isinstance(item, (int, float))
+                   or not math.isfinite(float(item)) for item in value)):
+        return None
+    start, end = float(value[0]), float(value[1])
+    return [start, end] if start < end else None
+
+
+def _nvasr_expected_adjusted_span(row: dict) -> list[float] | None:
+    """Compute the strict-v3 adjusted correspondence envelope."""
+    current = _nvasr_valid_evidence_span(
+        [row.get("start_s"), row.get("end_s")])
+    forced = _nvasr_valid_span(row.get("forced_span"))
+    anchor = _nvasr_anchor_span(row)
+    if current is None or forced is None or anchor is None:
+        return None
+    return [min(current[0], forced[0], anchor[0]),
+            max(current[1], forced[1], anchor[1])]
+
+
+def _nvasr_valid_anchor(value: object) -> bool:
+    """Validate the complete v2 anchor against locked producer runtime values."""
+    if not isinstance(value, dict) or set(value) != {
+            "schema", "raw_start_frame", "raw_end_frame",
+            "start", "end", "ordered_source_frame_ids", "raw_frame_count",
+            "query_frames", "frame_ms", "speech_start_frame",
+            "speech_end_frame",
+            "coordinate_system", "quantization"}:
+        return False
+    start, end = value.get("start"), value.get("end")
+    frame_ids = value.get("ordered_source_frame_ids")
+    if (not isinstance(start, (int, float)) or isinstance(start, bool)
+            or not math.isfinite(float(start))
+            or not isinstance(end, (int, float)) or isinstance(end, bool)
+            or not math.isfinite(float(end)) or end <= start
+            or not isinstance(frame_ids, list) or not frame_ids):
+        return False
+    if (any(not isinstance(frame, int) or isinstance(frame, bool)
+            or frame < 0 for frame in frame_ids)
+            or frame_ids != list(range(frame_ids[0], frame_ids[-1] + 1))):
+        return False
+    raw_start = value.get("raw_start_frame")
+    raw_end = value.get("raw_end_frame")
+    count = value.get("raw_frame_count")
+    if not (isinstance(count, int)
+            and not isinstance(value.get("raw_frame_count"), bool)
+            and count == len(frame_ids)
+            and isinstance(raw_start, int) and not isinstance(raw_start, bool)
+            and isinstance(raw_end, int) and not isinstance(raw_end, bool)
+            and raw_start >= 0 and raw_end > raw_start
+            and frame_ids == list(range(raw_start, raw_end))
+            and count == raw_end - raw_start
+            and value.get("query_frames") == CTC_QUERY_FRAMES
+            and value.get("frame_ms") == CTC_FRAME_MS
+            and value.get("speech_start_frame") == raw_start - CTC_QUERY_FRAMES
+            and value.get("speech_end_frame") == raw_end - CTC_QUERY_FRAMES
+            and value.get("schema") == NVASR_SPIKE_ANCHOR_SCHEMA
+            and value.get("coordinate_system") == NVASR_ANCHOR_COORDINATE_SYSTEM
+            and value.get("quantization") == NVASR_ANCHOR_QUANTIZATION):
+        return False
+    expected = _nvasr_expected_anchor({
+        "raw_start_frame": raw_start, "raw_end_frame": raw_end,
+        "query_frames": CTC_QUERY_FRAMES, "frame_ms": CTC_FRAME_MS,
+    })
+    return (value == expected
+            and math.isclose(float(end) - float(start),
+                             count * CTC_FRAME_MS / 1000.0, abs_tol=1e-9))
+
+
+def _nvasr_anchor_span(row: dict) -> list[float] | None:
+    anchor = row.get("ctc_spike_anchor")
+    if not _nvasr_valid_anchor(anchor):
+        return None
+    return [float(anchor["start"]), float(anchor["end"])]
+
+
+def _nvasr_expected_anchor(row: dict) -> dict | None:
+    if (not isinstance(row.get("raw_start_frame"), int)
+            or isinstance(row.get("raw_start_frame"), bool)
+            or not isinstance(row.get("raw_end_frame"), int)
+            or isinstance(row.get("raw_end_frame"), bool)
+            or row["raw_end_frame"] <= row["raw_start_frame"]):
+        return None
+    start_frame = row["raw_start_frame"]
+    end_frame = row["raw_end_frame"]
+    def round_half_up(value: float) -> float:
+        return float(Decimal(str(value)).quantize(
+            Decimal("0.000001"), rounding=ROUND_HALF_UP))
+
+    return {
+        "schema": NVASR_SPIKE_ANCHOR_SCHEMA,
+        "raw_start_frame": start_frame,
+        "raw_end_frame": end_frame,
+        "start": round_half_up((start_frame - CTC_QUERY_FRAMES) * CTC_FRAME_MS
+                                / 1000.0 - CTC_FRAME_MS / 2000.0),
+        "end": round_half_up((end_frame - CTC_QUERY_FRAMES) * CTC_FRAME_MS
+                              / 1000.0 - CTC_FRAME_MS / 2000.0),
+        "ordered_source_frame_ids": list(range(start_frame, end_frame)),
+        "raw_frame_count": end_frame - start_frame,
+        "query_frames": CTC_QUERY_FRAMES,
+        "frame_ms": CTC_FRAME_MS,
+        "speech_start_frame": start_frame - CTC_QUERY_FRAMES,
+        "speech_end_frame": end_frame - CTC_QUERY_FRAMES,
+        "coordinate_system": NVASR_ANCHOR_COORDINATE_SYSTEM,
+        "quantization": NVASR_ANCHOR_QUANTIZATION,
+    }
+
+
+def _nvasr_anchor_binding_reasons(row: dict) -> list[str]:
+    reasons: list[str] = []
+    if row.get("query_frames") != CTC_QUERY_FRAMES:
+        reasons.append("ctc_spike_anchor_query_frames_mismatch")
+    if row.get("frame_ms") != CTC_FRAME_MS:
+        reasons.append("ctc_spike_anchor_frame_ms_mismatch")
+    anchor = row.get("ctc_spike_anchor")
+    expected = _nvasr_expected_anchor(row)
+    if not isinstance(anchor, dict):
+        return reasons + ["ctc_spike_anchor_v2_malformed"]
+    if expected is None:
+        return reasons + ["ctc_spike_anchor_candidate_frames_invalid"]
+    for key in (
+            "raw_start_frame", "raw_end_frame", "ordered_source_frame_ids",
+            "raw_frame_count", "speech_start_frame", "speech_end_frame"):
+        if anchor.get(key) != expected.get(key):
+            reasons.append("ctc_spike_anchor_frame_binding_invalid")
+            break
+    if (row.get("raw_frame_count") != expected.get("raw_frame_count")
+            or row.get("speech_frame_count") != expected.get(
+                "raw_frame_count")):
+        reasons.append("ctc_spike_anchor_frame_binding_invalid")
+    if anchor != expected:
+        reasons.append("ctc_spike_anchor_coordinate_binding_invalid")
+    if not _nvasr_valid_anchor(anchor):
+        reasons.append("ctc_spike_anchor_v2_malformed")
+    return list(dict.fromkeys(reasons))
+
+
+def _nvasr_endpoint_compatible(left: list[float], right: list[float]) -> bool:
+    """Use one inclusive 30 ms endpoint tolerance for both sides.
+
+    30 ms is half of the locked 60 ms CTC frame.  Persisted coordinates are
+    rounded to microseconds; the 1 ns comparison cushion accepts an exact
+    rounded boundary but rejects any materially just-outside endpoint.
+    """
+    gap = max(left[0] - right[1], right[0] - left[1], 0.0)
+    return gap <= NVASR_ENDPOINT_TOLERANCE_S + 1e-9
+
+
+def _nvasr_neighbor_item_valid(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    ordinal = value.get("lexical_ordinal")
+    return (value.get("side") in {"left", "right"}
+            and isinstance(ordinal, int) and not isinstance(ordinal, bool)
+            and ordinal >= 0
+            and value.get("occurrence_id") == f"nvasr-lexical-{ordinal:04d}"
+            and isinstance(value.get("surface"), str)
+            and isinstance(value.get("surface_occurrence"), int)
+            and not isinstance(value.get("surface_occurrence"), bool))
+
+
+_NVASR_RAW_EVENT_FIELDS = frozenset({
+    "surface", "source", "token_id", "ordered_source_frame_ids",
+})
+_NVASR_RAW_EVENT_SOURCES = frozenset({"ctc", "blank_run"})
+
+
+def _nvasr_raw_event_valid(value: object) -> bool:
+    """Validate one exact raw decoder-timeline event diagnostic."""
+    if not isinstance(value, dict) or set(value) != _NVASR_RAW_EVENT_FIELDS:
+        return False
+    token_id = value.get("token_id")
+    frames = value.get("ordered_source_frame_ids")
+    return (
+        isinstance(value.get("surface"), str)
+        and value.get("source") in _NVASR_RAW_EVENT_SOURCES
+        and isinstance(token_id, int) and not isinstance(token_id, bool)
+        and token_id >= 0
+        and isinstance(frames, list) and bool(frames)
+        and all(isinstance(frame, int) and not isinstance(frame, bool)
+                and frame >= 0 for frame in frames)
+        and frames == list(range(frames[0], frames[-1] + 1))
+    )
+
+
+def _nvasr_raw_timeline_evidence_material(row: dict) -> dict:
+    """Mirror the producer's canonical raw-neighbour binding material."""
+    return {
+        "schema": row.get("raw_timeline_neighbors_schema"),
+        "candidate_id": row.get("candidate_id"),
+        "candidate_surface": row.get("candidate_surface"),
+        "candidate_source": row.get("candidate_source"),
+        "candidate_token_id": row.get("candidate_token_id"),
+        "candidate_token_ids": row.get("candidate_token_ids"),
+        "raw_start_frame": row.get("raw_start_frame"),
+        "raw_end_frame": row.get("raw_end_frame"),
+        "query_frames": row.get("query_frames"),
+        "frame_ms": row.get("frame_ms"),
+        "raw_timeline_index": row.get("raw_timeline_index"),
+        "raw_timeline_event_count": row.get("raw_timeline_event_count"),
+        "mapping_key": row.get("raw_timeline_mapping_key",
+                                row.get("mapping_key")),
+        "raw_timeline_neighbors": row.get("raw_timeline_neighbors"),
+    }
+
+
+def _nvasr_raw_timeline_evidence_sha256(row: dict) -> str:
+    payload = json.dumps(
+        _nvasr_raw_timeline_evidence_material(row),
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _nvasr_raw_timeline_contract_reasons(row: dict) -> list[str]:
+    """Fail closed on a malformed or altered persisted raw-neighbour window.
+
+    This contract is deliberately independent from
+    ``ordered_semantic_neighbors``. The raw index/count determines direct
+    timeline side presence, frame ordering binds each side to the candidate
+    run, and the producer digest preserves exact raw identities and token
+    evidence across canonical English retokenisation.
+    """
+    reasons: list[str] = []
+    if (row.get("raw_timeline_neighbors_schema") !=
+            NVASR_RAW_TIMELINE_NEIGHBORS_SCHEMA):
+        reasons.append("raw_timeline_neighbors_schema_invalid")
+
+    index = row.get("raw_timeline_index")
+    count = row.get("raw_timeline_event_count")
+    position_valid = (
+        isinstance(index, int) and not isinstance(index, bool)
+        and isinstance(count, int) and not isinstance(count, bool)
+        and count > 0 and 0 <= index < count)
+    if not position_valid:
+        reasons.append("raw_timeline_position_invalid")
+
+    neighbors = row.get("raw_timeline_neighbors")
+    if not isinstance(neighbors, dict) or set(neighbors) != {"left", "right"}:
+        reasons.append("raw_timeline_neighbors_structure_invalid")
+        neighbors = {"left": None, "right": None}
+
+    mapping_key = row.get("mapping_key")
+    if (row.get("nvasr_candidate_schema_version") ==
+            NVASR_CANDIDATE_SCHEMA_VERSION
+            and "raw_timeline_mapping_key" not in row):
+        reasons.append("raw_timeline_mapping_key_required")
+    mapping_key = row.get("raw_timeline_mapping_key", mapping_key)
+    if (not isinstance(mapping_key, dict)
+            or set(mapping_key) != {
+                "left_lexical_ordinal", "right_lexical_ordinal"}):
+        reasons.append("raw_timeline_mapping_key_invalid")
+        mapping_key = {"left_lexical_ordinal": None,
+                       "right_lexical_ordinal": None}
+    elif any(value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0)
+            for value in mapping_key.values()):
+        reasons.append("raw_timeline_mapping_key_invalid")
+
+    raw_start = row.get("raw_start_frame")
+    raw_end = row.get("raw_end_frame")
+    token_id = row.get("candidate_token_id")
+    token_ids = row.get("candidate_token_ids")
+    candidate_valid = (
+        isinstance(row.get("candidate_id"), str) and bool(row["candidate_id"])
+        and isinstance(row.get("candidate_surface"), str)
+        and bool(row["candidate_surface"])
+        and row.get("candidate_source") in _NVASR_RAW_EVENT_SOURCES
+        and isinstance(token_id, int) and not isinstance(token_id, bool)
+        and token_id >= 0
+        and isinstance(raw_start, int) and not isinstance(raw_start, bool)
+        and isinstance(raw_end, int) and not isinstance(raw_end, bool)
+        and 0 <= raw_start < raw_end
+        and row.get("query_frames") == CTC_QUERY_FRAMES
+        and row.get("frame_ms") == CTC_FRAME_MS
+        and isinstance(token_ids, list)
+        and token_ids == [token_id] * (raw_end - raw_start)
+    )
+    if not candidate_valid:
+        reasons.append("raw_timeline_candidate_identity_invalid")
+
+    for side in ("left", "right"):
+        neighbor = neighbors[side]
+        if neighbor is not None and not _nvasr_raw_event_valid(neighbor):
+            reasons.append(f"raw_timeline_{side}_event_invalid")
+
+    if position_valid:
+        if (neighbors["left"] is None) != (index == 0):
+            reasons.append("raw_timeline_left_presence_invalid")
+        if (neighbors["right"] is None) != (index + 1 == count):
+            reasons.append("raw_timeline_right_presence_invalid")
+    for side in ("left", "right"):
+        if (mapping_key.get(f"{side}_lexical_ordinal") is not None
+                and neighbors[side] is None):
+            reasons.append(f"raw_timeline_{side}_required_by_mapping_key")
+
+    if candidate_valid and _nvasr_raw_event_valid(neighbors["left"]):
+        if neighbors["left"]["ordered_source_frame_ids"][-1] >= raw_start:
+            reasons.append("raw_timeline_left_frame_order_invalid")
+    if candidate_valid and _nvasr_raw_event_valid(neighbors["right"]):
+        if neighbors["right"]["ordered_source_frame_ids"][0] < raw_end:
+            reasons.append("raw_timeline_right_frame_order_invalid")
+
+    digest = row.get("raw_timeline_evidence_sha256")
+    if (not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
+        reasons.append("raw_timeline_evidence_digest_invalid")
+    else:
+        try:
+            expected_digest = _nvasr_raw_timeline_evidence_sha256(row)
+        except (TypeError, ValueError):
+            expected_digest = None
+        if digest != expected_digest:
+            reasons.append("raw_timeline_evidence_digest_mismatch")
+    return list(dict.fromkeys(reasons))
+
+
+def _nvasr_overlap_or_touch(left: list[float], right: list[float]) -> bool:
+    return (min(left[1], right[1]) - max(left[0], right[0]) >= -1e-9
+            or _nvasr_endpoint_compatible(left, right))
+
+
+def _nvasr_span_from_value(value: object) -> list[float] | None:
+    if isinstance(value, dict):
+        mapping = value
+        value = mapping.get("span", mapping.get("interval"))
+        if value is None and "start" in mapping and "end" in mapping:
+            value = [mapping["start"], mapping["end"]]
+    return _nvasr_valid_span(value)
+
+
+def _nvasr_source_owner_evidence(
+        words_tier: Tier | None, row: dict, ctc_tokens: list[dict] | None,
+        source_words: list[dict] | None = None,
+        source_phone_lineage: dict | None = None,
+        *, include_legacy_authority: bool = True
+        ) -> tuple[list[dict], list[dict]]:
+    """Collect immutable source-MFA owners and hard-core phone spans."""
+    owners: list[dict] = []
+    phones: list[dict] = []
+
+    def add_owner(value, default_text=""):
+        if isinstance(value, Tier):
+            for interval in value.intervals:
+                add_owner({"text": interval.text,
+                           "span": [interval.xmin, interval.xmax]})
+            return
+        if not isinstance(value, dict):
+            return
+        span = _nvasr_span_from_value(value)
+        if span is None:
+            return
+        owners.append({**value, "text": str(value.get(
+            "text", value.get("word", default_text))), "span": span})
+
+    if include_legacy_authority:
+        for name in ("_nvasr_source_mfa", "_source_mfa",
+                     "_source_intervals", "_nvasr_source_intervals"):
+            value = (getattr(words_tier, name, None)
+                     if words_tier is not None else None)
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    add_owner(item)
+            elif value is not None:
+                add_owner(value)
+    for item in source_words or []:
+        add_owner(item)
+
+    # ``_ctc_word_authority`` is a stale in-memory compatibility projection.
+    # Strict-v3 source ownership must come from the source snapshot and phone
+    # lineage, while legacy callers retain the historical conflict behavior.
+    if include_legacy_authority:
+        authority = _ctc_authority_entries(words_tier)
+        for ordinal, entry in enumerate(authority or []):
+            if not isinstance(entry, dict):
+                continue
+            span = _nvasr_span_from_value(entry.get("mfa_span"))
+            if span is not None:
+                add_owner({"text": entry.get("text", entry.get("word", "")),
+                           "span": span, "ordinal": ordinal,
+                           "ctc_lexical_ordinal": entry.get(
+                               "ctc_lexical_ordinal")})
+
+    if include_legacy_authority:
+        for value in (row.get("source_mfa_span"), row.get("mfa_span")):
+            span = _nvasr_span_from_value(value)
+            if span is not None:
+                add_owner({"text": row.get("source_mfa_label", "spn"),
+                           "span": span, "ordinal": row.get(
+                               "ctc_lexical_ordinal")})
+        for token in ctc_tokens or []:
+            if not isinstance(token, dict):
+                continue
+            span = _nvasr_span_from_value(token.get("source_mfa_span"))
+            if span is not None:
+                add_owner({"text": token.get("source_mfa_label", "spn"),
+                           "span": span, "ordinal": token.get(
+                               "ctc_lexical_ordinal")})
+
+        for name in ("_nvasr_source_phones", "_source_phones"):
+            value = (getattr(words_tier, name, None)
+                     if words_tier is not None else None)
+            values = value.intervals if isinstance(value, Tier) else value
+            for item in values or []:
+                span = _nvasr_span_from_value(item)
+                label = item.text if isinstance(item, Interval) else (
+                    item.get("text", item.get("label", ""))
+                    if isinstance(item, dict) else "")
+                if (span is not None
+                        and not _nvasr_is_nonlexical_mfa_label(label)
+                        and not is_punct(str(label))):
+                    phones.append({"span": span, "label": str(label),
+                                   "owner": None})
+    lineage = source_phone_lineage if isinstance(
+        source_phone_lineage, dict) else None
+    if lineage is None and include_legacy_authority:
+        lineage = getattr(words_tier, "_source_phone_lineage", None)
+    if isinstance(lineage, dict):
+        for owner_key, entries in lineage.get("owners", {}).items():
+            for entry in entries if isinstance(entries, list) else []:
+                span = _nvasr_span_from_value(entry)
+                label = str(entry.get("label", entry.get("text", "")))
+                if span is not None and not _nvasr_is_nonlexical_mfa_label(label) \
+                        and not is_punct(label):
+                    phones.append({"span": span, "label": label,
+                                   "owner": owner_key})
+    unique_owners: list[dict] = []
+    seen_owner_keys: set[tuple] = set()
+    for owner in owners:
+        owner_ordinal = owner.get(
+            "ctc_lexical_ordinal", owner.get("ordinal"))
+        owner_key = (
+            _nvasr_nvv_identity(owner.get("text")),
+            owner_ordinal,
+            tuple(round(float(value), 9) for value in owner["span"]),
+        )
+        if owner_key in seen_owner_keys:
+            continue
+        seen_owner_keys.add(owner_key)
+        unique_owners.append(owner)
+    return unique_owners, phones
+
+
+def _nvasr_select_owner(words_tier: Tier | None, row: dict,
+                        anchor: list[float], ctc_tokens: list[dict] | None,
+                        source_words: list[dict] | None = None,
+                        source_phone_lineage: dict | None = None,
+                        *, strict_schema_v3: bool = False
+                        ) -> tuple[str | None, list[float] | None, str | None]:
+    """Select exactly one evidence-gated final owner branch for a v3 row."""
+    forced = _nvasr_valid_span(row.get("forced_span"))
+    adjusted = (_nvasr_valid_evidence_span(row.get("adjusted_span"))
+                if strict_schema_v3 else
+                _nvasr_valid_span(row.get("adjusted_span")))
+    if forced is None:
+        return None, None, "forced_span_malformed"
+    source_owners, source_phones = _nvasr_source_owner_evidence(
+        words_tier, row, ctc_tokens, source_words, source_phone_lineage,
+        include_legacy_authority=not strict_schema_v3)
+    row_identity = _nvasr_nvv_identity(row.get("word"))
+    ordinal = row.get("ctc_lexical_ordinal")
+
+    # A: exact source identity/order plus inclusive 30 ms interval relation.
+    compatible_owners = []
+    for owner in source_owners:
+        owner_identity = _nvasr_nvv_identity(owner.get("text"))
+        owner_ordinal = owner.get("ctc_lexical_ordinal", owner.get("ordinal"))
+        identity_ok = (owner_identity == row_identity
+                       or (owner_identity == "SPN"
+                           and row.get("source_mfa_label", "spn") == "spn"))
+        # Source-owner order is part of the identity proof.  Missing ordinals
+        # are unknown, never a wildcard that can satisfy branch A.
+        order_ok = (isinstance(ordinal, int) and not isinstance(ordinal, bool)
+                    and isinstance(owner_ordinal, int)
+                    and not isinstance(owner_ordinal, bool)
+                    and owner_ordinal == ordinal)
+        lexical_core_crossing = any(
+            str(other.get("text", "")).strip()
+            and not is_nvv_token(str(other.get("text", "")).strip())
+            and not _nvasr_is_nonlexical_mfa_label(other.get("text"))
+            and not is_punct(str(other.get("text", "")).strip())
+            and other is not owner
+            and other["span"][0] < owner["span"][1] - 1e-9
+            and other["span"][1] > owner["span"][0] + 1e-9
+            for other in source_owners)
+        if (identity_ok and order_ok
+                and _nvasr_endpoint_compatible(owner["span"], anchor)
+                and not lexical_core_crossing
+                and not any(
+                    phone["span"][0] < owner["span"][1] - 1e-9
+                    and phone["span"][1] > owner["span"][0] + 1e-9
+                    for phone in source_phones)):
+            compatible_owners.append(owner)
+    if len(compatible_owners) > 1:
+        return None, None, "multiple_compatible_source_mfa_owners"
+    if compatible_owners:
+        return "compatible_source_mfa", list(compatible_owners[0]["span"]), \
+            "exact_source_identity_order_within_30ms"
+
+    # B: adjusted CTC/energy owner must contain both correspondence evidence
+    # and the immutable anchor, and must not enter a source lexical/phone core.
+    if adjusted is None:
+        return None, None, "adjusted_span_malformed"
+    contains_evidence = (
+        adjusted[0] <= anchor[0] + 1e-9
+        and adjusted[1] >= anchor[1] - 1e-9
+        and adjusted[0] <= forced[0] + 1e-9
+        and adjusted[1] >= forced[1] - 1e-9)
+    if not contains_evidence:
+        return None, None, "adjusted_owner_missing_anchor_correspondence"
+
+    blocked: list[list[float]] = [phone["span"] for phone in source_phones]
+    for owner in source_owners:
+        text = str(owner.get("text", "")).strip()
+        if (text and not is_nvv_token(text)
+                and not _nvasr_is_nonlexical_mfa_label(text)
+                and not is_punct(text)):
+            blocked.append(owner["span"])
+    if any(adjusted[0] < span[1] - 1e-9
+           and adjusted[1] > span[0] + 1e-9 for span in blocked):
+        return None, None, "adjusted_owner_crosses_source_lexical_or_phone_core"
+    return "adjusted_ctc_energy_gap", list(adjusted), \
+        "anchor_and_forced_in_source_nonlexical_gap"
+
+
+def _nvasr_reconcile_fixed_owner_geometry(
+        intervals: list[Interval], fixed_spans: dict[int, list[float]],
+        *, axis_start: float, axis_end: float) -> list[Interval] | None:
+    """Fit display intervals around exact schema-v3 owner spans.
+
+    Owner/source spans in ``fixed_spans`` are immutable. Only a minimal
+    connected block whose interval partition became invalid is repartitioned.
+    Every gap adjacent to a fixed owner, plus every boundary that was already
+    contiguous before the transaction, remains contiguous after it. Unrelated
+    pre-existing sparse regions are retained. Labels are never deleted or
+    reordered, and every display interval remains strictly positive.
+    """
+    if (not math.isfinite(axis_start) or not math.isfinite(axis_end)
+            or axis_end <= axis_start or not intervals):
+        return None
+    original = [Interval(float(item.xmin), float(item.xmax), item.text)
+                for item in intervals]
+    tentative = [Interval(item.xmin, item.xmax, item.text)
+                 for item in original]
+    normalized_fixed: dict[int, list[float]] = {}
+    for index, span in fixed_spans.items():
+        valid = _nvasr_valid_span(span)
+        if (not isinstance(index, int) or isinstance(index, bool)
+                or index < 0 or index >= len(tentative) or valid is None
+                or valid[0] < axis_start - 1e-9
+                or valid[1] > axis_end + 1e-9):
+            return None
+        normalized_fixed[index] = valid
+        tentative[index] = Interval(valid[0], valid[1], tentative[index].text)
+    ordered_fixed = sorted(normalized_fixed.items())
+    if any(right_span[0] < left_span[1] - 1e-9
+           for (_left_index, left_span), (_right_index, right_span)
+           in zip(ordered_fixed, ordered_fixed[1:])):
+        return None
+
+    def boundary_must_be_contiguous(left_index: int) -> bool:
+        return bool(
+            left_index in normalized_fixed
+            or left_index + 1 in normalized_fixed
+            or math.isclose(original[left_index].xmax,
+                            original[left_index + 1].xmin, abs_tol=1e-9)
+        )
+
+    def violations(values: list[Interval]) -> list[list[int]]:
+        ranges: list[list[int]] = []
+        for index, item in enumerate(values):
+            if (not math.isfinite(item.xmin) or not math.isfinite(item.xmax)
+                    or item.xmax - item.xmin
+                    < _FRAME_SUPPORT_DISPLAY_MIN_S - 1e-12
+                    or item.xmin < axis_start - 1e-9
+                    or item.xmax > axis_end + 1e-9):
+                ranges.append([index, index])
+            if index:
+                delta = item.xmin - values[index - 1].xmax
+                if (delta < -1e-9
+                        or (delta > 1e-9
+                            and boundary_must_be_contiguous(index - 1))):
+                    ranges.append([index - 1, index])
+        merged: list[list[int]] = []
+        for left, right in sorted(ranges):
+            if not merged or left > merged[-1][1]:
+                merged.append([left, right])
+            else:
+                merged[-1][1] = max(merged[-1][1], right)
+        return merged
+
+    def pack_run(left: int, right: int, lower: float, upper: float,
+                 values: list[Interval]) -> list[Interval] | None:
+        if left > right:
+            return [] if math.isclose(lower, upper, abs_tol=1e-9) else None
+        count = right - left + 1
+        if (upper - lower
+                < count * _FRAME_SUPPORT_DISPLAY_MIN_S - 1e-12):
+            return None
+        current = values[left:right + 1]
+        already_valid = (
+            math.isclose(current[0].xmin, lower, abs_tol=1e-9)
+            and math.isclose(current[-1].xmax, upper, abs_tol=1e-9)
+            and all(item.xmax - item.xmin
+                    >= _FRAME_SUPPORT_DISPLAY_MIN_S - 1e-12
+                    for item in current)
+            and all(math.isclose(previous.xmax, item.xmin, abs_tol=1e-9)
+                    for previous, item in zip(current, current[1:])))
+        if already_valid:
+            return [Interval(item.xmin, item.xmax, item.text)
+                    for item in current]
+        desired = [
+            (original[index].xmax + original[index + 1].xmin) / 2.0
+            for index in range(left, right)
+        ]
+        boundaries: list[float] = []
+        for offset, target in enumerate(desired):
+            minimum = lower + (offset + 1) * _FRAME_SUPPORT_DISPLAY_MIN_S
+            if boundaries:
+                minimum = max(
+                    minimum,
+                    boundaries[-1] + _FRAME_SUPPORT_DISPLAY_MIN_S)
+            remaining = len(desired) - offset
+            maximum = upper - remaining * _FRAME_SUPPORT_DISPLAY_MIN_S
+            if minimum > maximum + 1e-12:
+                return None
+            boundaries.append(min(max(target, minimum), maximum))
+        points = [lower, *boundaries, upper]
+        return [Interval(points[offset], points[offset + 1], item.text)
+                for offset, item in enumerate(current)]
+
+    def solve_block(left: int, right: int,
+                    values: list[Interval]) -> list[Interval] | None:
+        block_start = max(
+            axis_start,
+            values[left - 1].xmax if left else axis_start,
+            min(item.xmin for item in values[left:right + 1]),
+        )
+        block_end = min(
+            axis_end,
+            values[right + 1].xmin if right + 1 < len(values) else axis_end,
+            max(item.xmax for item in values[left:right + 1]),
+        )
+        if block_end < block_start - 1e-12:
+            return None
+        fixed_here = [(index, normalized_fixed[index])
+                      for index in sorted(normalized_fixed)
+                      if left <= index <= right]
+        if not fixed_here:
+            return None
+        if (fixed_here[0][1][0] < block_start - 1e-9
+                or fixed_here[-1][1][1] > block_end + 1e-9
+                or any(right_span[0] < left_span[1] - 1e-9
+                       for (_li, left_span), (_ri, right_span)
+                       in zip(fixed_here, fixed_here[1:]))):
+            return None
+        solution = [Interval(item.xmin, item.xmax, item.text)
+                    for item in values[left:right + 1]]
+        cursor_index = left
+        cursor_time = block_start
+        for fixed_index, fixed_span in fixed_here:
+            packed = pack_run(cursor_index, fixed_index - 1,
+                              cursor_time, fixed_span[0], values)
+            if packed is None:
+                return None
+            for offset, item in enumerate(packed):
+                solution[cursor_index - left + offset] = item
+            solution[fixed_index - left] = Interval(
+                fixed_span[0], fixed_span[1], values[fixed_index].text)
+            cursor_index = fixed_index + 1
+            cursor_time = fixed_span[1]
+        packed = pack_run(cursor_index, right, cursor_time, block_end, values)
+        if packed is None:
+            return None
+        for offset, item in enumerate(packed):
+            solution[cursor_index - left + offset] = item
+        if (any(item.xmax - item.xmin
+                < _FRAME_SUPPORT_DISPLAY_MIN_S - 1e-12
+                for item in solution)
+                or any(not math.isclose(previous.xmax, item.xmin,
+                                        abs_tol=1e-9)
+                       for previous, item in zip(solution, solution[1:]))
+                or (left and (
+                    values[left - 1].xmax > solution[0].xmin + 1e-9
+                    or (boundary_must_be_contiguous(left - 1)
+                        and not math.isclose(
+                            values[left - 1].xmax, solution[0].xmin,
+                            abs_tol=1e-9))))
+                or (right + 1 < len(values) and (
+                    solution[-1].xmax > values[right + 1].xmin + 1e-9
+                    or (boundary_must_be_contiguous(right)
+                        and not math.isclose(
+                            solution[-1].xmax, values[right + 1].xmin,
+                            abs_tol=1e-9))))):
+            return None
+        return solution
+
+    # Each successful replacement can remove more than one violation. Start
+    # again from current geometry so multiple owners remain order-independent.
+    for _round in range(max(1, len(tentative) * 2)):
+        components = violations(tentative)
+        if not components:
+            return tentative
+        component_left, component_right = components[0]
+        chosen = None
+        for growth in range(len(tentative)):
+            candidates = []
+            for grow_left in range(growth + 1):
+                left = component_left - grow_left
+                right = component_right + (growth - grow_left)
+                if left < 0 or right >= len(tentative):
+                    continue
+                solution = solve_block(left, right, tentative)
+                if solution is None:
+                    continue
+                cost = sum(
+                    abs(solution[offset].xmin - original[left + offset].xmin)
+                    + abs(solution[offset].xmax
+                          - original[left + offset].xmax)
+                    for offset in range(len(solution)))
+                candidates.append((cost, left, right, solution))
+            if candidates:
+                _cost, left, right, solution = min(
+                    candidates, key=lambda item: (item[0], item[1], item[2]))
+                chosen = (left, right, solution)
+                break
+        if chosen is None:
+            return None
+        left, right, solution = chosen
+        tentative[left:right + 1] = solution
+    return None
+
+
+def _nvasr_semantic_axis_member(surface: object, *, candidate_kind=None) -> bool:
+    """Return whether a row occupies the canonical compact semantic axis."""
+    text = str(surface or "").strip()
+    return bool(
+        text
+        and candidate_kind is None
+        and not re.fullmatch(r"<\|[^|]+\|>", text)
+        and not is_nvv_token(text)
+        and not _nvasr_is_nonlexical_mfa_label(text)
+        and not is_punct(text)
+    )
 
 
 def _nvasr_owner_requirements(
@@ -848,10 +1991,10 @@ def _nvasr_owner_requirements(
         if forced is None:
             errors.append("forced_span_malformed")
             return None, None, None, errors
-        if (forced[0] < frame_support[0] - _FRAME_SUPPORT_EPS
-                or forced[1] > frame_support[1] + _FRAME_SUPPORT_EPS):
-            errors.append("forced_span_outside_selected_support")
-            return None, None, None, errors
+        # The forced span is correspondence evidence, not acoustic support.
+        # It may be adjacent to, or otherwise wider than, the immutable frame
+        # support.  Only the support itself is protected for a non-deduplicated
+        # candidate.
         return [list(frame_support)], list(frame_support), None, errors
 
     if not isinstance(ledger, dict):
@@ -908,17 +2051,23 @@ def _nvasr_owner_requirements(
 
 def _nvasr_frame_support(
         row: dict, *, wav_duration_s: float | None = None,
-        validate_forced: bool = False, require_mapping: bool = False
+        validate_forced: bool = False, require_mapping: bool = False,
+        strict_schema_v3: bool = False
         ) -> tuple[list[float] | None, str | None, bool, list[str]]:
-    """Derive immutable physical support from the persisted CTC frame row.
+    """Derive the immutable CTC spike anchor from a persisted frame row.
 
-    ``raw_span`` lives on the encoder axis.  The speech-axis support is the
-    speech frame range shifted left by half a frame; its unclamped duration is
-    therefore exactly ``raw_frame_count * CTC_FRAME_MS``.  ``forced_span`` and
-    ``adjusted_span`` are correspondence evidence only and never define this
-    support.  A WAV duration is the sole permitted clamp authority.
+    ``raw_span`` lives on the encoder axis.  The legacy compatibility
+    projection is the speech frame range shifted left by half a frame; its
+    unclamped width is therefore exactly ``raw_frame_count * CTC_FRAME_MS``.
+    For schema-v3, the persisted spike anchor is provenance evidence only:
+    ``forced_span`` and ``adjusted_span`` are correspondence evidence and
+    neither defines a final owner duration.  A WAV duration is the sole
+    permitted clamp authority for the legacy projection.
     """
     reasons: list[str] = []
+    schema_v3 = any(key in row for key in (
+        "nvasr_candidate_schema_version", "ctc_spike_anchor",
+        "ordered_semantic_neighbors", "raw_timeline_neighbors"))
 
     def finite(value: object) -> bool:
         return (isinstance(value, (int, float))
@@ -935,6 +2084,7 @@ def _nvasr_frame_support(
     raw_frame_count = row.get("raw_frame_count")
     speech_frame_count = row.get("speech_frame_count")
     frame_ms = row.get("frame_ms")
+    query_frames = row.get("query_frames")
     raw_frame_fields = (raw_start_frame, raw_end_frame)
     if any(not integer(value) for value in raw_frame_fields):
         reasons.append("frame_coordinates_malformed")
@@ -976,6 +2126,8 @@ def _nvasr_frame_support(
         reasons.append("speech_frame_count_mismatch")
     if frame_ms != CTC_FRAME_MS:
         reasons.append("frame_ms_mismatch")
+    if schema_v3 and query_frames != CTC_QUERY_FRAMES:
+        reasons.append("query_frames_mismatch")
     if (integer(raw_start_frame) and integer(raw_end_frame)
             and integer(speech_start_frame) and integer(speech_end_frame)
             and (raw_start_frame - speech_start_frame != CTC_QUERY_FRAMES
@@ -991,9 +2143,31 @@ def _nvasr_frame_support(
         reasons.append("speech_span_malformed")
     if not valid_span(forced_span):
         reasons.append("forced_span_malformed")
-    if not valid_span(adjusted_span):
+    if strict_schema_v3 and schema_v3:
+        expected_adjusted = _nvasr_expected_adjusted_span(row)
+        adjusted_evidence = _nvasr_valid_evidence_span(adjusted_span)
+        if adjusted_evidence is None:
+            reasons.append("adjusted_span_malformed")
+        elif expected_adjusted is None or any(
+                not math.isclose(adjusted_evidence[index], expected_adjusted[index],
+                                 abs_tol=1e-9)
+                for index in range(2)):
+            reasons.append("adjusted_span_envelope_mismatch")
+        if row.get("adjusted_span_basis") != ADJUSTED_SPAN_BASIS:
+            reasons.append("adjusted_span_basis_invalid")
+        if row.get("adjusted_span_is_acoustic_evidence") is not False:
+            reasons.append("adjusted_span_acoustic_flag_invalid")
+        adjusted_span = adjusted_evidence
+    elif not valid_span(adjusted_span):
         reasons.append("adjusted_span_malformed")
     mapping_selection = row.get("mapping_selection")
+    if schema_v3:
+        if row.get("nvasr_candidate_schema_version") != NVASR_CANDIDATE_SCHEMA_VERSION:
+            reasons.append("nvasr_candidate_schema_version_missing_or_invalid")
+        if row.get("mapping_axis") != NVASR_MAPPING_AXIS:
+            reasons.append("mapping_axis_mismatch")
+        reasons.extend(_nvasr_raw_timeline_contract_reasons(row))
+        reasons.extend(_nvasr_anchor_binding_reasons(row))
 
     if (require_mapping
             and mapping_selection == "unique_max_forced_speech_overlap"
@@ -1039,11 +2213,13 @@ def _nvasr_frame_support(
                     float(speech_frame_count) * CTC_FRAME_MS / 1000.0,
                     abs_tol=1e-9):
                 reasons.append("speech_span_duration_mismatch")
-    if (valid_span(adjusted_span) and isinstance(row.get("start_s"), (int, float))
+    if ((valid_span(adjusted_span) or _nvasr_valid_evidence_span(adjusted_span))
+            and isinstance(row.get("start_s"), (int, float))
             and isinstance(row.get("end_s"), (int, float))):
-        if any(not math.isclose(float(adjusted_span[index]), float(value),
-                                abs_tol=1e-9)
-               for index, value in enumerate((row["start_s"], row["end_s"]))):
+        if not strict_schema_v3 and any(
+                not math.isclose(float(adjusted_span[index]), float(value),
+                                 abs_tol=1e-9)
+                for index, value in enumerate((row["start_s"], row["end_s"]))):
             reasons.append("adjusted_span_coordinate_binding_invalid")
 
     support: list[float] | None = None
@@ -1052,12 +2228,16 @@ def _nvasr_frame_support(
     valid_selections = {
         "label_neighbors", "unique_max_forced_speech_overlap",
         "unique_max_forced_raw_overlap", "unique_punctuation_topology_bound",
+        "unique_label_forced_ctc_overlap",
     }
     if mapping_selection not in valid_selections:
         reasons.append("mapping_selection_unknown")
     if require_mapping:
         if row.get("provenance_schema") != NVASR_CANDIDATE_PROVENANCE_SCHEMA:
             reasons.append("mapping_provenance_invalid")
+        if ("mapping_axis" in row
+                and row.get("mapping_axis") != NVASR_MAPPING_AXIS):
+            reasons.append("mapping_axis_mismatch")
         if (row.get("mapping_basis") != NVASR_MAPPING_BASIS
                 or row.get("mapping_outcome") != "unique"):
             reasons.append("mapping_outcome_invalid")
@@ -1065,6 +2245,21 @@ def _nvasr_frame_support(
             overlap_score = row.get("mapping_forced_speech_overlap_s")
             if (not finite(overlap_score) or float(overlap_score) <= 0):
                 reasons.append("mapping_speech_overlap_score_invalid")
+        if mapping_selection == "unique_label_forced_ctc_overlap":
+            anchor = _nvasr_anchor_span(row)
+            overlap_score = row.get("mapping_forced_ctc_anchor_overlap_s")
+            expected_overlap = None
+            if valid_span(forced_span) and anchor is not None:
+                expected_overlap = max(
+                    0.0,
+                    min(float(forced_span[1]), anchor[1])
+                    - max(float(forced_span[0]), anchor[0]),
+                )
+            if (expected_overlap is None or expected_overlap <= 1e-9
+                    or not finite(overlap_score)
+                    or not math.isclose(float(overlap_score), expected_overlap,
+                                         abs_tol=1e-6)):
+                reasons.append("mapping_ctc_anchor_overlap_score_invalid")
 
     if (mapping_selection == "unique_max_forced_raw_overlap"
             and valid_span(forced_span) and valid_span(raw_span)
@@ -1084,14 +2279,20 @@ def _nvasr_frame_support(
 
     if (not reasons and valid_span(speech_span)
             and integer(raw_frame_count)):
-        if mapping_selection == "unique_max_forced_raw_overlap":
+        if schema_v3:
+            if mapping_selection == "unique_punctuation_topology_bound":
+                reasons.append("forced_span_never_anchor")
+            selected = _nvasr_anchor_span(row)
+            source = "ctc_spike_anchor_provenance"
+        elif mapping_selection == "unique_max_forced_raw_overlap":
             half_frame_s = CTC_FRAME_MS / 2000.0
             selected = [float(raw_span[0]) - half_frame_s,
                         float(raw_span[1]) - half_frame_s]
             source = "raw_ctc_frame_span_centered"
         elif mapping_selection == "unique_punctuation_topology_bound":
-            selected = [float(forced_span[0]), float(forced_span[1])]
-            source = "forced_span_punctuation_topology"
+            selected = [float(speech_span[0]) - CTC_FRAME_MS / 2000.0,
+                        float(speech_span[1]) - CTC_FRAME_MS / 2000.0]
+            source = "raw_ctc_frames_shifted_to_speech_axis"
         else:
             half_frame_s = CTC_FRAME_MS / 2000.0
             selected = [float(speech_span[0]) - half_frame_s,
@@ -1108,14 +2309,15 @@ def _nvasr_frame_support(
                                 CTC_FRAME_MS / 1000.0, abs_tol=1e-9):
                 reasons.append("topology_duration_invalid")
         if require_mapping:
-            if selected[0] < -_FRAME_SUPPORT_EPS:
-                reasons.append("frame_support_out_of_axis")
-            if wav_duration_s is not None:
-                if (not finite(wav_duration_s)
-                        or float(wav_duration_s) <= 0):
-                    reasons.append("wav_axis_malformed")
-                elif selected[1] > float(wav_duration_s) + _FRAME_SUPPORT_EPS:
+            if not schema_v3:
+                if selected[0] < -_FRAME_SUPPORT_EPS:
                     reasons.append("frame_support_out_of_axis")
+                if wav_duration_s is not None:
+                    if (not finite(wav_duration_s)
+                            or float(wav_duration_s) <= 0):
+                        reasons.append("wav_axis_malformed")
+                    elif selected[1] > float(wav_duration_s) + _FRAME_SUPPORT_EPS:
+                        reasons.append("frame_support_out_of_axis")
             if not reasons:
                 support = selected
         elif wav_duration_s is not None:
@@ -1148,18 +2350,21 @@ def _nvasr_frame_support(
 
 def _contain_nvasr_frame_support(
         words_tier: Tier | None, ctc_tokens: list[dict] | None, *,
-        wav_duration_s: float | None = None) -> dict:
-    """Contain every final NVV owner around its physical frame support.
+        wav_duration_s: float | None = None,
+        source_words: list[dict] | None = None,
+        source_phone_lineage: dict | None = None,
+        producer_authority: dict | None = None,
+        strict_schema_v3: bool = False,
+        strict_schema_v2: bool | None = None) -> dict:
+    """Select every final NVV owner from immutable CTC anchor evidence.
 
-    Persisted frame support outranks the neighbouring words-tier display
-    geometry.  A support/display collision is reconciled transactionally by
-    repartitioning only the affected ordered display block; labels, interval
-    count, and the physical support itself never change.  Only malformed or
-    ambiguous mapping, incompatible physical supports, or insufficient axis
-    capacity reject publication.
+    Schema-v3 rows use only the compatible-source-MFA or adjusted-gap owner
+    branches.  No nearest-owner or generic repartition is allowed.  Legacy
+    v1 direct fixtures retain the old diagnostic helper for compatibility.
     """
     rows = [row for row in (ctc_tokens or [])
             if isinstance(row, dict) and row.get("candidate_kind") == "nvv"]
+    strict_v3 = strict_schema_v3 or strict_schema_v2 is True
     final_rows = [interval for interval in (words_tier.intervals
                                             if words_tier is not None else [])
                   if is_nvv_token(interval.text.strip())]
@@ -1184,8 +2389,23 @@ def _contain_nvasr_frame_support(
             } for _ in final_rows]
             result["status"] = "rejected"
         return result
+    authority_reasons = _nvasr_producer_authority_reasons(
+        ctc_tokens, producer_authority, required=strict_v3)
+    if authority_reasons:
+        result["reasons"].extend(authority_reasons)
+        return result
     if len(rows) != len(final_rows):
         result["reasons"].append("final_nvv_frame_support_count_mismatch")
+        return result
+    if strict_v3 and any(not all(key in row for key in (
+            "nvasr_candidate_schema_version", "mapping_axis",
+            "ordered_semantic_neighbors", "raw_timeline_neighbors",
+            "candidate_source", "raw_timeline_neighbors_schema",
+            "raw_timeline_index", "raw_timeline_event_count",
+            "raw_timeline_evidence_sha256", "query_frames", "frame_ms",
+            "ctc_raw_token_row",
+            "ctc_spike_anchor")) for row in rows):
+        result["reasons"].append("nvasr_candidate_schema_v3_required")
         return result
 
     intervals = list(words_tier.intervals)
@@ -1193,24 +2413,27 @@ def _contain_nvasr_frame_support(
                      if is_nvv_token(interval.text.strip())]
 
     # Reconstruct the persisted neighbour mapping on the same compact
-    # non-NVV lexical axis used by the producer.  Object identity is safe
+    # non-NVV semantic axis used by the producer.  Object identity is safe
     # here because ``rows`` is a filtered view of this exact in-memory list.
-    lexical_ctc_rows: list[dict] = []
+    axis_ctc_rows: list[dict] = []
     for row in ctc_tokens or []:
         if not isinstance(row, dict):
             continue
         text = str(row.get("word", row.get("text", ""))).strip()
-        if text and not is_silence(text) and not is_punct(text):
-            lexical_ctc_rows.append(row)
-    ordinary_count = sum(
-        1 for row in lexical_ctc_rows
-        if row.get("candidate_kind") != "nvv")
+        if (text and not is_silence(text) and not is_punct(text)
+                and not is_nvv_token(text)):
+            axis_ctc_rows.append(row)
+    ordinary_count = sum(1 for row in axis_ctc_rows
+                         if _nvasr_semantic_axis_member(
+                             row.get("word", row.get("text", ""))))
     ordinary_before = 0
     expected_neighbours: dict[int, tuple[int | None, int | None]] = {}
     ctc_ordinals: dict[int, int] = {}
-    for ordinal, row in enumerate(lexical_ctc_rows):
+    for ordinal, row in enumerate(axis_ctc_rows):
         ctc_ordinals[id(row)] = ordinal
-        if row.get("candidate_kind") == "nvv":
+        if not _nvasr_semantic_axis_member(
+                row.get("word", row.get("text", "")),
+                candidate_kind=row.get("candidate_kind")):
             expected_neighbours[id(row)] = (
                 ordinary_before - 1 if ordinary_before else None,
                 ordinary_before if ordinary_before < ordinary_count else None,
@@ -1218,18 +2441,131 @@ def _contain_nvasr_frame_support(
         else:
             ordinary_before += 1
 
+    # Recompute the exact canonical semantic sequence from the final
+    # ordinary sidecar rows.  A count alone is insufficient: every identity,
+    # surface occurrence, and ordered neighbour must agree with the producer
+    # commit made after English/RIA canonicalization.
+    canonical_ordinary: list[tuple[int, dict, int]] = []
+    canonical_surface_counts: dict[str, int] = {}
+    semantic_contract_reasons: list[str] = []
+    for position, token in enumerate(ctc_tokens or []):
+        if not isinstance(token, dict):
+            continue
+        text = str(token.get("word", token.get("text", ""))).strip()
+        if not _nvasr_semantic_axis_member(
+                text, candidate_kind=token.get("candidate_kind")):
+            continue
+        ordinal = len(canonical_ordinary)
+        occurrence = canonical_surface_counts.get(text, 0)
+        canonical_surface_counts[text] = occurrence + 1
+        expected_id = f"nvasr-lexical-{ordinal:04d}"
+        if token.get("semantic_occurrence_id") != expected_id:
+            semantic_contract_reasons.append(
+                f"canonical_semantic_occurrence_id_invalid:{ordinal}")
+        if token.get("semantic_surface_occurrence") != occurrence:
+            semantic_contract_reasons.append(
+                f"canonical_semantic_surface_occurrence_invalid:{ordinal}")
+        canonical_ordinary.append((position, token, ordinal))
+    expected_semantic_neighbors: dict[int, list[dict]] = {}
+    for position, token in enumerate(ctc_tokens or []):
+        if not isinstance(token, dict) or token.get("candidate_kind") != "nvv":
+            continue
+        left = next((item for item in reversed(canonical_ordinary)
+                     if item[0] < position), None)
+        right = next((item for item in canonical_ordinary
+                      if item[0] > position), None)
+        expected = []
+        for side, item in (("left", left), ("right", right)):
+            if item is None:
+                continue
+            _pos, ordinary_row, ordinal = item
+            expected.append({
+                "side": side,
+                "lexical_ordinal": ordinal,
+                "occurrence_id": ordinary_row.get("semantic_occurrence_id"),
+                "surface": ordinary_row.get("word", ordinary_row.get("text", "")),
+                "surface_occurrence": ordinary_row.get(
+                    "semantic_surface_occurrence"),
+            })
+        expected_semantic_neighbors[id(token)] = expected
+        expected_neighbours[id(token)] = (
+            next((item[2] for item in reversed(canonical_ordinary)
+                  if item[0] < position), None),
+            next((item[2] for item in canonical_ordinary
+                  if item[0] > position), None),
+        )
+
     lexical_indices = [
         index for index, interval in enumerate(intervals)
         if interval.text.strip() and not is_silence(interval.text)
         and not is_punct(interval.text)]
     lexical_ordinals = {index: ordinal
                         for ordinal, index in enumerate(lexical_indices)}
-    authority_entries = _ctc_authority_entries(words_tier)
+    # Strict-v3 must not let the stale in-memory authority projection veto a
+    # candidate after manifest-sealed producer authority has been established.
+    authority_entries = (None if strict_v3 else
+                         _ctc_authority_entries(words_tier))
     candidate_ids: set[str] = set()
+    token_positions = {
+        id(token): position for position, token in enumerate(ctc_tokens or [])
+        if isinstance(token, dict)}
+    if strict_v3:
+        ordered_candidate_ids = [row.get("candidate_id") for row in rows]
+        if (not all(isinstance(value, str) and value
+                    for value in ordered_candidate_ids)
+                or ordered_candidate_ids != sorted(ordered_candidate_ids)
+                or len(ordered_candidate_ids) != len(set(
+                    ordered_candidate_ids))):
+            result["reasons"].append(
+                "nvasr_candidate_identity_sequence_mismatch")
     supports: list[dict] = []
     for index, row in enumerate(rows):
+        schema_v3 = strict_v3 and any(key in row for key in (
+            "nvasr_candidate_schema_version", "ctc_spike_anchor",
+            "ordered_semantic_neighbors", "raw_timeline_neighbors"))
+        if schema_v3:
+            locator = row.get("ctc_raw_token_row")
+            locator_stem = (locator.get("stem")
+                            if isinstance(locator, dict) else "")
+            for locator_reason in _nvasr_locator_reasons(
+                    row, stem=locator_stem,
+                    sidecar=f"{locator_stem}_tokens.jsonl",
+                    ordinal=token_positions.get(id(row), -1)):
+                result["reasons"].append(
+                    f"frame_support_{locator_reason}:{index}")
+            for contract_reason in semantic_contract_reasons:
+                result["reasons"].append(
+                    f"frame_support_{contract_reason}:{index}")
+            if row.get("nvasr_candidate_schema_version") != NVASR_CANDIDATE_SCHEMA_VERSION:
+                result["reasons"].append(
+                    f"nvasr_candidate_schema_version_invalid:{index}")
+            if row.get("mapping_axis") != NVASR_MAPPING_AXIS:
+                result["reasons"].append(
+                    f"frame_support_mapping_axis_mismatch:{index}")
+            anchor = row.get("ctc_spike_anchor")
+            expected_anchor = _nvasr_expected_anchor(row)
+            if (not _nvasr_valid_anchor(anchor)
+                    or expected_anchor is None
+                    or anchor != expected_anchor):
+                result["reasons"].append(
+                    f"ctc_spike_anchor_binding_invalid:{index}")
+            neighbors = row.get("ordered_semantic_neighbors")
+            if (not isinstance(neighbors, list)
+                    or any(not _nvasr_neighbor_item_valid(item)
+                           for item in neighbors)
+                    or [item.get("side") for item in neighbors]
+                    != sorted([item.get("side") for item in neighbors],
+                              key=("left", "right").index)):
+                result["reasons"].append(
+                    f"frame_support_semantic_identity_invalid:{index}")
+            expected_neighbors = expected_semantic_neighbors.get(id(row))
+            if (expected_neighbors is None
+                    or neighbors != expected_neighbors):
+                result["reasons"].append(
+                    f"frame_support_semantic_identity_mismatch:{index}")
         support, source, frame_limited, reasons = _nvasr_frame_support(
-            row, wav_duration_s=wav_duration_s, require_mapping=True)
+            row, wav_duration_s=wav_duration_s, require_mapping=True,
+            strict_schema_v3=strict_v3)
         required_segments, owner_required_span, dedup_spans, owner_reasons = (
             _nvasr_owner_requirements(row, support))
         reasons = list(reasons) + list(owner_reasons)
@@ -1246,6 +2582,19 @@ def _contain_nvasr_frame_support(
             "final_contains_owner_required_segments": False,
             "frame_limited": frame_limited,
         }
+        if schema_v3:
+            result["schema"] = "nvasr-owner-selection-v2"
+            item.pop("frame_support_span", None)
+            item.pop("frame_support_source", None)
+            item.pop("final_contains_frame_support", None)
+            item.pop("final_contains_owner_required_segments", None)
+            item["anchor_span"] = _nvasr_anchor_span(row)
+            item["anchor_frame_count"] = row.get("raw_frame_count")
+            item["multi_frame_anchor_guard"] = row.get("raw_frame_count") != 1
+            item["raw_timeline_neighbors_schema"] = row.get(
+                "raw_timeline_neighbors_schema")
+            item["raw_timeline_evidence_sha256"] = row.get(
+                "raw_timeline_evidence_sha256")
         result["candidates"].append(item)
         for reason in reasons:
             result["reasons"].append(f"{reason}:{index}")
@@ -1267,8 +2616,20 @@ def _contain_nvasr_frame_support(
                 or row.get("mapping_outcome") != "unique"):
             result["reasons"].append(
                 f"frame_support_mapping_not_unique:{index}")
+        if ("mapping_axis" in row
+                and row.get("mapping_axis") != NVASR_MAPPING_AXIS):
+            result["reasons"].append(
+                f"frame_support_mapping_axis_mismatch:{index}")
         mapping_key = row.get("mapping_key")
         expected = expected_neighbours.get(id(row))
+        if schema_v3:
+            exact_neighbors = expected_semantic_neighbors.get(id(row))
+            expected = (
+                (next((item["lexical_ordinal"] for item in exact_neighbors
+                       if item["side"] == "left"), None),
+                 next((item["lexical_ordinal"] for item in exact_neighbors
+                       if item["side"] == "right"), None))
+                if exact_neighbors is not None else None)
         if not isinstance(mapping_key, dict) or expected is None:
             result["reasons"].append(
                 f"frame_support_mapping_key_malformed:{index}")
@@ -1326,37 +2687,222 @@ def _contain_nvasr_frame_support(
         result["reasons"] = list(dict.fromkeys(result["reasons"]))
         return result
 
-    # Attributable supports are immutable and must retain the same lexical
-    # order.  Positive overlap between two such supports cannot be repaired
-    # by moving display ownership and is therefore a dedicated hard failure.
-    for position, current in enumerate(supports):
-        candidate_index = current["candidate_index"]
-        support = current["support"]
-        if (support[0] < words_tier.xmin - _FRAME_SUPPORT_EPS
-                or support[1] > words_tier.xmax + _FRAME_SUPPORT_EPS):
-            result["reasons"].append(
-                f"frame_support_out_of_textgrid_axis:{candidate_index}")
-        if position:
-            previous = supports[position - 1]
-            previous_support = previous["support"]
-            if support[0] < previous_support[0] - _FRAME_SUPPORT_EPS:
+    # Legacy projected spans are subject to the historical axis/order checks.
+    # A schema-v3 anchor is immutable provenance and may straddle the WAV edge
+    # or overlap another candidate; only the selected final owners are checked
+    # for in-axis, non-overlapping geometry below.
+    if not strict_v3:
+        for position, current in enumerate(supports):
+            candidate_index = current["candidate_index"]
+            support = current["support"]
+            if (support[0] < words_tier.xmin - _FRAME_SUPPORT_EPS
+                    or support[1] > words_tier.xmax + _FRAME_SUPPORT_EPS):
                 result["reasons"].append(
-                    "frame_support_physical_order_conflict:"
-                    f"{previous['candidate_index']}:{candidate_index}")
-            overlap = (min(previous_support[1], support[1])
-                       - max(previous_support[0], support[0]))
-            if overlap > _FRAME_SUPPORT_EPS:
-                result["reasons"].append(
-                    "frame_support_physical_conflict:"
-                    f"{previous['candidate_index']}:{candidate_index}")
+                    f"frame_support_out_of_textgrid_axis:{candidate_index}")
+            if position:
+                previous = supports[position - 1]
+                previous_support = previous["support"]
+                if support[0] < previous_support[0] - _FRAME_SUPPORT_EPS:
+                    result["reasons"].append(
+                        "frame_support_physical_order_conflict:"
+                        f"{previous['candidate_index']}:{candidate_index}")
+                overlap = (min(previous_support[1], support[1])
+                           - max(previous_support[0], support[0]))
+                if overlap > _FRAME_SUPPORT_EPS:
+                    result["reasons"].append(
+                        "frame_support_physical_conflict:"
+                        f"{previous['candidate_index']}:{candidate_index}")
     if result["reasons"]:
         result["reasons"] = list(dict.fromkeys(result["reasons"]))
         return result
 
+    # Schema-v3 owners are selected by evidence branch, never by nearest
+    # interval or generic repartition.  Keep the historical frame helper
+    # above available for frozen v1 geometry fixtures, but once an immutable
+    # anchor is present this is the only publication path.
+    if strict_v3:
+        selected_owners: list[tuple[int, list[float], str, str]] = []
+        result["owner_selection_schema"] = "nvasr-owner-selection-v2"
+        for entry in supports:
+            candidate_index = entry["candidate_index"]
+            row = rows[candidate_index]
+            anchor = _nvasr_anchor_span(row)
+            if anchor is None:
+                result["reasons"].append(
+                    f"ctc_spike_anchor_missing:{candidate_index}")
+                continue
+            branch, owner_span, owner_reason = _nvasr_select_owner(
+                words_tier, row, anchor, ctc_tokens,
+                source_words, source_phone_lineage,
+                strict_schema_v3=True)
+            item = result["candidates"][candidate_index]
+            item.update({
+                "ctc_spike_anchor": dict(row["ctc_spike_anchor"]),
+                "anchor_span": [float(anchor[0]), float(anchor[1])],
+                "owner_branch": branch or "rejected",
+                "owner_reason": owner_reason,
+                "owner_selected_span": owner_span,
+            })
+            if branch is None or owner_span is None:
+                result["reasons"].append(
+                    f"nvasr_owner_selection_rejected:{candidate_index}:"
+                    f"{owner_reason}")
+            else:
+                owner_axis_end = (float(wav_duration_s)
+                                  if wav_duration_s is not None
+                                  else float(words_tier.xmax))
+                if (owner_span[0] < float(words_tier.xmin) - 1e-9
+                        or owner_span[1] > owner_axis_end + 1e-9):
+                    result["reasons"].append(
+                        f"nvasr_owner_outside_wav_axis:{candidate_index}")
+                    continue
+                if (row.get("raw_frame_count", 1) > 1
+                        and math.isclose(owner_span[1] - owner_span[0],
+                                         CTC_FRAME_MS / 1000.0,
+                                         abs_tol=1e-9)):
+                    result["reasons"].append(
+                        f"multi_frame_anchor_final_60ms:{candidate_index}")
+                    continue
+                selected_owners.append((candidate_index, owner_span,
+                                        branch, owner_reason))
+        # Source/adjusted owners must remain an ordered, non-overlapping
+        # partition.  A collision is rejected; it is never repartitioned.
+        for previous, current in zip(selected_owners, selected_owners[1:]):
+            if current[1][0] < previous[1][1] - 1e-9:
+                result["reasons"].append(
+                    f"nvasr_owner_overlap:{previous[0]}:{current[0]}")
+        if result["reasons"] or len(selected_owners) != len(supports):
+            if len(selected_owners) != len(supports):
+                result["reasons"].append("nvasr_owner_selection_incomplete")
+            result["reasons"] = list(dict.fromkeys(result["reasons"]))
+            return result
+        original = [Interval(item.xmin, item.xmax, item.text)
+                    for item in intervals]
+        owner_fixed: dict[int, list[float]] = {}
+        source_fixed: dict[int, list[float]] = {}
+
+        # Prefer exact adjacent source cores when their textual order leaves
+        # positive display capacity. Some real fallback transcripts place a
+        # punctuation token between two acoustically contiguous source cores;
+        # in that case the optional source-display restoration is infeasible,
+        # but the independently selected NVV owner remains authoritative.
+        if source_words is not None:
+            final_core_indices = [index for index, interval in enumerate(original)
+                                  if _nvasr_semantic_axis_member(interval.text)]
+            for candidate_index, owner_span, _branch, _reason in selected_owners:
+                owner_index = supports[candidate_index]["owner_index"]
+                local_sources = []
+                for source_item in source_words:
+                    if not isinstance(source_item, dict) \
+                            or not _nvasr_semantic_axis_member(
+                                source_item.get("text")):
+                        continue
+                    source_span = _nvasr_span_from_value(source_item)
+                    if source_span is None:
+                        continue
+                    gap = max(owner_span[0] - source_span[1],
+                              source_span[0] - owner_span[1], 0.0)
+                    if gap <= NVASR_ENDPOINT_TOLERANCE_S + 1e-9:
+                        local_sources.append((source_span, source_item))
+                for source_span, source_item in local_sources:
+                    source_text = str(source_item.get("text", "")).strip()
+                    candidates = [index for index in final_core_indices
+                                  if ((index < owner_index
+                                       and source_span[1] <= owner_span[0]
+                                       and index < owner_index)
+                                      or (index > owner_index
+                                          and source_span[0] >= owner_span[1]
+                                          and index > owner_index))
+                                  and original[index].text.strip().casefold()
+                                  == source_text.casefold()]
+                    if len(candidates) != 1:
+                        result["reasons"].append(
+                            f"source_adjacent_core_identity_mismatch:{candidate_index}")
+                        continue
+                    protected_index = candidates[0]
+                    previous_span = source_fixed.get(protected_index)
+                    if (previous_span is not None
+                            and not spans_equal(previous_span, source_span)):
+                        result["reasons"].append(
+                            f"source_adjacent_core_span_conflict:{candidate_index}")
+                        continue
+                    source_fixed[protected_index] = list(source_span)
+            if result["reasons"]:
+                result["reasons"] = list(dict.fromkeys(result["reasons"]))
+                return result
+        for candidate_index, owner_span, branch, _reason in selected_owners:
+            owner_index = supports[candidate_index]["owner_index"]
+            owner_fixed[owner_index] = list(owner_span)
+            item = result["candidates"][candidate_index]
+            item["owner_contains_anchor"] = (
+                branch == "adjusted_ctc_energy_gap")
+            item["owner_contains_correspondence"] = (
+                branch == "adjusted_ctc_energy_gap")
+
+        axis_end = (float(wav_duration_s) if wav_duration_s is not None
+                    else float(words_tier.xmax))
+        combined_fixed = dict(source_fixed)
+        combined_fixed.update(owner_fixed)
+        tentative = _nvasr_reconcile_fixed_owner_geometry(
+            original, combined_fixed, axis_start=float(words_tier.xmin),
+            axis_end=axis_end)
+        source_status = "not_applicable"
+        applied_source_fixed: dict[int, list[float]] = {}
+        if source_fixed and tentative is not None:
+            source_status = "applied"
+            applied_source_fixed = source_fixed
+        elif source_fixed:
+            # The source spans remain immutable evidence for owner selection,
+            # but cannot all be serialized as positive intervals when display
+            # punctuation occupies their exact shared endpoint. Fall back to
+            # the already validated final CTC display axis around fixed NVVs.
+            tentative = _nvasr_reconcile_fixed_owner_geometry(
+                original, owner_fixed, axis_start=float(words_tier.xmin),
+                axis_end=axis_end)
+            source_status = "fallback_to_final_display_axis"
+        result["source_core_protection"] = {
+            "status": source_status,
+            "attempted_indices": sorted(source_fixed),
+            "applied_indices": sorted(applied_source_fixed),
+            "fallback_reason": (
+                "positive_display_topology_infeasible"
+                if source_status == "fallback_to_final_display_axis" else None),
+        }
+        if tentative is None:
+            result["reasons"].append("nvasr_owner_geometry_invalid")
+            result["changed"] = 0
+            return result
+
+        for index, (before, after) in enumerate(zip(original, tentative)):
+            if (math.isclose(before.xmin, after.xmin, abs_tol=1e-12)
+                    and math.isclose(before.xmax, after.xmax,
+                                     abs_tol=1e-12)):
+                continue
+            if index in owner_fixed:
+                source = "nvasr_evidence_gated_owner"
+            elif index in applied_source_fixed:
+                source = "nvasr_adjacent_source_core_protection"
+            else:
+                source = "nvasr_owner_display_collision_repartition"
+            result["reconciliations"].append({
+                "index": index,
+                "label": before.text.strip(),
+                "before": [float(before.xmin), float(before.xmax)],
+                "after": [float(after.xmin), float(after.xmax)],
+                "source": source,
+            })
+        result["changed"] = len(result["reconciliations"])
+        result["repartitioned_intervals"] = len(result["reconciliations"])
+        if result["reconciliations"]:
+            result["_contained_tier"] = _copy_tier_metadata(
+                words_tier, Tier(words_tier.name, words_tier.xmin,
+                                 words_tier.xmax, tentative))
+        result["status"] = "verified"
+        return result
+
     original = list(intervals)
     tentative = list(intervals)
-    # Repartitioning must preserve the complete owner envelope.  Physical
-    # ordering/conflict checks above intentionally remain frame-support-only.
+    # Legacy repartitioning must preserve the complete owner envelope.
     protected = {entry["owner_index"]: entry["owner_required_span"]
                  for entry in supports}
     expanded: set[int] = set()
@@ -1398,7 +2944,8 @@ def _contain_nvasr_frame_support(
         else:
             components[-1][1] = max(components[-1][1], right)
 
-    for left, right in components:
+    def solve_component(left: int, right: int):
+        """Return the deterministic minimum-deviation repartition, if feasible."""
         block = tentative[left:right + 1]
         outer_start = min(interval.xmin for interval in block)
         outer_end = max(interval.xmax for interval in block)
@@ -1408,9 +2955,7 @@ def _contain_nvasr_frame_support(
                 or (outer_end - outer_start
                     < interval_count * _FRAME_SUPPORT_DISPLAY_MIN_S
                     - 1e-12)):
-            result["reasons"].append(
-                f"frame_support_axis_capacity_conflict:{left}:{right}")
-            continue
+            return None
 
         boundary_count = interval_count - 1
         desired: list[float] = []
@@ -1438,37 +2983,67 @@ def _contain_nvasr_frame_support(
         earliest: list[float] = []
         for offset, value in enumerate(lower):
             if offset:
-                value = max(
-                    value,
-                    earliest[-1] + _FRAME_SUPPORT_DISPLAY_MIN_S)
+                value = max(value,
+                            earliest[-1] + _FRAME_SUPPORT_DISPLAY_MIN_S)
             earliest.append(value)
         latest = [0.0] * boundary_count
         for offset in range(boundary_count - 1, -1, -1):
             value = upper[offset]
             if offset < boundary_count - 1:
-                value = min(
-                    value,
-                    latest[offset + 1] - _FRAME_SUPPORT_DISPLAY_MIN_S)
+                value = min(value,
+                            latest[offset + 1] - _FRAME_SUPPORT_DISPLAY_MIN_S)
             latest[offset] = value
         if any(earliest[offset] > latest[offset] + 1e-12
                for offset in range(boundary_count)):
-            result["reasons"].append(
-                f"frame_support_axis_capacity_conflict:{left}:{right}")
-            continue
+            return None
 
         boundaries: list[float] = []
         for offset in range(boundary_count):
             minimum = earliest[offset]
             if boundaries:
-                minimum = max(
-                    minimum,
-                    boundaries[-1] + _FRAME_SUPPORT_DISPLAY_MIN_S)
+                minimum = max(minimum,
+                              boundaries[-1] + _FRAME_SUPPORT_DISPLAY_MIN_S)
             boundary = min(max(desired[offset], minimum), latest[offset])
             boundaries.append(boundary)
         points = [outer_start, *boundaries, outer_end]
-        for offset, interval in enumerate(block):
-            tentative[left + offset] = Interval(
-                points[offset], points[offset + 1], interval.text)
+        return [Interval(points[offset], points[offset + 1], interval.text)
+                for offset, interval in enumerate(block)]
+
+    for component_left, component_right in components:
+        # A boundary at the edge of an empty/MFA gap can make the minimal
+        # collision component locally infeasible even though its adjacent
+        # display interval supplies enough positive capacity.  Grow by the
+        # smallest number of intervals, trying narrower blocks first and
+        # resolving equal-width choices by block span then left index.
+        candidates: list[tuple[int, int]] = []
+        max_growth = len(tentative)
+        for growth in range(max_growth + 1):
+            for left in range(max(0, component_left - growth),
+                              min(component_left, len(tentative) - 1) + 1):
+                right = component_right + (growth - (component_left - left))
+                if right < component_right or right >= len(tentative):
+                    continue
+                if right - left != component_right - component_left + growth:
+                    continue
+                candidates.append((left, right))
+            if candidates:
+                feasible = [(left, right, solve_component(left, right))
+                            for left, right in candidates[-(growth + 1):]]
+                feasible = [item for item in feasible if item[2] is not None]
+                if feasible:
+                    left, right, solution = min(
+                        feasible,
+                        key=lambda item: (item[1] - item[0],
+                                          tentative[item[1]].xmax
+                                          - tentative[item[0]].xmin,
+                                          item[0]))
+                    for offset, interval in enumerate(solution):
+                        tentative[left + offset] = interval
+                    break
+        else:
+            result["reasons"].append(
+                f"frame_support_axis_capacity_conflict:"
+                f"{component_left}:{component_right}")
 
     if result["reasons"]:
         result["reasons"] = list(dict.fromkeys(result["reasons"]))
@@ -1520,7 +3095,7 @@ def _contain_nvasr_frame_support(
             "label": before.text.strip(),
             "before": [float(before.xmin), float(before.xmax)],
             "after": [float(after.xmin), float(after.xmax)],
-            "source": "physical_frame_support_display_repartition",
+                    "source": "legacy_frame_anchor_display_repartition",
         })
     result["repartitioned_intervals"] = len(result["reconciliations"])
     if result["reconciliations"]:
@@ -1534,9 +3109,42 @@ def _contain_nvasr_frame_support(
     return result
 
 
+def _publish_nvasr_owner_report(
+        report: dict, owner_result: dict) -> Tier | None:
+    """Publish JSON-only owner diagnostics and return the private tier.
+
+    The historical ``nvasr_frame_support`` key remains a deprecated alias for
+    parsers that still require it. For strict candidate schemas its payload semantics are
+    explicitly owner-selection provenance; the immutable spike anchor is not
+    presented as a final display-duration claim.
+    """
+    contained = owner_result.pop("_contained_tier", None)
+    serialized = json.dumps(
+        owner_result, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    payload = json.loads(serialized)
+    if payload.get("schema") == "nvasr-owner-selection-v2":
+        report["nvasr_owner_selection"] = payload
+        alias = json.loads(serialized)
+        alias.update({
+            "deprecated_alias": "nvasr_owner_selection",
+            "deprecated": True,
+            "compatibility_alias_schema": "nvasr-owner-report-alias-v1",
+            "compatibility_alias_semantics": "owner_selection_provenance",
+        })
+        report["nvasr_frame_support"] = alias
+    else:
+        report["nvasr_frame_support"] = payload
+    return contained
+
+
 def _nvasr_candidate_provenance_audit(
         ctc_tokens: list[dict] | None, words_tier: Tier | None, *,
-        required: bool = True, wav_duration_s: float | None = None) -> dict:
+        required: bool = True, wav_duration_s: float | None = None,
+        source_words: list[dict] | None = None,
+        source_phone_lineage: dict | None = None,
+        producer_authority: dict | None = None,
+        strict_schema_v3: bool = False,
+        strict_schema_v2: bool | None = None) -> dict:
     """Audit durable NVASR candidate spans against the final words owner.
 
     CTC rows are the only source of raw/forced/adjusted evidence.  The final
@@ -1553,10 +3161,13 @@ def _nvasr_candidate_provenance_audit(
     rows = [row for row in (ctc_tokens or [])
             if isinstance(row, dict)
             and row.get("candidate_kind") == "nvv"]
+    strict_v3 = strict_schema_v3 or strict_schema_v2 is True
     unprovenanced_ctc_nvv = [row for row in ctc_nvv_rows
                              if row.get("candidate_kind") != "nvv"]
     base = {
         "schema": NVASR_CANDIDATE_PROVENANCE_SCHEMA,
+        "nvasr_candidate_schema_version": NVASR_CANDIDATE_SCHEMA_VERSION,
+        "mapping_axis": NVASR_MAPPING_AXIS,
         "mapping_basis": NVASR_MAPPING_BASIS,
         "candidate_count": len(rows),
         "status": "not_applicable" if not rows else "rejected",
@@ -1575,7 +3186,98 @@ def _nvasr_candidate_provenance_audit(
             base["status"] = "rejected"
         return base
 
-    reasons: list[str] = []
+    authority_reasons = _nvasr_producer_authority_reasons(
+        ctc_tokens, producer_authority, required=strict_v3)
+    if authority_reasons:
+        base["reasons"].extend(authority_reasons)
+        return base
+
+    if strict_v3 and any(not all(key in row for key in (
+            "nvasr_candidate_schema_version", "mapping_axis",
+            "ordered_semantic_neighbors", "raw_timeline_neighbors",
+            "candidate_source", "raw_timeline_neighbors_schema",
+            "raw_timeline_index", "raw_timeline_event_count",
+            "raw_timeline_evidence_sha256", "query_frames", "frame_ms",
+            "ctc_raw_token_row",
+            "ctc_spike_anchor")) for row in rows):
+        base["reasons"].append("nvasr_candidate_schema_v3_required")
+        return base
+
+    if strict_v3:
+        canonical: list[tuple[int, dict, int]] = []
+        occurrences: dict[str, int] = {}
+        canonical_invalid = False
+        for position, token in enumerate(ctc_tokens or []):
+            if not isinstance(token, dict):
+                continue
+            text = str(token.get("word", token.get("text", ""))).strip()
+            if not _nvasr_semantic_axis_member(
+                    text, candidate_kind=token.get("candidate_kind")):
+                continue
+            ordinal = len(canonical)
+            occurrence = occurrences.get(text, 0)
+            occurrences[text] = occurrence + 1
+            if (token.get("semantic_occurrence_id")
+                    != f"nvasr-lexical-{ordinal:04d}"
+                    or token.get("semantic_surface_occurrence") != occurrence):
+                canonical_invalid = True
+            canonical.append((position, token, ordinal))
+        expected_by_id: dict[int, list[dict]] = {}
+        for position, token in enumerate(ctc_tokens or []):
+            if not isinstance(token, dict) or token.get("candidate_kind") != "nvv":
+                continue
+            left = next((item for item in reversed(canonical)
+                         if item[0] < position), None)
+            right = next((item for item in canonical if item[0] > position), None)
+            expected = []
+            for side, item in (("left", left), ("right", right)):
+                if item is None:
+                    continue
+                _pos, ordinary, ordinal = item
+                expected.append({
+                    "side": side,
+                    "lexical_ordinal": ordinal,
+                    "occurrence_id": ordinary.get("semantic_occurrence_id"),
+                    "surface": ordinary.get("word", ordinary.get("text", "")),
+                    "surface_occurrence": ordinary.get(
+                        "semantic_surface_occurrence"),
+                })
+            expected_by_id[id(token)] = expected
+        if canonical_invalid or any(
+                row.get("ordered_semantic_neighbors") != expected_by_id.get(id(row))
+                for row in rows):
+            base["reasons"].append("canonical_semantic_identity_order_mismatch")
+        ordered_candidate_ids = [row.get("candidate_id") for row in rows]
+        if (not all(isinstance(value, str) and value
+                    for value in ordered_candidate_ids)
+                or ordered_candidate_ids != sorted(ordered_candidate_ids)
+                or len(ordered_candidate_ids) != len(set(
+                    ordered_candidate_ids))):
+            base["reasons"].append(
+                "nvasr_candidate_identity_sequence_mismatch")
+        token_positions = {
+            id(token): position
+            for position, token in enumerate(ctc_tokens or [])
+            if isinstance(token, dict)
+        }
+        for candidate_index, candidate in enumerate(rows):
+            locator = candidate.get("ctc_raw_token_row")
+            locator_stem = (locator.get("stem")
+                            if isinstance(locator, dict) else "")
+            for reason in _nvasr_locator_reasons(
+                    candidate, stem=locator_stem,
+                    sidecar=f"{locator_stem}_tokens.jsonl",
+                    ordinal=token_positions.get(id(candidate), -1)):
+                base["reasons"].append(
+                    f"candidate_{reason}:{candidate_index}")
+
+    if any(any(key in row for key in (
+            "nvasr_candidate_schema_version", "ctc_spike_anchor",
+            "ordered_semantic_neighbors", "raw_timeline_neighbors"))
+           for row in rows):
+        base["owner_selection_schema"] = "nvasr-owner-selection-v2"
+
+    reasons: list[str] = list(base["reasons"])
     if required and unprovenanced_ctc_nvv:
         reasons.append("ctc_nvv_without_candidate_provenance")
     ids: set[str] = set()
@@ -1657,6 +3359,9 @@ def _nvasr_candidate_provenance_audit(
                     authority_ordinal_counts.get(ordinal, 0) + 1)
 
     for index, row in enumerate(rows):
+        schema_v3 = strict_v3 or any(key in row for key in (
+            "nvasr_candidate_schema_version", "ctc_spike_anchor",
+            "ordered_semantic_neighbors", "raw_timeline_neighbors"))
         candidate_id = row.get("candidate_id")
         if (not isinstance(candidate_id, str) or not candidate_id
                 or candidate_id in ids):
@@ -1665,15 +3370,37 @@ def _nvasr_candidate_provenance_audit(
             ids.add(candidate_id)
         if row.get("provenance_schema") != NVASR_CANDIDATE_PROVENANCE_SCHEMA:
             reasons.append(f"provenance_schema_mismatch:{index}")
+        if schema_v3:
+            if row.get("nvasr_candidate_schema_version") != NVASR_CANDIDATE_SCHEMA_VERSION:
+                reasons.append(f"nvasr_candidate_schema_version_invalid:{index}")
+            if row.get("mapping_axis") != NVASR_MAPPING_AXIS:
+                reasons.append(f"mapping_axis_mismatch:{index}")
+            anchor = row.get("ctc_spike_anchor")
+            expected_anchor = _nvasr_expected_anchor(row)
+            if (not _nvasr_valid_anchor(anchor)
+                    or expected_anchor is None or anchor != expected_anchor):
+                reasons.append(f"ctc_spike_anchor_binding_invalid:{index}")
+            neighbors = row.get("ordered_semantic_neighbors")
+            if (not isinstance(neighbors, list)
+                    or any(not _nvasr_neighbor_item_valid(item)
+                           for item in neighbors)
+                    or [item.get("side") for item in neighbors]
+                    != sorted([item.get("side") for item in neighbors],
+                              key=("left", "right").index)):
+                reasons.append(f"semantic_neighbor_identity_invalid:{index}")
         if row.get("mapping_basis") != NVASR_MAPPING_BASIS:
             reasons.append(f"mapping_basis_mismatch:{index}")
+        if ("mapping_axis" in row
+                and row.get("mapping_axis") != NVASR_MAPPING_AXIS):
+            reasons.append(f"mapping_axis_mismatch:{index}")
         if row.get("mapping_outcome") != "unique":
             reasons.append(f"mapping_not_unique:{index}")
         mapping_selection = row.get("mapping_selection")
         if mapping_selection not in {
                 "label_neighbors", "unique_max_forced_speech_overlap",
                 "unique_max_forced_raw_overlap",
-                "unique_punctuation_topology_bound"}:
+                "unique_punctuation_topology_bound",
+                "unique_label_forced_ctc_overlap"}:
             reasons.append(f"mapping_selection_unknown:{index}")
         mapping_key = row.get("mapping_key")
         if not isinstance(mapping_key, dict):
@@ -1702,7 +3429,8 @@ def _nvasr_candidate_provenance_audit(
         adjusted = span(row, "adjusted_span")
         frame_support, frame_support_source, frame_limited, frame_reasons = (
             _nvasr_frame_support(row, wav_duration_s=wav_duration_s,
-                                 require_mapping=True))
+                                 require_mapping=True,
+                                 strict_schema_v3=strict_v3))
         reasons.extend(f"{reason}:{index}" for reason in frame_reasons)
         owner_required_segments, owner_required_span, dedup_spans, owner_reasons = (
             _nvasr_owner_requirements(row, frame_support))
@@ -1715,6 +3443,23 @@ def _nvasr_candidate_provenance_audit(
             reasons.append(f"forced_span_missing:{index}")
         if adjusted is None:
             reasons.append(f"adjusted_span_missing:{index}")
+        owner_branch = None
+        owner_reason = None
+        owner_selected = None
+        if schema_v3 and _nvasr_anchor_span(row) is not None:
+            explicit_source_words = (
+                source_words if source_words is not None or strict_v3 else
+                getattr(words_tier, "_nvasr_source_mfa", None))
+            explicit_phone_lineage = (
+                source_phone_lineage
+                if source_phone_lineage is not None or strict_v3 else
+                getattr(words_tier, "_source_phone_lineage", None))
+            owner_branch, owner_selected, owner_reason = _nvasr_select_owner(
+                words_tier, row, _nvasr_anchor_span(row), ctc_tokens,
+                explicit_source_words, explicit_phone_lineage,
+                strict_schema_v3=True)
+            if owner_branch is None:
+                reasons.append(f"owner_selection_rejected:{index}:{owner_reason}")
         if raw is not None:
             raw_coordinate_values = [row.get("raw_start_s"), row.get("raw_end_s")]
             if (any(isinstance(value, bool) or not isinstance(value, (int, float))
@@ -1728,9 +3473,17 @@ def _nvasr_candidate_provenance_audit(
             final = [float(final_rows[index].xmin), float(final_rows[index].xmax)]
             if nvv_identity(final_rows[index].text) != nvv_identity(row.get("word")):
                 reasons.append(f"final_nvv_label_mismatch:{index}")
+        if schema_v3 and owner_selected is not None and final is not None:
+            if not spans_equal(owner_selected, final):
+                reasons.append(f"final_owner_branch_geometry_mismatch:{index}")
+        if (schema_v3 and final is not None
+                and row.get("raw_frame_count", 1) > 1
+                and math.isclose(final[1] - final[0], CTC_FRAME_MS / 1000.0,
+                                 abs_tol=1e-9)):
+            reasons.append(f"multi_frame_anchor_final_60ms:{index}")
         adjusted_differs = (adjusted is not None and final is not None
                             and not spans_equal(adjusted, final))
-        if adjusted_differs:
+        if adjusted_differs and not schema_v3:
             # A display-only final span may diverge from the adjusted span
             # only when the frozen full-CTC authority proves the exact same
             # lexical owner and both sides of the publication transaction.
@@ -1763,10 +3516,9 @@ def _nvasr_candidate_provenance_audit(
                 ctc_authority_ok = (
                     common_authority
                     and authority.get("boundary_source") == "ctc")
-                # Physical frame support is narrower authority than a CTC
-                # display decision.  It may justify only the frozen display
-                # divergence that contains this exact candidate's immutable
-                # support; it never turns the wider display into evidence.
+                # The immutable anchor is evidence, not a display-duration
+                # authority.  A wider final display is accepted only through
+                # the explicitly verified authority transaction below.
                 frame_support_authority_ok = (
                     common_authority
                     and frame_support is not None
@@ -1775,7 +3527,7 @@ def _nvasr_candidate_provenance_audit(
                 authority_ok = ctc_authority_ok or frame_support_authority_ok
                 if not authority_ok:
                     reasons.append(f"unauthorized_final_ctc_divergence:{index}")
-        base["candidates"].append({
+        candidate_report = {
             "candidate_id": candidate_id,
             "label": row.get("word"),
             "mapping_basis": row.get("mapping_basis"),
@@ -1790,6 +3542,11 @@ def _nvasr_candidate_provenance_audit(
             "speech_span": speech,
             "forced_span": forced,
             "adjusted_span": adjusted,
+            "ctc_spike_anchor": row.get("ctc_spike_anchor") if schema_v3 else None,
+            "anchor_span": _nvasr_anchor_span(row) if schema_v3 else None,
+            "owner_branch": owner_branch or ("rejected" if schema_v3 else None),
+            "owner_reason": owner_reason,
+            "owner_selected_span": owner_selected,
             "frame_support_span": frame_support,
             "frame_support_source": frame_support_source or "rejected",
             "owner_required_segments": owner_required_segments or [],
@@ -1809,7 +3566,20 @@ def _nvasr_candidate_provenance_audit(
                         and final[1] >= segment[1] - _FRAME_SUPPORT_EPS
                         for segment in owner_required_segments)),
             "frame_limited": frame_limited,
-        })
+        }
+        if schema_v3:
+            candidate_report.pop("frame_support_span", None)
+            candidate_report.pop("frame_support_source", None)
+            candidate_report.pop("final_contains_frame_support", None)
+            candidate_report.pop("final_contains_owner_required_segments", None)
+            candidate_report["anchor_frame_count"] = row.get("raw_frame_count")
+            candidate_report["multi_frame_anchor_guard"] = (
+                row.get("raw_frame_count") != 1)
+            candidate_report["raw_timeline_neighbors_schema"] = row.get(
+                "raw_timeline_neighbors_schema")
+            candidate_report["raw_timeline_evidence_sha256"] = row.get(
+                "raw_timeline_evidence_sha256")
+        base["candidates"].append(candidate_report)
     base["reasons"] = list(dict.fromkeys(reasons))
     base["status"] = "verified" if not base["reasons"] else "rejected"
     return base
@@ -12024,9 +13794,18 @@ def _strict_en_fail(required_words: int, reason: str, *, ledger_sha256: str = ""
 
 def _source_unknown_context(words_tier: Tier) -> list[dict]:
     """Snapshot source words needed by the narrow initial-Mira proof."""
-    return [{"ordinal": ordinal, "start": float(iv.xmin),
-             "end": float(iv.xmax), "text": iv.text.strip()}
-            for ordinal, iv in enumerate(words_tier.intervals)]
+    ctc_ordinal = 0
+    snapshot = []
+    for ordinal, iv in enumerate(words_tier.intervals):
+        text = iv.text.strip()
+        entry = {"ordinal": ordinal, "start": float(iv.xmin),
+                 "end": float(iv.xmax), "text": text,
+                 "ctc_lexical_ordinal": None}
+        if text and not is_silence(text) and not is_punct(text):
+            entry["ctc_lexical_ordinal"] = ctc_ordinal
+            ctc_ordinal += 1
+        snapshot.append(entry)
+    return snapshot
 
 
 def _fallback_punctuation_surface_ledger(raw_text: str) -> dict:
@@ -14405,13 +16184,30 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     en_data = None if strict_en_mode else load_en_phones(stem, en_phones_dir)
     report: dict = {"stem": stem, "status": "ok", "warnings": []}
     ctc_lifecycle = _load_ctc_lifecycle(txt_dir, stem)
+    _nvasr_producer_authority_private = None
     if ctc_lifecycle is None:
         report["ctc_lifecycle"] = {
             "schema": "ctc-processed-input-lifecycle-v1",
             "status": "legacy_single_directory_fixture",
         }
     else:
-        report["ctc_lifecycle"] = ctc_lifecycle
+        _nvasr_producer_authority_private = ctc_lifecycle.get(
+            "_nvasr_producer_authority")
+        report["ctc_lifecycle"] = {
+            key: value for key, value in ctc_lifecycle.items()
+            if not key.startswith("_")}
+        _authority_summary = (
+            _nvasr_producer_authority_private.get("summary")
+            if isinstance(_nvasr_producer_authority_private, dict) else None)
+        if not isinstance(_authority_summary, dict):
+            raise ValueError("NVASR producer authority projection is missing")
+        report["nvasr_producer_authority"] = _nvasr_json_copy(
+            _authority_summary)
+        if _authority_summary.get("status") != "verified":
+            raise ValueError(
+                "invalid NVASR producer authority: "
+                + "; ".join(str(reason) for reason in
+                            _authority_summary.get("reasons", ())))
     txt_path = txt_dir / f"{stem}.txt"
     lab_path = txt_dir / f"{stem}.lab"
     reference_mode_policy = getattr(args, "reference_mode", "auto")
@@ -14430,6 +16226,14 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     phones_tier = tg.tiers[1]
     source_words_snapshot = _source_unknown_context(words_tier)
     source_phone_lineage = _bind_source_phone_lineage(words_tier, phones_tier)
+    # Bind the immutable source evidence to the words tier before any rebuild;
+    # the schema-v3 owner selector receives this same snapshot at the final barrier.
+    words_tier._nvasr_source_mfa = list(source_words_snapshot)
+    words_tier._source_phone_lineage = source_phone_lineage
+    words_tier._nvasr_source_phones = [
+        {"text": interval.text.strip(),
+         "span": [float(interval.xmin), float(interval.xmax)]}
+        for interval in phones_tier.intervals]
     mfa_unknown_before_snap = [
         iv.text.strip() for iv in words_tier.intervals
         if is_unknown_token(iv.text)
@@ -14550,10 +16354,18 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
             if line:
                 token = json.loads(line)
                 if (reference_text_authoritative and isinstance(token, dict)
+                        and token.get("candidate_kind") != "nvv"
                         and isinstance(token.get("word"), str)):
                     token = dict(token)
                     token["word"] = _canonicalize_reference_hyphens(token["word"])
                 ctc_token_list.append(token)
+    if (any(isinstance(token, dict)
+            and token.get("candidate_kind") == "nvv"
+            for token in ctc_token_list)
+            and _nvasr_producer_authority_private is None):
+        raise ValueError(
+            "schema-v3 NVASR candidates require manifest-anchored producer "
+            "authority")
 
     # Restore only explicit MFA unknown placeholders.  A no-reference CTC
     # English anchor is not authority to relabel a neighbouring pinyin word.
@@ -15746,17 +17558,28 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # publication authority.  In particular, never reassert ``resolved_span``
     # or a raw CTC span here: doing so resurrects the pre-processed boundary
     # after ``handle_unexpected_silences`` merged an internal <sp0>.
-    # NVV frame support is the narrow exception: it is immutable physical
-    # evidence and may locally repartition conflicting display ownership,
-    # while remaining distinct from the wider non-acoustic display span.
+    # Schema-v3 NVV ownership is resolved from immutable spike-anchor
+    # provenance and remains distinct from the wider display span.
     _wav_axis_duration = (len(wav_audio) / float(wav_sr)
                           if wav_audio is not None and wav_sr else None)
+    _owner_words = tier_by_name(new_tg, "words")
+    if _owner_words is not None:
+        _owner_words._nvasr_source_mfa = list(source_words_snapshot)
+        _owner_words._source_phone_lineage = source_phone_lineage
+        _owner_words._nvasr_source_phones = [
+            {"text": interval.text.strip(),
+             "span": [float(interval.xmin), float(interval.xmax)]}
+            for interval in phones_tier.intervals]
     _frame_support_result = _contain_nvasr_frame_support(
-        tier_by_name(new_tg, "words"), ctc_token_list,
-        wav_duration_s=_wav_axis_duration)
-    report["nvasr_frame_support"] = _frame_support_result
+        _owner_words, ctc_token_list,
+        wav_duration_s=_wav_axis_duration,
+        source_words=source_words_snapshot,
+        source_phone_lineage=source_phone_lineage,
+        producer_authority=_nvasr_producer_authority_private,
+        strict_schema_v3=True)
     _frame_support_rejected = _frame_support_result.get("status") == "rejected"
-    _contained_words = _frame_support_result.pop("_contained_tier", None)
+    _contained_words = _publish_nvasr_owner_report(
+        report, _frame_support_result)
     if _contained_words is not None:
         for _index, _tier in enumerate(new_tg.tiers):
             if _tier.name == "words":
@@ -16008,7 +17831,7 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     # ================================================================
     filter_reasons = []
     if _frame_support_rejected:
-        filter_reasons.append("nvasr_frame_support_rejected")
+        filter_reasons.append("nvasr_owner_selection_rejected")
     if (getattr(args, "filter_suspicious", True)
             and _word_energy_enabled(args)):
         for _energy_reason in {
@@ -17035,7 +18858,11 @@ def process_one(tg_path: Path, txt_dir: Path, wav_dir: Path,
     _nvasr_provenance = _nvasr_candidate_provenance_audit(
         ctc_token_list, _final_words,
         required=not reference_text_authoritative,
-        wav_duration_s=_wav_axis_duration)
+        wav_duration_s=_wav_axis_duration,
+        source_words=source_words_snapshot,
+        source_phone_lineage=source_phone_lineage,
+        producer_authority=_nvasr_producer_authority_private,
+        strict_schema_v3=True)
     report["nvasr_candidate_provenance"] = _nvasr_provenance
     if _nvasr_provenance["status"] == "rejected":
         filter_reasons.append("nvasr_candidate_provenance_rejected")

@@ -464,15 +464,15 @@ def test_ctc_reference_hyphenless_fragments_merge_to_one_anchor():
         {"word": "v", "start": 1.00, "end": 1.20},
         {"word": "tu", "start": 1.20, "end": 1.40},
         {"word": "ber", "start": 1.40, "end": 1.70},
-        {"word": "QUESTION-YI", "start": 1.70, "end": 1.90},
+        {"word": "LAUGHTER", "start": 1.70, "end": 1.90},
         {"word": "open", "start": 2.00, "end": 2.20},
         {"word": "ai", "start": 2.20, "end": 2.50},
     ]
-    merged = ctc._merge_reference_english_fragments(source, "v-tuber [Question-yi] open-ai")
+    merged = ctc._merge_reference_english_fragments(source, "v-tuber [Laughter] open-ai")
 
     assert [row["word"] for row in merged] == [
-        "vtuber", "QUESTION-YI", "openai"]
+        "vtuber", "LAUGHTER", "openai"]
     assert (merged[0]["start"], merged[0]["end"]) == (1.00, 1.70)
     assert (merged[2]["start"], merged[2]["end"]) == (2.00, 2.50)
     assert [row["word"] for row in source] == [
-        "v", "tu", "ber", "QUESTION-YI", "open", "ai"]
+        "v", "tu", "ber", "LAUGHTER", "open", "ai"]

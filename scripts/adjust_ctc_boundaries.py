@@ -37,6 +37,9 @@ from pipeline_utils import (
     find_wav,
 )
 
+ADJUSTED_SPAN_BASIS = (
+    "ctc_spike_anchor_forced_correspondence_envelope_v1")
+
 
 # ===== Speech boundary search (vectorised) =====
 
@@ -311,7 +314,13 @@ def _protect_processed_english_geometry(tokens: list[dict]) -> None:
 
 def _record_adjusted_candidate_spans(tokens: list[dict],
                                      punct: list[dict]) -> None:
-    """Seal adjusted spans while leaving candidate raw coordinates untouched."""
+    """Seal adjusted spans while leaving candidate raw coordinates untouched.
+
+    Strict-v3 adjusted evidence is the envelope of the current processed
+    geometry, forced correspondence, and immutable CTC spike anchor.  It is
+    correspondence evidence only; the current ``start_s``/``end_s`` geometry
+    remains unchanged and is the only geometry written to the TextGrid.
+    """
     for row in [*tokens, *punct]:
         if row.get("provenance_schema") != "nvasr-candidate-provenance-v1":
             continue
@@ -321,9 +330,38 @@ def _record_adjusted_candidate_spans(tokens: list[dict],
             continue
         if not isinstance(end, (int, float)) or isinstance(end, bool):
             continue
-        if not math.isfinite(float(start)) or not math.isfinite(float(end)):
-            continue
-        row["adjusted_span"] = [float(start), float(end)]
+        if (not math.isfinite(float(start)) or not math.isfinite(float(end))
+                or float(end) <= float(start)):
+            raise ValueError("NVV current geometry is malformed")
+        if row.get("nvasr_candidate_schema_version") == 3:
+            forced = row.get("forced_span")
+            anchor = row.get("ctc_spike_anchor")
+            if (not isinstance(forced, (list, tuple)) or len(forced) != 2
+                    or any(not isinstance(value, (int, float))
+                           or isinstance(value, bool)
+                           or not math.isfinite(float(value))
+                           for value in forced)
+                    or float(forced[1]) <= float(forced[0])
+                    or not isinstance(anchor, dict)):
+                raise ValueError("NVV forced/anchor evidence is malformed")
+            anchor_start = anchor.get("start")
+            anchor_end = anchor.get("end")
+            if (not isinstance(anchor_start, (int, float))
+                    or isinstance(anchor_start, bool)
+                    or not isinstance(anchor_end, (int, float))
+                    or isinstance(anchor_end, bool)
+                    or not math.isfinite(float(anchor_start))
+                    or not math.isfinite(float(anchor_end))
+                    or float(anchor_end) <= float(anchor_start)):
+                raise ValueError("NVV spike anchor evidence is malformed")
+            row["adjusted_span"] = [
+                min(float(start), float(forced[0]), float(anchor_start)),
+                max(float(end), float(forced[1]), float(anchor_end)),
+            ]
+            row["adjusted_span_basis"] = ADJUSTED_SPAN_BASIS
+            row["adjusted_span_is_acoustic_evidence"] = False
+        else:
+            row["adjusted_span"] = [float(start), float(end)]
         row["adjusted_mapping_outcome"] = "unique"
 
 

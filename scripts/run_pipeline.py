@@ -2661,6 +2661,20 @@ def step_normalize_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     if rc != 0:
         return rc
 
+    # Standalone/ctc-ready normalization is a separate producer route from
+    # ctc_prealign's integrated normalizer chain. English contractions change
+    # row cardinality, so seal final locators/canonical semantic coordinates
+    # here before bundle validation and the work receipt are committed.
+    try:
+        from ctc_prealign import _rebase_final_token_sidecars
+        rebased = _rebase_final_token_sidecars(ctc_dir)
+    except (OSError, UnicodeError, TypeError, ValueError,
+            json.JSONDecodeError) as exc:
+        print(f"  ERROR: final CTC sidecar rebase failed: {exc}")
+        return 1
+    if rebased:
+        print(f"  Final CTC sidecar rebase: {rebased} file(s)")
+
     invalid: list[tuple[str, list[str]]] = []
     for lab_path in sorted(ctc_dir.glob("*.lab")):
         errors = validate_ctc_transcript_bundle(

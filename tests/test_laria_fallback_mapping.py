@@ -34,8 +34,8 @@ def _ledger(source, ctc, final):
 
 def test_ledger_is_complete_stable_and_digest_bound():
     source = _source("<unk>", "<unk>")
-    ctc = _ctc("SURPRISE-WA", "BREATHING")
-    final = _final("SURPRISE-WA", "BREATHING")
+    ctc = _ctc("COUGH", "BREATHING")
+    final = _final("COUGH", "BREATHING")
 
     first = _ledger(source, ctc, final)
     second = _ledger(source, ctc, final)
@@ -55,19 +55,19 @@ def test_ledger_is_complete_stable_and_digest_bound():
 def test_multiple_unknowns_require_exact_same_nvv_at_each_ordinal():
     positive = _ledger(
         _source("<unk>", "<unk>"),
-        _ctc("SURPRISE-WA", "BREATHING"),
-        _final("SURPRISE-WA", "BREATHING"),
+        _ctc("COUGH", "BREATHING"),
+        _final("COUGH", "BREATHING"),
     )
     assert positive["safe"] is True
     assert [entry["resolved_text"] for entry in positive["entries"]] == [
-        "SURPRISE-WA", "BREATHING"]
+        "COUGH", "BREATHING"]
 
     # LAria_00160: the second unknown cannot consume the first repeated final
     # owner when CTC proves BREATHING at that ordinal.
     negative = _ledger(
         _source("<unk>", "<unk>"),
-        _ctc("SURPRISE-WA", "BREATHING"),
-        _final("SURPRISE-WA", "SURPRISE-WA"),
+        _ctc("COUGH", "BREATHING"),
+        _final("COUGH", "COUGH"),
     )
     assert negative["safe"] is False
     assert negative["status"] == "rejected"
@@ -78,14 +78,14 @@ def test_multiple_unknowns_require_exact_same_nvv_at_each_ordinal():
 def test_restore_unknowns_consumes_distinct_ordered_ctc_ordinals_and_spans():
     words = _final("<unk>", "<unk>")
     restored = post._restore_fallback_unknown_surfaces(words, [
-        {"ordinal": 0, "word": "SURPRISE-WA", "start_s": 0.20,
+        {"ordinal": 0, "word": "COUGH", "start_s": 0.20,
          "end_s": 1.50, "type": "word"},
         {"ordinal": 1, "word": "BREATHING", "start_s": 1.00,
          "end_s": 2.40, "type": "word"},
     ])
 
     assert [iv.text for iv in restored.intervals] == [
-        "SURPRISE-WA", "BREATHING"]
+        "COUGH", "BREATHING"]
     projection = restored._fallback_unknown_projection
     recovered = [entry["recovery_evidence"] for entry in projection["entries"]]
     assert [item["ctc_ordinal"] for item in recovered] == [0, 1]

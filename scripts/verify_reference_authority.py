@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from ctc_prealign import (
-    QUERY_FRAMES, FRAME_MS, NVV_START, NVV_END, BLANK_ID,
+    QUERY_FRAMES, FRAME_MS, NVV_START, NVV_END, BLANK_ID, NVV_SUPPRESSED_IDS,
     _clamp_words_to_wav_axis,
     _free_decode_logits,
     _merge_ria_tokens,
@@ -927,12 +927,19 @@ def _case_reference_only_masks_nvv_ids_in_free_decode() -> None:
     logits2[0, 3, 100] = 10.0        # frame 3 argmax = token 100
     biased = _free_decode_logits(
         logits2, reference_only=False, enable_nvv=True, bias_value=4.0)
-    # blank frame (index 2): NVV range should be > 0 (bias applied)
-    assert (biased[0, 2, NVV_START:NVV_END + 1] > 0).all(), \
-        "blank frame must have NVV bias applied"
-    # non-blank frame (index 3): NVV range should still be 0
-    assert (biased[0, 3, NVV_START:NVV_END + 1] == 0).all(), \
-        "non-blank frame must not have NVV bias"
+    kept_ids = [i for i in range(NVV_START, NVV_END + 1)
+                if i not in NVV_SUPPRESSED_IDS]
+    suppressed_ids = sorted(NVV_SUPPRESSED_IDS)
+    # blank frame (index 2): kept NVV slots get bias (> 0); suppressed stay -inf
+    assert (biased[0, 2, kept_ids] > 0).all(), \
+        "blank frame must have NVV bias applied to kept NVV slots"
+    assert torch.isinf(biased[0, 2, suppressed_ids]).all(), \
+        "suppressed interjection NVV slots must stay -inf on blank frames"
+    # non-blank frame (index 3): kept NVV slots remain 0; suppressed stay -inf
+    assert (biased[0, 3, kept_ids] == 0).all(), \
+        "non-blank frame must not have NVV bias on kept slots"
+    assert torch.isinf(biased[0, 3, suppressed_ids]).all(), \
+        "suppressed interjection NVV slots must stay -inf on non-blank frames"
 
 
 # ── D7: Case 82 extension — v4 marker content identity ────────────

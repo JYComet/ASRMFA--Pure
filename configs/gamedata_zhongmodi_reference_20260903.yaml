@@ -1,0 +1,82 @@
+# GAMEDATA / 终末地 — 有参考文本模式 (reference_mode: authority)
+# 输入已落地到 NVMe (扁平 wav+txt): /mnt/nvme3/gamedata_20260903/zhongmodi/
+# 有参考文本: 用 ground-truth 中文做对齐, 缺少同名 .txt 即失败, 不回退 ASR。
+#
+# 执行模型: ASR(NVASR/CTC) 只用 2 张 GPU (CUDA_VISIBLE_DEVICES=0,1);
+#           MFA/English MFA 全 CPU 执行 (num_jobs 走 CPU 多核)。
+#
+# 运行:
+#   CUDA_VISIBLE_DEVICES=0,1 \
+#     /home/user/miniconda3/envs/mfa-dev/bin/python scripts/run_pipeline.py \
+#       --config configs/gamedata_zhongmodi_reference_20260903.yaml \
+#       --python /home/user/miniconda3/envs/mfa-dev/bin/python
+mode: nvrasr_fallback
+reference_mode: authority
+
+data_dir: /mnt/nvme3/gamedata_20260903/zhongmodi
+output_dir: /mnt/Raw/GAMEDATA_对齐_20260903/zhongmodi
+output_staging: true
+keep_16k_audio: true
+workspace: /mnt/nvme3/mfa_work_gamedata_zhongmodi_20260903
+temp_dir: temp
+
+pad_silence:
+  enabled: true
+  target_edge_silence_sec: 0.5
+  output_audio: false
+
+ctc_prealign:
+  enabled: true
+  python: /home/user/miniconda3/envs/asr/bin/python
+  model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
+  device: cuda:0
+  all_gpus: true
+  limit: 0
+  timeout: 14400
+  nvv_enabled: false
+  reference_nvv_enabled: true
+  allow_missing_reference: false
+
+ctc_adjust:
+  enabled: false
+
+models_dir: /mnt/local_E/MFA_Pause/repo/models/mfa
+
+mfa:
+  num_jobs: 64
+  single_speaker: true
+  output_format: long_textgrid
+  clean: false
+  no_tokenization: true
+  skip_validate: true
+  fine_tune: false
+  beam: 20
+  retry_beam: 80
+  allow_partial: true
+  min_output_ratio: 0.90
+  timeout: 7200
+
+mfa_en:
+  enabled: true
+  num_jobs: 16
+  padding_ms: 50
+  min_segment_dur_ms: 200
+  max_gap_merge_s: 0.35
+  beam: 10
+  retry_beam: 40
+  fine_tune: false
+  strict_provenance: true
+  acoustic_model: /mnt/local_E/MFA_Pause/pretrained_models/acoustic/english_us_arpa.zip
+  dictionary: dict/cmudict.dict
+  g2p_model: /mnt/local_E/MFA_Pause/pretrained_models/g2p/english_us_arpa.zip
+
+postprocess:
+  strict_ok: true
+  allow_filtered_integrity_failures: true
+  merge_silence: true
+  min_sil_merge_sec: 0.2
+  fix_short_word: false
+  detect_bgm: false
+  filter_suspicious: false
+  enable_text_correction: true
+  handle_unexpected_sil: false

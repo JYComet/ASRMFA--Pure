@@ -306,15 +306,53 @@ def _reclaim_fragments(lab_tokens: list[str],
             continue
         new_lab.append(replacements[i][0] if i in replacements else t)
 
+    def merge_rows(rows: list[dict], first_index: int, word: str,
+                   start: float, end: float) -> dict:
+        """Retain the leftmost row and union all consumed source ordinals."""
+        merged = dict(rows[0])
+        ordinals: list[int] = []
+        for offset, row in enumerate(rows):
+            values = row.get("source_ctc_ordinals")
+            if values is None and "source_ctc_ordinal" in row:
+                values = [row["source_ctc_ordinal"]]
+            if values is None:
+                values = [first_index + offset]
+            if (not isinstance(values, (list, tuple))
+                    or any(not isinstance(value, int)
+                           or isinstance(value, bool) or value < 0
+                           for value in values)):
+                raise ValueError("invalid source CTC ordinal metadata")
+            ordinals.extend(values)
+        merged.update({
+            "word": word,
+            "start_ms": round(start * 1000),
+            "end_ms": round(end * 1000),
+            "start_s": start,
+            "end_s": end,
+            "type": merged.get("type", "word"),
+            "source_ctc_ordinals": sorted(set(ordinals)),
+        })
+        merged.pop("source_ctc_ordinal", None)
+        return merged
+
     new_ctc = []
     for i, ct in enumerate(ctc_tokens):
         if i in to_delete:
             continue
         if i in replacements:
             word, s, e = replacements[i]
-            new_ctc.append({"word": word, "start_ms": round(s * 1000),
-                           "end_ms": round(e * 1000), "start_s": s, "end_s": e,
-                           "type": ct.get("type", "word")})
+            consumed_indices = [i]
+            left = i - 1
+            while left in to_delete:
+                consumed_indices.insert(0, left)
+                left -= 1
+            right = i + 1
+            while right in to_delete:
+                consumed_indices.append(right)
+                right += 1
+            consumed = [ctc_tokens[index] for index in consumed_indices]
+            new_ctc.append(merge_rows(
+                consumed, consumed_indices[0], word, s, e))
         else:
             new_ctc.append(ct)
 
@@ -514,13 +552,45 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
 
     # ── Apply Pass 1 merges ──
     if changes:
+        def merge_rows(indices: list[int], word: str,
+                       start: float, end: float) -> dict:
+            """Retain leftmost evidence and union consumed source ordinals."""
+            merged = dict(ctc_tokens[indices[0]])
+            ordinals: list[int] = []
+            for index in indices:
+                row = ctc_tokens[index]
+                values = row.get("source_ctc_ordinals")
+                if values is None and "source_ctc_ordinal" in row:
+                    values = [row["source_ctc_ordinal"]]
+                if values is None:
+                    values = [index]
+                if (not isinstance(values, (list, tuple))
+                        or any(not isinstance(value, int)
+                               or isinstance(value, bool) or value < 0
+                               for value in values)):
+                    raise ValueError("invalid source CTC ordinal metadata")
+                ordinals.extend(values)
+            merged.update({
+                "word": word,
+                "start_ms": round(start * 1000),
+                "end_ms": round(end * 1000),
+                "start_s": start,
+                "end_s": end,
+                "type": merged.get("type", "word"),
+                "source_ctc_ordinals": sorted(set(ordinals)),
+            })
+            merged.pop("source_ctc_ordinal", None)
+            return merged
+
         to_delete: set[int] = set()
         replacements: dict[int, tuple[str, float, float]] = {}
+        replacement_indices: dict[int, list[int]] = {}
         for en_word, indices in changes:
             first, last = indices[0], indices[-1]
             s = ctc_tokens[first]["start_s"] if first < len(ctc_tokens) else 0.0
             e = ctc_tokens[last]["end_s"] if last < len(ctc_tokens) else 0.0
             replacements[first] = (en_word, s, e)
+            replacement_indices[first] = list(indices)
             for i in indices[1:]:
                 to_delete.add(i)
 
@@ -534,9 +604,8 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
             if i in to_delete: continue
             if i in replacements:
                 en_word, s, e = replacements[i]
-                new_ctc.append({"word": en_word, "start_ms": round(s * 1000),
-                               "end_ms": round(e * 1000), "start_s": s, "end_s": e,
-                               "type": "word"})
+                new_ctc.append(merge_rows(
+                    replacement_indices[i], en_word, s, e))
             else:
                 new_ctc.append(ct)
     else:

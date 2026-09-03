@@ -21,6 +21,7 @@ NV V 标签处理:
 """
 
 import argparse
+from decimal import Decimal, ROUND_HALF_UP
 import hashlib
 import json
 import math
@@ -37,6 +38,22 @@ import torch
 
 # ─── NVV 标签范围 & CTC 常量 ───
 NVV_START, NVV_END = 25025, 25054   # 30 类 NVV: [Breathing]..[Crying]
+# 疑问/惊讶/确认/不满 语气词 token id — 这些由 Qwen 转写为 CJK 原词
+# (哎/咦/嗯/啊), 必须从 NVV 输出中屏蔽, 仅保留 vegetative 生理发声类.
+NVV_SUPPRESSED_IDS: frozenset[int] = frozenset({
+    25036,  # [Question-huh]
+    25038,  # [Confirmation-en]
+    25041,  # [Surprise-ah]
+    25042,  # [Surprise-oh]
+    25044,  # [Dissatisfaction-hnn]
+    25045,  # [Surprise-wa]
+    25046,  # [Question-yi]
+    25047,  # [Question-ei]
+    25049,  # [Question-ah]
+    25050,  # [Question-oh]
+    25051,  # [Surprise-yo]
+    25052,  # [Question-en]
+})
 BLANK_ID = 0
 ELLIPSIS_ID = 9724                    # "…" 省略号 token
 PAUSE_FRAMES_DEFAULT = 8              # ≥8 帧 ≈ 480ms 注入省略号, 可改
@@ -58,6 +75,16 @@ ALLOWED_PUNCT = set(ALLOWED_PUNCT_CJK + ALLOWED_PUNCT_ASCII)
 PUNCTUATION_EVIDENCE_SCHEMA = "ctc-punctuation-evidence-v2"
 NVASR_CANDIDATE_PROVENANCE_SCHEMA = "nvasr-candidate-provenance-v1"
 NVASR_MAPPING_BASIS = "raw_ctc_label_neighbors_forced_overlap-v2"
+NVASR_CANDIDATE_SCHEMA_VERSION = 3
+NVASR_MAPPING_AXIS = "non_nvv_compact_v1"
+NVASR_RAW_TIMELINE_NEIGHBORS_SCHEMA = "nvasr-raw-timeline-neighbors-v1"
+NVASR_SPIKE_ANCHOR_SCHEMA = "ctc_spike_anchor_v2"
+CTC_RAW_TOKEN_ROW_SCHEMA = "ctc_raw_token_row_v1"
+# Kept as an import-compatible name for existing consumers.  The value is
+# the exact compact-axis contract, rather than a descriptive metadata schema.
+NVASR_SEMANTIC_AXIS_SCHEMA = NVASR_MAPPING_AXIS
+NVASR_ANCHOR_COORDINATE_SYSTEM = "speech_seconds_from_ctc_encoder_frames"
+NVASR_ANCHOR_QUANTIZATION = "half_open_60ms_frames_centered_30ms_round_half_up"
 CTC_TOKEN_SIDECAR_PASSTHROUGH_FIELDS = (
     "surface_text", "source_ctc_ordinals", "canonical_span",
     "canonical_unit", "canonical_unit_sha256", "reference_identity",
@@ -67,10 +94,20 @@ CTC_TOKEN_SIDECAR_PASSTHROUGH_FIELDS = (
     "candidate_token_ids", "raw_span", "speech_span", "raw_start_frame",
     "raw_end_frame", "speech_start_frame", "speech_end_frame",
     "raw_start_s", "raw_end_s", "speech_start_s", "speech_end_s",
-    "raw_frame_count", "speech_frame_count", "frame_ms",
-    "mapping_basis", "mapping_key", "mapping_outcome", "forced_span",
+    "raw_frame_count", "speech_frame_count", "query_frames", "frame_ms",
+    "mapping_basis", "mapping_axis", "mapping_key", "mapping_outcome", "forced_span",
+    "raw_timeline_mapping_key",
+    "nvasr_candidate_schema_version", "ordered_semantic_neighbors",
+    "candidate_source", "raw_timeline_neighbors",
+    "raw_timeline_neighbors_schema", "raw_timeline_index",
+    "raw_timeline_event_count", "raw_timeline_evidence_sha256",
+    "ctc_spike_anchor",
     "mapping_selection", "mapping_forced_speech_overlap_s",
-    "nvv_deduplication",
+    "mapping_forced_ctc_anchor_overlap_s", "ctc_lexical_ordinal",
+    "ctc_raw_token_row",
+    "semantic_occurrence_id", "semantic_surface_occurrence",
+    "nvv_deduplication", "adjusted_span", "adjusted_span_basis",
+    "adjusted_span_is_acoustic_evidence", "adjusted_mapping_outcome",
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -169,6 +206,7 @@ from pipeline_utils import (
     make_ctc_normalization_marker, parse_ctc_normalization_marker,
     NVV_NAMES, NVV_TO_MFA,
     is_nvv_token, is_english_token, is_pinyin_syllable, is_punct,
+    is_silence,
     RIA_VARIANTS, replace_ria_variants, normalize_punct_inline,
     _ASCII_TO_CJK_PUNCT,
     normalize_reference_numerals, normalize_authority_reference_numerals,
@@ -178,6 +216,8 @@ from pipeline_utils import (
     read_pipeline_accounting_receipt, validate_pipeline_accounting_receipt,
     make_pipeline_run_id, cuda_visible_token,
 )
+
+NVASR_NONLEXICAL_MFA_LABELS = frozenset({"sil", "sp", "spn", "<eps>"})
 
 try:
     from english_units import (
@@ -354,6 +394,441 @@ def nvv_to_mfa(label: str) -> str:
     return NVV_TO_MFA.get(inner, inner.upper().replace(" ", "-"))
 
 
+def _nvasr_semantic_axis_member(surface: object, *, candidate_kind=None) -> bool:
+    """Return whether a row occupies the canonical compact semantic axis."""
+    text = str(surface or "").strip()
+    return bool(
+        text
+        and candidate_kind is None
+        and not re.fullmatch(r"<\|[^|]+\|>", text)
+        and not is_nvv_token(text)
+        and text.casefold() not in NVASR_NONLEXICAL_MFA_LABELS
+        and not is_silence(text)
+        and not is_punct(text)
+    )
+
+
+def _nvasr_semantic_identity(surface: object) -> str:
+    """Return the stable identity used by the compact semantic axis."""
+    return str(surface or "").strip()
+
+
+def _nvasr_anchor_from_frames(start_frame: int, end_frame: int, *,
+                              query_frames: int = QUERY_FRAMES,
+                              frame_ms: int = FRAME_MS) -> dict:
+    """Build immutable speech-time evidence from a half-open CTC frame run.
+
+    Coordinates are rounded to six decimal places using the producer's
+    documented half-open-frame convention.  The resulting interval is an
+    evidence anchor only; its width is never a physiological duration.
+    """
+    half_frame_s = frame_ms / 2000.0
+    start = (start_frame - query_frames) * frame_ms / 1000.0 - half_frame_s
+    end = (end_frame - query_frames) * frame_ms / 1000.0 - half_frame_s
+
+    def round_half_up(value: float) -> float:
+        return float(Decimal(str(value)).quantize(
+            Decimal("0.000001"), rounding=ROUND_HALF_UP))
+
+    speech_start_frame = start_frame - query_frames
+    speech_end_frame = end_frame - query_frames
+    return {
+        "schema": NVASR_SPIKE_ANCHOR_SCHEMA,
+        "raw_start_frame": start_frame,
+        "raw_end_frame": end_frame,
+        "start": round_half_up(start),
+        "end": round_half_up(end),
+        "ordered_source_frame_ids": list(range(start_frame, end_frame)),
+        "raw_frame_count": end_frame - start_frame,
+        "query_frames": query_frames,
+        "frame_ms": frame_ms,
+        "speech_start_frame": speech_start_frame,
+        "speech_end_frame": speech_end_frame,
+        "coordinate_system": NVASR_ANCHOR_COORDINATE_SYSTEM,
+        "quantization": NVASR_ANCHOR_QUANTIZATION,
+    }
+
+
+def _nvasr_valid_anchor(value: object) -> bool:
+    """Validate the complete v2 anchor against locked producer runtime values."""
+    if not isinstance(value, dict):
+        return False
+    required = {
+        "schema", "raw_start_frame", "raw_end_frame",
+        "start", "end", "ordered_source_frame_ids", "raw_frame_count",
+        "query_frames", "frame_ms", "speech_start_frame", "speech_end_frame",
+        "coordinate_system", "quantization",
+    }
+    if set(value) != required:
+        return False
+    start, end = value.get("start"), value.get("end")
+    frame_ids = value.get("ordered_source_frame_ids")
+    count = value.get("raw_frame_count")
+    raw_start = value.get("raw_start_frame")
+    raw_end = value.get("raw_end_frame")
+    query_frames = value.get("query_frames")
+    frame_ms = value.get("frame_ms")
+    speech_start = value.get("speech_start_frame")
+    speech_end = value.get("speech_end_frame")
+    if (not isinstance(start, (int, float)) or isinstance(start, bool)
+            or not math.isfinite(float(start))
+            or not isinstance(end, (int, float)) or isinstance(end, bool)
+            or not math.isfinite(float(end)) or end <= start
+            or not isinstance(frame_ids, list)):
+        return False
+    if (not frame_ids
+            or any(not isinstance(frame, int) or isinstance(frame, bool)
+                   or frame < 0 for frame in frame_ids)
+            or frame_ids != list(range(frame_ids[0], frame_ids[-1] + 1))):
+        return False
+    if (not isinstance(count, int) or isinstance(count, bool)
+            or count <= 0 or count != len(frame_ids)
+            or not isinstance(raw_start, int) or isinstance(raw_start, bool)
+            or not isinstance(raw_end, int) or isinstance(raw_end, bool)
+            or raw_start < 0 or raw_end <= raw_start
+            or frame_ids != list(range(raw_start, raw_end))
+            or count != raw_end - raw_start
+            or query_frames != QUERY_FRAMES
+            or frame_ms != FRAME_MS
+            or speech_start != raw_start - QUERY_FRAMES
+            or speech_end != raw_end - QUERY_FRAMES
+            or value.get("schema") != NVASR_SPIKE_ANCHOR_SCHEMA
+            or value.get("coordinate_system") != NVASR_ANCHOR_COORDINATE_SYSTEM
+            or value.get("quantization") != NVASR_ANCHOR_QUANTIZATION):
+        return False
+    expected = _nvasr_anchor_from_frames(
+        raw_start, raw_end, query_frames=QUERY_FRAMES, frame_ms=FRAME_MS)
+    if value != expected:
+        return False
+    return math.isclose(
+        float(end) - float(start), count * FRAME_MS / 1000.0,
+        abs_tol=1e-9)
+
+
+def _nvasr_anchor_binding_reasons(row: dict) -> list[str]:
+    """Bind a complete spike anchor to its candidate and runtime constants."""
+    reasons: list[str] = []
+    if row.get("query_frames") != QUERY_FRAMES:
+        reasons.append("ctc_spike_anchor_query_frames_mismatch")
+    if row.get("frame_ms") != FRAME_MS:
+        reasons.append("ctc_spike_anchor_frame_ms_mismatch")
+    anchor = row.get("ctc_spike_anchor")
+    if not isinstance(anchor, dict):
+        return reasons + ["ctc_spike_anchor_v2_malformed"]
+    raw_start = row.get("raw_start_frame")
+    raw_end = row.get("raw_end_frame")
+    if (not isinstance(raw_start, int) or isinstance(raw_start, bool)
+            or not isinstance(raw_end, int) or isinstance(raw_end, bool)
+            or raw_start < 0 or raw_end <= raw_start):
+        return reasons + ["ctc_spike_anchor_candidate_frames_invalid"]
+    if (anchor.get("raw_start_frame") != raw_start
+            or anchor.get("raw_end_frame") != raw_end
+            or anchor.get("ordered_source_frame_ids") != list(range(
+                raw_start, raw_end))
+            or anchor.get("raw_frame_count") != raw_end - raw_start
+            or row.get("raw_frame_count") != raw_end - raw_start
+            or anchor.get("speech_start_frame") != row.get(
+                "speech_start_frame")
+            or anchor.get("speech_end_frame") != row.get("speech_end_frame")
+            or row.get("speech_frame_count") != raw_end - raw_start):
+        reasons.append("ctc_spike_anchor_frame_binding_invalid")
+    expected = _nvasr_anchor_from_frames(
+        raw_start, raw_end, query_frames=QUERY_FRAMES, frame_ms=FRAME_MS)
+    if anchor != expected:
+        reasons.append("ctc_spike_anchor_coordinate_binding_invalid")
+    if not _nvasr_valid_anchor(anchor):
+        reasons.append("ctc_spike_anchor_v2_malformed")
+    return list(dict.fromkeys(reasons))
+
+
+def _nvasr_candidate_coordinate_binding_reasons(row: dict) -> list[str]:
+    """Validate every immutable raw/speech frame and second coordinate."""
+    reasons: list[str] = []
+    raw_start = row.get("raw_start_frame")
+    raw_end = row.get("raw_end_frame")
+    speech_start = row.get("speech_start_frame")
+    speech_end = row.get("speech_end_frame")
+    if (not isinstance(raw_start, int) or isinstance(raw_start, bool)
+            or not isinstance(raw_end, int) or isinstance(raw_end, bool)
+            or not isinstance(speech_start, int)
+            or isinstance(speech_start, bool)
+            or not isinstance(speech_end, int) or isinstance(speech_end, bool)
+            or raw_start < 0 or raw_end <= raw_start):
+        return ["nvasr_candidate_frame_coordinates_invalid"]
+    count = raw_end - raw_start
+    if (row.get("raw_frame_count") != count
+            or row.get("speech_frame_count") != count
+            or speech_start != raw_start - QUERY_FRAMES
+            or speech_end != raw_end - QUERY_FRAMES):
+        reasons.append("nvasr_candidate_frame_count_or_offset_invalid")
+    if row.get("query_frames") != QUERY_FRAMES:
+        reasons.append("nvasr_candidate_query_frames_invalid")
+    if row.get("frame_ms") != FRAME_MS:
+        reasons.append("nvasr_candidate_frame_ms_invalid")
+    expected_raw = [raw_start * FRAME_MS / 1000.0,
+                    raw_end * FRAME_MS / 1000.0]
+    expected_speech = [speech_start * FRAME_MS / 1000.0,
+                       speech_end * FRAME_MS / 1000.0]
+    for values, expected, label in (
+            ([row.get("raw_start_s"), row.get("raw_end_s")],
+             expected_raw, "raw_coordinates"),
+            (row.get("raw_span"), expected_raw, "raw_span"),
+            ([row.get("speech_start_s"), row.get("speech_end_s")],
+             expected_speech, "speech_coordinates"),
+            (row.get("speech_span"), expected_speech, "speech_span")):
+        if (not isinstance(values, (list, tuple)) or len(values) != 2
+                or any(not isinstance(value, (int, float))
+                       or isinstance(value, bool)
+                       or not math.isfinite(float(value))
+                       or not math.isclose(float(value), expected[index],
+                                           abs_tol=1e-9)
+                       for index, value in enumerate(values))):
+            reasons.append(f"nvasr_candidate_{label}_binding_invalid")
+    return list(dict.fromkeys(reasons))
+
+
+_NVASR_RAW_EVENT_FIELDS = frozenset({
+    "surface", "source", "token_id", "ordered_source_frame_ids",
+})
+_NVASR_RAW_EVENT_SOURCES = frozenset({"ctc", "blank_run"})
+
+
+def _nvasr_raw_event_diagnostic(event: dict) -> dict:
+    """Project one raw event without assigning canonical semantics to it."""
+    return {
+        "surface": event["surface"],
+        "source": event["source"],
+        "token_id": event["token_id"],
+        "ordered_source_frame_ids": list(
+            range(event["start"], event["end"])),
+    }
+
+
+def _nvasr_raw_event_valid(value: object) -> bool:
+    """Validate one exact raw-timeline event diagnostic."""
+    if not isinstance(value, dict) or set(value) != _NVASR_RAW_EVENT_FIELDS:
+        return False
+    frames = value.get("ordered_source_frame_ids")
+    token_id = value.get("token_id")
+    return (
+        isinstance(value.get("surface"), str)
+        and value.get("source") in _NVASR_RAW_EVENT_SOURCES
+        and isinstance(token_id, int) and not isinstance(token_id, bool)
+        and token_id >= 0
+        and isinstance(frames, list) and bool(frames)
+        and all(isinstance(frame, int) and not isinstance(frame, bool)
+                and frame >= 0 for frame in frames)
+        and frames == list(range(frames[0], frames[-1] + 1))
+    )
+
+
+def _nvasr_raw_mapping_key(row: dict) -> dict | None:
+    raw_mapping_key = row.get("raw_timeline_mapping_key")
+    if raw_mapping_key is not None:
+        return raw_mapping_key if isinstance(raw_mapping_key, dict) else None
+    mapping_key = row.get("mapping_key")
+    if mapping_key is not None:
+        return mapping_key if isinstance(mapping_key, dict) else None
+    if ("left_lexical_ordinal" not in row
+            and "right_lexical_ordinal" not in row):
+        return None
+    return {
+        "left_lexical_ordinal": row.get("left_lexical_ordinal"),
+        "right_lexical_ordinal": row.get("right_lexical_ordinal"),
+    }
+
+
+def _nvasr_raw_candidate_value(row: dict, durable: str, producer: str):
+    return row.get(durable) if durable in row else row.get(producer)
+
+
+def _nvasr_raw_timeline_evidence_material(row: dict) -> dict:
+    """Return the canonical JSON material binding a candidate raw window."""
+    return {
+        "schema": row.get("raw_timeline_neighbors_schema"),
+        "candidate_id": row.get("candidate_id"),
+        "candidate_surface": _nvasr_raw_candidate_value(
+            row, "candidate_surface", "surface"),
+        "candidate_source": _nvasr_raw_candidate_value(
+            row, "candidate_source", "source"),
+        "candidate_token_id": _nvasr_raw_candidate_value(
+            row, "candidate_token_id", "token_id"),
+        "candidate_token_ids": _nvasr_raw_candidate_value(
+            row, "candidate_token_ids", "token_ids"),
+        "raw_start_frame": row.get("raw_start_frame"),
+        "raw_end_frame": row.get("raw_end_frame"),
+        "query_frames": row.get("query_frames"),
+        "frame_ms": row.get("frame_ms"),
+        "raw_timeline_index": row.get("raw_timeline_index"),
+        "raw_timeline_event_count": row.get("raw_timeline_event_count"),
+        "mapping_key": _nvasr_raw_mapping_key(row),
+        "raw_timeline_neighbors": row.get("raw_timeline_neighbors"),
+    }
+
+
+def _nvasr_raw_timeline_evidence_sha256(row: dict) -> str:
+    """Hash the exact candidate/raw-neighbour evidence contract."""
+    payload = json.dumps(
+        _nvasr_raw_timeline_evidence_material(row),
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _nvasr_raw_timeline_sequence_reasons(value: object) -> list[str]:
+    """Validate the producer's complete ordered raw-event sequence."""
+    if not isinstance(value, list) or not value:
+        return ["raw_timeline_events_empty_or_malformed"]
+    reasons: list[str] = []
+    for index, event in enumerate(value):
+        if not _nvasr_raw_event_valid(event):
+            reasons.append(f"raw_timeline_event_invalid:{index}")
+    if reasons:
+        return reasons
+    for index, (left, right) in enumerate(zip(value, value[1:])):
+        if (left["ordered_source_frame_ids"][-1]
+                >= right["ordered_source_frame_ids"][0]):
+            reasons.append(f"raw_timeline_event_order_invalid:{index}")
+    return reasons
+
+
+def _nvasr_raw_timeline_contract_reasons(
+        row: dict, *, timeline_events: list[dict] | None = None) -> list[str]:
+    """Validate one immutable raw-neighbour window and its candidate binding.
+
+    Raw neighbours are direct decoder-timeline events, not canonical semantic
+    neighbours. Their side nullability is determined solely by the persisted
+    raw event index/count. The digest makes the exact identities, token IDs,
+    frame runs, candidate coordinates, and raw mapping key tamper-evident after
+    the full producer timeline is no longer available to a consumer.
+    """
+    reasons: list[str] = []
+    if (row.get("raw_timeline_neighbors_schema") !=
+            NVASR_RAW_TIMELINE_NEIGHBORS_SCHEMA):
+        reasons.append("raw_timeline_neighbors_schema_invalid")
+
+    index = row.get("raw_timeline_index")
+    count = row.get("raw_timeline_event_count")
+    if (not isinstance(index, int) or isinstance(index, bool)
+            or not isinstance(count, int) or isinstance(count, bool)
+            or count <= 0 or index < 0 or index >= count):
+        reasons.append("raw_timeline_position_invalid")
+
+    neighbors = row.get("raw_timeline_neighbors")
+    if not isinstance(neighbors, dict) or set(neighbors) != {"left", "right"}:
+        reasons.append("raw_timeline_neighbors_structure_invalid")
+        neighbors = {"left": None, "right": None}
+
+    mapping_key = _nvasr_raw_mapping_key(row)
+    if (row.get("nvasr_candidate_schema_version") ==
+            NVASR_CANDIDATE_SCHEMA_VERSION
+            and "raw_timeline_mapping_key" not in row):
+        reasons.append("raw_timeline_mapping_key_required")
+    if (not isinstance(mapping_key, dict)
+            or set(mapping_key) != {
+                "left_lexical_ordinal", "right_lexical_ordinal"}):
+        reasons.append("raw_timeline_mapping_key_invalid")
+        mapping_key = {"left_lexical_ordinal": None,
+                       "right_lexical_ordinal": None}
+    elif any(value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0)
+            for value in mapping_key.values()):
+        reasons.append("raw_timeline_mapping_key_invalid")
+
+    raw_start = row.get("raw_start_frame")
+    raw_end = row.get("raw_end_frame")
+    token_id = _nvasr_raw_candidate_value(
+        row, "candidate_token_id", "token_id")
+    token_ids = _nvasr_raw_candidate_value(
+        row, "candidate_token_ids", "token_ids")
+    surface = _nvasr_raw_candidate_value(
+        row, "candidate_surface", "surface")
+    source = _nvasr_raw_candidate_value(
+        row, "candidate_source", "source")
+    candidate_valid = (
+        isinstance(row.get("candidate_id"), str) and bool(row["candidate_id"])
+        and isinstance(surface, str) and bool(surface)
+        and source in _NVASR_RAW_EVENT_SOURCES
+        and isinstance(token_id, int) and not isinstance(token_id, bool)
+        and token_id >= 0
+        and isinstance(raw_start, int) and not isinstance(raw_start, bool)
+        and isinstance(raw_end, int) and not isinstance(raw_end, bool)
+        and 0 <= raw_start < raw_end
+        and row.get("query_frames") == QUERY_FRAMES
+        and row.get("frame_ms") == FRAME_MS
+        and isinstance(token_ids, list)
+        and token_ids == [token_id] * (raw_end - raw_start)
+    )
+    if not candidate_valid:
+        reasons.append("raw_timeline_candidate_identity_invalid")
+
+    for side in ("left", "right"):
+        neighbor = neighbors[side]
+        if neighbor is not None and not _nvasr_raw_event_valid(neighbor):
+            reasons.append(f"raw_timeline_{side}_event_invalid")
+
+    if (isinstance(index, int) and not isinstance(index, bool)
+            and isinstance(count, int) and not isinstance(count, bool)
+            and count > 0 and 0 <= index < count):
+        left_required = index > 0
+        right_required = index + 1 < count
+        if (neighbors["left"] is None) != (not left_required):
+            reasons.append("raw_timeline_left_presence_invalid")
+        if (neighbors["right"] is None) != (not right_required):
+            reasons.append("raw_timeline_right_presence_invalid")
+    for side in ("left", "right"):
+        if (mapping_key.get(f"{side}_lexical_ordinal") is not None
+                and neighbors[side] is None):
+            reasons.append(f"raw_timeline_{side}_required_by_mapping_key")
+
+    if candidate_valid and _nvasr_raw_event_valid(neighbors["left"]):
+        if neighbors["left"]["ordered_source_frame_ids"][-1] >= raw_start:
+            reasons.append("raw_timeline_left_frame_order_invalid")
+    if candidate_valid and _nvasr_raw_event_valid(neighbors["right"]):
+        if neighbors["right"]["ordered_source_frame_ids"][0] < raw_end:
+            reasons.append("raw_timeline_right_frame_order_invalid")
+
+    digest = row.get("raw_timeline_evidence_sha256")
+    if (not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
+        reasons.append("raw_timeline_evidence_digest_invalid")
+    else:
+        try:
+            expected_digest = _nvasr_raw_timeline_evidence_sha256(row)
+        except (TypeError, ValueError):
+            expected_digest = None
+        if digest != expected_digest:
+            reasons.append("raw_timeline_evidence_digest_mismatch")
+
+    if timeline_events is not None:
+        sequence_reasons = _nvasr_raw_timeline_sequence_reasons(
+            timeline_events)
+        reasons.extend(sequence_reasons)
+        if (not sequence_reasons and isinstance(index, int)
+                and not isinstance(index, bool) and isinstance(count, int)
+                and not isinstance(count, bool) and count == len(timeline_events)
+                and 0 <= index < count and candidate_valid):
+            candidate_event = {
+                "surface": surface,
+                "source": source,
+                "token_id": token_id,
+                "ordered_source_frame_ids": list(range(raw_start, raw_end)),
+            }
+            expected_neighbors = {
+                "left": timeline_events[index - 1] if index else None,
+                "right": (timeline_events[index + 1]
+                          if index + 1 < count else None),
+            }
+            if timeline_events[index] != candidate_event:
+                reasons.append("raw_timeline_candidate_event_mismatch")
+            if neighbors != expected_neighbors:
+                reasons.append("raw_timeline_neighbor_identity_mismatch")
+        elif (not sequence_reasons and isinstance(count, int)
+              and not isinstance(count, bool) and count != len(timeline_events)):
+            reasons.append("raw_timeline_event_count_mismatch")
+    return list(dict.fromkeys(reasons))
+
+
 def preprocess_asr_for_mfa(text: str) -> str:
     """将 ASR 输出中的 [NVV] 标签转换为 MFA 大写 token.
 
@@ -383,6 +858,10 @@ def _free_decode_logits(logits: torch.Tensor, *, reference_only: bool,
         top_pred = decoded.argmax(dim=-1)
         is_blank = top_pred == blank_id
         decoded[is_blank, NVV_START:NVV_END + 1] += bias_value
+    # 疑问/惊讶/确认语气词永不为 NVV (由 Qwen 转写为 CJK 原词), 屏蔽放在
+    # bias 之后, 避免 bias 复活这些槽位.
+    if NVV_SUPPRESSED_IDS:
+        decoded[..., sorted(NVV_SUPPRESSED_IDS)] = -float("inf")
     return decoded
 
 
@@ -415,6 +894,13 @@ def _candidate_coordinates(start_frame: int, end_frame: int, *,
         "raw_end_s": round(raw_end_s, 6),
         "speech_start_s": round(speech_start_frame * frame_ms / 1000, 6),
         "speech_end_s": round(speech_end_frame * frame_ms / 1000, 6),
+        "raw_span": [round(raw_start_s, 6), round(raw_end_s, 6)],
+        "speech_span": [
+            round(speech_start_frame * frame_ms / 1000, 6),
+            round(speech_end_frame * frame_ms / 1000, 6),
+        ],
+        "raw_frame_count": end_frame - start_frame,
+        "speech_frame_count": end_frame - start_frame,
     }
 
 
@@ -474,6 +960,8 @@ def extract_nvasr_candidate_timeline(
         stripped = surface.strip()
         if token_id == ellipsis_id or stripped == "…":
             return "punctuation"
+        if token_id in NVV_SUPPRESSED_IDS:
+            return None
         if NVV_START <= token_id <= NVV_END:
             return "nvv"
         if re.fullmatch(r"\[[A-Za-z][^\]]*\]", stripped):
@@ -539,13 +1027,7 @@ def extract_nvasr_candidate_timeline(
         event["start"], event["end"], event["token_id"]))
 
     def is_lexical_surface(surface: str, kind: str | None) -> bool:
-        stripped = surface.strip()
-        return bool(
-            stripped
-            and kind is None
-            and not re.fullmatch(r"<\|[^|]+\|>", stripped)
-            and not is_punct(stripped)
-        )
+        return _nvasr_semantic_axis_member(surface, candidate_kind=kind)
 
     lexical_events = [
         event for event in raw_events
@@ -568,6 +1050,8 @@ def extract_nvasr_candidate_timeline(
             "kind": "lexical",
             "token_id": event["token_id"],
             "token_ids": list(event["token_ids"]),
+            "query_frames": query_frames,
+            "frame_ms": frame_ms,
             "surface_occurrence": surface_occurrence,
             "surface_occurrence_index": surface_occurrence,
             "surface_occurrence_id": f"{surface}#{surface_occurrence}",
@@ -581,6 +1065,9 @@ def extract_nvasr_candidate_timeline(
         id(event): row["lexical_ordinal"]
         for event, row in zip(lexical_events, lexical_occurrences)
     }
+    lexical_by_ordinal = {
+        row["lexical_ordinal"]: row for row in lexical_occurrences
+    }
     right_lexical_by_event_id: dict[int, int | None] = {}
     next_lexical_ordinal: int | None = None
     for event in reversed(raw_events):
@@ -588,6 +1075,9 @@ def extract_nvasr_candidate_timeline(
         if id(event) in lexical_event_ids:
             next_lexical_ordinal = lexical_by_event_id[id(event)]
 
+    raw_timeline_events = [
+        _nvasr_raw_event_diagnostic(event) for event in raw_events
+    ]
     candidates = []
     left_lexical_ordinal: int | None = None
     for ordinal, event in enumerate(raw_events):
@@ -600,6 +1090,26 @@ def extract_nvasr_candidate_timeline(
         start = event["start"]
         end = event["end"]
         surface = event["surface"]
+        left_event = next((raw_events[pos - 1] for pos in range(len(raw_events))
+                           if raw_events[pos] is event and pos > 0), None)
+        right_event = next((raw_events[pos + 1] for pos in range(len(raw_events))
+                            if raw_events[pos] is event
+                            and pos + 1 < len(raw_events)), None)
+
+        semantic_neighbors = []
+        for side, lexical_ordinal in (
+                ("left", left_lexical_ordinal),
+                ("right", right_lexical_by_event_id[id(event)])):
+            if lexical_ordinal is None:
+                continue
+            lexical = lexical_by_ordinal[lexical_ordinal]
+            semantic_neighbors.append({
+                "side": side,
+                "lexical_ordinal": lexical_ordinal,
+                "occurrence_id": lexical["occurrence_id"],
+                "surface": lexical["surface"],
+                "surface_occurrence": lexical["surface_occurrence"],
+            })
         candidate = {
             "candidate_id": f"nvasr-candidate-{len(candidates):04d}",
             "occurrence": len(candidates),
@@ -608,24 +1118,69 @@ def extract_nvasr_candidate_timeline(
             "kind": kind,
             "source": event["source"],
             "mapping_basis": NVASR_MAPPING_BASIS,
+            "mapping_axis": NVASR_MAPPING_AXIS,
+            "nvasr_candidate_schema_version": NVASR_CANDIDATE_SCHEMA_VERSION,
+            "query_frames": query_frames,
+            "frame_ms": frame_ms,
             "token_id": event["token_id"],
             "token_ids": list(event["token_ids"]),
             "diagnostic": diagnostic_text,
             "left_lexical_ordinal": left_lexical_ordinal,
             "right_lexical_ordinal": right_lexical_by_event_id[id(event)],
+            "raw_timeline_mapping_key": {
+                "left_lexical_ordinal": left_lexical_ordinal,
+                "right_lexical_ordinal": right_lexical_by_event_id[id(event)],
+            },
+            "ordered_semantic_neighbors": semantic_neighbors,
+            "raw_timeline_neighbors_schema":
+                NVASR_RAW_TIMELINE_NEIGHBORS_SCHEMA,
+            "raw_timeline_index": ordinal,
+            "raw_timeline_event_count": len(raw_events),
+            "raw_timeline_neighbors": {
+                "left": (_nvasr_raw_event_diagnostic(left_event)
+                         if left_event is not None else None),
+                "right": (_nvasr_raw_event_diagnostic(right_event)
+                          if right_event is not None else None),
+            },
         }
         candidate.update(_candidate_coordinates(
             start, end, query_frames=query_frames, frame_ms=frame_ms))
+        candidate["ctc_spike_anchor"] = _nvasr_anchor_from_frames(
+            int(candidate["raw_start_frame"]),
+            int(candidate["raw_end_frame"]),
+            query_frames=query_frames, frame_ms=frame_ms)
+        candidate["raw_timeline_evidence_sha256"] = (
+            _nvasr_raw_timeline_evidence_sha256(candidate))
         candidates.append(candidate)
 
     timeline = {
+        # The envelope name remains stable for readers that dispatch on it;
+        # the mandatory numeric version below carries the contract revision.
         "schema": "nvasr-candidate-timeline-v1",
+        "nvasr_candidate_schema_version": NVASR_CANDIDATE_SCHEMA_VERSION,
+        "mapping_axis": NVASR_MAPPING_AXIS,
         "duration_s": round(
             max(0, len(frame_token_ids) - query_frames) * frame_ms / 1000,
             6,
         ),
         "query_frames": query_frames,
         "frame_ms": frame_ms,
+        "semantic_axis": {
+            "schema": NVASR_MAPPING_AXIS,
+            "name": "non_nvv_compact_semantic",
+            "ordinal_field": "lexical_ordinal",
+            "excluded_kinds": ["nvv", "punctuation", "silence", "special"],
+        },
+        "ordered_semantic_neighbors": [
+            {
+                "lexical_ordinal": row["lexical_ordinal"],
+                "occurrence_id": row["occurrence_id"],
+                "surface": row["surface"],
+                "surface_occurrence": row["surface_occurrence"],
+            }
+            for row in lexical_occurrences
+        ],
+        "raw_timeline_neighbors": raw_timeline_events,
         "diagnostic": diagnostic_text,
         "diagnostic_text": diagnostic_text,
         "lexical_occurrences": lexical_occurrences,
@@ -648,11 +1203,20 @@ def _nvasr_candidate_provenance(candidate: dict, *, forced_span=None) -> dict:
                 float(candidate["raw_end_s"])]
     speech_span = [float(candidate["speech_start_s"]),
                    float(candidate["speech_end_s"])]
+    anchor = candidate.get("ctc_spike_anchor")
+    if not isinstance(anchor, dict):
+        # Compatibility for direct legacy helper fixtures.  Extracted
+        # producer timelines always carry the mandatory v2 anchor.
+        anchor = _nvasr_anchor_from_frames(
+            int(candidate["raw_start_frame"]),
+            int(candidate["raw_end_frame"]))
     result = {
         "provenance_schema": NVASR_CANDIDATE_PROVENANCE_SCHEMA,
         "candidate_id": str(candidate["candidate_id"]),
+        "nvasr_candidate_schema_version": NVASR_CANDIDATE_SCHEMA_VERSION,
         "candidate_kind": str(candidate["kind"]),
         "candidate_surface": str(candidate["surface"]),
+        "candidate_source": str(candidate.get("source", "")),
         "candidate_token_id": int(candidate["token_id"]),
         "candidate_token_ids": list(candidate["token_ids"]),
         "raw_span": raw_span,
@@ -669,14 +1233,34 @@ def _nvasr_candidate_provenance(candidate: dict, *, forced_span=None) -> dict:
                             - int(candidate["raw_start_frame"])),
         "speech_frame_count": (int(candidate["speech_end_frame"])
                                - int(candidate["speech_start_frame"])),
-        "frame_ms": FRAME_MS,
+        "query_frames": int(candidate.get("query_frames", QUERY_FRAMES)),
+        "frame_ms": int(candidate.get("frame_ms", FRAME_MS)),
         "mapping_basis": NVASR_MAPPING_BASIS,
+        "mapping_axis": NVASR_MAPPING_AXIS,
+        "ordered_semantic_neighbors": list(
+            candidate.get("ordered_semantic_neighbors", ())),
+        "raw_timeline_neighbors": json.loads(json.dumps(
+            candidate.get("raw_timeline_neighbors", {}),
+            ensure_ascii=False)),
+        "ctc_spike_anchor": dict(anchor),
         "mapping_key": {
             "left_lexical_ordinal": candidate.get("left_lexical_ordinal"),
             "right_lexical_ordinal": candidate.get("right_lexical_ordinal"),
         },
+        "raw_timeline_mapping_key": dict(
+            candidate.get("raw_timeline_mapping_key", {
+                "left_lexical_ordinal": candidate.get(
+                    "left_lexical_ordinal"),
+                "right_lexical_ordinal": candidate.get(
+                    "right_lexical_ordinal"),
+            })),
         "mapping_outcome": "unique",
     }
+    for key in (
+            "raw_timeline_neighbors_schema", "raw_timeline_index",
+            "raw_timeline_event_count", "raw_timeline_evidence_sha256"):
+        if key in candidate:
+            result[key] = candidate[key]
     if forced_span is not None:
         result["forced_span"] = [float(forced_span[0]), float(forced_span[1])]
     return result
@@ -765,15 +1349,99 @@ def _deduplicate_adjacent_nvv_rows(words_pinyin: list[dict]) -> list[dict]:
     return result
 
 
+def _merge_ctc_row_metadata(rows: list[dict], *, word: str,
+                            start: float, end: float,
+                            fallback_ordinals: list[int] | None = None) -> dict:
+    """Retain the leftmost row while unioning source CTC ordinals.
+
+    Cardinality-changing normalizers must not manufacture a bare row: the
+    leftmost row carries the durable producer evidence, while the consumed
+    source ordinals explain the contraction.  Final physical/canonical
+    coordinates are assigned by ``_rebase_final_token_sidecars``.
+    """
+    if not rows:
+        raise ValueError("cannot merge an empty CTC row group")
+    merged = dict(rows[0])
+    ordinals: list[int] = []
+    for position, row in enumerate(rows):
+        values = row.get("source_ctc_ordinals")
+        if values is None and "source_ctc_ordinal" in row:
+            values = [row["source_ctc_ordinal"]]
+        if values is None and fallback_ordinals is not None:
+            values = [fallback_ordinals[position]]
+        if values is None:
+            continue
+        if (not isinstance(values, (list, tuple))
+                or any(not isinstance(value, int) or isinstance(value, bool)
+                       or value < 0 for value in values)):
+            raise ValueError("invalid source CTC ordinal metadata")
+        ordinals.extend(values)
+    if ordinals:
+        merged["source_ctc_ordinals"] = sorted(set(ordinals))
+        merged.pop("source_ctc_ordinal", None)
+    merged.update({
+        "word": word,
+        "start": float(start),
+        "end": float(end),
+    })
+    return merged
+
+
 def _validate_emitted_nvasr_provenance(words_pinyin: list[dict]) -> list[str]:
     """Verify the final free-decode rows immediately before serialization."""
     required = (
         "provenance_schema", "candidate_id", "candidate_kind",
-        "candidate_surface", "raw_span", "speech_span", "forced_span",
-        "mapping_basis", "mapping_outcome",
+        "candidate_surface", "candidate_source", "raw_span", "speech_span",
+        "forced_span",
+        "mapping_basis", "mapping_axis", "mapping_outcome",
+        "nvasr_candidate_schema_version", "ordered_semantic_neighbors",
+        "raw_timeline_neighbors", "raw_timeline_neighbors_schema",
+        "raw_timeline_index", "raw_timeline_event_count",
+        "raw_timeline_evidence_sha256", "query_frames", "frame_ms",
+        "ctc_spike_anchor",
     )
     errors: list[str] = []
     candidate_ids: set[str] = set()
+    canonical_rows: list[tuple[int, dict, int]] = []
+    canonical_surface_counts: dict[str, int] = {}
+    canonical_ready = any("semantic_occurrence_id" in row
+                          for row in words_pinyin)
+    if canonical_ready:
+        for position, row in enumerate(words_pinyin):
+            text = str(row.get("word", "")).strip()
+            if not _nvasr_semantic_axis_member(text):
+                continue
+            ordinal = len(canonical_rows)
+            occurrence = canonical_surface_counts.get(text, 0)
+            canonical_surface_counts[text] = occurrence + 1
+            expected_id = f"nvasr-lexical-{ordinal:04d}"
+            if (row.get("semantic_occurrence_id") != expected_id
+                    or row.get("semantic_surface_occurrence") != occurrence):
+                errors.append(
+                    f"row {position}: canonical semantic identity/order invalid")
+            canonical_rows.append((position, row, ordinal))
+    canonical_neighbors: dict[int, list[dict]] = {}
+    if canonical_ready:
+        for position, row in enumerate(words_pinyin):
+            if not is_nvv_token(str(row.get("word", "")).strip()):
+                continue
+            left = next((item for item in reversed(canonical_rows)
+                         if item[0] < position), None)
+            right = next((item for item in canonical_rows
+                          if item[0] > position), None)
+            expected = []
+            for side, item in (("left", left), ("right", right)):
+                if item is None:
+                    continue
+                _pos, neighbor, ordinal = item
+                expected.append({
+                    "side": side,
+                    "lexical_ordinal": ordinal,
+                    "occurrence_id": neighbor["semantic_occurrence_id"],
+                    "surface": neighbor["word"],
+                    "surface_occurrence": neighbor["semantic_surface_occurrence"],
+                })
+            canonical_neighbors[id(row)] = expected
 
     def valid_span(value: object) -> bool:
         return (isinstance(value, (list, tuple)) and len(value) == 2
@@ -807,8 +1475,41 @@ def _validate_emitted_nvasr_provenance(words_pinyin: list[dict]) -> list[str]:
         if (row.get("provenance_schema") != NVASR_CANDIDATE_PROVENANCE_SCHEMA
                 or row.get("candidate_kind") != "nvv"
                 or row.get("mapping_basis") != NVASR_MAPPING_BASIS
+                or row.get("mapping_axis") != NVASR_MAPPING_AXIS
+                or row.get("nvasr_candidate_schema_version") !=
+                NVASR_CANDIDATE_SCHEMA_VERSION
                 or row.get("mapping_outcome") != "unique"):
             errors.append(f"row {index}: output NVV {label!r} has invalid provenance contract")
+        neighbors = row.get("ordered_semantic_neighbors")
+        if (not isinstance(neighbors, list)
+                or any(not isinstance(item, dict)
+                       or item.get("side") not in {"left", "right"}
+                       or not isinstance(item.get("lexical_ordinal"), int)
+                       or not isinstance(item.get("occurrence_id"), str)
+                       or not isinstance(item.get("surface"), str)
+                       for item in neighbors)
+                or [item.get("side") for item in neighbors]
+                != sorted([item.get("side") for item in neighbors],
+                          key=("left", "right").index)):
+            errors.append(f"row {index}: output NVV {label!r} semantic neighbors invalid")
+        if canonical_ready and neighbors != canonical_neighbors.get(id(row)):
+            errors.append(
+                f"row {index}: output NVV {label!r} canonical neighbor identity mismatch")
+        raw_reasons = _nvasr_raw_timeline_contract_reasons(row)
+        if raw_reasons:
+            errors.append(
+                f"row {index}: output NVV {label!r} raw neighbors invalid:"
+                f"{','.join(raw_reasons)}")
+        anchor_reasons = _nvasr_anchor_binding_reasons(row)
+        if anchor_reasons:
+            errors.append(
+                f"row {index}: output NVV {label!r} spike anchor invalid:"
+                f"{','.join(anchor_reasons)}")
+        coordinate_reasons = _nvasr_candidate_coordinate_binding_reasons(row)
+        if coordinate_reasons:
+            errors.append(
+                f"row {index}: output NVV {label!r} coordinates invalid:"
+                f"{','.join(coordinate_reasons)}")
         if nvv_to_mfa(str(row.get("candidate_surface", ""))) != label:
             errors.append(f"row {index}: output NVV {label!r} candidate label mismatch")
         for span_key in ("raw_span", "speech_span", "forced_span"):
@@ -849,7 +1550,8 @@ def _validate_emitted_nvasr_provenance(words_pinyin: list[dict]) -> list[str]:
 
 def attach_nvasr_candidate_provenance(
         words_pinyin: list[dict], punct_entries: list[dict],
-        timeline: dict) -> list[str]:
+        timeline: dict, *, strict_schema_v3: bool = False,
+        strict_schema_v2: bool | None = None) -> list[str]:
     """Bind NVASR candidates to CTC rows by label and lexical neighbor ordinals.
 
     The candidate's raw encoder coordinates are copied verbatim.  Matching is
@@ -865,16 +1567,95 @@ def attach_nvasr_candidate_provenance(
     nvv_rows = [(index, row) for index, row in enumerate(words_pinyin)
                 if is_nvv_token(row.get("word", ""))]
 
+    # ``strict_schema_v2`` remains an API-only alias for older tests/callers;
+    # it selects the current strict contract and never admits a version-2 row.
+    strict_v3 = strict_schema_v3 or strict_schema_v2 is True
+    semantic_axis = timeline.get("semantic_axis")
+    if strict_v3 and (
+            timeline.get("nvasr_candidate_schema_version") !=
+            NVASR_CANDIDATE_SCHEMA_VERSION
+            or timeline.get("mapping_axis") != NVASR_MAPPING_AXIS
+            or timeline.get("query_frames") != QUERY_FRAMES
+            or timeline.get("frame_ms") != FRAME_MS
+            or not isinstance(semantic_axis, dict)
+            or semantic_axis.get("schema") != NVASR_MAPPING_AXIS
+            or semantic_axis.get("name") != "non_nvv_compact_semantic"
+            or semantic_axis.get("ordinal_field") != "lexical_ordinal"
+            or not isinstance(timeline.get("ordered_semantic_neighbors"), list)
+            or not isinstance(timeline.get("raw_timeline_neighbors"), list)):
+        return ["candidate timeline schema-v3 metadata is invalid"]
+    if semantic_axis is not None and (
+            not isinstance(semantic_axis, dict)
+            or semantic_axis.get("schema") != NVASR_MAPPING_AXIS
+            or semantic_axis.get("name") != "non_nvv_compact_semantic"
+            or semantic_axis.get("ordinal_field") != "lexical_ordinal"):
+        return ["candidate timeline semantic axis metadata is invalid"]
+    timeline_lexical = timeline.get("lexical_occurrences")
+    emitted_semantic = [
+        row for row in words_pinyin
+        if _nvasr_semantic_axis_member(row.get("word"))]
+    if isinstance(timeline_lexical, list) and len(timeline_lexical) != len(
+            emitted_semantic):
+        return [
+            "candidate timeline semantic axis round-trip count mismatch: "
+            f"timeline={len(timeline_lexical)} emitted={len(emitted_semantic)}"
+        ]
+    if strict_v3:
+        expected_axis = [{
+            "lexical_ordinal": row.get("lexical_ordinal"),
+            "occurrence_id": row.get("occurrence_id"),
+            "surface": row.get("surface"),
+            "surface_occurrence": row.get("surface_occurrence"),
+        } for row in timeline_lexical or []]
+        if timeline.get("ordered_semantic_neighbors") != expected_axis:
+            return ["candidate timeline ordered semantic identity/order mismatch"]
+        if not isinstance(timeline_lexical, list) or any(
+                not isinstance(row, dict)
+                or row.get("lexical_ordinal") != index
+                or row.get("occurrence_id") != row.get("lexical_occurrence_id")
+                or not isinstance(row.get("surface"), str)
+                for index, row in enumerate(timeline_lexical)):
+            return ["candidate timeline lexical identity/order is invalid"]
+        timeline_raw = timeline.get("raw_timeline_neighbors")
+        raw_sequence_reasons = _nvasr_raw_timeline_sequence_reasons(
+            timeline_raw)
+        if raw_sequence_reasons:
+            return [
+                "candidate timeline raw event contract invalid:"
+                f"{','.join(raw_sequence_reasons)}"
+            ]
+        for candidate_index, candidate in enumerate(candidates):
+            anchor_reasons = _nvasr_anchor_binding_reasons(candidate)
+            if anchor_reasons:
+                return [
+                    f"candidate timeline spike-anchor contract invalid at "
+                    f"{candidate_index}:{','.join(anchor_reasons)}"
+                ]
+            coordinate_reasons = _nvasr_candidate_coordinate_binding_reasons(
+                candidate)
+            if coordinate_reasons:
+                return [
+                    f"candidate timeline coordinate contract invalid at "
+                    f"{candidate_index}:{','.join(coordinate_reasons)}"
+                ]
+            raw_reasons = _nvasr_raw_timeline_contract_reasons(
+                candidate, timeline_events=timeline_raw)
+            if raw_reasons:
+                return [
+                    f"candidate timeline raw neighbor contract invalid at "
+                    f"{candidate_index}:{','.join(raw_reasons)}"
+                ]
+
     def row_key(row: dict, rows: list[dict], index: int) -> tuple[int | None, int | None]:
         explicit = explicit_neighbor_key(row)
         if explicit is not None:
             return explicit
         lexical_before = sum(
             1 for prior in rows[:index]
-            if not is_nvv_token(prior.get("word", "")))
+            if _nvasr_semantic_axis_member(prior.get("word")))
         lexical_after = sum(
             1 for later in rows[index + 1:]
-            if not is_nvv_token(later.get("word", "")))
+            if _nvasr_semantic_axis_member(later.get("word")))
         return (lexical_before - 1 if lexical_before else None,
                 lexical_before if lexical_after else None)
 
@@ -906,7 +1687,41 @@ def attach_nvasr_candidate_provenance(
                             candidate.get("speech_end_s")])
             and frames_valid
             and candidate["raw_start_frame"] < candidate["raw_end_frame"]
-            and candidate["speech_start_frame"] < candidate["speech_end_frame"])
+            and candidate["speech_start_frame"] < candidate["speech_end_frame"]
+            and (not strict_v3 or (
+                candidate.get("nvasr_candidate_schema_version") ==
+                NVASR_CANDIDATE_SCHEMA_VERSION
+                and candidate.get("mapping_axis") == NVASR_MAPPING_AXIS
+                and isinstance(candidate.get("ordered_semantic_neighbors"), list)
+                and not _nvasr_candidate_coordinate_binding_reasons(candidate)
+                and not _nvasr_raw_timeline_contract_reasons(
+                    candidate,
+                    timeline_events=timeline.get("raw_timeline_neighbors"))
+                and _nvasr_valid_anchor(candidate.get("ctc_spike_anchor")))))
+
+    def candidate_v3_identity_valid(candidate: dict) -> bool:
+        if not strict_v3:
+            return True
+        lexical_by_ordinal = {
+            item.get("lexical_ordinal"): item
+            for item in timeline_lexical or [] if isinstance(item, dict)}
+        expected = []
+        for side, ordinal in (
+                ("left", candidate.get("left_lexical_ordinal")),
+                ("right", candidate.get("right_lexical_ordinal"))):
+            if ordinal is None:
+                continue
+            item = lexical_by_ordinal.get(ordinal)
+            if item is None:
+                return False
+            expected.append({
+                "side": side,
+                "lexical_ordinal": ordinal,
+                "occurrence_id": item.get("occurrence_id"),
+                "surface": item.get("surface"),
+                "surface_occurrence": item.get("surface_occurrence"),
+            })
+        return candidate.get("ordered_semantic_neighbors") == expected
 
     def explicit_neighbor_key(row: dict):
         mapping_key = row.get("mapping_key")
@@ -967,11 +1782,13 @@ def attach_nvasr_candidate_provenance(
             return explicit
         lexical_before = sum(
             1 for prior_kind, _prior_index, prior in emitted_events[:position]
-            if prior_kind == "word" and not is_nvv_token(prior.get("word", ""))
+            if prior_kind == "word"
+            and _nvasr_semantic_axis_member(prior.get("word"))
         )
         lexical_after = sum(
             1 for later_kind, _later_index, later in emitted_events[position + 1:]
-            if later_kind == "word" and not is_nvv_token(later.get("word", ""))
+            if later_kind == "word"
+            and _nvasr_semantic_axis_member(later.get("word"))
         )
         return (lexical_before - 1 if lexical_before else None,
                 lexical_before if lexical_after else None)
@@ -1108,9 +1925,42 @@ def attach_nvasr_candidate_provenance(
             and (candidate.get("left_lexical_ordinal"),
                  candidate.get("right_lexical_ordinal")) == key
         ]
+        if strict_v3 and any(
+                not valid_candidate(candidate)
+                or not candidate_v3_identity_valid(candidate)
+                for _candidate_index, candidate in matches):
+            errors.append(
+                f"output NVV row {row_index}: semantic candidate identity/order invalid")
+            continue
         selection = "label_neighbors"
         selected_overlap = None
         topology_eligible = False
+        if not matches and strict_v3:
+            # Canonical English retokenisation can change the raw-neighbour
+            # key.  The only permitted recovery is a unique label match with
+            # positive forced/CTC-anchor overlap; raw-neighbour diagnostics do
+            # not participate in this fallback proof.
+            label_matches = [
+                (index, candidate) for index, candidate in enumerate(nvv_candidates)
+                if index not in used_candidates
+                and nvv_to_mfa(str(candidate.get("surface", ""))) == label
+                and valid_candidate(candidate)
+                and candidate_v3_identity_valid(candidate)
+            ]
+            positive = []
+            for candidate_index, candidate in label_matches:
+                anchor = candidate["ctc_spike_anchor"]
+                overlap = max(
+                    0.0,
+                    min(float(forced[1]), float(anchor["end"]))
+                    - max(float(forced[0]), float(anchor["start"])),
+                )
+                if overlap > 1e-9:
+                    positive.append((candidate_index, candidate, overlap))
+            if len(positive) == 1:
+                candidate_index, candidate, selected_overlap = positive[0]
+                matches = [(candidate_index, candidate)]
+                selection = "unique_label_forced_ctc_overlap"
         if len(matches) > 1:
             # An ambiguous key is only rankable when every matching candidate
             # is structurally trustworthy.  Do this before either coordinate
@@ -1220,12 +2070,21 @@ def attach_nvasr_candidate_provenance(
     if errors:
         return errors
     for row, candidate, selection, selected_overlap in pending_nvv_bindings:
+        forced_span = row.get("forced_span") or [row["start"], row["end"]]
         row.update(_nvasr_candidate_provenance(
-            candidate, forced_span=(row.get("forced_span") or
-                                    [row["start"], row["end"]])))
+            candidate, forced_span=forced_span))
+        # ``adjusted_span`` is the durable display/correspondence coordinate;
+        # keep it bound to the emitted row without confusing it with the
+        # immutable spike-anchor provenance derived by the consumer.
+        row.setdefault("adjusted_span", [float(row["start"]),
+                                          float(row["end"])])
         row["mapping_selection"] = selection
         if selected_overlap is not None:
-            row["mapping_forced_speech_overlap_s"] = round(selected_overlap, 6)
+            overlap_field = (
+                "mapping_forced_ctc_anchor_overlap_s"
+                if selection == "unique_label_forced_ctc_overlap"
+                else "mapping_forced_speech_overlap_s")
+            row[overlap_field] = round(selected_overlap, 6)
 
     # Punctuation already has its own ``ctc-punctuation-evidence-v2``
     # coordinate contract.  In particular, its ``raw_start_s`` means the
@@ -1571,8 +2430,9 @@ def _atomic_write_text(path: Path, text: str) -> None:
             temporary.unlink()
 
 
-def _ctc_token_sidecar_row(word_row: dict, start_s: float,
-                           end_s: float) -> dict:
+def _ctc_token_sidecar_row(
+        word_row: dict, start_s: float, end_s: float, *,
+        stem: str | None = None, row_ordinal: int | None = None) -> dict:
     """Serialize one durable token row without dropping provenance fields."""
     line = {
         "word": word_row["word"],
@@ -1585,6 +2445,17 @@ def _ctc_token_sidecar_row(word_row: dict, start_s: float,
     for key in CTC_TOKEN_SIDECAR_PASSTHROUGH_FIELDS:
         if key in word_row:
             line[key] = word_row[key]
+    if stem is not None or row_ordinal is not None:
+        if (not isinstance(stem, str) or not stem or Path(stem).name != stem
+                or not isinstance(row_ordinal, int)
+                or isinstance(row_ordinal, bool) or row_ordinal < 0):
+            raise ValueError("raw CTC token locator arguments are invalid")
+        line["ctc_raw_token_row"] = {
+            "schema": CTC_RAW_TOKEN_ROW_SCHEMA,
+            "stem": stem,
+            "sidecar": f"{stem}_tokens.jsonl",
+            "row_ordinal": row_ordinal,
+        }
     return line
 
 def write_textgrid(words_pinyin: list[dict], duration_s: float,
@@ -1945,6 +2816,181 @@ def _normalize_numerals(ctc_dir: Path) -> int:
     return changed
 
 
+def _rebase_final_token_sidecars(ctc_dir: Path) -> int:
+    """Rebase every final token sidecar after cardinality-changing passes.
+
+    Normalizers may contract rows, so their persisted coordinates and
+    producer locators are no longer authoritative.  This single barrier
+    assigns physical row locators, contiguous full lexical ordinals, and the
+    final compact semantic identities.  Raw NVASR evidence is deliberately
+    excluded from the rewrite; its digest is checked against
+    ``raw_timeline_mapping_key`` and is never rehashed here.
+    """
+    plans: list[tuple[Path, list[dict], str, str]] = []
+    for path in sorted(ctc_dir.rglob("*_tokens.jsonl")):
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"unsafe final token sidecar: {path}")
+        stem = path.name[:-len("_tokens.jsonl")]
+        if not stem or Path(stem).name != stem:
+            raise ValueError(f"invalid final token sidecar stem: {path}")
+        try:
+            original_text = path.read_text(encoding="utf-8-sig")
+            rows = [json.loads(line) for line in original_text.splitlines()
+                    if line.strip()]
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid final token sidecar: {path}") from exc
+        if not rows or any(not isinstance(row, dict) for row in rows):
+            raise ValueError(f"empty/non-object final token sidecar: {path}")
+        plans.append((path, rows, stem, original_text))
+
+    changed = 0
+    serialized: list[tuple[Path, str, str]] = []
+    for path, rows, stem, original_text in plans:
+        sidecar = path.name
+        for ordinal, row in enumerate(rows):
+            row["ctc_raw_token_row"] = {
+                "schema": CTC_RAW_TOKEN_ROW_SCHEMA,
+                "stem": stem,
+                "sidecar": sidecar,
+                "row_ordinal": ordinal,
+            }
+
+        lexical_ordinal = 0
+        semantic_rows: list[tuple[int, dict, int]] = []
+        surface_counts: dict[str, int] = {}
+        for position, row in enumerate(rows):
+            text = str(row.get("word", "")).strip()
+            if text and not is_silence(text) and not is_punct(text):
+                row["ctc_lexical_ordinal"] = lexical_ordinal
+                lexical_ordinal += 1
+            if not _nvasr_semantic_axis_member(text):
+                continue
+            semantic_ordinal = len(semantic_rows)
+            occurrence = surface_counts.get(text, 0)
+            surface_counts[text] = occurrence + 1
+            row["semantic_occurrence_id"] = (
+                f"nvasr-lexical-{semantic_ordinal:04d}")
+            row["semantic_surface_occurrence"] = occurrence
+            semantic_rows.append((position, row, semantic_ordinal))
+
+        for position, row in enumerate(rows):
+            if not is_nvv_token(str(row.get("word", "")).strip()):
+                continue
+            left = next((item for item in reversed(semantic_rows)
+                         if item[0] < position), None)
+            right = next((item for item in semantic_rows
+                          if item[0] > position), None)
+            neighbors = []
+            for side, item in (("left", left), ("right", right)):
+                if item is None:
+                    continue
+                _position, neighbor, ordinal = item
+                neighbors.append({
+                    "side": side,
+                    "lexical_ordinal": ordinal,
+                    "occurrence_id": neighbor["semantic_occurrence_id"],
+                    "surface": neighbor["word"],
+                    "surface_occurrence": neighbor[
+                        "semantic_surface_occurrence"],
+                })
+            if row.get("nvasr_candidate_schema_version") == \
+                    NVASR_CANDIDATE_SCHEMA_VERSION:
+                row["ordered_semantic_neighbors"] = neighbors
+                row["mapping_key"] = {
+                    "left_lexical_ordinal": (
+                        left[2] if left is not None else None),
+                    "right_lexical_ordinal": (
+                        right[2] if right is not None else None),
+                }
+
+        # Validate the complete planned output before publishing any member.
+        expected_ordinals = list(range(lexical_ordinal))
+        actual_ordinals = [row.get("ctc_lexical_ordinal") for row in rows
+                           if str(row.get("word", "")).strip()
+                           and not is_silence(str(row.get("word", "")))
+                           and not is_punct(str(row.get("word", "")))]
+        if actual_ordinals != expected_ordinals:
+            raise ValueError(f"non-contiguous final CTC lexical ordinals: {path}")
+        for ordinal, row in enumerate(rows):
+            locator = row.get("ctc_raw_token_row")
+            if locator != {
+                    "schema": CTC_RAW_TOKEN_ROW_SCHEMA,
+                    "stem": stem, "sidecar": sidecar,
+                    "row_ordinal": ordinal}:
+                raise ValueError(f"final CTC locator validation failed: {path}:{ordinal}")
+            if row.get("nvasr_candidate_schema_version") != \
+                    NVASR_CANDIDATE_SCHEMA_VERSION:
+                continue
+            raw_key = row.get("raw_timeline_mapping_key")
+            if (not isinstance(raw_key, dict)
+                    or set(raw_key) != {
+                        "left_lexical_ordinal", "right_lexical_ordinal"}):
+                raise ValueError(
+                    f"strict-v3 raw timeline mapping key missing: {path}:{ordinal}")
+            raw_reasons = _nvasr_raw_timeline_contract_reasons(row)
+            if raw_reasons:
+                raise ValueError(
+                    f"strict-v3 raw timeline evidence invalid: {path}:{ordinal}: "
+                    f"{','.join(raw_reasons)}")
+            if not is_nvv_token(str(row.get("word", "")).strip()):
+                continue
+            left = next((item for item in reversed(semantic_rows)
+                         if item[0] < ordinal), None)
+            right = next((item for item in semantic_rows if item[0] > ordinal), None)
+            expected_key = {
+                "left_lexical_ordinal": left[2] if left else None,
+                "right_lexical_ordinal": right[2] if right else None,
+            }
+            if (row.get("mapping_key") != expected_key
+                    or row.get("ordered_semantic_neighbors") != [
+                        {
+                            "side": side,
+                            "lexical_ordinal": item[2],
+                            "occurrence_id": item[1]["semantic_occurrence_id"],
+                            "surface": item[1]["word"],
+                            "surface_occurrence": item[1][
+                                "semantic_surface_occurrence"],
+                        }
+                        for side, item in (("left", left), ("right", right))
+                        if item is not None]):
+                raise ValueError(
+                    f"strict-v3 canonical mapping rebase validation failed: "
+                    f"{path}:{ordinal}")
+        output = "".join(json.dumps(row, ensure_ascii=False) + "\n"
+                         for row in rows)
+        serialized.append((path, output, original_text))
+        if output != original_text:
+            changed += 1
+
+    # No filesystem offers an atomic multi-file replace. Stage the complete
+    # validated plan in memory, publish only changed members, and roll back
+    # every already-published member if a later replace fails. A rollback
+    # failure remains a hard error so the manifest/receipt layer fails closed.
+    published: list[tuple[Path, str]] = []
+    try:
+        for path, output, original_text in serialized:
+            if output == original_text:
+                continue
+            _atomic_write_text(path, output)
+            published.append((path, original_text))
+    except Exception as exc:
+        rollback_errors = []
+        for path, original_text in reversed(published):
+            try:
+                _atomic_write_text(path, original_text)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"{path}:{rollback_exc}")
+        detail = (f"; rollback failed: {', '.join(rollback_errors)}"
+                  if rollback_errors else "; rollback complete")
+        raise OSError(f"final CTC sidecar transaction failed{detail}") from exc
+    return changed
+
+
+# Explicit descriptive aliases for downstream callers/tests.
+rebase_final_token_sidecars = _rebase_final_token_sidecars
+_rebase_final_ctc_tokens = _rebase_final_token_sidecars
+
+
 def _validate_all_ctc_bundles(
     ctc_dir: Path, authority_references: dict[str, str] | None = None,
 ) -> bool:
@@ -2037,12 +3083,29 @@ def _merge_ria_tokens(tokens_path: Path) -> bool:
         if (re.match(r'^rui[0-5]$', w) and i + 1 < len(entries)
                 and re.match(r'^(ya|a)[0-5]$', entries[i + 1]["word"])):
             a, b = entries[i], entries[i + 1]
-            new_entries.append({
+            merged = dict(a)
+            merged.update({
                 "word": "ria",
                 "start_ms": a["start_ms"], "end_ms": b["end_ms"],
                 "start_s": a["start_s"], "end_s": b["end_s"],
                 "type": a.get("type", "word"),
             })
+            source_ordinals: list[int] = []
+            for fallback, row in ((i, a), (i + 1, b)):
+                values = row.get("source_ctc_ordinals")
+                if values is None and "source_ctc_ordinal" in row:
+                    values = [row["source_ctc_ordinal"]]
+                if values is None:
+                    values = [fallback]
+                if (not isinstance(values, (list, tuple))
+                        or any(not isinstance(value, int)
+                               or isinstance(value, bool) or value < 0
+                               for value in values)):
+                    return False
+                source_ordinals.extend(values)
+            merged["source_ctc_ordinals"] = sorted(set(source_ordinals))
+            merged.pop("source_ctc_ordinal", None)
+            new_entries.append(merged)
             i += 2
             changed = True
         else:
@@ -2129,11 +3192,10 @@ def _protect_ria(words_pinyin: list[dict]) -> list[dict]:
             if match_end is not None:
                 matched = fragments[:match_end]
                 # Merge: one "ria" token spanning the full time range
-                result.append({
-                    "word": _RIA_TARGET,
-                    "start": matched[0]["start"],
-                    "end": matched[-1]["end"],
-                })
+                result.append(_merge_ctc_row_metadata(
+                    matched, word=_RIA_TARGET,
+                    start=matched[0]["start"], end=matched[-1]["end"],
+                    fallback_ordinals=list(range(i, i + match_end))))
                 i += match_end
                 continue
 
@@ -2141,6 +3203,54 @@ def _protect_ria(words_pinyin: list[dict]) -> list[dict]:
         i += 1
 
     return result
+
+
+def _finalize_nvasr_canonical_neighbors(words_pinyin: list[dict]) -> list[dict]:
+    """Commit canonical semantic identities after all lexical merges.
+
+    Candidate binding intentionally happens before English/RIA normalization so
+    raw timeline diagnostics remain available.  This final pass rewrites only
+    the semantic-neighbour identity to the emitted ordinary rows; the raw
+    neighbour diagnostic and immutable spike anchor are never changed.
+    """
+    ordinary: list[tuple[int, dict]] = []
+    surface_counts: dict[str, int] = {}
+    ctc_ordinal = 0
+    for index, row in enumerate(words_pinyin):
+        text = str(row.get("word", "")).strip()
+        if text and not is_silence(text) and not is_punct(text):
+            row["ctc_lexical_ordinal"] = ctc_ordinal
+            ctc_ordinal += 1
+        if not _nvasr_semantic_axis_member(text):
+            continue
+        ordinal = len(ordinary)
+        occurrence = surface_counts.get(text, 0)
+        surface_counts[text] = occurrence + 1
+        row["semantic_occurrence_id"] = f"nvasr-lexical-{ordinal:04d}"
+        row["semantic_surface_occurrence"] = occurrence
+        ordinary.append((index, row))
+
+    for index, row in enumerate(words_pinyin):
+        if not is_nvv_token(str(row.get("word", "")).strip()):
+            continue
+        left = next((item for item in reversed(ordinary) if item[0] < index), None)
+        right = next((item for item in ordinary if item[0] > index), None)
+        neighbors = []
+        for side, item in (("left", left), ("right", right)):
+            if item is None:
+                continue
+            _ordinary_index, neighbor = item
+            ordinal = int(neighbor["semantic_occurrence_id"].rsplit("-", 1)[1])
+            neighbors.append({
+                "side": side,
+                "lexical_ordinal": ordinal,
+                "occurrence_id": neighbor["semantic_occurrence_id"],
+                "surface": neighbor["word"],
+                "surface_occurrence": neighbor["semantic_surface_occurrence"],
+            })
+        if "nvasr_candidate_schema_version" in row:
+            row["ordered_semantic_neighbors"] = neighbors
+    return words_pinyin
 
 
 def _merge_reference_english_fragments(words_pinyin: list[dict], reference: str) -> list[dict]:
@@ -2985,6 +4095,12 @@ def main():
                 print(f"  Merged {len(_merged)} manifest entries, {_merged_entries} files")
                 print(f"\n{_summary}")
 
+                # All shard-local normalizers may have changed token
+                # cardinality.  Rebase the merged publication once more so
+                # physical locators and final semantic mappings describe the
+                # exact parent sidecars before validation/manifest/receipt.
+                _rebase_final_token_sidecars(_merge_output_dir)
+
                 # ── Write normalization marker ──
                 # Tells run_pipeline.py that normalize_* steps were already done
                 # by ctc_prealign. pad_silence only shifts timestamps, doesn't
@@ -3410,7 +4526,8 @@ def main():
                 continue
 
         _candidate_mapping_errors = attach_nvasr_candidate_provenance(
-            words_pinyin, punct_entries, r.get("nvasr_candidate_timeline", {}))
+            words_pinyin, punct_entries, r.get("nvasr_candidate_timeline", {}),
+            strict_schema_v3=True)
         if _candidate_mapping_errors:
             print(f"  FAIL {stem}: NVASR candidate mapping - "
                   f"{'; '.join(_candidate_mapping_errors[:5])}")
@@ -3455,11 +4572,10 @@ def main():
                     # (e.g. "R"+"I"+"A" → "ria", not "RIA").
                     if merged_word.lower() in _SINGLE_LETTER_LOWERCASE_NAMES:
                         merged_word = merged_word.lower()
-                    merged_pinyin.append({
-                        "word": merged_word,
-                        "start": w["start"],
-                        "end": words_pinyin[j - 1]["end"],
-                    })
+                    merged_pinyin.append(_merge_ctc_row_metadata(
+                        words_pinyin[i:j], word=merged_word,
+                        start=w["start"], end=words_pinyin[j - 1]["end"],
+                        fallback_ordinals=list(range(i, j))))
                     i = j
                 else:
                     merged_pinyin.append(w)
@@ -3473,6 +4589,10 @@ def main():
         if not args.no_nvv:
             words_pinyin = _protect_ria(words_pinyin)
 
+        # Canonical English/RIA merges are complete.  Preserve the raw
+        # timeline diagnostics from attach, but publish semantic neighbours
+        # only from this final ordinary-row sequence.
+        words_pinyin = _finalize_nvasr_canonical_neighbors(words_pinyin)
         words_pinyin = _clamp_words_to_wav_axis(words_pinyin, duration_s)
         if not args.no_nvv:
             _final_provenance_errors = _validate_emitted_nvasr_provenance(
@@ -3758,7 +4878,7 @@ def main():
             last_word_vad_end = _vad_speech_end(audio_path, words[-1]["start"])
 
         tokens_path = args.output_dir / f"{stem}_tokens.jsonl"
-        token_lines: list[str] = []
+        token_rows: list[dict] = []
         for i, w in enumerate(words):
             canonical_span = w.get("canonical_span")
             has_timed_canonical_span = (
@@ -3792,8 +4912,27 @@ def main():
             # ledgers into the sidecar.  Centralizing the passthrough list
             # prevents a successful in-memory binding from disappearing at
             # the producer serialization boundary.
-            line = _ctc_token_sidecar_row(w, start_s, end_s)
-            token_lines.append(json.dumps(line, ensure_ascii=False))
+            line = _ctc_token_sidecar_row(
+                w, start_s, end_s, stem=stem, row_ordinal=i)
+            token_rows.append(line)
+        _serialized_candidates = [
+            row["candidate_id"] for row in token_rows
+            if row.get("candidate_kind") == "nvv"
+        ]
+        _serialized_locator_ordinals = [
+            row.get("ctc_raw_token_row", {}).get("row_ordinal")
+            for row in token_rows]
+        if (_serialized_locator_ordinals != list(range(len(token_rows)))
+                or _serialized_candidates != sorted(_serialized_candidates)
+                or len(_serialized_candidates) != len(set(
+                    _serialized_candidates))):
+            print(f"  FAIL {stem}: serialized token locators/candidate IDs "
+                  "are not unique and ordered")
+            skipped.setdefault("nvasr_candidate_mapping", []).append(stem)
+            fail += 1
+            continue
+        token_lines = [json.dumps(row, ensure_ascii=False)
+                       for row in token_rows]
         _atomic_write_text(tokens_path, "\n".join(token_lines) + "\n")
 
     # ── Build skip summary lines ──
@@ -3838,6 +4977,7 @@ def main():
             _normalize_ria(args.output_dir)
             _normalize_english(args.output_dir, args.dict_path,
                                update_dict=not args.no_dict_update)
+        _rebase_final_token_sidecars(args.output_dir)
         if _validate_all_ctc_bundles(args.output_dir, ref_texts):
             _rebuild_final_manifest(args.output_dir, audio_dir,
                                     wav_files=wav_files)

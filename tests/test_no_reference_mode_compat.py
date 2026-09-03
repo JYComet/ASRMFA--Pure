@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from argparse import Namespace
 from pathlib import Path
@@ -64,6 +65,100 @@ def _publish_and_verify(paths: dict[str, Path], manifest: dict) -> list[str]:
     manifest_path = paths["output"] / "strict_ok_manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     return verifier.verify(manifest_path, paths["output"])
+
+
+@pytest.mark.parametrize("schema", [
+    audit.CTC_LIFECYCLE_SCHEMA,
+    audit.NVASR_SPIKE_ANCHOR_SCHEMA,
+    audit.CTC_RAW_TOKEN_ROW_SCHEMA,
+    audit.NVASR_CANDIDATE_PROVENANCE_SCHEMA,
+    audit.NVASR_PRODUCER_AUTHORITY_SCHEMA,
+    audit.NVASR_IMMUTABLE_PROJECTION_SCHEMA,
+    "nvasr-candidate-timeline-v1",
+    "nvasr-raw-timeline-neighbors-v1",
+    "ctc-frame-support-v1",
+    "nvasr-owner-selection-v2",
+])
+def test_audit_rejects_schema_only_v3_sidecar_without_lifecycle_markers(
+        tmp_path, schema):
+    paths = verifier._write_fixture(tmp_path)
+    sidecar = paths["ctc"] / "demo_tokens.jsonl"
+    rows = [json.loads(line) for line in sidecar.read_text().splitlines()]
+    rows[0] = {"schema": schema}
+    sidecar.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    manifest, clean = _audit_fixture(paths)
+
+    assert not clean
+    assert not manifest["ok"]
+    assert "ctc_lifecycle_missing_for_v3:demo" in manifest["global_reasons"]
+
+
+@pytest.mark.parametrize("key", sorted(audit._MODERN_REPORT_CONTRACT_KEYS))
+def test_audit_rejects_empty_modern_report_contract_without_lifecycle(
+        tmp_path, key):
+    paths = verifier._write_fixture(tmp_path)
+    report = paths["output"] / "postprocess_report.jsonl"
+    row = json.loads(report.read_text(encoding="utf-8").strip())
+    row[key] = {}
+    report.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    manifest, clean = _audit_fixture(paths)
+
+    assert not clean
+    assert not manifest["ok"]
+    assert "postprocess_v3_claim_without_ctc_lifecycle" in \
+        manifest["global_reasons"]
+
+
+def test_audit_rejects_broken_default_raw_manifest_symlink(tmp_path):
+    paths = verifier._write_fixture(tmp_path)
+    os.symlink("missing_raw_manifest.json", paths["ctc"] /
+               audit.CTC_RAW_MANIFEST_NAME)
+
+    manifest, clean = _audit_fixture(paths)
+
+    assert not clean
+    assert not manifest["ok"]
+    assert "ctc_raw_manifest_missing_or_symlink" in \
+        manifest["global_reasons"]
+
+
+def test_audit_rejects_report_only_v3_lifecycle_claim(tmp_path):
+    paths = verifier._write_fixture(tmp_path)
+    report = paths["output"] / "postprocess_report.jsonl"
+    row = json.loads(report.read_text(encoding="utf-8").strip())
+    row["ctc_lifecycle"] = {
+        "schema": audit.CTC_LIFECYCLE_SCHEMA,
+        "status": "legacy_single_directory_fixture",
+    }
+    report.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    manifest, clean = _audit_fixture(paths)
+
+    assert not clean
+    assert not manifest["ok"]
+    assert "postprocess_v3_claim_without_ctc_lifecycle" in \
+        manifest["global_reasons"]
+
+
+@pytest.mark.parametrize("kind", ["symlink", "malformed"])
+def test_audit_does_not_downgrade_unsafe_sidecar_to_legacy(tmp_path, kind):
+    paths = verifier._write_fixture(tmp_path)
+    sidecar = paths["ctc"] / "demo_tokens.jsonl"
+    if kind == "symlink":
+        sidecar.unlink()
+        os.symlink("missing_tokens.jsonl", sidecar)
+    else:
+        sidecar.write_text("{not-json}\n", encoding="utf-8")
+
+    manifest, clean = _audit_fixture(paths)
+
+    assert not clean
+    assert not manifest["ok"]
+    assert "ctc_v3_token_sidecar_unreadable:demo" in \
+        manifest["global_reasons"]
 
 
 def test_asr_fallback_positive_has_exclusive_disk_evidence(tmp_path):

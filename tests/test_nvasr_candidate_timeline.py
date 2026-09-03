@@ -7,10 +7,51 @@ import pytest
 from scripts.ctc_prealign import (
     _ctc_token_sidecar_row,
     _deduplicate_adjacent_nvv_rows,
+    _nvasr_anchor_from_frames,
     _validate_emitted_nvasr_provenance,
     attach_nvasr_candidate_provenance,
     extract_nvasr_candidate_timeline,
 )
+
+
+def test_schema_v3_extract_attach_and_raw_locator_serialization_contract():
+    timeline = extract_nvasr_candidate_timeline(
+        [0, 0, 0, 0, 31, 11, 32], "你[Breathing]好",
+        token_surfaces={31: "你", 11: "[Breathing]", 32: "好"},
+        stem="demo")
+    candidate = timeline["candidates"][0]
+
+    assert timeline["nvasr_candidate_schema_version"] == 3
+    assert candidate["nvasr_candidate_schema_version"] == 3
+    assert candidate["query_frames"] == 4
+    assert candidate["frame_ms"] == 60
+    assert candidate["ctc_spike_anchor"] == _nvasr_anchor_from_frames(5, 6)
+    assert candidate["ctc_spike_anchor"]["schema"] == "ctc_spike_anchor_v2"
+    assert candidate["ctc_spike_anchor"]["end"] - \
+        candidate["ctc_spike_anchor"]["start"] == pytest.approx(0.06)
+
+    words = [
+        {"word": "ni3", "start": 0.0, "end": 0.06},
+        {"word": "BREATHING", "start": 0.06, "end": 0.12},
+        {"word": "hao3", "start": 0.12, "end": 0.18},
+    ]
+    assert attach_nvasr_candidate_provenance(
+        words, [], timeline, strict_schema_v3=True) == []
+    assert _validate_emitted_nvasr_provenance(words) == []
+
+    serialized = [
+        _ctc_token_sidecar_row(
+            row, row["start"], row["end"], stem="demo",
+            row_ordinal=ordinal)
+        for ordinal, row in enumerate(words)
+    ]
+    assert [row["ctc_raw_token_row"] for row in serialized] == [
+        {"schema": "ctc_raw_token_row_v1", "stem": "demo",
+         "sidecar": "demo_tokens.jsonl", "row_ordinal": ordinal}
+        for ordinal in range(3)
+    ]
+    assert serialized[1]["ctc_spike_anchor"] == \
+        candidate["ctc_spike_anchor"]
 
 
 def test_timeline_is_provider_free_and_preserves_duplicate_occurrences():

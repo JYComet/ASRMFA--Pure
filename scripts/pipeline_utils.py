@@ -1268,14 +1268,14 @@ def is_silence(text: str) -> bool:
 EN_PHONE_PREFIX: str = "en:"
 
 # ── NVV (Non-Verbal Vocalisation) names ─────────────────────────
+# NVV labels are restricted to vegetative (physiological) vocalisations only.
+# Question/Surprise/Confirmation/Dissatisfaction interjections were removed:
+# those are transcribed as CJK particles (哎/咦/嗯/啊) by Qwen and must never
+# be emitted as NVV labels (see ctc_prealign.NVV_SUPPRESSED_IDS).
 NVV_NAMES: set[str] = {
     "BREATHING", "LAUGHTER", "BURP", "COUGH", "CRYING", "GROAN",
     "HISS", "HUM", "SHH", "SIGH", "SNEEZE", "SNIFF", "SNORE",
     "TSK", "UHM", "WHISTLE", "YAWN",
-    "QUESTION-YI", "QUESTION-EN", "QUESTION-OH", "QUESTION-AH",
-    "QUESTION-EI", "QUESTION-HUH",
-    "SURPRISE-OH", "SURPRISE-AH", "SURPRISE-WA", "SURPRISE-YO",
-    "CONFIRMATION-EN", "DISSATISFACTION-HNN",
 }
 
 NVV_TO_MFA: dict[str, str] = {
@@ -1284,13 +1284,6 @@ NVV_TO_MFA: dict[str, str] = {
     "Hum": "HUM", "Shh": "SHH", "Sigh": "SIGH", "Sneeze": "SNEEZE",
     "Sniff": "SNIFF", "Snore": "SNORE", "Tsk": "TSK", "Uhm": "UHM",
     "Whistle": "WHISTLE", "Yawn": "YAWN",
-    "Question-yi": "QUESTION-YI", "Question-en": "QUESTION-EN",
-    "Question-oh": "QUESTION-OH", "Question-ah": "QUESTION-AH",
-    "Question-ei": "QUESTION-EI", "Question-huh": "QUESTION-HUH",
-    "Surprise-oh": "SURPRISE-OH", "Surprise-ah": "SURPRISE-AH",
-    "Surprise-wa": "SURPRISE-WA", "Surprise-yo": "SURPRISE-YO",
-    "Confirmation-en": "CONFIRMATION-EN",
-    "Dissatisfaction-hnn": "DISSATISFACTION-HNN",
     "Pause": "PAUSE",
 }
 
