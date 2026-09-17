@@ -49,14 +49,24 @@
 #   target_edge_silence_sec: 0.5
 #   output_audio: false      # write padded WAVs to output/ (default off)
 
-# ── CTC 预对齐 ──────────────────────────────────────────────────────────
+# ── Qwen3 预对齐（保留 ctc_prealign 配置名） ─────────────────────────────
 # ctc_prealign:
+#   provider: qwen3_hf
 #   enabled: true
-#   model_path: "/mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR"  # NVASR model (symlink not supported on CIFS)
+#   model_path: /mnt/nvme3/models/Qwen3-ASR-1.7B-hf
+#   forced_aligner_model_path: /mnt/nvme3/models/Qwen3-ForcedAligner-0.6B-hf
+#   python: /home/user/miniconda3/bin/python
 #   device: cuda:0
-#   python: "/home/user/miniconda3/envs/asr/bin/python"  # Python env with funasr+torch (mfa-dev doesn't have funasr)
+#   forced_aligner_device: cuda:1  # optional: place the whole aligner on another GPU; all_gpus must be false
+#   all_gpus: false          # 可见 GPU 各持有一个 Qwen 模型实例
+#   batch_size: 1            # 每卡排队数量；模型 API 仍单条推理
+#   nvv_enabled: false       # Qwen 无 NVASR 事件分类器
+#   reference_nvv_enabled: false
 #   limit: 0
+#   offset: 0
 #   timeout: 3600
+# 固定步骤：非开头 sp0 (<0.2s) 并入前词；sp1/2/3 优先原标点，无标点才补省略号；开头不补；MFA 修正照常。
+# 原模型失败不回退 NVASR；迁移模型／正则化版本时使用新 workspace。
 
 # ── CTC 边界能量修正 ────────────────────────────────────────────────────
 # ctc_adjust:

@@ -29,6 +29,7 @@ import subprocess
 import sys
 import time
 import shutil
+from functools import lru_cache
 from pathlib import Path
 
 try:
@@ -45,13 +46,14 @@ DEFAULT_CONFIG = PROJECT_ROOT / "config.yaml"
 sys.path.insert(0, str(SCRIPTS_DIR))
 from pipeline_utils import (
     parse_ctc_normalization_marker,
-    find_mfa_python, get_mfa_env, resolve_mfa_dither,
+    find_mfa_python, get_mfa_env, resolve_mfa_dither, require_mfa_anchor_support,
     build_ctc_presence, build_file_index, build_flat_file_names,
     count_files_fast, find_wav,
     is_punct, is_word_like, is_english_token,
     load_ctc_token_entries, repair_degenerate_ctc_token_intervals,
     normalize_reference_numerals,
     read_ctc_textgrid_words, rebuild_lab_from_tokens,
+    _read_ctc_textgrid_lexical_intervals,
     validate_ctc_transcript_bundle,
     validate_strict_mfa_textgrid,
     make_pipeline_run_id, write_pipeline_run_receipt,
@@ -76,7 +78,389 @@ from pipeline_utils import (
     _axis_audio_metadata,
     _textgrid_global_bounds,
     classify_input_path,
+    resolve_ctc_prealign_provider,
 )
+
+
+_NATIVE_MIN_UTTERANCE_S = 0.11
+_NATIVE_WINDOW_EPSILON_S = 1e-9
+
+
+def _group_native_anchor_intervals(
+        intervals: list[tuple[str, float, float]],
+        xmin: float, xmax: float) -> list[dict]:
+    """Group CTC lexical intervals into stock-MFA utterance windows.
+
+    Stock MFA treats each neutral-tier interval as an utterance.  Keep normal
+    anchors as one-token windows, first borrowing adjacent *silence* to make a
+    short token at least 110ms long.  Only when there is not enough silence do
+    we merge that token with one nearest lexical neighbor.  The result is
+    deterministic and retains every source token in order.
+    """
+    if not intervals:
+        return []
+    groups: list[dict] = []
+    for ordinal, (text, start, end) in enumerate(intervals):
+        groups.append({"tokens": [(ordinal, text, start, end)],
+                       "window_start": start, "window_end": end})
+
+    # Expand short groups into the neighboring silence first.  The midpoint
+    # limits guarantee adjacent windows never overlap, making containment
+    # unambiguous for the downstream validator.
+    while True:
+        short_index = next((index for index, group in enumerate(groups)
+                            if group["window_end"] - group["window_start"]
+                            < _NATIVE_MIN_UTTERANCE_S - _NATIVE_WINDOW_EPSILON_S), None)
+        if short_index is None:
+            break
+        current = groups[short_index]
+        tokens = current["tokens"]
+        start, end = tokens[0][2], tokens[-1][3]
+        if len(groups) == 1:
+            desired = min(_NATIVE_MIN_UTTERANCE_S, max(0.0, xmax - xmin))
+            current["window_start"] = max(xmin, min(start, xmax - desired))
+            current["window_end"] = min(xmax, current["window_start"] + desired)
+            break
+        left_limit = (xmin if short_index == 0 else
+                      (groups[short_index - 1]["window_end"] + start) / 2)
+        right_limit = (xmax if short_index == len(groups) - 1 else
+                       (end + groups[short_index + 1]["window_start"]) / 2)
+        need = _NATIVE_MIN_UTTERANCE_S - (current["window_end"] - current["window_start"])
+        left_available = max(0.0, start - left_limit)
+        right_available = max(0.0, right_limit - end)
+        if left_available + right_available >= need:
+            # Prefer the side with more silence; ties go left for stability.
+            left_take = min(left_available, need) if left_available >= right_available else 0.0
+            right_take = need - left_take
+            if right_take > right_available:
+                right_take = right_available
+                left_take = need - right_take
+            current["window_start"] -= left_take
+            current["window_end"] += right_take
+            continue
+
+        # No sufficient silence: merge with the closest lexical neighbor,
+        # preferring the previous one on a tie, then retry the short check.
+        if short_index == 0:
+            groups[1]["tokens"] = groups[0]["tokens"] + groups[1]["tokens"]
+            groups[1]["window_start"] = min(groups[0]["window_start"],
+                                             groups[1]["window_start"])
+            groups[1]["window_end"] = max(groups[0]["window_end"],
+                                           groups[1]["window_end"])
+            groups.pop(0)
+        elif short_index == len(groups) - 1:
+            groups[-2]["tokens"].extend(groups[-1]["tokens"])
+            groups[-2]["window_end"] = max(groups[-2]["window_end"],
+                                            groups[-1]["window_end"])
+            groups.pop()
+        else:
+            left_gap = start - groups[short_index - 1]["tokens"][-1][3]
+            right_gap = groups[short_index + 1]["tokens"][0][2] - end
+            if left_gap <= right_gap:
+                prior = groups[short_index - 1]
+                prior["tokens"].extend(current["tokens"])
+                prior["window_end"] = max(prior["window_end"],
+                                           current["window_end"])
+                groups.pop(short_index)
+            else:
+                current["tokens"].extend(groups[short_index + 1]["tokens"])
+                current["window_end"] = max(current["window_end"],
+                                             groups[short_index + 1]["window_end"])
+                groups.pop(short_index + 1)
+
+    # A single-token corpus can have less than 110ms total audio.  Expand as
+    # far as the declared audio bounds allow; MFA cannot create time outside
+    # the audio axis, and the validator will still enforce that axis.
+
+    result: list[dict] = []
+    for group in groups:
+        tokens = group["tokens"]
+        result.append({
+            "anchor_indices": [row[0] for row in tokens],
+            "tokens": [{"text": row[1], "start": row[2], "end": row[3]}
+                       for row in tokens],
+            "window_start": group["window_start"],
+            "window_end": group["window_end"],
+            "text": " ".join(row[1] for row in tokens),
+        })
+    return result
+
+
+def _build_native_anchor_corpus(ctc_dir: Path, stems: list[str],
+                                output_dir: Path) -> list[str]:
+    """Build stock-MFA-compatible corpus TextGrids from CTC word anchors.
+
+    MFA 3.3.x has no ``--textgrid_directory`` anchor option.  Its corpus
+    TextGrid reader nevertheless preserves utterance boundaries, provided the
+    CTC ``words`` tier is exposed under a neutral tier name (``speaker``).
+    This explicit fallback copies only lexical word intervals into a fresh,
+    run-local corpus namespace; the producer CTC tree remains untouched.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    created: list[str] = []
+    metadata = {"schema": "native-anchor-groups-v1", "stems": {}}
+    for stem in sorted(str(item) for item in stems):
+        source = Path(ctc_dir) / f"{stem}.TextGrid"
+        intervals = _read_ctc_textgrid_lexical_intervals(source)
+        xmin, xmax = _textgrid_global_bounds(source)
+        groups = _group_native_anchor_intervals(intervals, xmin, xmax)
+        lines = [
+            'File type = "ooTextFile"',
+            'Object class = "TextGrid"',
+            "",
+            f"xmin = {xmin}",
+            f"xmax = {xmax}",
+            "tiers? <exists>",
+            "size = 1",
+            "item []:",
+            "    item [1]:",
+            '        class = "IntervalTier"',
+            '        name = "speaker"',
+            f"        xmin = {xmin}",
+            f"        xmax = {xmax}",
+            f"        intervals: size = {len(groups)}",
+        ]
+        for index, group in enumerate(groups, 1):
+            lines.extend([
+                f"        intervals [{index}]:",
+                f"            xmin = {group['window_start']}",
+                f"            xmax = {group['window_end']}",
+                f'            text = "{group["text"].replace(chr(34), chr(34) * 2)}"',
+            ])
+        destination = output_dir / f"{stem}.TextGrid"
+        destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        metadata["stems"][stem] = {
+            "source_path": str(source.resolve()),
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "source_bounds": [xmin, xmax],
+            "groups": groups,
+        }
+        created.append(stem)
+    metadata["identity"] = stable_json_digest(metadata)
+    (output_dir / "native_anchor_groups.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8")
+    return created
+
+
+def _read_named_textgrid_intervals(path: Path, tier_name: str) -> list[tuple[float, float, str]]:
+    """Read interval tuples from one named long-format TextGrid tier."""
+    import re as _re
+    raw = Path(path).read_text(encoding="utf-8-sig")
+    match = _re.search(
+        rf'^\s*name\s*=\s*"{_re.escape(tier_name)}"\s*$', raw,
+        _re.MULTILINE)
+    if match is None:
+        return []
+    end_match = _re.search(r'^\s*item\s*\[\d+\]:\s*$', raw[match.end():], _re.MULTILINE)
+    segment = raw[match.end():match.end() + end_match.start()
+                   if end_match else len(raw)]
+    pattern = _re.compile(
+        r'intervals\s*\[\d+\]:\s*\n\s*xmin\s*=\s*([^\n]+)\s*\n'
+        r'\s*xmax\s*=\s*([^\n]+)\s*\n\s*text\s*=\s*"((?:""|[^"])*)"',
+        _re.MULTILINE)
+    result: list[tuple[float, float, str]] = []
+    for item in pattern.finditer(segment):
+        result.append((float(item.group(1)), float(item.group(2)),
+                       item.group(3).replace('""', '"')))
+    return result
+
+
+@lru_cache(maxsize=16)
+def _load_native_anchor_group_mapping_cached(
+        path_text: str, mtime_ns: int, size: int) -> dict:
+    """Parse and authenticate one immutable native-anchor mapping once."""
+    del mtime_ns, size  # Cache-key identity; content is read through path_text.
+    mapping = json.loads(Path(path_text).read_text(encoding="utf-8"))
+    if mapping.get("schema") != "native-anchor-groups-v1":
+        raise ValueError("native anchor group mapping schema is invalid")
+    identity = mapping.get("identity")
+    unsigned = dict(mapping)
+    unsigned.pop("identity", None)
+    if identity != stable_json_digest(unsigned):
+        raise ValueError("native anchor group mapping identity mismatch")
+    return mapping
+
+
+def _load_native_anchor_group_mapping(path: Path) -> dict:
+    """Load a mapping with stat-based invalidation for safe repeated use."""
+    resolved = Path(path).resolve()
+    stat = resolved.stat()
+    return _load_native_anchor_group_mapping_cached(
+        str(resolved), stat.st_mtime_ns, stat.st_size)
+
+
+def _validate_native_anchor_bounds(anchor_path: Path, aligned_path: Path,
+                                   *, tolerance: float = 1e-6,
+                                   group_map_path: Path | None = None) -> list[str]:
+    """Verify MFA words remain inside CTC intervals.
+
+    Native anchors are constraints, not approximate hints.  Group windows
+    account for MFA's four-decimal CTM/TextGrid export at their exact edges;
+    the source membership/geometry and legacy ungrouped checks retain the
+    microsecond tolerance.
+    """
+    try:
+        anchors = _read_ctc_textgrid_lexical_intervals(Path(anchor_path))
+        output = [row for row in _read_named_textgrid_intervals(
+            Path(aligned_path), "words") if row[2].strip()]
+    except (OSError, TypeError, ValueError) as exc:
+        return [f"native anchor bounds unreadable: {exc}"]
+    errors: list[str] = []
+
+    # The native corpus deliberately groups source anchors into utterance
+    # windows.  With a mapping, validate that actual grouped axis: every
+    # window must emit words/phones in order whose token stream covers the
+    # grouped source tokens.  The legacy no-mapping path retains strict
+    # per-anchor containment below.
+    grouped: list[dict] = []
+    if group_map_path is not None:
+        try:
+            mapping = _load_native_anchor_group_mapping(Path(group_map_path))
+            stem_row = mapping.get("stems", {}).get(Path(anchor_path).stem)
+            grouped = list(stem_row.get("groups", [])) if isinstance(stem_row, dict) else []
+            if not grouped:
+                raise ValueError("native anchor group mapping is empty or invalid")
+            if (not isinstance(stem_row.get("source_sha256"), str)
+                    or stem_row["source_sha256"] != hashlib.sha256(
+                        Path(anchor_path).read_bytes()).hexdigest()):
+                raise ValueError("native anchor group source digest mismatch")
+            expected_index = 0
+            for group in grouped:
+                indices = group.get("anchor_indices")
+                tokens = group.get("tokens")
+                if (indices != list(range(expected_index, expected_index + len(indices or [])))
+                        or not isinstance(tokens, list)
+                        or len(tokens) != len(indices or [])):
+                    raise ValueError("native anchor group membership/order is invalid")
+                for index, token in zip(indices or [], tokens):
+                    source_text, source_start, source_end = anchors[index]
+                    if str(token.get("text", "")) != source_text:
+                        raise ValueError("native anchor group token membership is invalid")
+                    if (abs(float(token.get("start")) - source_start) > tolerance
+                            or abs(float(token.get("end")) - source_end) > tolerance):
+                        raise ValueError("native anchor group token geometry is invalid")
+                if (float(group["window_start"]) > float(group["window_end"])
+                        or float(group["window_start"]) > (tokens[0]["start"] if tokens else 0)
+                        or float(group["window_end"]) < (tokens[-1]["end"] if tokens else 0)):
+                    raise ValueError("native anchor group window does not cover tokens")
+                expected_index += len(indices or [])
+            if expected_index != len(anchors):
+                raise ValueError("native anchor group coverage is incomplete")
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            return [f"native anchor group mapping unreadable: {exc}"]
+
+    def _normalized_tokens(value: object) -> str:
+        return "".join(ch.casefold() for ch in str(value) if not ch.isspace())
+
+    if grouped:
+        def contains_exported(group, start, end):
+            # MFA exports boundary seconds rounded to four decimals.  A
+            # 6.103333 window can therefore start at 6.1033 in its output.
+            # Admit precisely that rounded edge, not an extra acoustic frame
+            # or a general relaxation of the original anchor geometry.
+            lower, upper = float(group["window_start"]), float(group["window_end"])
+            return (start >= min(lower, round(lower, 4)) - tolerance
+                    and end <= max(upper, round(upper, 4)) + tolerance)
+
+        grouped_output: list[list[tuple[float, float, str]]] = [[] for _ in grouped]
+        previous_group = -1
+        previous_start = float("-inf")
+        for index, (start, end, text) in enumerate(output):
+            if start < previous_start - tolerance:
+                errors.append(f"native utterance word order regressed at word {index}")
+            previous_start = start
+            matches = [group_index for group_index, group in enumerate(grouped)
+                       if contains_exported(group, start, end)]
+            if len(matches) != 1:
+                errors.append(f"word {index} is outside a unique native utterance window: "
+                              f"[{start}, {end}]")
+                continue
+            group_index = matches[0]
+            if group_index < previous_group:
+                errors.append(f"native utterance word order regressed at word {index}")
+            previous_group = group_index
+            grouped_output[group_index].append((start, end, text))
+        for group_index, (group, observed) in enumerate(zip(grouped, grouped_output)):
+            if not observed:
+                errors.append(f"native utterance group {group_index} has no MFA word")
+                continue
+            expected = [_normalized_tokens(token.get("text", ""))
+                        for token in group.get("tokens", [])]
+            observed_labels = [str(row[2]).strip() for row in observed]
+            # MFA can represent a dictionary OOV as ``<unk>`` followed by
+            # ``<eps>``.  Treat the unknown marker as one covered source token
+            # and epsilon as a non-consuming alignment symbol; known labels
+            # remain strict and are allowed to split a source token.
+            expected_index = 0
+            known_buffer = ""
+            coverage_error = False
+            for label in observed_labels:
+                normalized = _normalized_tokens(label)
+                if ("<unk>" in label.casefold() or "<oov>" in label.casefold()
+                        or normalized in {"spn", "unk", "oov"}):
+                    if known_buffer or expected_index >= len(expected):
+                        coverage_error = True
+                        break
+                    expected_index += 1
+                elif normalized in {"<eps>", "eps"}:
+                    continue
+                else:
+                    known_buffer += normalized
+                    remaining = "".join(expected[expected_index:])
+                    if expected_index >= len(expected) or not remaining.startswith(known_buffer):
+                        coverage_error = True
+                        break
+                    while (expected_index < len(expected)
+                           and known_buffer.startswith(expected[expected_index])):
+                        known_buffer = known_buffer[len(expected[expected_index]):]
+                        expected_index += 1
+            if known_buffer or expected_index != len(expected):
+                coverage_error = True
+            if coverage_error:
+                expected_text = " ".join(expected)
+                observed_text = " ".join(_normalized_tokens(label)
+                                          for label in observed_labels)
+                errors.append(f"native utterance group {group_index} token coverage/order mismatch: "
+                              f"expected={expected_text!r} observed={observed_text!r}")
+        phone_intervals = [row for row in _read_named_textgrid_intervals(
+            Path(aligned_path), "phones") if row[2].strip()]
+        for index, (start, end, _) in enumerate(phone_intervals):
+            matches = [group_index for group_index, group in enumerate(grouped)
+                       if contains_exported(group, start, end)]
+            if len(matches) != 1:
+                errors.append(f"phone {index} escaped native utterance window: "
+                              f"[{start}, {end}]")
+    else:
+        def containing_anchor(start: float, end: float) -> int | None:
+            """Return the sole anchor containing an interval, if any."""
+            matches = [index for index, (_, anchor_start, anchor_end)
+                       in enumerate(anchors)
+                       if start >= anchor_start - tolerance
+                       and end <= anchor_end + tolerance]
+            return matches[0] if len(matches) == 1 else None
+
+        covered: set[int] = set()
+        for index, (out_start, out_end, _) in enumerate(output):
+            anchor_index = containing_anchor(out_start, out_end)
+            if anchor_index is None:
+                errors.append(
+                    f"word {index} escaped CTC interval: "
+                      f"[{out_start}, {out_end}]")
+            else:
+                covered.add(anchor_index)
+        for index, (_, start, end) in enumerate(anchors):
+            if index not in covered:
+                errors.append(
+                    f"anchor {index} has no MFA word in CTC interval [{start}, {end}]")
+        phone_intervals = [row for row in _read_named_textgrid_intervals(
+            Path(aligned_path), "phones") if row[2].strip()]
+        for index, (start, end, _) in enumerate(phone_intervals):
+            if containing_anchor(start, end) is None:
+                errors.append(
+                    f"phone {index} escaped CTC interval: [{start}, {end}]")
+    return errors
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -240,12 +624,15 @@ DEFAULT_CFG: dict = {
     "prepare": {"copy_wav": False, "keep_punctuation": True},
     "ctc_prealign": {
         "enabled": True,
-        "model_path": "/mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR",
+        "provider": "qwen3_hf",
+        "model_path": "/mnt/nvme3/models/Qwen3-ASR-1.7B-hf",
+        "forced_aligner_model_path": "/mnt/nvme3/models/Qwen3-ForcedAligner-0.6B-hf",
         "device": "cuda:0",
-        "python": "/home/user/miniconda3/envs/asr/bin/python",
+        "python": "/home/user/miniconda3/bin/python",
         "limit": 0,
         "timeout": 3600,
-        "nvv_enabled": True,           # NVV 标签检测 (默认启用)
+        "nvv_enabled": False,
+        "reference_nvv_enabled": False,
     },
     "ctc_adjust": {"enabled": True, "limit": 0},
     "mfa": {
@@ -270,6 +657,10 @@ DEFAULT_CFG: dict = {
         # never silently dropped).
         "allow_partial": False,
         "min_output_ratio": 1.0,
+        # Stock MFA 3.3.x has no --textgrid_directory support.  When enabled
+        # explicitly, step_mfa_align builds a neutral-tier corpus TextGrid
+        # fallback and validates the emitted words against CTC bounds.
+        "native_anchor_fallback": False,
     },
     "mfa_en": {
         "enabled": True,
@@ -401,7 +792,41 @@ def load_config(config_path: Path) -> dict:
         sys.exit(1)
     with open(config_path, "r", encoding="utf-8") as f:
         user_cfg = yaml.safe_load(f) or {}
-    return _deep_merge(DEFAULT_CFG, user_cfg)
+    cfg = _deep_merge(DEFAULT_CFG, user_cfg)
+    return migrate_main_prealign_config(cfg, cfg.get("mode", "full"))
+
+
+def migrate_main_prealign_config(cfg: dict, mode: str) -> dict:
+    # Fresh main-pipeline producers are Qwen-only. Retained CTC/replay inputs
+    # keep their historical provider; MFA's configuration is never rewritten.
+    if mode in {"full", "nvrasr_fallback"}:
+        pc = cfg.get("ctc_prealign")
+        if not isinstance(pc, dict):
+            return cfg  # let the existing schema validator report this
+        provider = str(pc.get("provider", "qwen3_hf")).strip().lower()
+        if provider in {"nvasr", "funasr", "qwen3", "qwen3_hf"}:
+            notices = []
+            if provider in {"nvasr", "funasr"}:
+                notices.append("provider -> qwen3_hf")
+            pc["provider"] = "qwen3_hf"
+            if (provider in {"nvasr", "funasr"}
+                    or "nvasr" in str(pc.get("model_path", "")).lower()):
+                pc["model_path"] = DEFAULT_CFG["ctc_prealign"]["model_path"]
+                notices.append("NVASR model_path -> Qwen3 model_path")
+                if pc.get("python") == "/home/user/miniconda3/envs/asr/bin/python":
+                    pc["python"] = DEFAULT_CFG["ctc_prealign"]["python"]
+                    notices.append("ASR interpreter -> native Qwen interpreter")
+            for key in ("nvv_enabled", "reference_nvv_enabled"):
+                if pc.get(key):
+                    notices.append(f"{key}=false (Qwen has no NVASR event decoder)")
+                    pc[key] = False
+            for key in ("nvv_bias", "pause_threshold"):
+                if key in pc:
+                    pc.pop(key)
+                    notices.append(f"removed NVASR-only {key}; fixed Qwen pause thresholds apply")
+            if notices:
+                print("Qwen3 config migration: " + "; ".join(notices))
+    return cfg
 
 
 def resolve_path(base: Path, value: str | None) -> Path | None:
@@ -592,6 +1017,11 @@ def _pipeline_resume_fingerprints(ctx: dict, cfg: dict, *, outputs=None) -> dict
     module_paths = [Path(__file__), SCRIPTS_DIR / "pipeline_utils.py"]
     if (SCRIPTS_DIR / "ctc_prealign.py").is_file():
         module_paths.append(SCRIPTS_DIR / "ctc_prealign.py")
+    if resolve_ctc_prealign_provider(cfg.get("ctc_prealign", {})) == "qwen3_hf":
+        for _name in ("qwen3_hf_backend.py", "qwen3_prealign.py", "qwen3_timestamp_normalization.py"):
+            _path = SCRIPTS_DIR / _name
+            if _path.is_file():
+                module_paths.append(_path)
     producer = {str(path.relative_to(PROJECT_ROOT)): _sha256_file(path)
                 for path in module_paths if path.is_file()}
     effective = stable_json_digest(cfg)
@@ -802,6 +1232,12 @@ def run_python(script: Path, script_args: list[str], mfa_python: Path,
 def run_mfa(mfa_args: list[str], mfa_python: Path, models_dir: Path,
             desc: str = "", timeout: int | None = None) -> int:
     print(f"\n{'='*60}\n  {desc or 'MFA: ' + ' '.join(mfa_args)}\n{'='*60}\n")
+    if any(arg.split("=", 1)[0] == "--textgrid_directory" for arg in mfa_args):
+        try:
+            require_mfa_anchor_support(mfa_python, models_dir)
+        except ValueError as exc:
+            print(f"  ERROR: {exc}")
+            return 1
     try:
         return subprocess.run(
             [str(mfa_python), "-m", "montreal_forced_aligner.command_line.mfa"] + mfa_args,
@@ -812,13 +1248,41 @@ def run_mfa(mfa_args: list[str], mfa_python: Path, models_dir: Path,
         return 1
 
 
+def _ctc_output_stems(ctx: dict, fallback: list[str] | tuple[str, ...] | set[str]) -> list[str]:
+    """Return the producer's output stems (stems with real CTC artifacts).
+
+    Legitimately skipped stems (e.g. an empty reference producing no text) are
+    absent from the raw CTC namespace, so downstream resample/align stages must
+    not ask them for CTC bindings.  Falls back to the frozen denominator when no
+    receipt is bound yet.
+    """
+    receipt = ctx.get("accounting_receipt")
+    if isinstance(receipt, dict):
+        out = receipt.get("output", {}).get("stems")
+        if isinstance(out, (list, tuple)) and out:
+            return sorted(str(stem) for stem in out)
+    return sorted(str(stem) for stem in fallback)
+
+
 def _seal_ctc_raw(ctx: dict) -> int:
     """Create/validate the immutable raw manifest after producer writes finish."""
     raw = Path(ctx["ctc_pretg"])
     try:
+        # The raw manifest inventories only stems that actually produced raw
+        # CTC artifacts.  Legitimately skipped stems (e.g. an empty reference
+        # producing no text) are recorded in the accounting receipt's filtered
+        # set, not in the raw namespace, so seal against the producer's output
+        # stems rather than the frozen eligible denominator.
+        receipt = ctx.get("accounting_receipt")
+        stems = None
+        if isinstance(receipt, dict):
+            out = receipt.get("output", {}).get("stems")
+            if isinstance(out, (list, tuple)) and out:
+                stems = list(out)
+        if stems is None:
+            stems = list(ctx.get("accounting_eligible_stems", ())) or None
         manifest = write_ctc_raw_manifest(
-            raw, producer_receipt=raw / ".ctc_run_receipt.json",
-            stems=list(ctx.get("accounting_eligible_stems", ())) or None)
+            raw, producer_receipt=raw / ".ctc_run_receipt.json", stems=stems)
         ctx["ctc_raw_manifest"] = raw / CTC_RAW_MANIFEST_NAME
         ctx["ctc_raw_manifest_data"] = manifest
         return 0
@@ -851,10 +1315,17 @@ def _ensure_ctc_work(ctx: dict, *, overwrite: bool = False) -> Path | None:
                 raise ValueError("; ".join(errors))
             ctx["ctc_raw_manifest"] = manifest_path
             ctx["ctc_raw_manifest_data"] = manifest
+        refresh_pending = bool(ctx.get("_refresh_ctc_work_pending", False))
+        materialize_overwrite = overwrite or refresh_pending
         had_receipt = (work / CTC_WORK_RECEIPT_NAME).is_file()
         receipt = materialize_ctc_work(
-            raw, work, raw_manifest_path=manifest_path, overwrite=overwrite)
-        if not overwrite and had_receipt:
+            raw, work, raw_manifest_path=manifest_path,
+            overwrite=materialize_overwrite)
+        if refresh_pending:
+            # Recovery refresh is deliberately one-shot. Later normalization
+            # stages must build on the mutations made by earlier stages.
+            ctx["_refresh_ctc_work_pending"] = False
+        if not materialize_overwrite and had_receipt:
             freshness_errors = _validate_ctc_work_freshness(
                 ctx, work, receipt)
             if freshness_errors:
@@ -878,6 +1349,9 @@ def _ctc_work_freshness_fingerprints(ctx: dict, work: Path,
     module_paths = [Path(__file__), SCRIPTS_DIR / "pipeline_utils.py"]
     if (SCRIPTS_DIR / "ctc_prealign.py").is_file():
         module_paths.append(SCRIPTS_DIR / "ctc_prealign.py")
+    if resolve_ctc_prealign_provider(ctx.get("config", {}).get("ctc_prealign", {})) == "qwen3_hf":
+        module_paths.extend(SCRIPTS_DIR / name for name in
+                            ("qwen3_hf_backend.py", "qwen3_prealign.py", "qwen3_timestamp_normalization.py"))
     producer = {str(path.relative_to(PROJECT_ROOT)): _sha256_file(path)
                 for path in module_paths if path.is_file()}
     rows = []
@@ -1047,6 +1521,40 @@ def _resample_one(wav_path: Path, audio_dir: Path, out_dir: Path,
     return (str(rel), True, "resampled")
 
 
+def _clear_mfa_temp_derived_state(temp_dir: Path, workspace: Path) -> int:
+    """Remove stale MFA temp state from one validated run-local directory.
+
+    MFA may place ``corpus.db`` below nested corpus/model directories.  A
+    shallow ``temp_dir.glob("*.db")`` therefore leaves a prior database that
+    can make an overwrite run report ``Alignment already done`` and reuse old
+    anchors.  This helper clears only children of a run-local temp root after
+    all input/axis preflight checks; it never follows a symlinked root.
+    """
+    temp_dir = Path(temp_dir)
+    workspace = Path(workspace)
+    try:
+        if (not temp_dir.is_absolute() or not workspace.is_absolute()
+                or temp_dir.is_symlink() or workspace.is_symlink()):
+            raise ValueError("MFA temp/workspace paths must be real absolute roots")
+        workspace_root = workspace.resolve()
+        temp_root = temp_dir.resolve()
+        if temp_root == workspace_root or workspace_root not in temp_root.parents:
+            raise ValueError("MFA temp root must be strictly below run workspace")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        import shutil as _shutil
+        for child in list(temp_dir.iterdir()):
+            if child.is_symlink() or child.is_file():
+                child.unlink()
+            elif child.is_dir():
+                _shutil.rmtree(child)
+            else:
+                raise ValueError(f"unsupported MFA temp entry: {child.name}")
+    except (OSError, ValueError) as exc:
+        print(f"  ERROR: unable to clear run-local MFA temp state: {exc}")
+        return 1
+    return 0
+
+
 def _freeze_pre_ctc_stems(cfg: dict, ctx: dict) -> tuple[str, ...] | None:
     """Freeze one auditable pre-CTC stem denominator for fresh full runs.
 
@@ -1118,6 +1626,32 @@ def _freeze_pre_ctc_stems(cfg: dict, ctx: dict) -> tuple[str, ...] | None:
             selection_source = "existing_manifest"
         else:
             selected = universe[:limit] if limit > 0 else universe
+            # In authority (reference) mode a non-empty, non-Japanese reference
+            # text is required; exclude empty/missing and kana-bearing stems so
+            # the frozen denominator agrees with ctc_prealign's
+            # _reference_inventory.
+            if (cfg.get("reference_mode") == "authority"
+                    and not prealign_cfg.get("allow_missing_reference", False)):
+                _txt_root = Path(ctx["data_dir"])
+                _selected_with_ref = []
+                for _stem in selected:
+                    _txt = _txt_root / f"{_stem}.txt"
+                    try:
+                        _ref = _txt.read_text(encoding="utf-8").strip() if _txt.is_file() else ""
+                    except OSError:
+                        _ref = ""
+                    if not _ref:
+                        continue
+                    _kana = any(
+                        0x3041 <= ord(_ch) <= 0x3096
+                        or ord(_ch) in (0x309D, 0x309E)
+                        or 0x30A1 <= ord(_ch) <= 0x30FA
+                        or ord(_ch) in (0x30FD, 0x30FE)
+                        for _ch in _ref)
+                    if _kana:
+                        continue
+                    _selected_with_ref.append(_stem)
+                selected = _selected_with_ref
             manifest.parent.mkdir(parents=True, exist_ok=True)
             manifest.write_text("\n".join(selected) + "\n", encoding="utf-8")
             selection_source = "physical_wav_scan"
@@ -1194,14 +1728,34 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
             elif child.is_file() or child.is_symlink():
                 child.unlink()
 
-    # Capture this before freezing expected_stems: the frozen selection must
-    # not make a fresh pre-CTC route look like a post-CTC subset.
+    # Capture this before freezing expected_stems: a resumed route has a
+    # formal eligible denominator that can be larger than the producer's
+    # actual CTC output namespace.  The former remains the accounting scope;
+    # only the latter is a valid MFA/audio axis.
     pre_ctc_mode = (ctx.get("mode") in ("nvrasr_fallback", "full")
                     and not ctx.get("expected_stems"))
+    ctc_output_stems: tuple[str, ...] = ()
     if pre_ctc_mode:
-        if _freeze_pre_ctc_stems(cfg, ctx) is None:
+        source_receipt = ctx.get("accounting_source_receipt_path")
+        if source_receipt is not None and Path(source_receipt).is_file():
+            # ``--skip-to resample`` resumes after CTC production.  Pin the
+            # producer's v2 receipt before touching audio; filtered eligible
+            # stems must never be reconstructed by scanning the source dir.
+            if _load_ctc_accounting(ctx, required=True) != 0:
+                return 1
+            ctc_output_stems = tuple(_ctc_output_stems(ctx, ()))
+            if not ctc_output_stems:
+                print("  ERROR: resumed CTC receipt has no output stems")
+                return 1
+            ctx["ctc_output_stems"] = ctc_output_stems
+            print(f"  Resuming CTC output axis: {len(ctc_output_stems)} stems "
+                  f"(formal eligible={len(ctx.get('expected_stems', ()))})")
+        elif _freeze_pre_ctc_stems(cfg, ctx) is None:
             return 1
     expected_stems = tuple(ctx.get("expected_stems", ()))
+    # This is deliberately distinct from expected_stems: accounting retains
+    # output∪filtered==eligible, while resample/MFA operate on output only.
+    selected_stems = tuple(ctx.get("ctc_output_stems", ())) or expected_stems
     if ctx.get("ctc_ready_subset") and not expected_stems:
         print("  ERROR: frozen ctc_ready subset is unavailable; refusing "
               "full data_dir resample fallback")
@@ -1220,12 +1774,12 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     # Use scandir for fast flat-listing (common case)
     wavs: list[Path] = []
 
-    if expected_stems and ctx.get("strict_ready"):
+    if selected_stems and ctx.get("strict_ready"):
         evidence = ctx.get("strict_ready_evidence")
         if (not isinstance(evidence, dict) or audio_dir != evidence.get("_audio_root")):
             print("  ERROR: strict resample input escaped evidenced audio_view")
             return 1
-        for stem in expected_stems:
+        for stem in selected_stems:
             candidate = audio_dir / f"{stem}.wav"
             record = evidence["_artifacts"][stem]["audio"]
             try:
@@ -1253,14 +1807,29 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
             return 1
         print(f"  Selected {len(wavs)} WAVs from frozen pre-CTC subset"
               " (source namespace may contain extras)")
-    elif expected_stems and ctx.get("ctc_ready_subset"):
+    elif selected_stems and ctx.get("ctc_output_stems"):
+        missing: list[str] = []
+        for stem in selected_stems:
+            candidate = audio_dir / f"{stem}.wav"
+            if not candidate.is_file() or candidate.is_symlink():
+                candidate = Path(ctx.get("pre_ctc_audio_index", {}).get(stem, ""))
+            if not candidate.is_file() or candidate.is_symlink():
+                missing.append(stem)
+            else:
+                wavs.append(candidate)
+        if missing or len(wavs) != len(selected_stems):
+            print("  ERROR: resumed CTC output audio axis is incomplete")
+            return 1
+        print(f"  Selected {len(wavs)} WAVs from pinned CTC output axis"
+              " (filtered eligible stems excluded)")
+    elif selected_stems and ctx.get("ctc_ready_subset"):
         # A filtered ctc_ready run deliberately reads from a complete,
         # possibly read-only data_dir.  Construct only the frozen stem paths;
         # never require the source namespace itself to contain only the
         # selected subset and never fall back to a directory scan.
         missing: list[str] = []
         unsafe: list[str] = []
-        for stem in expected_stems:
+        for stem in selected_stems:
             candidate = audio_dir / f"{stem}.wav"
             if candidate.is_symlink() or not candidate.is_file():
                 missing.append(stem)
@@ -1268,7 +1837,7 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                 unsafe.append(stem)
             else:
                 wavs.append(candidate)
-        if missing or unsafe or len(wavs) != len(expected_stems):
+        if missing or unsafe or len(wavs) != len(selected_stems):
             print("  ERROR: frozen subset audio input is incomplete or unsafe")
             if missing:
                 print(f"    missing={len(missing)}")
@@ -1277,11 +1846,11 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
             return 1
         print(f"  Selected {len(wavs)} WAVs from frozen ctc_ready subset"
               f" (source namespace may contain extras)")
-    elif expected_stems:
+    elif selected_stems:
         # Preserve the historical full-denominator contract for ordinary
         # non-filtered callers that already provide expected_stems: their
         # source namespace must equal the frozen full set.
-        expected_names = {f"{stem}.wav" for stem in expected_stems}
+        expected_names = {f"{stem}.wav" for stem in selected_stems}
         try:
             entries = list(audio_dir.iterdir())
         except OSError as exc:
@@ -1295,7 +1864,7 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
             print(f"    missing={len(expected_names - ordinary_names)}, "
                   f"extra={len(ordinary_names - expected_names)}")
             return 1
-        wavs = [audio_dir / f"{stem}.wav" for stem in expected_stems]
+        wavs = [audio_dir / f"{stem}.wav" for stem in selected_stems]
 
     # Fast path: read stems from ctc_ready manifest (no directory scan)
     manifest_path = ctx.get("ctc_pretg", Path()) / "ctc_ready_manifest.json"
@@ -1362,17 +1931,22 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
             pass
     if existing_count >= len(wavs) and not overwrite:
         print(f"  {existing_count} resampled WAVs already exist. Use --overwrite to redo.")
-        if expected_stems:
+        if selected_stems:
             entries = list(mfa_audio_dir.iterdir())
             actual_names = {entry.name for entry in entries
                             if entry.is_file() and not entry.is_symlink()}
-            expected_names = {f"{stem}.wav" for stem in expected_stems}
+            expected_names = {f"{stem}.wav" for stem in selected_stems}
             if (actual_names != expected_names or len(entries) != len(expected_names)
                     or any(entry.is_symlink() or not entry.is_file()
                            for entry in entries)):
                 print("  ERROR: existing resampled WAV set differs from frozen denominator")
                 return 1
-        stems_for_receipts = sorted(ctx.get("expected_stems", ()) or {p.stem for p in wavs})
+        if pre_ctc_mode and not isinstance(ctx.get("ctc_axis_receipt"), dict):
+            ctx["mfa_transform_receipts_pending"] = True
+            print("  Resample lineage deferred until lexical prealign receipt exists")
+            return 0
+        stems_for_receipts = _ctc_output_stems(
+            ctx, ctx.get("expected_stems", ()) or {p.stem for p in wavs})
         return _ensure_mfa_transform_receipts(ctx, stems_for_receipts)
 
     mfa_audio_dir.mkdir(parents=True, exist_ok=True)
@@ -1411,16 +1985,21 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     for action, n in sorted(actions.items()):
         parts.append(f"{n} {action}")
     print(f"  Resampled to {target_sr}Hz -> {mfa_audio_dir}  ({', '.join(parts)})")
-    if expected_stems:
+    if selected_stems:
         entries = list(mfa_audio_dir.iterdir())
         actual_names = {entry.name for entry in entries
                         if entry.is_file() and not entry.is_symlink()}
-        expected_names = {f"{stem}.wav" for stem in expected_stems}
+        expected_names = {f"{stem}.wav" for stem in selected_stems}
         if (actual_names != expected_names or len(entries) != len(expected_names)
                 or any(entry.is_symlink() or not entry.is_file() for entry in entries)):
             print("  ERROR: resampled WAV set differs from frozen denominator")
             return 1
-    stems_for_receipts = sorted(ctx.get("expected_stems", ()) or {p.stem for p in wavs})
+    if pre_ctc_mode and not isinstance(ctx.get("ctc_axis_receipt"), dict):
+        ctx["mfa_transform_receipts_pending"] = True
+        print("  Resample lineage deferred until lexical prealign receipt exists")
+        return 0 if done > 0 or skipped > 0 else 1
+    stems_for_receipts = _ctc_output_stems(
+        ctx, ctx.get("expected_stems", ()) or {p.stem for p in wavs})
     if _ensure_mfa_transform_receipts(ctx, stems_for_receipts) != 0:
         return 1
     return 0 if done > 0 or skipped > 0 else 1
@@ -1457,22 +2036,69 @@ def step_mfa_validate(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     return run_mfa(mfa_args, mfa_python, ctx["models_dir"], "Step 5: MFA Validate")
 
 
+def _complete_prealign_evidence(ctx: dict) -> int:
+    """Seal producer evidence and bind any already-resampled MFA audio."""
+    rc = _load_ctc_accounting(ctx, required=True)
+    if rc:
+        return rc
+    ctx["_ctc_axis_producer_phase"] = True
+    try:
+        rc = _ensure_ctc_axis_receipt(ctx)
+    finally:
+        ctx.pop("_ctc_axis_producer_phase", None)
+    if rc:
+        return rc
+    rc = _seal_ctc_raw(ctx)
+    if rc:
+        return rc
+    mfa_audio_value = ctx.get("mfa_audio_dir")
+    mfa_audio_dir = Path(mfa_audio_value) if mfa_audio_value else None
+    if mfa_audio_dir is not None and mfa_audio_dir.is_dir():
+        stems = _ctc_output_stems(ctx, ctx.get("expected_stems", ()))
+        if stems:
+            rc = _ensure_mfa_transform_receipts(ctx, list(stems))
+            if rc:
+                return rc
+            ctx.pop("mfa_transform_receipts_pending", None)
+    return 0
+
+
 def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
-    """Run NVASR CTC forced alignment -> produce MFA anchor TextGrids."""
+    """Run the selected lexical prealign provider -> MFA anchor TextGrids."""
     if (ctx.get("mode") in ("nvrasr_fallback", "full")
             and not ctx.get("expected_stems")):
         if _freeze_pre_ctc_stems(cfg, ctx) is None:
             return 1
     pc = cfg.get("ctc_prealign", {})
+    try:
+        provider = resolve_ctc_prealign_provider(pc)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        return 1
     if not pc.get("enabled", False):
         print("  CTC prealign disabled in config (ctc_prealign.enabled=false). Skipping.")
         return 0
 
     ctc_out = ctx["ctc_pretg"]
+    producer_receipt_path = ctc_out / ".ctc_run_receipt.json"
+    if producer_receipt_path.is_file():
+        try:
+            stored_receipt = json.loads(producer_receipt_path.read_text(encoding="utf-8"))
+            stored_provider = stored_receipt.get("extra", {}).get("provider", "nvasr")
+            if stored_provider != provider:
+                print("  ERROR: prealign provider changed; use a fresh workspace/output directory")
+                return 1
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"  ERROR: invalid producer receipt: {exc}")
+            return 1
     if (ctc_out / CTC_RAW_MANIFEST_NAME).is_file() and args.overwrite:
         print("  ERROR: sealed CTC raw root is immutable; --overwrite cannot rerun producer in place")
         return 1
-    if ctc_out.exists() and not args.overwrite:
+    # A legacy normalization marker only proves the six-file bundle.  It does
+    # not prove which acoustic provider/model produced it.  Qwen bundles are
+    # therefore always revalidated by the provider receipt before reuse; this
+    # also prevents an old NVASR marker from short-circuiting a Qwen switch.
+    if ctc_out.exists() and not args.overwrite and provider != "qwen3_hf":
         _marker = ctc_out / ".ctc_normalized"
         _manifest = ctc_out / "manifest.json"
         if _marker.is_file() and _manifest.is_file():
@@ -1486,15 +2112,7 @@ def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                 if _actual_digest == _marker_data.get("manifest_sha256"):
                     print(f"  CTC prealign complete ({_marker_data['stems']} stems,"
                           f" marker v4). Use --overwrite to re-run.")
-                    rc = _load_ctc_accounting(ctx, required=True)
-                    if rc:
-                        return rc
-                    ctx["_ctc_axis_producer_phase"] = True
-                    try:
-                        rc = _ensure_ctc_axis_receipt(ctx)
-                    finally:
-                        ctx.pop("_ctc_axis_producer_phase", None)
-                    return rc if rc else _seal_ctc_raw(ctx)
+                    return _complete_prealign_evidence(ctx)
                 print(f"  CTC .ctc_normalized manifest digest mismatch —"
                       f" re-running (stale marker).")
             else:
@@ -1508,6 +2126,54 @@ def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                 print(f"  CTC TextGrids ({_tg_count}) exist without normalization"
                       f" marker — re-running (incomplete bundle).")
             # fall through to re-run
+
+    if provider == "qwen3_hf":
+        qwen_py = pc.get("python", "") or sys.executable
+        qwen_py_path = Path(qwen_py)
+        if not qwen_py_path.exists():
+            print(f"ERROR: Qwen3 HF Python not found: {qwen_py}")
+            return 1
+        qwen_args = [
+            "--data-dir", str(ctx["data_dir"]),
+            "--audio-dir", str(ctx.get("audio_dir", ctx["data_dir"])),
+            "--output-dir", str(ctc_out),
+            "--model-path", str(resolve_path(PROJECT_ROOT, pc.get("model_path", ""))),
+            "--forced-aligner-model-path",
+            str(resolve_path(PROJECT_ROOT, pc.get("forced_aligner_model_path", ""))),
+            "--dict-path", str(ctx["mfa_dict"]),
+            "--device", getattr(args, "device", None) or pc.get("device", "cuda:0"),
+            "--dtype", str(pc.get("dtype", "bfloat16")),
+            "--reference-mode", str(ctx.get("reference_mode", "auto")),
+            "--no-nvv",
+        ]
+        if pc.get("language") is not None:
+            qwen_args += ["--language", str(pc.get("language"))]
+        if pc.get("context"):
+            qwen_args += ["--context", str(pc.get("context"))]
+        if pc.get("max_new_tokens") is not None:
+            qwen_args += ["--max-new-tokens", str(pc.get("max_new_tokens"))]
+        if pc.get("batch_size") is not None:
+            qwen_args += ["--batch-size", str(pc.get("batch_size"))]
+        if pc.get("all_gpus"):
+            qwen_args += ["--all-gpus"]
+        if pc.get("forced_aligner_device"):
+            qwen_args += ["--forced-aligner-device", str(pc["forced_aligner_device"])]
+        if pc.get("allow_item_failures", False):
+            qwen_args.append("--allow-item-failures")
+        if ctx.get("pre_ctc_stems_file"):
+            qwen_args += ["--stems-file", str(ctx["pre_ctc_stems_file"])]
+        else:
+            if pc.get("limit", 0) > 0:
+                qwen_args += ["--limit", str(pc["limit"])]
+            if pc.get("offset", 0) > 0:
+                qwen_args += ["--offset", str(pc["offset"])]
+        print(f"  Qwen3 HF Python: {qwen_py_path}")
+        rc = run_python(SCRIPTS_DIR / "qwen3_prealign.py", qwen_args, qwen_py_path,
+                        ctx["models_dir"], "Step 4: Qwen3 HF lexical pre-alignment",
+                        timeout=pc.get("timeout", 3600))
+        if rc != 0:
+            return rc
+        return _complete_prealign_evidence(ctx)
 
     # NVASR needs funasr+torch — use dedicated Python, not MFA's
     nvras_py = pc.get("python", "")
@@ -1556,19 +2222,11 @@ def step_prealign(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
 
     # Use run_python with the NVASR Python, not mfa_python
     rc = run_python(SCRIPTS_DIR / "ctc_prealign.py", prealign_args, nvras_py_path,
-                    ctx["models_dir"], "Step 4: CTC Pre-alignment (NVASR -> MFA anchors)",
+                    ctx["models_dir"], "Step 4: Qwen3 pre-alignment -> MFA anchors",
                     timeout=pc.get("timeout", 3600))
     if rc != 0:
         return rc
-    rc = _load_ctc_accounting(ctx, required=True)
-    if rc:
-        return rc
-    ctx["_ctc_axis_producer_phase"] = True
-    try:
-        rc = _ensure_ctc_axis_receipt(ctx)
-    finally:
-        ctx.pop("_ctc_axis_producer_phase", None)
-    return rc if rc else _seal_ctc_raw(ctx)
+    return _complete_prealign_evidence(ctx)
 
 
 def _ensure_ctc_axis_receipt(ctx: dict) -> int:
@@ -2200,8 +2858,15 @@ def _load_ctc_accounting(ctx: dict, *, required: bool = False) -> int:
             # below handles both that case and a bounded producer receipt.
             if (not isinstance(ctx.get("pre_ctc_selection"), dict)
                     or not expected_set <= producer_eligible):
-                print("  ERROR: frozen v2 eligible stems differ from pipeline denominator")
-                return 1
+                if isinstance(ctx.get("pre_ctc_selection"), dict) and producer_eligible <= expected_set:
+                    # The producer excluded a few stems the frozen physical
+                    # scan included (e.g. an empty/unsupported reference).
+                    # Adopt its narrower eligible set so the denominator agrees.
+                    existing = tuple(sorted(producer_eligible))
+                    ctx["accounting_eligible_stems"] = existing
+                else:
+                    print("  ERROR: frozen v2 eligible stems differ from pipeline denominator")
+                    return 1
         elif isinstance(ctx.get("pre_ctc_selection"), dict):
             # A bounded producer receipt is not permission to discard the
             # pipeline-level physical source/exclusion ledger.
@@ -2224,6 +2889,28 @@ def _load_ctc_accounting(ctx: dict, *, required: bool = False) -> int:
                 "accounting_exclusions": tuple(receipt.get("exclusions", ())),
                 "expected_stems": eligible})
     return 0
+
+
+def _restore_post_ctc_resume_scope(
+        cfg: dict, ctx: dict) -> tuple[str, ...] | None:
+    """Restore formal accounting and the narrower executable CTC output.
+
+    Cold resumes at adjust/align/postprocess must retain CTC-filtered stems in
+    the final conservation denominator without sending them back into MFA.
+    """
+    source_receipt = ctx.get("accounting_source_receipt_path")
+    if source_receipt is not None and Path(source_receipt).is_file():
+        if _load_ctc_accounting(ctx, required=True) != 0:
+            return None
+        ctc_output = tuple(_ctc_output_stems(ctx, ()))
+        if not ctc_output:
+            print("  ERROR: resumed CTC receipt has no output stems")
+            return None
+        ctx["ctc_output_stems"] = ctc_output
+        print(f"  Resuming post-CTC output axis: {len(ctc_output)} stems "
+              f"(formal eligible={len(ctx.get('expected_stems', ()))})")
+        return ctc_output
+    return _freeze_pre_ctc_stems(cfg, ctx)
 
 
 def _skip_if_ctc_normalized(ctx: dict) -> bool:
@@ -2427,6 +3114,37 @@ def step_normalize_text(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     ctc_dir = _ensure_ctc_work(ctx, overwrite=bool(getattr(args, "overwrite", False)))
     if ctc_dir is None:
         return 1
+    # Older Qwen bundles joined CJK characters across punctuation when
+    # deriving MFA readings (完成。都 -> 成都).  The model text and times stay
+    # immutable; a receipt-bound work projection corrects only those readings.
+    qwen_readings_changed = 0
+    try:
+        for token_path in sorted(ctc_dir.glob("*_tokens.jsonl")):
+            rows = [json.loads(line) for line in token_path.read_text(
+                encoding="utf-8").splitlines() if line.strip()]
+            if not rows or not all(row.get("provider") == "qwen3_hf" for row in rows):
+                continue
+            from qwen3_prealign import reproject_pinyin_rows
+            stem = token_path.name[:-len("_tokens.jsonl")]
+            source_text = (ctc_dir / f"{stem}_text_cn.txt").read_text(
+                encoding="utf-8").strip()
+            projected = reproject_pinyin_rows(rows, source_text)
+            if projected == rows:
+                continue
+            from normalize_english_tokens import rewrite_ctc_textgrid_words
+            rewrite_ctc_textgrid_words(ctc_dir / f"{stem}.TextGrid", projected)
+            token_path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n"
+                                          for row in projected), encoding="utf-8")
+            rebuild_lab_from_tokens(token_path, ctc_dir / f"{stem}.lab")
+            qwen_readings_changed += 1
+    except (OSError, ValueError, StopIteration) as exc:
+        print(f"  ERROR: Qwen contextual pinyin projection failed: {exc}")
+        return 1
+    if qwen_readings_changed:
+        print(f"  Qwen contextual pinyin: {qwen_readings_changed} bundle(s) corrected; "
+              "source text and model timestamps preserved")
+        if _record_ctc_work_stage(ctx, "qwen_contextual_pinyin") != 0:
+            return 1
     if _skip_if_ctc_normalized(ctx):
         return _record_ctc_work_stage(ctx, "normalize", status="skipped")
     try:
@@ -2693,7 +3411,7 @@ def step_normalize_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
 
 
 def _processed_geometry_cache_complete(ctc_dir: Path,
-                                       stems: set[str]) -> bool:
+                                       stems: set[str], *, require_energy: bool = False) -> bool:
     """Return whether an adjusted CTC cache has all derived English spans.
 
     Non-English rows do not need processed geometry.  Every canonical
@@ -2710,6 +3428,11 @@ def _processed_geometry_cache_complete(ctc_dir: Path,
                     token_path.read_text(encoding="utf-8").splitlines()
                     if line.strip()]
         except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        if require_energy and (not rows or any(
+                not isinstance(row, dict)
+                or row.get("energy_adjustment_schema") != "ctc-energy-adjustment-v1"
+                for row in rows)):
             return False
         for row in rows:
             if isinstance(row, dict) and row.get("candidate_kind") == "nvv":
@@ -2794,7 +3517,7 @@ def step_adjust_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         _in_labs = {p.stem for p in ctc_in.glob("*.lab")}
         _out_tgs = {p.stem for p in ctc_out.glob("*.TextGrid")}
         if (_in_labs and _in_labs == _out_tgs
-                and _processed_geometry_cache_complete(ctc_out, _in_labs)):
+                and _processed_geometry_cache_complete(ctc_out, _in_labs, require_energy=True)):
             print(f"  Adjusted CTC anchors complete ({len(_out_tgs)} stems)."
                   f" Use --overwrite to re-run.")
             ctx["ctc_pretg_adj"] = ctc_out
@@ -2914,6 +3637,14 @@ def _execute_single_process_mfa_retry(
 ) -> dict:
     """Run one complete, anchor-preserving retry for a fallback MFA run."""
     import json as _json
+
+    if source_anchors is not None:
+        try:
+            require_mfa_anchor_support(mfa_python, models_dir)
+        except ValueError as exc:
+            return {"return_code": 1, "produced": [], "invalid": [],
+                    "invocation_outcome": "not_started",
+                    "exception_type": type(exc).__name__, "exception": str(exc)}
 
     retry_root.mkdir(parents=True, exist_ok=False)
     try:
@@ -3046,6 +3777,8 @@ def _run_mfa_sharded(
     min_output_ratio: float = 1.0,
     desc: str = "MFA Align",
     mfa_axis_receipt: dict | None = None,
+    native_anchor_dir: Path | None = None,
+    native_anchor_groups_path: Path | None = None,
     **extra_args,
 ) -> int:
     """Run MFA align in parallel shards to accelerate MFCC extraction.
@@ -3066,6 +3799,13 @@ def _run_mfa_sharded(
     _n_shards = min(8, _mp.cpu_count() // 4, max(1, _n // 200))
     if _n_shards <= 1:
         return None  # signal: caller should run single MFA
+
+    if anchors_dir is not None and native_anchor_dir is None:
+        try:
+            require_mfa_anchor_support(mfa_python, models_dir)
+        except ValueError as exc:
+            print(f"  ERROR: {exc}")
+            return 1
 
     _per_shard = (_n + _n_shards - 1) // _n_shards
     _jobs_per_shard = max(1, num_jobs // _n_shards)
@@ -3100,11 +3840,12 @@ def _run_mfa_sharded(
             (_sd / _sub).mkdir(parents=True, exist_ok=True)
 
         for _stem in _ss:
-            _src = corpus_dir / f"{_stem}.lab"
+            _corpus_suffix = ".TextGrid" if native_anchor_dir is not None else ".lab"
+            _src = corpus_dir / f"{_stem}{_corpus_suffix}"
             if _src.exists():
-                _link_tasks.append((_src, _sd / "corpus" / f"{_stem}.lab"))
+                _link_tasks.append((_src, _sd / "corpus" / f"{_stem}{_corpus_suffix}"))
             else:
-                _input_errors.append(f"{_stem}: missing lab")
+                _input_errors.append(f"{_stem}: missing {_corpus_suffix}")
             _src = audio_dir / f"{_stem}.wav"
             if _src.exists():
                 _link_tasks.append((_src, _sd / "audio" / f"{_stem}.wav"))
@@ -3306,6 +4047,14 @@ def _run_mfa_sharded(
                 if _errors:
                     _invalid.append(_tg.stem)
                     _invalid_detail.append({"stem": _tg.stem, "errors": _errors})
+                if native_anchor_dir is not None and not _errors:
+                    _bound_errors = _validate_native_anchor_bounds(
+                        native_anchor_dir / f"{_tg.stem}.TextGrid", _tg,
+                        group_map_path=native_anchor_groups_path)
+                    if _bound_errors:
+                        _invalid.append(_tg.stem)
+                        _invalid_detail.append({"stem": _tg.stem,
+                                                "errors": _bound_errors})
             except OSError:
                 _invalid.append(_tg.stem)
                 _invalid_detail.append({"stem": _tg.stem, "errors": ["OSError reading TextGrid"]})
@@ -3342,6 +4091,13 @@ def _run_mfa_sharded(
                         for row in _manifest_rows]
     _retry_missing = sorted({stem for rec in _reconciliations
                              if rec.get("retry_missing") for stem in rec.get("missing", [])})
+    if native_anchor_dir is not None and _retry_missing:
+        # Native corpus TextGrids are intentionally not fed through the
+        # legacy singleton retry packet, whose corpus writer expects .lab and
+        # whose anchor branch would reintroduce --textgrid_directory.
+        print(f"  Native anchor mode: {len(_retry_missing)} missing outputs "
+              "remain fail-closed; singleton retry disabled")
+        _retry_missing = []
     if _retry_missing:
         _retry_invocation = 0
         def _execute_retained_missing(_missing, *, _beam=20, _retry_beam=80,
@@ -3641,47 +4397,57 @@ def _record_single_process_mfa_partition(ctx: dict, stems: list[str],
 
 
 def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
-    """MFA align — uses NVASR .lab as corpus + CTC TextGrid as anchors.
-
-    NVASR produces both the transcript (.lab) and the word boundaries (TextGrid)
-    from the same ASR text.  This guarantees 100% word matching between corpus and
-    anchors, so MFA uses every CTC word boundary for phone-level refinement.
-    """
+    """MFA align using the normalized timestamp corpus and anchor TextGrids."""
     mc = cfg["mfa"]
     # Use adjusted CTC if available (must exist AND contain .lab files),
-    # fall back to raw CTC output
+    # fall back to raw CTC output.  Adjusted anchors are intentionally the
+    # MFA constraint geometry, but _ensure_ctc_work (called by adjust and all
+    # preceding CTC stages) binds this work tree to the sealed raw manifest
+    # and freshness receipt; never treat an unbound adjusted cache as raw.
     ctc_dir = ctx.get("ctc_pretg_adj", ctx["ctc_pretg"])
     if not ctc_dir.exists() or not any(ctc_dir.glob("*.lab")):
         ctc_dir = ctx["ctc_pretg"]
 
-    # Check for NVASR corpus (.lab files)
-    use_nvasr_corpus = ctc_dir.exists() and any(ctc_dir.glob("*.lab"))
-    corpus_dir = ctc_dir if use_nvasr_corpus else ctx["pinyin_dir"]
+    # Qwen's normalized timestamp tree supplies matching .lab and TextGrid
+    # files; legacy ctc_ready inputs follow the same generic contract.
+    use_timestamp_corpus = ctc_dir.exists() and any(ctc_dir.glob("*.lab"))
+    corpus_dir = ctc_dir if use_timestamp_corpus else ctx["pinyin_dir"]
 
-    # Clean temp dir when overwriting — only remove alignment DB, keep feature cache
+    # Validate capability before --overwrite can delete previous alignments.
+    use_anchors = ctc_dir.exists() and any(ctc_dir.glob("*.TextGrid"))
+    native_anchor_dir = None
+    native_anchor_groups_path = None
+    if use_anchors and mc.get("native_anchor_fallback", False):
+        native_anchor_dir = ctc_dir
+        corpus_dir = ctx["workspace"] / "native_anchor_corpus"
+        try:
+            _build_native_anchor_corpus(
+                ctc_dir, sorted(p.stem for p in ctc_dir.glob("*.TextGrid")),
+                corpus_dir)
+        except (OSError, TypeError, ValueError) as _native_exc:
+            print(f"  ERROR: native TextGrid anchor fallback failed: {_native_exc}")
+            return 1
+        native_anchor_groups_path = corpus_dir / "native_anchor_groups.json"
+        use_anchors = False
+        print("  Native TextGrid anchor fallback: neutral speaker tier; "
+              "stock MFA --textgrid_directory disabled")
+    elif use_anchors:
+        try:
+            require_mfa_anchor_support(mfa_python, ctx["models_dir"])
+        except ValueError as exc:
+            print(f"  ERROR: {exc}")
+            return 1
+
     import shutil
-    if args.overwrite:
-        # Only clean alignment outputs, preserve MFCC feature cache in temp_dir
-        if ctx["aligned_dir"].exists():
-            shutil.rmtree(ctx["aligned_dir"], ignore_errors=True)
-            ctx["aligned_dir"].mkdir(parents=True, exist_ok=True)
-        # Remove stale MFA sqlite DBs (they reference old alignment state)
-        if ctx["temp_dir"].exists():
-            for db_file in ctx["temp_dir"].glob("*.db"):
-                try:
-                    db_file.unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-    if not list(corpus_dir.glob("*.lab" if use_nvasr_corpus else "*.txt")):
+    _corpus_suffix = (
+        "*.TextGrid" if native_anchor_dir is not None
+        else "*.lab" if use_timestamp_corpus else "*.txt")
+    if not list(corpus_dir.glob(_corpus_suffix)):
         print("ERROR: No corpus files found.")
         return 1
 
-    # Check for CTC anchors
-    use_anchors = ctc_dir.exists() and any(ctc_dir.glob("*.TextGrid"))
-
-    if use_nvasr_corpus:
-        print(f"  NVASR corpus: {ctc_dir} (.lab files from ASR text)")
+    if use_timestamp_corpus and native_anchor_dir is None:
+        print(f"  Timestamp corpus: {ctc_dir} (.lab files from normalized text)")
     if use_anchors:
         print(f"  CTC anchors:  {ctc_dir}")
         print(f"  Transcript and anchors from SAME source -> 100% word match")
@@ -3741,8 +4507,8 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
 
     # ── Try sharded MFA (parallel MFCC extraction) ──
     _mfa_audio_dir = ctx["mfa_audio_dir"]
-    _stems = sorted(p.stem for p in corpus_dir.glob("*.lab"))
-    _frozen = set(ctx.get("expected_stems", ()))
+    _stems = sorted(p.stem for p in corpus_dir.glob(_corpus_suffix))
+    _frozen = set(_ctc_output_stems(ctx, ctx.get("expected_stems", ())))
     if _frozen and (set(_stems) != _frozen or len(_stems) != len(_frozen)):
         print("  ERROR: MFA corpus differs from frozen strict denominator")
         print(f"    missing ({len(_frozen - set(_stems))}): "
@@ -3772,6 +4538,13 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
                                     or ctx["aligned_dir"].is_symlink()):
         print(f"  ERROR: strict aligned target preexists: {ctx['aligned_dir']}")
         return 1
+    # Only discard previous output after runtime, input set, and axis checks
+    # succeed. A failed preflight must leave the previous run reviewable.
+    if args.overwrite:
+        if _clear_mfa_temp_derived_state(ctx["temp_dir"], ctx["workspace"]) != 0:
+            return 1
+        if ctx["aligned_dir"].exists():
+            shutil.rmtree(ctx["aligned_dir"])
     ctx["aligned_dir"].mkdir(parents=True, exist_ok=not ctx.get("strict_ready", False))
     ctx["temp_dir"].mkdir(parents=True, exist_ok=True)
     _extra = {}
@@ -3806,6 +4579,8 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         min_output_ratio=float(mc.get("min_output_ratio", 1.0)),
         desc="Step 6: MFA Align (sharded)",
         mfa_axis_receipt=ctx.get("mfa_input_axis_receipt"),
+        native_anchor_dir=native_anchor_dir,
+        native_anchor_groups_path=native_anchor_groups_path,
         **_extra,
     )
     if _rc is not None:
@@ -3828,8 +4603,8 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     _rc = run_mfa(
         mfa_args, mfa_python, ctx["models_dir"],
         "Step 6: MFA Align"
-        + (" (NVASR corpus + CTC anchors)"
-           if use_nvasr_corpus and use_anchors else ""),
+        + (" (timestamp corpus + anchors)"
+           if use_timestamp_corpus and use_anchors else ""),
         timeout=mc.get("timeout"),
     )
     if _rc != 0:
@@ -3844,7 +4619,7 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     _produced = {path.stem for path in ctx["aligned_dir"].glob("*.TextGrid")}
     _single_missing = sorted(set(_stems) - _produced)
     _single_extra = sorted(_produced - set(_stems))
-    if _single_missing and not _single_extra:
+    if _single_missing and not _single_extra and native_anchor_dir is None:
         # Batches below the sharding threshold use this fallback path.  They
         # must receive the same anchor-preserving singleton recovery contract
         # as sharded MFA; otherwise batch size alone changes which utterances
@@ -3899,12 +4674,40 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
             "initial_missing": _single_missing,
             "coordinator": _single_retry_state,
         }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        _produced = {path.stem for path in ctx["aligned_dir"].glob("*.TextGrid")}
-        print(f"  Single-process MFA retry recovered "
-              f"{len(set(_single_missing) & _produced)}/{len(_single_missing)}; "
-              f"plan={_single_retry_plan}")
+    _produced = {path.stem for path in ctx["aligned_dir"].glob("*.TextGrid")}
+    if native_anchor_dir is not None:
+        _native_invalid = []
+        for _grid in sorted(ctx["aligned_dir"].glob("*.TextGrid")):
+            _errors = _validate_native_anchor_bounds(
+                native_anchor_dir / _grid.name, _grid,
+                group_map_path=native_anchor_groups_path)
+            if _errors:
+                _native_invalid.append((_grid, _errors))
+        if _native_invalid:
+            if not mc.get("allow_partial", False):
+                for _, _errors in _native_invalid[:20]:
+                    for _error in _errors:
+                        print(f"  ERROR: {_error}")
+                return 1
+            # Invalid native-anchor geometry is an explicit filtered/MFA
+            # missing item.  Remove only the newly produced alignment so the
+            # downstream denominator records it instead of processing it.
+            for _grid, _errors in _native_invalid:
+                _grid.unlink()
+                print(f"  Native anchor bounds rejected {_grid.stem}: {_errors[0]}")
+            ctx["mfa_missing_stems"] = tuple(sorted(
+                set(ctx.get("mfa_missing_stems", ()))
+                | {_grid.stem for _grid, _ in _native_invalid}))
+            _produced = {path.stem for path in ctx["aligned_dir"].glob("*.TextGrid")}
     _missing, _extra = _record_single_process_mfa_partition(
         ctx, _stems, _produced, bool(mc.get("allow_partial", False)))
+    if (_missing and mc.get("allow_partial", False)
+            and (len(_produced) / len(_stems) if _stems else 0.0) <
+                 float(mc.get("min_output_ratio", 1.0))):
+        print(f"  ERROR: native/single MFA output ratio below threshold: "
+              f"{len(_produced)}/{len(_stems)} < "
+              f"{float(mc.get('min_output_ratio', 1.0)):.2%}")
+        return 1
     if _extra or (_missing and not mc.get("allow_partial", False)):
         return 1
     if _write_mfa_alignment_axis_receipt(ctx, ctx["aligned_dir"]) != 0:
@@ -4034,6 +4837,12 @@ def _refresh_postprocess_accounting(ctx: dict, output_stems: set[str],
         if validate_pipeline_accounting_receipt(source):
             raise ValueError("frozen accounting receipt invalid")
         eligible = set(source["eligible"]["stems"])
+        # Stems already filtered at prealign (e.g. an empty reference producing
+        # no text) are carried forward as filtered, not re-emitted by
+        # postprocess, so they must be folded into the filtered partition to
+        # keep output ∪ filtered == eligible.
+        prior_filtered = set(source.get("filtered", {}).get("stems", []))
+        filtered_stems = set(filtered_stems) | prior_filtered
         if (output_stems & filtered_stems
                 or output_stems | filtered_stems != eligible):
             raise ValueError("postprocess output/filtered conservation mismatch")
@@ -4109,6 +4918,55 @@ def _refresh_strict_manifest_accounting_binding(output_dir: Path) -> int:
         return 1
 
 
+def _read_postprocess_report(
+        report_path: str | os.PathLike) -> tuple[list[str], int]:
+    """Read the formal postprocess JSONL contract one line at a time."""
+    report_path = Path(os.fspath(report_path))
+    report_stems: list[str] = []
+    report_invalid = 0
+    try:
+        report_handle = report_path.open("r", encoding="utf-8")
+    except OSError:
+        print(f"  ERROR: missing postprocess report: {report_path}")
+        return report_stems, 1
+
+    with report_handle:
+        for line_no, line in enumerate(report_handle, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                report_stems.append(row["stem"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                report_invalid += 1
+                print(f"  ERROR: invalid report row {line_no}")
+    return report_stems, report_invalid
+
+
+def _recover_mfa_missing_stems(workspace: Path,
+                               missing_aligned: set[str]) -> set[str]:
+    """Recover the exact rejected MFA set for a cold postprocess resume.
+
+    The sharded aligner records structurally invalid TextGrids separately
+    from files MFA did not emit.  Both classes are absent from ``aligned/``
+    and therefore belong to the same downstream missing-MFA partition.
+    """
+    for ledger in sorted(
+            (Path(workspace) / "mfa_logs").glob("*/mfa_missing_stems.json"),
+            reverse=True):
+        try:
+            payload = json.loads(ledger.read_text(encoding="utf-8"))
+            if set(payload.get("extra", ())):
+                continue
+            candidate = (set(payload.get("missing", ()))
+                         | set(payload.get("invalid", ())))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if candidate == set(missing_aligned):
+            return candidate
+    return set()
+
+
 def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     """Post-process MFA aligned TextGrids.
 
@@ -4130,8 +4988,9 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     if _accounting_required:
         if _load_ctc_accounting(ctx, required=True) != 0:
             return 1
-    expected_stems = set(ctx.get("accounting_eligible_stems",
-                                ctx.get("expected_stems", ())))
+    expected_stems = set(_ctc_output_stems(
+        ctx, ctx.get("accounting_eligible_stems",
+                     ctx.get("expected_stems", ()))))
     mfa_missing_stems = set(ctx.get("mfa_missing_stems", ()))
     allow_partial_mfa = bool(cfg.get("mfa", {}).get("allow_partial", False))
     if not expected_stems:
@@ -4152,20 +5011,10 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     # the exact missing-MFA ledger from the workspace, but only accept it when
     # it exactly matches the current aligned/expected partition.
     if allow_partial_mfa and not mfa_missing_stems and missing_aligned:
-        _missing_set = set(missing_aligned)
-        for _ledger in sorted(
-                (ctx["workspace"] / "mfa_logs").glob("*/mfa_missing_stems.json"),
-                reverse=True):
-            try:
-                _payload = json.loads(_ledger.read_text(encoding="utf-8"))
-                _candidate = set(_payload.get("missing", ()))
-            except (OSError, json.JSONDecodeError, TypeError):
-                continue
-            if _candidate == _missing_set:
-                mfa_missing_stems = _candidate
-                print(f"  Recovered MFA missing ledger: {len(mfa_missing_stems)} stems "
-                      f"from {_ledger}")
-                break
+        mfa_missing_stems = _recover_mfa_missing_stems(
+            ctx["workspace"], set(missing_aligned))
+        if mfa_missing_stems:
+            print(f"  Recovered MFA missing ledger: {len(mfa_missing_stems)} stems")
     allowed_missing_aligned = bool(
         allow_partial_mfa and mfa_missing_stems
         and set(missing_aligned).issubset(mfa_missing_stems)
@@ -4343,22 +5192,7 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     unexpected_result = sorted(combined - expected_stems)
 
     report_path = ctx["output_dir"] / "postprocess_report.jsonl"
-    report_stems: list[str] = []
-    report_invalid = 0
-    if report_path.exists():
-        for line_no, line in enumerate(
-                report_path.read_text(encoding="utf-8").splitlines(), 1):
-            if not line.strip():
-                continue
-            try:
-                row = _json.loads(line)
-                report_stems.append(row["stem"])
-            except (KeyError, _json.JSONDecodeError):
-                report_invalid += 1
-                print(f"  ERROR: invalid report row {line_no}")
-    else:
-        report_invalid = 1
-        print(f"  ERROR: missing postprocess report: {report_path}")
+    report_stems, report_invalid = _read_postprocess_report(report_path)
 
     tone_path = ctx["output_dir"] / "tone_mapping.json"
     tone_valid = False
@@ -4805,7 +5639,7 @@ def validate_strict_ready_invocation(args, cfg: dict, mode: str, use_cache: bool
     if not _is_sha256_hex(pin_hash) or not _is_sha256_hex(taxonomy_hash):
         raise ValueError(
             "strict v4 evidence SHA256 and taxonomy SHA256 must be finalized")
-    forbidden_flags = ["force", "overwrite", "use_cache", "auto_cache", "scan_only",
+    forbidden_flags = ["force", "overwrite", "refresh_ctc_work", "use_cache", "auto_cache", "scan_only",
                        "output_staging"]
     active = [name for name in forbidden_flags if getattr(args, name, False)]
     active += [f"skip_{name}" for name in STEPS if getattr(args, f"skip_{name}", False)]
@@ -6112,16 +6946,16 @@ STEPS = {
     "pad_silence": ("Pad/trim head+tail silence to 0.5s", step_pad_silence),
     "trim": ("Audio preprocessing", step_trim_silence),
     "resample": ("Resample to 16kHz for MFA", step_resample_for_mfa),
-    "prealign": ("CTC pre-alignment (NVASR -> MFA anchors)", step_prealign),
+    "prealign": ("Qwen3 pre-alignment -> MFA anchors", step_prealign),
     "normalize_punct": ("Normalize punctuation (ASCII -> CJK)", step_normalize_punct),
     "normalize": ("Normalize numerals (Arabic -> Chinese)", step_normalize_text),
     "normalize_ria": ("Normalize ria transliterations (瑞娅/瑞亚/瑞雅/瑞啊 -> ria)", step_normalize_ria),
     "normalize_en": ("Normalise English-word fragments in CTC output", step_normalize_en),
     "adjust": ("Adjust CTC boundaries (energy-based)", step_adjust_ctc),
     "validate": ("MFA validate", step_mfa_validate),
-    "align": ("MFA align (NVASR corpus + CTC anchors)", step_mfa_align),
+    "align": ("MFA align (timestamp corpus + anchors)", step_mfa_align),
     "align_en": ("English MFA align (English-only segments)", step_mfa_align_en),
-    "postprocess": ("Post-processing (includes NVV brackets + sp1 normalization)", step_postprocess),
+    "postprocess": ("Post-processing (pause and punctuation normalization)", step_postprocess),
     "strict_ok": ("Independent strict-ok audit and manifest", step_strict_ok),
 }
 
@@ -6257,7 +7091,10 @@ def validate_config(cfg: dict, mode: str) -> list[str]:
             errors.append(
                 f"reference_mode=fallback conflicts with {section_name}.allow_missing_reference=false"
             )
-    if reference_mode == "fallback" and pc.get("nvv_enabled") is False:
+    _provider = str(pc.get("provider", "nvasr")).strip().lower()
+    if _provider not in {"nvasr", "qwen3_hf"}:
+        errors.append("ctc_prealign.provider must be 'nvasr' or 'qwen3_hf'")
+    if reference_mode == "fallback" and pc.get("nvv_enabled") is False and _provider == "nvasr":
         errors.append(
             "reference_mode=fallback requires ctc_prealign.nvv_enabled=true"
         )
@@ -6271,7 +7108,16 @@ def validate_config(cfg: dict, mode: str) -> list[str]:
         )
 
     # 5. NVV configuration conflicts
-    if pc.get("nvv_enabled") is False and pc.get("nvv_bias", 0) > 0:
+    if _provider == "qwen3_hf" and pc.get("nvv_enabled", False):
+        errors.append("ctc_prealign.provider=qwen3_hf requires nvv_enabled=false")
+    if _provider == "qwen3_hf" and pc.get("reference_nvv_enabled", False):
+        errors.append("ctc_prealign.provider=qwen3_hf forbids reference NVV labels")
+    if _provider == "qwen3_hf" and pc.get("all_gpus") and pc.get("forced_aligner_device"):
+        errors.append("all_gpus cannot share a fixed forced_aligner_device")
+    if (_provider == "qwen3_hf" and (not isinstance(pc.get("batch_size", 1), int)
+                                    or pc.get("batch_size", 1) < 1)):
+        errors.append("ctc_prealign.provider=qwen3_hf requires a positive batch_size")
+    if pc.get("nvv_enabled") is False and pc.get("nvv_bias", 0) > 0 and _provider == "nvasr":
         errors.append(
             "ctc_prealign.nvv_bias > 0 but nvv_enabled is false;"
             " bias will have no effect"
@@ -6279,7 +7125,7 @@ def validate_config(cfg: dict, mode: str) -> list[str]:
 
     # Reference NVV labels are part of the authoritative transcript contract
     # and must not be controlled by the optional audio-discovery switch.
-    if pc.get("reference_nvv_enabled", True) is not True:
+    if _provider == "nvasr" and pc.get("reference_nvv_enabled", True) is not True:
         errors.append(
             "ctc_prealign.reference_nvv_enabled must remain true;"
             " reference NVV labels are always preserved"
@@ -8609,7 +9455,7 @@ def run_strict_replay(args, cfg: dict, config_path: Path) -> int:
     if any(getattr(args, name, None) in (None, "") for name in required):
         print("ERROR: strict_replay requires all frozen CLI paths")
         return 1
-    forbidden = ("overwrite", "force", "step", "skip_to", "dataset_limit",
+    forbidden = ("overwrite", "refresh_ctc_work", "force", "step", "skip_to", "dataset_limit",
                  "dataset_offset", "ctc_ready", "output_staging", "use_cache",
                  "auto_cache", "scan_only", "data_dir", "python", "device",
                  "nvme_cache", "no_cache", "no_output_staging", "validate",
@@ -8964,6 +9810,9 @@ def main() -> int:
         parser.add_argument(f"--skip-{s}", action="store_true", help=f"Skip {s}")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--refresh-ctc-work", action="store_true",
+        help="Rebuild mutable CTC work from sealed Qwen evidence once, then resume normally.")
     parser.add_argument("--mfa-jobs", type=int, default=None, metavar="N",
                         help="Override mfa.num_jobs for this invocation (must be positive).")
     parser.add_argument("--mfa-en-jobs", type=int, default=None, metavar="N",
@@ -9132,6 +9981,7 @@ def main() -> int:
     print(f"Pipeline mode: {mode}")
 
     # ── Config schema validation (R8) ────────────────────────────────
+    cfg = migrate_main_prealign_config(cfg, mode)
     _config_errors = validate_config(cfg, mode)
     if _config_errors:
         print(f"ERROR: Config validation failed ({len(_config_errors)} issues):")
@@ -9792,6 +10642,7 @@ def main() -> int:
         "axis_contract_required": True,
         "ctc_pretg": workspace / cfg.get("ctc_pretg", "ctc_pretg"),
         "ctc_pretg_adj": workspace / cfg.get("ctc_pretg_adj", "ctc_pretg_adj"),
+        "_refresh_ctc_work_pending": bool(args.refresh_ctc_work),
         "en_phones_dir": en_phones_dir,
         "en_mfa_temp_dir": en_mfa_temp_dir,
         # Keep the reference transcript available to postprocess.  Full and
@@ -9825,7 +10676,7 @@ def main() -> int:
     if (args.skip_to and args.skip_to not in {"trim", "resample", "prealign"}
             and mode in ("nvrasr_fallback", "full")
             and not ctx.get("expected_stems")):
-        if _freeze_pre_ctc_stems(cfg, ctx) is None:
+        if _restore_post_ctc_resume_scope(cfg, ctx) is None:
             print("ERROR: unable to restore frozen pre-CTC denominator for resume")
             return 1
 

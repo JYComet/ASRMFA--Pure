@@ -180,6 +180,17 @@ def test_asr_fallback_positive_has_exclusive_disk_evidence(tmp_path):
                    for reason in manifest["rejected"].get("demo", []))
 
 
+def test_strict_disk_audit_rejects_raw_only_nvv_even_when_report_is_ok(tmp_path):
+    paths = verifier._write_fixture(tmp_path)
+    grid = parse_textgrid(paths["output"] / "demo.TextGrid")
+    raw = next(tier for tier in grid.tiers if tier.name == "raw_text")
+    raw.intervals[0].text = "你好 <BREATHING>"
+    write_textgrid(grid, paths["output"] / "demo.TextGrid")
+    manifest, clean = _audit_fixture(paths)
+    assert not manifest["ok"]
+    assert "cross_tier_nvv_sequence_mismatch" in manifest["rejected"]["demo"]
+
+
 def test_lab_fallback_and_ctc_ready_share_the_same_contract(tmp_path):
     paths = verifier._write_fixture(tmp_path)
     _fallback(paths, "lab_fallback")

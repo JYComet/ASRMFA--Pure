@@ -44,6 +44,7 @@ from english_units import (  # noqa: E402
     validate_processed_english_token_binding,
 )
 from postprocess_textgrids import parse_textgrid, tier_by_name  # noqa: E402
+from nvv_contract import audit_nvv_contract  # noqa: E402
 
 POLICY_VERSION = "strict-ok-v3.2"
 EN_PROVENANCE_SCHEMA = "strict-en-mfa-v2"
@@ -1638,7 +1639,7 @@ def _report_reasons(row: dict) -> list[str]:
         # They are independently checked through the reference, CTC, English
         # ledger, and publication contracts below.
         "authority_compound_reconciliation", "english_surface_units_restored",
-        "reference_numeral_normalization", "reference_text_normalized",
+        "reference_numeral_normalization", "reference_text_normalized", "timestamp_normalized_transcript",
         "reference_text_original_raw", "reference_text_raw_sha256",
         "visual_reference_digest", "word_energy_audit", "swallowed_punct",
         "terminal_punctuation_tail_absorption", "punctuation_gap_restorations",
@@ -2060,6 +2061,9 @@ def _publication_geometry_reasons(tg) -> list[str]:
 def _content_reasons(tg, reference: str, *, reference_authoritative: bool = True) -> list[str]:
     reasons: list[str] = []
     raw, pinyin, hanzi, words, phones = tg.tiers
+    # Independently recompute the exact known-NVV occurrence sequence from
+    # the final disk TextGrid; report claims cannot substitute for this.
+    reasons.extend(audit_nvv_contract(tg))
     reasons.extend(_publication_geometry_reasons(tg))
     if any(len(tier.intervals) != 1 for tier in (raw, pinyin)):
         reasons.append("raw_or_pinyin_not_single_full_interval")
@@ -3196,8 +3200,14 @@ def audit(args: argparse.Namespace) -> tuple[dict, bool]:
         receipt_path = Path("/") / ".missing_pipeline_run_receipt_v2.json"
     pipeline_receipt, receipt_reasons = _load_pipeline_receipt(Path(receipt_path))
     ctc_stems = {path.stem for path in ctc_dir.glob("*.lab")}
-    expected = (set(pipeline_receipt["eligible"]["stems"])
-                if pipeline_receipt is not None else set(ctc_stems))
+    # The audit conserves the producer's CTC output axis, not the frozen
+    # eligible denominator: stems skipped at prealign (e.g. an empty reference
+    # producing no text) have no .lab / axis rows and must not make the axis
+    # look corrupt.  Fall back to the receipt eligible only when the CTC root
+    # is empty (e.g. a replay-only audit).
+    expected = (set(ctc_stems)
+                if ctc_stems or pipeline_receipt is None
+                else set(pipeline_receipt["eligible"]["stems"]))
     axis_global_reasons, axis_stem_reasons = _axis_contract_reasons(args, expected)
     global_reasons = list(axis_global_reasons)
     lifecycle_reasons, lifecycle = _ctc_lifecycle_reasons(args, expected)
@@ -3365,6 +3375,16 @@ def audit(args: argparse.Namespace) -> tuple[dict, bool]:
         reference_path = reference_index.get(stem)
         reference_original = (reference_path.read_text(encoding="utf-8").strip()
                               if reference_path is not None else "")
+        try:
+            from qwen3_timestamp_normalization import read_normalized_transcript
+        except ImportError:
+            from .qwen3_timestamp_normalization import read_normalized_transcript
+        try:
+            qwen_normalized_text = read_normalized_transcript(ctc_dir, stem)
+            if qwen_normalized_text is not None:
+                reference_original = qwen_normalized_text
+        except (OSError, ValueError, TypeError) as exc:
+            reasons.append(f"qwen_normalized_transcript:{exc}")
         reference = reference_original
         if reference_path is not None:
             # The postprocessor projects authority references after the

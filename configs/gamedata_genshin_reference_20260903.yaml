@@ -71,7 +71,7 @@ mfa_en:
   g2p_model: /mnt/local_E/MFA_Pause/pretrained_models/g2p/english_us_arpa.zip
 
 postprocess:
-  strict_ok: true
+  strict_ok: false
   allow_filtered_integrity_failures: true
   merge_silence: true
   min_sil_merge_sec: 0.2

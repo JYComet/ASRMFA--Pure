@@ -506,6 +506,24 @@ def _direct_word(surface: str, ordinal: int = 0) -> dict:
     }
 
 
+def test_strict_dictionary_ignores_explicitly_rejected_segments(tmp_path: Path):
+    """A rejected segment stays in the ledger but cannot poison MFA inputs."""
+    base = tmp_path / "base.dict"
+    base.write_text("HELLO HH EH L OW\n", encoding="utf-8")
+    segments = {
+        "good": [{"skipped": False, "words": [_direct_word("hello")]}],
+        "bad": [{"skipped": True, "reject_reason": "source_unit_not_canonical",
+                 "words": [{}]}],
+    }
+
+    result = producer.build_en_dict(
+        segments, base, tmp_path / "unused-g2p.zip", Path("python"),
+        tmp_path / "models", tmp_path / "run", strict=True,
+    )
+
+    assert "HELLO HH EH L OW" in result.read_text(encoding="utf-8")
+
+
 def test_sos_run_local_override_preserves_app_and_base_bytes(tmp_path: Path):
     base = tmp_path / "base.dict"
     original = b"APP AE1 P\nSOS EH2 OW2 EH1 S\nSOSA S OW1 S AH0\n"

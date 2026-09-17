@@ -54,6 +54,45 @@ def test_schema_v3_extract_attach_and_raw_locator_serialization_contract():
         candidate["ctc_spike_anchor"]
 
 
+def test_reference_mode_skips_semantic_axis_round_trip_count_check():
+    # Reference (authority) mode forces words to the reference text, so the
+    # emitted semantic axis can legitimately differ from the raw NVASR decode
+    # (e.g. a leading filler "嗯" dropped by the raw decoder but present in
+    # the reference).  The raw-decode round-trip count check must therefore be
+    # skipped, not reject the bundle.
+    timeline = extract_nvasr_candidate_timeline(
+        [0, 0, 0, 0, 31, 32], "你好",
+        token_surfaces={31: "你", 32: "好"},
+        stem="ref",
+    )
+    words = [
+        {"word": "en2", "start": 0.00, "end": 0.06},
+        {"word": "ni3", "start": 0.06, "end": 0.12},
+        {"word": "hao3", "start": 0.12, "end": 0.18},
+    ]
+    errors = attach_nvasr_candidate_provenance(
+        words, [], timeline, strict_schema_v3=True)
+    assert any("round-trip count mismatch" in err for err in errors)
+    assert attach_nvasr_candidate_provenance(
+        words, [], timeline, strict_schema_v3=True,
+        reference_mode=True) == []
+
+
+def test_speechless_timeline_has_no_raw_events_and_passes_contract():
+    # A bare-punctuation reference ("……") with no speech produces zero lexical
+    # occurrences and zero raw decoder events.  That empty raw-event sequence
+    # is a valid no-speech state and must not be rejected as malformed.
+    timeline = extract_nvasr_candidate_timeline(
+        [0, 0, 0, 0], "……",
+        token_surfaces={},
+        stem="empty",
+    )
+    assert timeline["lexical_occurrences"] == []
+    assert timeline["raw_timeline_neighbors"] == []
+    assert attach_nvasr_candidate_provenance(
+        [], [], timeline, strict_schema_v3=True) == []
+
+
 def test_timeline_is_provider_free_and_preserves_duplicate_occurrences():
     surfaces = {
         101: "你",

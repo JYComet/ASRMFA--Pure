@@ -1326,6 +1326,13 @@ def build_en_dict(en_segments: dict[str, list[dict]],
     all_words: set[str] = set()
     for stem, segments in en_segments.items():
         for seg in segments:
+            # Strict corpus construction retains rejected segments so the
+            # final provenance manifest can account for them explicitly.
+            # They are not MFA launch inputs and therefore must not enter the
+            # pronunciation dictionary or turn one local rejection into a
+            # cohort-wide G2P failure.
+            if seg.get("skipped"):
+                continue
             for w in seg["words"]:
                 try:
                     unit = _validated_unit(w)

@@ -34,6 +34,7 @@ def test_single_process_retry_command_keeps_anchor(tmp_path: Path, monkeypatch):
         return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
     monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    monkeypatch.setattr(pipeline, "require_mfa_anchor_support", lambda *_args: None)
     monkeypatch.setattr(pipeline, "validate_strict_mfa_textgrid", lambda _path: [])
     result = _execute_single_process_mfa_retry(
         stem="demo", retry_root=tmp_path / "retry",

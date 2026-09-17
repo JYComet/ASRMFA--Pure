@@ -20,6 +20,7 @@ from scripts.ctc_processed_geometry import (
 )
 from scripts.adjust_ctc_boundaries import _read_pause_intervals
 from scripts.pipeline_utils import validate_ctc_authority_bundle
+from scripts.normalize_english_tokens import rewrite_ctc_textgrid_words
 
 
 def _row(text: str, ordinal: int, start: float, end: float) -> dict:
@@ -34,6 +35,56 @@ def _row(text: str, ordinal: int, start: float, end: float) -> dict:
 def _ria_row(text: str, ordinal: int) -> dict:
     start = ordinal * 0.1
     return {"word": text, "start": start, "end": start + 0.1}
+
+
+def test_rewrite_repairs_serialized_zero_duration_trailing_blank(tmp_path: Path):
+    """Mutable CTC work can heal output produced before the writer fix."""
+    path = tmp_path / "demo.TextGrid"
+    path.write_text('''File type = "ooTextFile"
+Object class = "TextGrid"
+
+xmin = 0
+xmax = 3.006281
+tiers? <exists>
+size = 2
+item []:
+    item [1]:
+        class = "IntervalTier"
+        name = "words"
+        xmin = 0
+        xmax = 3.006281
+        intervals: size = 3
+        intervals [1]:
+            xmin = 0
+            xmax = 2.84
+            text = ""
+        intervals [2]:
+            xmin = 2.84
+            xmax = 3.006281
+            text = "zhe3"
+        intervals [3]:
+            xmin = 3.006281
+            xmax = 3.006281
+            text = ""
+    item [2]:
+        class = "IntervalTier"
+        name = "pauses"
+        xmin = 0
+        xmax = 3.006281
+        intervals: size = 1
+        intervals [1]:
+            xmin = 0
+            xmax = 3.006281
+            text = ""
+''', encoding="utf-8")
+
+    rewrite_ctc_textgrid_words(path, [{
+        "word": "zhe3", "start_s": 2.84, "end_s": 3.006281,
+    }])
+
+    text = path.read_text(encoding="utf-8")
+    assert 'xmin = 3.006281\n            xmax = 3.006281' not in text
+    assert "intervals: size = 2" in text
 
 
 @pytest.mark.parametrize("token", ["a1", "a2", "a3", "a4", "a5"])
@@ -162,6 +213,33 @@ def test_authority_dropped_hyphen_gap_is_bound_to_the_compound_owner():
     assert merged[0]["surface_text"] == "K-Pop"
     assert merged[0]["source_ctc_ordinals"] == [1, 3]
     assert merged[0]["hyphen_separator_omitted"] is True
+
+
+def test_authority_alpha_digit_suffix_collects_full_surface_not_partial():
+    # Regression: "MP3" has surface "MP3" (3 chars) but alignment_token "mp"
+    # (numeric suffix stripped).  The collection loop must reach the full
+    # hyphenless surface so the digit "3" is included; stopping at the
+    # alphabetic base ("mp", 2 chars) used to raise partial_fragment_match.
+    merged = ctc._merge_reference_english_fragments(
+        [_row("MP", 0, 0.10, 0.20), _row("3", 1, 0.20, 0.30)],
+        "MP3",
+    )
+    assert len(merged) == 1
+    assert merged[0]["word"] == "mp"
+    assert merged[0]["surface_text"] == "MP3"
+    assert merged[0]["source_ctc_ordinals"] == [0, 1]
+    assert merged[0]["canonical_span"] == [0.10, 0.30]
+
+
+def test_authority_alpha_digit_single_token_is_still_exact():
+    merged = ctc._merge_reference_english_fragments(
+        [_row("MP3", 0, 0.10, 0.20)],
+        "MP3",
+    )
+    assert len(merged) == 1
+    assert merged[0]["word"] == "mp"
+    assert merged[0]["surface_text"] == "MP3"
+    assert merged[0]["canonical_span"] == [0.10, 0.20]
 
 
 @pytest.mark.parametrize("field", ["reference_identity", "canonical_unit_sha256"])
@@ -431,6 +509,19 @@ def test_readable_audio_clamp_cannot_shorten_canonical_span(monkeypatch):
     with pytest.raises(geometry.ProcessedGeometryError,
                        match="canonical_span_outside_readable_audio"):
         resolve_processed_english_spans([english], [], [], 5.2, "demo.wav")
+
+
+def test_submillisecond_terminal_frame_rounding_clamps_processed_not_canonical():
+    """A 60 ms CTC grid may round its final frame just past WAV duration."""
+    english = _canonical_timed_row(4.65, 4.95)
+    original = deepcopy(english)
+
+    resolve_processed_english_spans([english], [], [], 4.949396)
+
+    assert english["canonical_span"] == original["canonical_span"]
+    assert english["canonical_unit"] == original["canonical_unit"]
+    assert english["processed_ctc_span"] == pytest.approx([4.65, 4.949396])
+    assert english["processed_ctc_boundary_source"] == "raw_end_axis_clamp"
 
 
 def test_processed_span_extends_from_raw_60ms_anchor_to_next_lexical_start():

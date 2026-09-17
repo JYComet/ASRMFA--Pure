@@ -1,0 +1,9 @@
+# Isolated native Qwen3 HF prealign environment.
+# Keep requirements-qwen3asr.txt unchanged for the legacy qwen3asr mode.
+transformers>=5.13.0
+accelerate>=1.10.0
+torch>=2.7.0
+numpy
+pypinyin>=0.50
+soundfile
+librosa

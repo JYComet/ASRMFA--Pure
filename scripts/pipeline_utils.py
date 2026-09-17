@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Optional
 
@@ -272,6 +273,44 @@ def get_mfa_env(mfa_python: Path, models_dir: Path,
     return env
 
 
+def require_mfa_anchor_support(mfa_python: Path, models_dir: Path) -> None:
+    """Reject runtimes that silently discard our custom CTC anchor option.
+
+    Stock MFA accepts unknown CLI flags, so a successful process exit is not
+    evidence that ``--textgrid_directory`` was consumed. Probe the selected
+    interpreter's actual parameter parser without loading a model or corpus.
+    """
+    probe = (
+        "import json\n"
+        "from montreal_forced_aligner.alignment import PretrainedAligner\n"
+        "marker = '__mfa_pipeline_anchor_probe__'\n"
+        "params = PretrainedAligner.parse_parameters("
+        "None, {}, ['--textgrid_directory', marker])\n"
+        "print('MFA_ANCHOR_CAPABILITY=' + json.dumps("
+        "{'supported': str(params.get('textgrid_directory', '')) == marker}))\n"
+    )
+    try:
+        result = subprocess.run(
+            [str(mfa_python), "-c", probe], env=get_mfa_env(mfa_python, models_dir),
+            capture_output=True, text=True, timeout=30,
+        )
+        rows = [line.split("=", 1)[1] for line in result.stdout.splitlines()
+                if line.startswith("MFA_ANCHOR_CAPABILITY=")]
+        supported = (result.returncode == 0 and len(rows) == 1
+                     and json.loads(rows[0]).get("supported") is True)
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError) as exc:
+        raise ValueError(
+            f"Cannot verify MFA CTC anchor support with {mfa_python}: {exc}") from exc
+    if not supported:
+        detail = result.stderr.strip()[-1000:] if result.returncode else ""
+        raise ValueError(
+            f"MFA runtime {mfa_python} does not consume --textgrid_directory. "
+            "CTC-anchored alignment requires a compatible anchor-enabled MFA "
+            "runtime selected through python_path/--python; stock MFA may "
+            "silently ignore this option. Alignment was not started."
+            + (f" Probe error: {detail}" if detail else ""))
+
+
 # ═══════════════════════════════════════════════════════════════
 # 文件索引 — 单次 scandir + set 查找 (避免逐文件 exists())
 # ═══════════════════════════════════════════════════════════════
@@ -281,6 +320,19 @@ CTC_SUFFIXES: list[str] = [
     ".TextGrid", ".lab", "_tokens.jsonl", "_punct.json",
     "_text_cn.txt", "_text_raw.txt",
 ]
+
+CTC_PREALIGN_PROVIDERS = ("nvasr", "qwen3_hf")
+
+
+def resolve_ctc_prealign_provider(section: object) -> str:
+    """Return the explicit pre-alignment provider used by all pipeline stages."""
+    if not isinstance(section, dict):
+        raise ValueError("ctc_prealign must be a mapping")
+    provider = str(section.get("provider", "nvasr")).strip().lower()
+    if provider not in CTC_PREALIGN_PROVIDERS:
+        raise ValueError(
+            "ctc_prealign.provider must be one of " + ", ".join(CTC_PREALIGN_PROVIDERS))
+    return provider
 
 # CTC raw/work lifecycle.  The raw directory is the producer-owned input
 # namespace; all pipeline transforms must operate on the physical work copy.
@@ -745,6 +797,35 @@ def _ctc_regular_file(path: Path, label: str) -> Path:
     return path
 
 
+def _ctc_logical_stem_key(stem: str) -> str:
+    """Return the flat-namespace identity for a producer stem."""
+    return unicodedata.normalize("NFC", stem).casefold()
+
+
+def _ctc_stem_set_errors(stems: object) -> list[str]:
+    """Return invariant violations for a flat CTC producer stem list."""
+    if not isinstance(stems, list) or not stems:
+        return ["CTC raw manifest stem set is empty"]
+    if any(not isinstance(stem, str) or not stem for stem in stems):
+        return ["CTC raw manifest stem set contains an empty or non-string stem"]
+    errors: list[str] = []
+    if len(stems) != len(set(stems)):
+        errors.append("CTC raw manifest stem set contains duplicate stems")
+    keys: dict[str, str] = {}
+    for stem in stems:
+        if "/" in stem or "\\" in stem or re.match(r"^[A-Za-z]:", stem):
+            errors.append(f"CTC raw manifest stem is path-like: {stem!r}")
+        key = _ctc_logical_stem_key(stem)
+        previous = keys.get(key)
+        if previous is not None and previous != stem:
+            errors.append(
+                "CTC raw manifest stem logical collision: "
+                f"{previous!r} vs {stem!r}")
+        else:
+            keys[key] = stem
+    return errors
+
+
 def _ctc_manifest_payload(raw_dir: Path, producer_receipt: Path,
                           stems: list[str] | None = None) -> dict:
     """Build the canonical six-file inventory for an immutable CTC raw root."""
@@ -757,8 +838,9 @@ def _ctc_manifest_payload(raw_dir: Path, producer_receipt: Path,
                         if p.name.endswith("_tokens.jsonl")
                         and p.is_file() and not p.is_symlink()})
     stems = sorted(str(stem) for stem in stems)
-    if not stems or len(stems) != len(set(stems)):
-        raise ValueError("CTC raw manifest stem set is empty or duplicated")
+    stem_errors = _ctc_stem_set_errors(stems)
+    if stem_errors:
+        raise ValueError("; ".join(stem_errors))
     files: list[dict] = []
     for stem in stems:
         for suffix in CTC_SUFFIXES:
@@ -819,7 +901,8 @@ def validate_ctc_raw_manifest(raw_dir: Path, manifest: dict | None = None) -> li
             return ["CTC raw manifest schema mismatch"]
         stems = manifest.get("stems")
         files = manifest.get("files")
-        if (not isinstance(stems, list) or stems != sorted(set(stems))
+        stem_errors = _ctc_stem_set_errors(stems)
+        if (stem_errors or stems != sorted(set(stems))
                 or manifest.get("stem_count") != len(stems)
                 or manifest.get("stem_digest") != _stable_json_digest(stems)):
             errors.append("CTC raw manifest stem set invalid")
@@ -827,7 +910,7 @@ def validate_ctc_raw_manifest(raw_dir: Path, manifest: dict | None = None) -> li
             errors.append("CTC raw manifest artifact classes mismatch")
         if not isinstance(files, list) or len(files) != len(stems) * len(CTC_SUFFIXES):
             errors.append("CTC raw manifest file inventory cardinality mismatch")
-        else:
+        elif not stem_errors:
             expected = {(stem, suffix) for stem in stems for suffix in CTC_SUFFIXES}
             actual = {(row.get("stem"), row.get("suffix")) for row in files
                       if isinstance(row, dict)}
@@ -2523,6 +2606,7 @@ def write_ctc_run_receipt(
     input_stems: list[str],
     output_stems: list[str],
     audio_bindings: list[dict] | None = None,
+    extra: dict | None = None,
 ) -> dict:
     """Atomically write a CTC run receipt binding provenance evidence.
 
@@ -2556,6 +2640,8 @@ def write_ctc_run_receipt(
         "output_stems_digest": _stable_json_digest(output_sorted),
         "audio_bindings": sorted(audio_bindings or [], key=lambda row: row.get("stem", "")),
     }
+    if extra:
+        receipt["extra"] = json.loads(json.dumps(extra, ensure_ascii=False))
     receipt_path = output_dir / ".ctc_run_receipt.json"
     tmp = receipt_path.with_name(".ctc_run_receipt.json.tmp")
     tmp.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",

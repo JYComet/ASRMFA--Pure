@@ -1,0 +1,97 @@
+# NVV-only repair publication.  This is an independent, create-new run and
+# must never mutate GAMEDATA, GAMEDATA_对齐_20260903, or the legacy GAMESL root.
+schema: gamedata-nvv-repair-v1
+run_id: 20260910T000000Z-nvv-repair
+
+inputs:
+  accepted_textgrid_root: /mnt/Raw/GAMEDATA_对齐_20260903
+  paired_wav_root: /mnt/Raw/GAMESL
+  source_root: \\RS3621\Research_TTS\Data\Raw\GAMEDATA
+  frozen_manifest: /mnt/nvme3/gamedata_nvv_repair_20260910/manifests/nvv_repair.jsonl
+  # The manifest tool hashes these actual source paths itself.  It must never
+  # accept a caller-provided source hash as provenance.
+  source_resolution:
+    records_require_absolute_source_wav_path: true
+    baijing_flat_source_wav_root: /mnt/nvme3/mfa_work_gamedata_baijing_20260903/audio_16k
+    baijing_speaker_manifest: /mnt/nvme3/gamedata_20260903/baijing/.stage_manifest.json
+    fresh4_rebuild_manifests:
+      persona: /mnt/nvme3/gamedata_rebuild_20260909/runs/20260909T105050Z-fresh4/staging/persona/.rebuild_manifest.json
+      punishing_gray_raven: /mnt/nvme3/gamedata_rebuild_20260909/runs/20260909T105050Z-fresh4/staging/punishing_gray_raven/.rebuild_manifest.json
+      reverse1999: /mnt/nvme3/gamedata_rebuild_20260909/runs/20260909T105050Z-fresh4/staging/reverse1999/.rebuild_manifest.json
+    allowed_source_wav_roots:
+      - /mnt/nvme3/mfa_work_gamedata_baijing_20260903/audio_16k
+      - /mnt/nvme3/gamedata_rebuild_20260909/runs/20260909T105050Z-fresh4/staging
+  manifest_freeze:
+    mode: snapshot_production_20260910
+    dynamic_public_root_is_not_authority: true
+    snapshot_textgrids:
+      baijing: /mnt/nvme3/mfa_work_gamedata_baijing_20260903/output_staging/20260903T162031Z_2492831_2492831
+      persona: /mnt/nvme3/gamedata_rebuild_20260909/runs/20260909T105050Z-fresh4/publish_accepted_v1/persona
+      punishing_gray_raven: /mnt/nvme3/gamedata_rebuild_20260909/runs/20260909T105050Z-fresh4/accepted/punishing_gray_raven
+      reverse1999: /mnt/nvme3/gamedata_rebuild_20260909/runs/20260909T105050Z-fresh4/accepted/reverse1999
+    baijing_stage_manifest: /mnt/nvme3/gamedata_20260903/baijing/.stage_manifest.json
+    select_only_raw_nvv_nonempty_cross_tier_mismatch: true
+    expected_files_by_game:
+      baijing: 514
+      persona: 834
+      punishing_gray_raven: 25
+      reverse1999: 50
+    expected_files_total: 1423
+    expected_nvv_occurrences_total: 1452
+    frozen_manifest_sha256: d8249d4f81b52f56c53ed40696d573d4c6852d68d7a2bba19240c5b2539543aa
+
+  rerun:
+    canary_root: /mnt/nvme3/gamedata_nvv_repair_20260910/runs/20260910T094100Z-nvv-canary-v2
+    canary_materialization_receipt_sha256: c2d81a1d165becddda9c5da2c0cea3e977a3ea46bb4d16481c8792e685d382a8
+    full_root: /mnt/nvme3/gamedata_nvv_repair_20260910/runs/20260910T-full-v2
+    full_materialization_receipt_sha256: fd7b65a7a7587ce4c21bfe9a8d7d465f202f1a0ce481099e68091ed1287c646e
+    superseded_invalid_roots:
+      - /mnt/nvme3/gamedata_nvv_repair_20260910/runs/20260910T092500Z-nvv-canary
+      - /mnt/nvme3/gamedata_nvv_repair_20260910/runs/20260910T-full
+    gpu_policy: all_8_when_available
+    launcher_python: /home/user/miniconda3/bin/python
+    mfa_python_argument: /home/user/miniconda3/envs/mfa-dev/bin/python
+    run_games_serially: true
+
+outputs:
+  # Requested independent publication tree; its UNC spelling is retained for
+  # operators executing from Windows hosts.
+  root_posix: /mnt/Raw/对齐0910
+  root_unc: \\RS3621\Research_TTS\Data\Raw\对齐0910
+  aligned_textgrid: "{root_posix}/{game}/{speaker}/{stem}.TextGrid"
+  normalized_audio: "{root_posix}/GAMESL/{game}/{speaker}/{stem}.wav"
+  staging_root: /mnt/nvme3/gamedata_nvv_repair_20260910/staging
+  publish_mode: create_new_only
+
+safety:
+  source_read_only: true
+  never_overwrite:
+    - /mnt/Raw/GAMEDATA_对齐_20260903
+    - /mnt/Raw/GAMESL
+    - \\RS3621\Research_TTS\Data\Raw\GAMEDATA_对齐_20260903
+    - \\RS3621\Research_TTS\Data\Raw\GAMESL
+  reject_symlinks: true
+  require_frozen_manifest_hashes: true
+  require_paired_textgrid_wav: true
+
+nvv_contract:
+  schema: nvv-cross-tier-contract-v1
+  expected_sequence_from_manifest: true
+  require_all_tiers: [raw_text, pinyin, hanzi, words, pinyin_phones]
+  reject_missing_candidate_or_timing: true
+  reject_cross_tier_mismatch: true
+  reject_no_nvv: true
+  fallback_on_unproven_nvv: filter_item
+
+scope:
+  affected_games: [baijing, persona, punishing_gray_raven, reverse1999]
+  run_only_manifest_rows: true
+  preserve_clean_items_from_existing_verified_snapshot: false
+  output_only_repaired_passing_subset: true
+  reclassify_by_game_and_speaker: true
+  pad_wav_head_tail_seconds: 0.5
+
+verification:
+  verify_all_output_pairs_before_publish: true
+  verify_manifest_sequence_and_hash_binding: true
+  require_atomic_publish_receipt: true

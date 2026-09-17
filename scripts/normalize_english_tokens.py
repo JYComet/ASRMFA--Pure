@@ -248,6 +248,7 @@ def _reclaim_fragments(lab_tokens: list[str],
         if i > 0 and i - 1 not in to_delete:
             prev = lab_tokens[i - 1]
             if (prev.isascii() and prev.isalpha() and len(prev) >= 2
+                    and not is_nvv_token(prev)
                     and t.lower() in prev.lower()):
                 # Absorb fragment into previous word, extend its end time
                 if i - 1 in replacements:
@@ -264,6 +265,7 @@ def _reclaim_fragments(lab_tokens: list[str],
         if i + 1 < n and i + 1 not in to_delete:
             nxt = lab_tokens[i + 1]
             if (nxt.isascii() and nxt.isalpha() and len(nxt) >= 2
+                    and not is_nvv_token(nxt)
                     and t.lower() in nxt.lower()):
                 if i + 1 in replacements:
                     _, old_s, _ = replacements[i + 1]
@@ -279,6 +281,7 @@ def _reclaim_fragments(lab_tokens: list[str],
         if i > 0 and i - 1 not in to_delete:
             prev = lab_tokens[i - 1]
             if (prev.isascii() and prev.isalpha() and 1 <= len(prev) <= 2
+                    and not is_nvv_token(prev)
                     and i - 1 not in to_delete):
                 merged = prev + t
                 s = ctc_tokens[i - 1]["start_s"]
@@ -290,7 +293,8 @@ def _reclaim_fragments(lab_tokens: list[str],
         # Look right: merge with adjacent fragment
         if i + 1 < n and i + 1 not in to_delete:
             nxt = lab_tokens[i + 1]
-            if (nxt.isascii() and nxt.isalpha() and 1 <= len(nxt) <= 2):
+            if (nxt.isascii() and nxt.isalpha() and 1 <= len(nxt) <= 2
+                    and not is_nvv_token(nxt)):
                 merged = t + nxt
                 s = ctc_tokens[i]["start_s"]
                 e = ctc_tokens[i + 1]["end_s"]
@@ -380,6 +384,14 @@ def rewrite_ctc_textgrid_words(tg_path: Path, tokens: list[dict]) -> None:
         raise ValueError(f"Requires an intact standard words tier: {tg_path}")
     previous_end = original.xmin
     for index, interval in enumerate(words[0].intervals):
+        serialized_trailing_blank = (
+            index == len(words[0].intervals) - 1
+            and not interval.text.strip()
+            and abs(interval.xmin - original.xmax) <= 1e-6
+            and abs(interval.xmax - original.xmax) <= 1e-6
+        )
+        if interval.xmax <= interval.xmin and serialized_trailing_blank:
+            continue
         if interval.xmax <= interval.xmin or interval.xmin + .003 < previous_end:
             raise ValueError(f"Requires valid standard word intervals ({index}): {tg_path}")
         previous_end = interval.xmax
@@ -395,8 +407,10 @@ def rewrite_ctc_textgrid_words(tg_path: Path, tokens: list[dict]) -> None:
         if start > cursor + 1e-9:
             intervals.append(Interval(cursor, start, ""))
         intervals.append(Interval(start, end, text)); cursor = end
-    if cursor < original.xmax - 1e-9:
+    if cursor < original.xmax - 1e-6:
         intervals.append(Interval(cursor, original.xmax, ""))
+    elif intervals and abs(cursor - original.xmax) <= 1e-6:
+        intervals[-1].xmax = original.xmax
     if not intervals and original.xmax > original.xmin:
         intervals.append(Interval(original.xmin, original.xmax, ""))
     words[0].xmin = original.xmin; words[0].xmax = original.xmax; words[0].intervals = intervals

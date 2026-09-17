@@ -175,6 +175,39 @@ def test_resample_explicit_subset_reads_only_selected_stems_from_full_source(
     assert receipt_stems == [("ok_a", "ok_b")]
 
 
+def test_fresh_full_resample_defers_ctc_lineage_until_prealign(
+        tmp_path, monkeypatch):
+    source = tmp_path / "audio"
+    output = tmp_path / "audio_16k"
+    workspace = tmp_path / "workspace"
+    source.mkdir()
+    workspace.mkdir()
+    _wav = source / "a.wav"
+    with wave.open(str(_wav), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(b"\x00\x00" * 160)
+    ctx = {
+        "mode": "full", "audio_dir": source, "mfa_audio_dir": output,
+        "workspace": workspace, "ctc_pretg": workspace / "ctc_pretg",
+    }
+    lineage_calls = []
+    monkeypatch.setattr(
+        run_pipeline, "_ensure_mfa_transform_receipts",
+        lambda _ctx, stems: lineage_calls.append(tuple(stems)) or 1,
+    )
+
+    rc = run_pipeline.step_resample_for_mfa(
+        Namespace(overwrite=False),
+        {"mfa": {"num_jobs": 1}, "ctc_prealign": {"limit": 0}},
+        None, ctx)
+
+    assert rc == 0
+    assert lineage_calls == []
+    assert (output / "a.wav").is_file()
+
+
 def test_resample_flattens_nested_source_for_mfa(tmp_path):
     source = tmp_path / "source"
     nested = source / "speaker" / "nested.wav"
@@ -396,6 +429,29 @@ def test_load_ctc_accounting_without_selection_keeps_producer_scope(tmp_path):
     formal = json.loads(receipt_path.read_text())
     assert formal == producer
     assert "denominator_projection" not in formal.get("extra", {})
+
+
+def test_late_resume_keeps_formal_denominator_but_runs_only_ctc_output(tmp_path):
+    source_receipt = tmp_path / "ctc" / ".pipeline_run_receipt_v2.json"
+    formal_receipt = tmp_path / "resume_output" / ".pipeline_run_receipt_v2.json"
+    _write_ctc_accounting(
+        source_receipt,
+        source=["ctc_filtered", "ctc_pass"],
+        eligible=["ctc_filtered", "ctc_pass"],
+        output=["ctc_pass"],
+        filtered=["ctc_filtered"],
+    )
+    ctx = {
+        "mode": "nvrasr_fallback",
+        "accounting_source_receipt_path": source_receipt,
+        "accounting_receipt_path": formal_receipt,
+    }
+
+    restored = run_pipeline._restore_post_ctc_resume_scope({}, ctx)
+
+    assert restored == ("ctc_pass",)
+    assert ctx["expected_stems"] == ("ctc_filtered", "ctc_pass")
+    assert ctx["ctc_output_stems"] == ("ctc_pass",)
 
 
 def test_load_ctc_accounting_projects_legacy_full_producer_compatibly(tmp_path):
@@ -751,6 +807,23 @@ def test_partial_missing_mfa_reason_is_bound_to_accounting_receipt(tmp_path):
     }
 
 
+def test_cold_postprocess_recovers_invalid_mfa_output_as_missing(tmp_path):
+    """A strict-invalid MFA grid is absent downstream and must remain filtered."""
+    workspace = tmp_path / "workspace"
+    ledger_dir = workspace / "mfa_logs" / "run_001"
+    ledger_dir.mkdir(parents=True)
+    ledger_dir.joinpath("mfa_missing_stems.json").write_text(json.dumps({
+        "missing": [],
+        "extra": [],
+        "invalid": ["invalid_grid"],
+    }), encoding="utf-8")
+
+    recovered = run_pipeline._recover_mfa_missing_stems(
+        workspace, {"invalid_grid"})
+
+    assert recovered == {"invalid_grid"}
+
+
 def test_link_fast_path_rejects_manifest_from_full_workspace(tmp_path):
     source = tmp_path / "source"
     ctc_source = tmp_path / "source_ctc"
@@ -916,6 +989,26 @@ def test_stale_or_legacy_ctc_work_receipt_cannot_resume(tmp_path):
     assert run_pipeline._ensure_ctc_work(ctx) == work
     ctx["config"] = {"revision": 2}
     assert run_pipeline._ensure_ctc_work(ctx) is None
+
+
+def test_refresh_ctc_work_is_consumed_after_one_materialization(tmp_path):
+    raw = tmp_path / "raw"
+    work = tmp_path / "work"
+    raw.mkdir()
+    for suffix in run_pipeline._CTC_SUFFIXES:
+        (raw / f"sample{suffix}").write_text("sealed\n", encoding="utf-8")
+    (raw / ".ctc_run_receipt.json").write_text("{}\n", encoding="utf-8")
+    ctx = {
+        "ctc_pretg": raw, "ctc_pretg_adj": work, "workspace": tmp_path,
+        "data_dir": tmp_path / "data", "models_dir": tmp_path / "models",
+        "expected_stems": ("sample",), "config": {"revision": 1},
+        "reference_mode": "authority", "_refresh_ctc_work_pending": True,
+    }
+    assert run_pipeline._ensure_ctc_work(ctx) == work
+    (work / "sample.TextGrid").write_text("stale\n", encoding="utf-8")
+
+    assert run_pipeline._ensure_ctc_work(ctx) is None
+    assert ctx["_refresh_ctc_work_pending"] is False
 
     receipt_path = work / run_pipeline.CTC_WORK_RECEIPT_NAME
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))

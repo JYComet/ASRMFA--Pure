@@ -1,0 +1,65 @@
+mode: full
+reference_mode: authority
+data_dir: /mnt/nvme3/bailu_0915_reference_test100_eligible_input
+workspace: /mnt/nvme3/mfa_workspace_bailu_0915_reference_test100_punctsync
+output_dir: /mnt/Raw/0915/白露_reference_test100_punctsync/output
+output_staging: true
+keep_16k_audio: true
+trim:
+  workers: 32
+ctc_prealign:
+  enabled: true
+  provider: qwen3_hf
+  python: /home/user/miniconda3/bin/python
+  model_path: /mnt/nvme3/models/Qwen3-ASR-1.7B-hf
+  forced_aligner_model_path: /mnt/nvme3/models/Qwen3-ForcedAligner-0.6B-hf
+  device: cuda:0
+  dtype: bfloat16
+  language: Chinese
+  context: ''
+  max_new_tokens: 2048
+  batch_size: 4
+  all_gpus: true
+  limit: 0
+  timeout: 86400
+  nvv_enabled: false
+  reference_nvv_enabled: false
+ctc_adjust:
+  enabled: true
+  limit: 0
+mfa:
+  num_jobs: 40
+  single_speaker: true
+  native_anchor_fallback: true
+  dither: 0.0
+  output_format: long_textgrid
+  clean: false
+  fine_tune: false
+  skip_validate: true
+  beam: 20
+  retry_beam: 80
+  allow_partial: true
+  min_output_ratio: 0.9
+mfa_en:
+  enabled: true
+  strict_provenance: true
+  num_jobs: 8
+  padding_ms: 75
+  beam: 10
+  retry_beam: 40
+  fine_tune: false
+postprocess:
+  strict_ok: false
+  allow_filtered_integrity_failures: true
+  merge_silence: true
+  min_sil_merge_sec: 0.2
+  fix_short_word: true
+  short_word_max_sec: 0.25
+  flank_silence_sec: 0.4
+  detect_bgm: true
+  filter_suspicious: true
+  filter_min_phone_coverage: 0.35
+  enable_text_correction: true
+  handle_unexpected_sil: true
+  workers: 32
+python_path: /home/user/miniconda3/envs/mfa-dev/bin/python

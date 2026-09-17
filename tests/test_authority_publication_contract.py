@@ -425,6 +425,17 @@ def test_reference_coverage_allows_missing_punctuation_but_rejects_replacement()
     assert "reference_semantic_sequence_mismatch" in reasons
 
 
+def test_publication_contract_rejects_raw_only_nvv_surface():
+    fixture = _contract_fixture(include_comma=False)
+    words, hanzi, pp, phones, reference, source, ctc, provenance = fixture
+    raw = Tier("raw_text", 0.0, 1.0, [Interval(0.0, 1.0, "你[Breathing]好")])
+    pinyin = Tier("pinyin", 0.0, 1.0, [Interval(0.0, 1.0, "ni3 hao3")])
+    reasons, _details = _publication_contract_audit(
+        words, hanzi, pp, phones, reference, source, ctc, True, provenance,
+        raw_text_tier=raw, pinyin_tier=pinyin)
+    assert "cross_tier_nvv_sequence_mismatch" in reasons
+
+
 def test_ok100_audit_reports_per_stem_and_conservation_failure(tmp_path: Path):
     selection_path = Path(__file__).parents[1] / "configs" / \
         "hecheng_ria_ok100_authority.selection.json"

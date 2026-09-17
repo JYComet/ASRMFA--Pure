@@ -2,12 +2,14 @@
 # 输入已落地到 NVMe (扁平 wav, 无参考 txt): /mnt/nvme3/gamedata_20260903/reverse1999/
 # 无参考文本: 用 NVASR ASR 输出作为文本。
 #
-# 执行模型: ASR(NVASR/CTC) 只用 2 张 GPU (streaming.num_gpus=2);
-#           MFA/English MFA 全 CPU 执行 (pipelined.cpu_workers)。
+# 执行模型: ASR(NVASR) 用 2 张 GPU (CUDA_VISIBLE_DEVICES=5,6, all_gpus=true);
+#           MFA/English MFA 全 CPU 执行。与有参考模式同走 run_pipeline.py。
 #
-# 运行 (streaming pipelined):
-#   /home/user/miniconda3/envs/mfa-dev/bin/python scripts/streaming_pipeline.py \
-#       --config configs/gamedata_reverse1999_noref_20260903.yaml --pipelined
+# 运行:
+#   CUDA_VISIBLE_DEVICES=5,6 \
+#     /home/user/miniconda3/envs/mfa-dev/bin/python scripts/run_pipeline.py \
+#       --config configs/gamedata_reverse1999_noref_20260903.yaml \
+#       --python /home/user/miniconda3/envs/mfa-dev/bin/python
 mode: nvrasr_fallback
 reference_mode: fallback
 
@@ -20,27 +22,12 @@ workspace: /mnt/nvme3/mfa_work_gamedata_reverse1999_20260903
 pad_silence:
   enabled: false
 
-streaming:
-  batch_cache: cache/gamedata_reverse1999_noref_20260903.cache.json
-  batch_size: 132
-  parallel: 2
-  num_gpus: 2
-  prefetch_buffer: 4
-  upload_buffer: 4
-  local_work:
-    - /mnt/nvme0/mfa_work_gamedata_reverse1999_20260903
-    - /mnt/nvme3/mfa_work_gamedata_reverse1999_20260903
-
-pipelined:
-  cpu_workers: 8
-  restore_ctc_cache: false
-
 ctc_prealign:
   enabled: true
   python: /home/user/miniconda3/envs/asr/bin/python
   model_path: /mnt/local_E/nvvasr_standalone/models/Multilingual-NVASR
   device: cuda:0
-  all_gpus: false
+  all_gpus: true
   limit: 0
   timeout: 7200
   nvv_enabled: true
@@ -54,7 +41,7 @@ ctc_ready:
   allow_missing_reference: true
 
 mfa:
-  num_jobs: 8
+  num_jobs: 64
   single_speaker: true
   output_format: long_textgrid
   clean: false
@@ -67,8 +54,8 @@ mfa:
 
 mfa_en:
   enabled: true
-  strict_provenance: true
-  num_jobs: 4
+  strict_provenance: false
+  num_jobs: 16
   beam: 10
   retry_beam: 40
   fine_tune: false

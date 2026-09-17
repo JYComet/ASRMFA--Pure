@@ -1,0 +1,55 @@
+# Incremental GAMEDATA preparation contract (no MFA/ASR execution).
+# This run rebuilds reverse1999 and the three newly discovered source folders.
+schema: gamedata-rebuild-v1
+source_root: \\RS3621\Research_TTS\Data\Raw\GAMEDATA
+staging_root: /mnt/nvme3/gamedata_rebuild_20260909/staging
+archive_root: /mnt/Raw/.gamedata_publish_archive
+run_root_template: /mnt/nvme3/gamedata_rebuild_20260909/runs/{run_id}
+publish_staging_root: /mnt/Raw/.gamedata_publish_staging
+publish_archive_root: /mnt/Raw/.gamedata_publish_archive
+output_root: \\RS3621\Research_TTS\Data\Raw\GAMEDATA_对齐_20260903
+gamesl_root: \\RS3621\Research_TTS\Data\Raw\GAMESL
+ffmpeg: /home/user/miniconda3/envs/mfa-dev/bin/ffmpeg
+
+games:
+  - codename: reverse1999
+    source_name: 重返未来1999
+    source_dir: 重返未来1999
+    reference_mode: auto
+  - codename: persona
+    source_name: 女神异闻录
+    source_dir: 女神异闻录
+    reference_mode: auto
+  - codename: punishing_gray_raven
+    source_name: 战双帕弥什
+    source_dir: 战双帕弥什
+    reference_mode: auto
+  - codename: wuwa_new
+    source_name: 物华弥新
+    source_dir: 物华弥新
+    reference_mode: auto
+
+# ``auto`` means a non-empty sibling TXT is authority text and all other
+# records are sent through the ASR fallback configuration.  The resolved
+# per-game split is written to .pipeline_configs.json in each staging dir.
+inventory:
+  audio_extensions: [.wav, .ogg, .mp3, .flac, .m4a, .aac, .opus, .wma]
+  reference_text: same_directory_nonempty_same_stem
+  collision_policy: deterministic_dup_suffix
+
+output_layout:
+  aligned_textgrid: "{output_root}/{game}/{speaker}/{stem}.TextGrid"
+  normalized_audio: "{gamesl_root}/{game}/{speaker}/{stem}.wav"
+  staging_manifest: "{staging_root}/{game}/.rebuild_manifest.json"
+  pipeline_configs: "{staging_root}/{game}/.pipeline_configs.json"
+
+pipeline:
+  split_by_text_mode: true
+  reference:
+    pipeline_kind: reference
+    reference_mode: authority
+    allow_missing_reference: false
+  asr:
+    pipeline_kind: noref
+    reference_mode: fallback
+    allow_missing_reference: true

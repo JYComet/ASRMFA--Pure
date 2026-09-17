@@ -48,3 +48,21 @@ def test_indexed_wav_disappearance_falls_back_to_recursive_lookup(tmp_path: Path
     indexed.unlink()
 
     assert _find_wav("vanishing", tmp_path, index) == fallback
+
+
+def test_wav_index_preserves_broad_stem_names_and_nested_long_parents(
+        tmp_path: Path):
+    parent = (tmp_path / "parent with spaces" / "中文🙂" / "e\u0301"
+              / ("nested-" + "x" * 80) / "part.one")
+    parent.mkdir(parents=True)
+    names = [".leading.wav", "-leading.wav", "clip.multi.part.wav",
+             "e\u0301🙂.wav"]
+    for name in names:
+        (parent / name).write_bytes(b"wav")
+
+    index = _build_wav_index(tmp_path)
+
+    assert {key for key in index if key in {name[:-4] for name in names}} == {
+        name[:-4] for name in names}
+    for name in names:
+        assert _find_wav(name[:-4], tmp_path, index) == parent / name

@@ -1,5 +1,59 @@
 # Qwen3-ASR 模式：transcript_only 与 anchored_nvv
 
+## 主管线默认：原生 Qwen 后端与固定时间戳正则化
+
+当前设计见 [Qwen3 主管线设计](superpowers/specs/2026-09-14-qwen3-main-pipeline-design.md)。
+无参考文本先识别再生成时间戳，有参考文本只使用 ForcedAligner。两者都将非开头 sp0 并入前词；
+sp1/2/3 优先保留原标点并用标点覆盖静音，无标点才补省略号，开头静音不补省略号。
+再执行原有 MFA 锚点修正和对齐。最终文本及独立审计采用修复后的文本。
+新主流程不会回退 FunASR/NVASR；下文独立 `qwen3asr/anchored_nvv` 属于保留的历史独立工具。
+
+与下文的独立 `mode: qwen3asr` 不同，`ctc_prealign.provider: qwen3_hf` 使用普通
+`full` 管线的预对齐位置。它替换该位置上的 NVASR/FunASR 推理，并继续执行 MFA。
+配置模板见 `configs/qwen3_hf_canary.yaml`，能力依据见 `docs/QWEN3_UPGRADE_ANALYSIS.md`。
+
+需要两个本地原生模型目录：`Qwen3-ASR-1.7B-hf`（也可选 `0.6B-hf`）与
+`Qwen3-ForcedAligner-0.6B-hf`。使用独立环境安装 `requirements-qwen3-hf.txt`。
+原生 ASR 要求 Transformers 5.13.0 及以上；还必须具备原生 ForcedAligner 处理器接口。
+如果安装版本缺少 `prepare_forced_aligner_inputs` 或 `decode_forced_alignment`，按
+[官方模型卡](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B-hf)安装支持该模型的
+Transformers 源码版本。管线不会自动下载或转换模型。
+
+先将模板中的数据、模型和解释器路径改为实际本地路径。可直接预检而不加载权重或创建输出：
+
+```bash
+/path/to/qwen3-hf/bin/python scripts/qwen3_prealign.py \
+  --data-dir /path/to/reference-and-wavs --audio-dir /path/to/wavs \
+  --output-dir /path/to/fresh-check-output \
+  --model-path /local/models/Qwen3-ASR-1.7B-hf \
+  --forced-aligner-model-path /local/models/Qwen3-ForcedAligner-0.6B-hf \
+  --reference-mode auto --language Chinese --no-nvv --check
+```
+
+预检验证模型树、运行时 API、输入选择及长度；处理器和权重实际加载是否成功仍需短音频
+试跑。准备好实际路径后运行 `python scripts/run_pipeline.py --config configs/qwen3_hf_canary.yaml`。
+`reference_mode: authority` 对齐已有参考文本；`fallback` 始终识别；`auto` 按每条音频是否
+存在非空参考文本选择。可以设置 `language`、`context` 热词提示和 `max_new_tokens`。
+
+当前模型按单条音频离线推理，`batch_size` 控制每卡排队数，`all_gpus` 使用所有可见 GPU，
+每卡使用独立的 spawn 进程持有 Qwen ASR 与 ForcedAligner，避免 Transformers 并发加载共享状态。
+进程在该卡的全部任务间复用模型，父进程按输入顺序收集结果和写入交接文件。每条音频不超过 300 秒。
+显存不足以同时容纳两个模型时，可在 `ctc_prealign` 设置 `device: cuda:1` 和
+`forced_aligner_device: cuda:0`，将 ASR 与 ForcedAligner 整体放到不同 GPU。
+省略 `forced_aligner_device` 时沿用 `device`；显式设置时要求 `all_gpus: false`。
+模型本身的批推理、11 语言对齐、流式 ASR 等能力不代表本次 MFA 管线全部支持这些模式。
+现有 MFA 字典交接支持中文字符和英文规范词条；不支持的词条会明确拒绝。
+
+结果包含原有六文件交接，以及参考文本侧车（仅有参考文本时）、manifest、身份记录和
+producer/accounting receipts。`provider` 为 `qwen3_hf`，`lexical_timing_source` 为
+`qwen3_forced_aligner_hf`。英文参考词保留 canonical metadata；其中历史字段
+`source_ctc_ordinals` 表示交接词条的来源序号，另有 `source_ordinal_provider` 标明 Qwen，
+不表示模型产生了 CTC 帧。词／字时间戳不能冒充音素时间戳，音素仍由 MFA 生成。
+
+该后端拒绝 NVV 开关及参考文本中的 NVV 事件标签，不生成笑声／喘息等事件候选。
+同身份的完整结果可直接复用；失败项可重试；模型、输入、参考文本或已有结果变化时
+拒绝继续覆盖，应选择新输出目录。进程中断导致缺少正式身份记录时也要求新目录。
+
 ## 目标与非目标
 
 `mode: qwen3asr` 是独立的本地 Qwen producer，不是现有 NVASR/CTC/MFA 管线的新 step。
@@ -40,8 +94,8 @@ run_pipeline.py
 
 | 模式/入口 | 与 Qwen 模式的关系 | 兼容策略 |
 |---|---|---|
-| `full` | 无关系 | step order、NVASR、MFA 和 receipt 不变 |
-| `nvrasr_fallback` | 无关系 | 继续由当前 NVASR 同时提供 lexical/NVV/CTC |
+| `full` | 主管线使用原生 Qwen | 固定时间戳正则化；MFA 与既有后处理保留 |
+| `nvrasr_fallback` | 保留模式名，producer 迁移 Qwen | 无参考识别与时间戳正则化，不再调用 NVASR |
 | `ctc_ready` | 无关系 | 继续导入既有 CTC bundle，不读取 Qwen output |
 | `batch_ctc_ready` | 无关系 | launcher 和 dataset accounting 不变 |
 | `strict_replay` | 无关系 | sealed evidence/receipt 不变 |

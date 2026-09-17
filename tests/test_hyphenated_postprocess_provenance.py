@@ -83,6 +83,30 @@ def test_012871_canary_restores_one_surface_owner_without_mfa(tmp_path):
     assert len(pairs) == 1
 
 
+def test_strict_report_and_evidence_preserve_hyphenated_unicode_spelling(tmp_path):
+    """Surface publication keeps exact reference spelling in evidence paths."""
+    ledger_path, _ = _ledger_fixture(tmp_path)
+    words = post.Tier("words", 0.0, 0.4, [
+        post.Interval(0.0, 0.4, "KPop"),
+    ])
+    hanzi = post.Tier("hanzi", 0.0, 0.4, [
+        post.Interval(0.0, 0.4, "KPop"),
+    ])
+    restored = post._restore_reference_surfaces(
+        words, hanzi, "你好K-Pop🙂")
+    report, pairs = post.load_strict_en_provenance(
+        "012871", words, tmp_path, reference_text="你好K-Pop🙂")
+
+    assert restored == ["en-u0000"]
+    assert report["status"] == "verified"
+    assert report["ledger_sha256"] == hashlib.sha256(
+        ledger_path.read_bytes()).hexdigest()
+    assert report["failed_word_ids"] == []
+    assert pairs[0][1]["word_id"] == "012871:s0:w0"
+    assert words.intervals[0].text == "K-Pop"
+    assert hanzi.intervals[0].text == "K-Pop"
+
+
 def test_fallback_english_projects_processed_raw_ordinal_to_compact_ctc_axis(
         tmp_path):
     """Processed CTC and MFA-source raw interval ordinals are different axes."""

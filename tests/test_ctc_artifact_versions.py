@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import wave
 from pathlib import Path
@@ -37,6 +38,20 @@ from scripts.pipeline_utils import (  # noqa: E402
     write_ctc_raw_manifest,
     write_ctc_work_receipt,
 )
+
+
+def test_adjust_cli_propagates_main_failure_exit_code(tmp_path):
+    """A failed atomic adjust must stop the the parent pipeline."""
+    missing = tmp_path / "missing"
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "adjust_ctc_boundaries.py"),
+         "--ctc-dir", str(missing), "--audio-dir", str(missing),
+         "--output-dir", str(tmp_path / "output"),
+         "--raw-manifest", str(missing / ".ctc_raw_manifest.json")],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 1
+    assert "raw manifest unavailable" in result.stdout
 
 
 def _sha256(path: Path) -> str:
@@ -160,6 +175,44 @@ def _bind_nvasr_lifecycle(monkeypatch, fixture: dict) -> None:
         "CTC_WORK_RECEIPT", str(fixture["work_receipt_path"]))
 
 
+def _write_flat_raw_namespace(root: Path, stems: list[str]) -> Path:
+    """Write the six-file producer namespace used by ambiguity canaries."""
+    root.mkdir(parents=True)
+    for stem in stems:
+        for suffix in CTC_SUFFIXES:
+            (root / f"{stem}{suffix}").write_text(
+                f"evidence:{stem}:{suffix}\n", encoding="utf-8")
+    receipt = root / ".ctc_run_receipt.json"
+    receipt.write_text('{"schema":"ctc-run-receipt-v2"}\n', encoding="utf-8")
+    return receipt
+
+
+@pytest.mark.parametrize("stems", [
+    ["duplicate", "duplicate"],
+    ["Clip", "clip"],
+    ["e\u0301", "é"],
+])
+def test_flat_producer_namespace_fails_closed_on_logical_stem_collisions(
+        tmp_path, stems):
+    """A flat namespace must reject exact, casefold, and NFC collisions."""
+    raw = tmp_path / "deep parent with spaces" / "中文🙂" / ("nested-" + "x" * 80)
+    receipt = _write_flat_raw_namespace(raw, stems)
+
+    with pytest.raises(ValueError, match="(?i)(duplicate|collision|ambiguous|stem)"):
+        write_ctc_raw_manifest(raw, producer_receipt=receipt, stems=stems)
+
+
+def test_flat_producer_namespace_accepts_distinct_multidot_leading_names(
+        tmp_path):
+    stems = [".leading", "-leading", "clip.part.two", "中文🙂"]
+    raw = tmp_path / "a" / "b" / "c" / ("long-" + "p" * 70)
+    receipt = _write_flat_raw_namespace(raw, stems)
+
+    manifest = write_ctc_raw_manifest(raw, producer_receipt=receipt, stems=stems)
+    assert manifest["stems"] == sorted(stems)
+    assert {row["stem"] for row in manifest["files"]} == set(stems)
+
+
 def _fresh_nvasr_owner_inputs(fixture: dict):
     stem = fixture["stem"]
     rows = [json.loads(line) for line in
@@ -222,6 +275,125 @@ def test_fresh_schema_v3_lifecycle_builds_manifest_authority_before_owner(
     assert provenance["status"] == "verified"
 
 
+def test_qwen3_lifecycle_verifies_forced_aligner_rows_without_nvasr_locators(tmp_path):
+    stem = "demo"
+    name = f"{stem}_tokens.jsonl"
+    raw_rows = [{
+        "unit": "你", "text": "你", "word": "ni3",
+        "start_s": 0.08, "end_s": 0.16,
+        "raw_start_s": 0.08, "raw_end_s": 0.16,
+        "provider": "qwen3_hf",
+        "lexical_timing_source": "qwen3_forced_aligner_hf",
+        "source": "qwen3_forced_aligner_hf",
+    }]
+    raw_manifest = {
+        "identity": "raw-id",
+        "files": [{"stem": stem, "suffix": "_tokens.jsonl",
+                   "name": name, "sha256": "raw-sha"}],
+    }
+    work_receipt = {
+        "identity": "work-id",
+        "files": [{"stem": stem, "suffix": "_tokens.jsonl", "name": name}],
+    }
+
+    authority = post._nvasr_build_producer_authority(
+        raw_manifest, work_receipt, tmp_path, tmp_path, stem,
+        raw_rows=raw_rows, work_rows=json.loads(json.dumps(raw_rows)))
+
+    assert authority["summary"]["status"] == "verified"
+    assert authority["summary"]["provider"] == "qwen3_hf"
+    assert authority["summary"]["candidate_count"] == 0
+    assert authority["summary"]["reasons"] == []
+
+
+def test_qwen3_lifecycle_rejects_tampered_forced_aligner_raw_timing(tmp_path):
+    stem = "demo"
+    name = f"{stem}_tokens.jsonl"
+    raw_rows = [{
+        "unit": "你", "text": "你", "word": "ni3",
+        "start_s": 0.08, "end_s": 0.16,
+        "raw_start_s": 0.08, "raw_end_s": 0.16,
+        "provider": "qwen3_hf",
+        "lexical_timing_source": "qwen3_forced_aligner_hf",
+        "source": "qwen3_forced_aligner_hf",
+    }]
+    work_rows = json.loads(json.dumps(raw_rows))
+    work_rows[0]["raw_end_s"] = 0.24
+    raw_manifest = {
+        "identity": "raw-id",
+        "files": [{"stem": stem, "suffix": "_tokens.jsonl",
+                   "name": name, "sha256": "raw-sha"}],
+    }
+    work_receipt = {
+        "identity": "work-id",
+        "files": [{"stem": stem, "suffix": "_tokens.jsonl", "name": name}],
+    }
+
+    authority = post._nvasr_build_producer_authority(
+        raw_manifest, work_receipt, tmp_path, tmp_path, stem,
+        raw_rows=raw_rows, work_rows=work_rows)
+
+    assert authority["summary"]["status"] == "rejected"
+    assert "qwen3_forced_aligner_projection_mismatch" in authority["summary"]["reasons"]
+
+
+def test_qwen_pinyin_projection_requires_sealed_source_and_exact_derivation(tmp_path):
+    import hashlib
+    from scripts.qwen3_prealign import reproject_pinyin_rows
+    stem = "demo"
+    source = "完成。都认真！"
+    text_path = tmp_path / "demo_text_cn.txt"
+    text_path.write_text(source, encoding="utf-8")
+    raw = [{"unit": u, "text": u, "word": w,
+            "start_s": i * 0.2, "end_s": i * 0.2 + 0.1,
+            "raw_start_s": i * 0.2, "raw_end_s": i * 0.2 + 0.1,
+            "provider": "qwen3_hf", "source": "qwen3_forced_aligner_hf",
+            "lexical_timing_source": "qwen3_forced_aligner_hf"}
+           for i, (u, w) in enumerate(zip("完成都认真", [
+               "wan2", "cheng2", "du1", "ren4", "zhen1"]))]
+    manifest = {"identity": "raw-id", "files": [
+        {"stem": stem, "suffix": "_tokens.jsonl", "name": "demo_tokens.jsonl", "sha256": "raw-sha"},
+        {"stem": stem, "suffix": "_text_cn.txt", "name": text_path.name,
+         "sha256": hashlib.sha256(text_path.read_bytes()).hexdigest()}]}
+    receipt = {"identity": "work-id", "files": [
+        {"stem": stem, "suffix": "_tokens.jsonl", "name": "demo_tokens.jsonl"}]}
+    work = reproject_pinyin_rows(raw, source)
+    def check():
+        return post._nvasr_build_producer_authority(
+            manifest, receipt, tmp_path, tmp_path, stem,
+            raw_rows=raw, work_rows=work)["summary"]
+    assert check()["status"] == "verified"
+    work[2]["word"] = "ma3"
+    assert check()["status"] == "rejected"
+    work = reproject_pinyin_rows(raw, source)
+    work[2].pop("pinyin_projection")
+    assert check()["status"] == "rejected"
+    work = reproject_pinyin_rows(raw, source)
+    text_path.write_text("完成都认真", encoding="utf-8")
+    assert check()["status"] == "rejected"
+
+
+def test_v3_source_core_span_conflict_reports_reason_not_name_error(
+        monkeypatch, tmp_path):
+    fixture = _fresh_nvasr_authority_fixture(tmp_path)
+    _bind_nvasr_lifecycle(monkeypatch, fixture)
+    lifecycle = post._load_ctc_lifecycle(fixture["work"], fixture["stem"])
+    authority = lifecycle["_nvasr_producer_authority"]
+    rows, words, source_words = _fresh_nvasr_owner_inputs(fixture)
+    source_words.insert(1, {
+        "ordinal": 0, "ctc_lexical_ordinal": 0,
+        "start": 0.005, "end": 0.03, "text": "ni3",
+    })
+
+    result = post._contain_nvasr_frame_support(
+        words, rows, wav_duration_s=0.5, source_words=source_words,
+        source_phone_lineage={"owners": {}},
+        producer_authority=authority, strict_schema_v3=True)
+
+    assert result["status"] == "rejected"
+    assert "source_adjacent_core_span_conflict:0" in result["reasons"]
+
+
 def test_english_merge_retains_left_row_and_unions_source_ordinals(tmp_path):
     (tmp_path / "demo_ref.txt").write_text("hello\n", encoding="utf-8")
     (tmp_path / "demo.lab").write_text("hel lo\n", encoding="utf-8")
@@ -245,6 +417,31 @@ def test_english_merge_retains_left_row_and_unions_source_ordinals(tmp_path):
     assert rows[0]["start_s"] == 0.0
     assert rows[0]["end_s"] == 0.2
     assert "ctc_lexical_ordinal" not in rows[0]
+
+
+@pytest.mark.parametrize(("lab_tokens", "nvv_index"), [
+    (["in", "BREATHING"], 1),
+    (["A", "LAUGHTER"], 1),
+    (["R", "BREATHING"], 1),
+])
+def test_fragment_reclaim_never_consumes_adjacent_nvv(lab_tokens, nvv_index):
+    """Short English fragments must not rewrite an NVV evidence row."""
+    rows = [
+        {
+            "word": word,
+            "start_s": index * 0.1,
+            "end_s": (index + 1) * 0.1,
+            "candidate_id": f"nvv-{index}" if index == nvv_index else None,
+        }
+        for index, word in enumerate(lab_tokens)
+    ]
+
+    new_lab, new_rows, merged = normalize_en._reclaim_fragments(
+        lab_tokens, rows)
+
+    assert merged == 0
+    assert new_lab == lab_tokens
+    assert new_rows == rows
 
 
 def test_standalone_normalize_en_rebases_before_bundle_validation(
@@ -541,7 +738,7 @@ def test_raw_manifest_is_immutable_and_work_is_physical_six_artifact_copy(tmp_pa
 
 
 def test_adjust_disabled_still_binds_independent_work_directory(monkeypatch, tmp_path):
-    raw, manifest_path, _ = _raw_fixture(tmp_path)
+    raw, manifest_path, manifest = _raw_fixture(tmp_path)
     work = tmp_path / "workspace" / "ctc_pretg_adj"
     called = []
     monkeypatch.setattr(run_pipeline, "run_python",
@@ -566,6 +763,9 @@ def test_adjust_disabled_still_binds_independent_work_directory(monkeypatch, tmp
     assert work.is_dir() and work != raw
     receipt = json.loads((work / CTC_WORK_RECEIPT_NAME).read_text(encoding="utf-8"))
     assert receipt["work_root"] == str(work.resolve())
+    assert receipt["raw_manifest"]["path"] == str(manifest_path.resolve())
+    assert receipt["raw_manifest"]["sha256"] == _sha256(manifest_path)
+    assert receipt["raw_manifest"]["identity"] == manifest["identity"]
     assert receipt["transform_ledger"][-1]["stage"] == "adjust"
     assert receipt["transform_ledger"][-1]["status"] == "geometry_only"
     assert receipt["transform_ledger"][-1]["work_files_digest"]
@@ -886,6 +1086,36 @@ def test_sp0_merge_survives_sync_barrier_and_textgrid_roundtrip(tmp_path):
     assert post._processed_geometry_digest(post.tier_by_name(loaded, "words")) == digest
     assert any(iv.text == "<sp0>"
                for iv in post.tier_by_name(loaded, "words").intervals)
+
+
+def test_frozen_words_have_one_final_derived_publication_transaction(monkeypatch):
+    """R5: derived tiers publish once after the words geometry freeze."""
+    words = post.Tier("words", 0.0, 0.4, [
+        post.Interval(0.0, 0.2, "ni3"),
+        post.Interval(0.2, 0.4, "hao3"),
+    ])
+    grid = post.TextGrid(0.0, 0.4, [
+        post.Tier("raw_text", 0.0, 0.4, [post.Interval(0.0, 0.4, "你好")]),
+        post.Tier("pinyin", 0.0, 0.4, [post.Interval(0.0, 0.4, "ni3 hao3")]),
+        words,
+    ])
+    frozen, reasons = post._freeze_processed_geometry(grid)
+    assert frozen is words
+    assert reasons == []
+
+    rebuilds = []
+    original = post._rebuild_derived_from_frozen_words
+
+    def counted(*args, **kwargs):
+        rebuilds.append(args[0])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(post, "_rebuild_derived_from_frozen_words", counted)
+    post._rebuild_derived_from_frozen_words(
+        grid, {}, None, "你好", warnings=[])
+    assert rebuilds == [grid]
+    assert grid._derived_publication_transaction["tiers"] == [
+        "hanzi", "pinyin_phones", "raw_text", "pinyin"]
 
 
 @pytest.mark.parametrize("layout", ["punct-sp", "sp-punct"])

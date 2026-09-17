@@ -12419,3 +12419,917 @@ NVASR（SenseVoice 系）把中文语气词（哎/咦/嗯/啊 等）转写为语
 4. `verify_reference_authority.py` 中 `_case_reference_only_masks_nvv_ids_in_free_decode`
    的 enable_nvv 断言已改为"保留槽位 bias / 被删槽位 -inf"，并通过对 `NVV_SUPPRESSED_IDS`
    的导入引用。
+
+## Case 227: authority 字母数字后缀收集只到 alpha 基（MP3 → partial_fragment_match）
+
+**日期**：2026-09-03
+**涉及文件**：`scripts/ctc_prealign.py`（`_merge_reference_english_fragments`，约 3336-3352）
+**状态**：已修复；单文件复现 2/2 OK + 定向 pytest 通过
+
+### 问题与真实原因
+
+参考文本 `MP3，旧时代的一种音乐播放器。` 里的 `MP3` 是字母+数字 token。
+`_merge_reference_english_fragments` 收集候选 CTC 行时用
+`len(authority.alignment_token)` 作为停止目标。`alignment_token` 由
+`_canonical_token` 生成并剥离尾部数字（`re.sub(r"[0-9]+$", "", token)`），对 `MP3`
+得到 `mp`（长度 2）；同时累加紧凑长度用的是 `is_english_token`，而
+`is_english_token("3")` 为 False（数字不算英文 token）。因此当 NVASR 把 `MP3` 拆成
+`MP` + `3` 两行时，收集在 `MP`（长度 2）就停下、漏掉 `3`，共享校验器
+`validate_authority_fragment_group` 比较 compact=`mp` 与 authority_surface=`mp3`
+（长度 2 < 3）抛出 `partial_fragment_match`，ValueError 一路传播把整个 prealign
+shard 崩掉（`SystemExit`），不只是跳过该条。
+
+根因链：`alignment_token` 是字典查询键（剥数字后缀，`target1`/`target2` 都归并到
+`target`），不是收集目标；收集循环把"字典键长度"当成了"surface 身份长度"。校验器
+比较的权威身份是 `surface_text`（保留数字后缀），两者长度不一致。
+
+### 修复与不变量
+
+- 收集目标改为 `len(authority.surface_text.replace("-", ""))`（完整 surface 去连字符
+  长度，含数字后缀）。
+- 累加条件从 `is_english_token` 改为 `is_english_fragment_token`（`english_units`，
+  承认数字-only 片段作为最终后缀），使 `MP` + `3` 累计到 3 并停下；单 token `MP3`
+  也照常通过。
+- 不变量不变：CJK/NVV/标点越界仍由共享校验器 fail-closed 拒绝；数字后缀仍必须位于
+  组尾。
+
+### 验证
+
+- 单文件复现：`Vo_dlc35ep6_girl001_14`（含 `MP3`）单独跑
+  `ctc_prealign --no-nvv --reference-mode authority` → 通过（原硬崩）。
+- 新增 `tests/test_ctc_english_units.py::test_authority_alpha_digit_suffix_collects_full_surface_not_partial`
+  与 `test_authority_alpha_digit_single_token_is_still_exact`。
+- `pytest tests/test_ctc_english_units.py tests/test_nvasr_candidate_timeline.py` → 89 passed。
+
+## Case 228: 参考文本模式语义轴 round-trip 计数校验误拒（raw decode vs 强制参考文本）
+
+**日期**：2026-09-03
+**涉及文件**：`scripts/ctc_prealign.py`（`attach_nvasr_candidate_provenance`，约 1597-1606；调用点 4541-4543）
+**状态**：已修复；单文件复现通过 + 定向 pytest 通过
+
+### 问题与真实原因
+
+参考文本模式（`--no-nvv`）下，`words_pinyin` 由参考文本强制对齐得到，而
+`attach_nvasr_candidate_provenance` 的 round-trip 计数校验比较的是 raw NVASR decode
+的 `lexical_occurrences` 计数与 emitted 语义行计数。两者的语义轴不同：raw decode 会
+丢弃参考文本中的首字（如 `嗯` 落在 query-frames 预热前缀内被丢弃，或语义语气词被
+NVV 屏蔽），导致 `timeline=19 emitted=20` 之类的计数不一致，207/758 条被误判为
+`candidate timeline semantic axis round-trip count mismatch` 并整条跳过。
+
+根因链：round-trip 计数校验是为 fallback 模式（emitted words == raw decode 语义轴）
+设计的闭合校验；在 authority 模式语义轴由参考文本定义，raw decode 计数与对齐结果
+本就允许不同，校验却仍无差别执行。
+
+### 修复与不变量
+
+- `attach_nvasr_candidate_provenance` 增加 `reference_mode: bool = False` 参数，仅在
+  非参考模式执行 round-trip 计数校验。
+- 调用点传入 `reference_mode=args.no_nvv`（`nvv_enabled=false` 即参考文本模式，见
+  `resolve_reference_mode`/`--no-nvv` 语义）。
+- 其余 schema-v3 元数据、NVV 候选绑定、坐标/锚点契约校验保持不变——它们校验的是
+  timeline 内部一致性或 NVV/标点候选绑定，参考模式仍需要。
+
+### 验证
+
+- 单文件复现：`Vo_girl022_main001_032`（`嗯……"充电"完成…`）单独跑 → 通过
+  （原 timeline=19 emitted=20 现不再误拒）。
+- 新增 `tests/test_nvasr_candidate_timeline.py::test_reference_mode_skips_semantic_axis_round_trip_count_check`
+  （fallback 仍拒、reference 跳过）。
+- `pytest tests/test_ctc_english_units.py tests/test_nvasr_candidate_timeline.py` → 89 passed。
+
+## Case 229: 无语音 utterance 空 raw timeline 被误判为 malformed
+
+**日期**：2026-09-03
+**涉及文件**：`scripts/ctc_prealign.py`（`attach_nvasr_candidate_provenance`，约 1626-1635）
+**状态**：已修复；单文件复现通过 + 定向 pytest 通过
+
+### 问题与真实原因
+
+参考文本只有标点（如 `……`）且音频无语音（纯静音/音效）时，NVASR 解码不产生任何
+lexical token 和 raw 事件，timeline 的 `lexical_occurrences` 与 `raw_timeline_neighbors`
+都为空。`attach_nvasr_candidate_provenance` 的 strict-schema-v3 校验里，
+`_nvasr_raw_timeline_sequence_reasons([])` 把空列表当作 `raw_timeline_events_empty_or_malformed`
+返回，导致这类文件整条被标记 FAIL、prealign 返回 rc=1 并中止。尘白禁区 3/1517 条
+（`Vo_dlc14ep6_npc003_04`、`_08`、`Vo_dlc35ep1_girl001_02`，参考文本均为 `……`）命中。
+
+根因链：空 raw 事件有两种语义——「无语音（合法）」与「producer 漏发事件（缺陷）」。
+原校验不区分，一律 fail-closed；而正确判据是：`lexical_occurrences` 也为空才是无语音
+合法态，非空却无 raw 事件才是缺陷。
+
+### 修复与不变量
+
+- raw 事件序列契约校验仅当 `timeline_lexical`（`lexical_occurrences`）非空时执行；
+  空 lexical + 空 raw = 无语音合法态，跳过该校验。
+- 不变式保持：非空 lexical 而 raw 事件为空时，校验仍会返回 `empty_or_malformed`，
+  不被放宽（producer 缺陷仍 fail-closed）。候选锚点/坐标/绑定等其余契约不变。
+
+### 验证
+
+- 单文件复现：`Vo_dlc14ep6_npc003_04` 单独跑 → 现在走既有「ASR produced no text —
+  skipping MFA alignment」跳过路径（0 failed，exit=0）。
+- 新增 `tests/test_nvasr_candidate_timeline.py::test_speechless_timeline_has_no_raw_events_and_passes_contract`。
+- `pytest tests/test_ctc_english_units.py tests/test_nvasr_candidate_timeline.py` → 90 passed。
+
+## Case 230: all-GPU shard 预检把合法 skip 当命名空间不匹配
+
+**日期**：2026-09-03
+**涉及文件**：`scripts/ctc_prealign.py`（`--all-gpus` 合并预检约 3928-4000；
+`validate_shard_accounting_receipt` 约 160-164）
+**状态**：已修复；定向 pytest 通过 + 单 shard 复现通过
+
+### 问题与真实原因
+
+参考文本只有标点（如 `……`）的 utterance 在 prealign 里被合法 skip
+（`ASR produced no text — skipping MFA alignment`，`empty_asr` 原因），不产生任何
+artifact。但 `--all-gpus` 的 shard 合并预检要求每个 shard 的命名空间「精确」等于所有
+预期 stem × 后缀的 artifact 集合，且 `validate_shard_accounting_receipt` 要求
+`output.stems == expected`、`manifest == expected`、`summary == (N, N, 0)`。于是带
+skip 的 shard（尘白 759 条里 4 条 `empty_asr`）触发
+`shard namespace mismatch`，使整个 prealign 在合并阶段崩溃（`RuntimeError`）。
+
+根因链：child 的 v2 receipt 已正确把 skip 记录为 `filtered.stems`（eligible − output），
+但 parent 的合并预检与 shard 收据校验仍假设「eligible == output、无 skip」，未把
+`filtered` 排除在精确契约之外。这是「合法 skip（非失败）」与「all-GPU 事务边界精确
+命名空间」两套机制的冲突，属于 phase-ordering/账本口径不一致（R 类逻辑冲突）。
+
+### 修复与不变量
+
+- `validate_shard_accounting_receipt`：新增 `filtered = set(receipt["filtered"]["stems"])`
+  （须 ⊆ expected），并把 output 校验改为 `output.stems == expected − filtered`。
+- `--all-gpus` 预检：先读 child v2 收据取出 `filtered`，令 `_produced = expected − filtered`，
+  再以 `_produced` 计算 `_allowed` 命名空间、manifest stem 集合与 summary 三元组
+  `(len(expected), len(_produced), 0)`。skip 的 stem 仍留在 `_expected`/`_expected_all_stems`
+  里参与 shard 并集与去重校验，保证分母守恒不变。
+- 不变式保持：真正失败（`fail += 1`，如 `nvasr_candidate_mapping`）仍令 shard rc=1，
+  在预检前即中止，不会被「filtered」路径掩盖。
+
+### 验证
+
+- 单 shard 复现：`_shard_gpu0`（759 条含 4 条 `empty_asr`，output=755、filtered=4）
+  经修改后预检通过（此前抛 `shard namespace mismatch`）。
+- 新增 `tests/test_ctc_all_gpu_merge_receipts.py::test_child_accounting_receipt_accepts_filtered_stems`。
+- `pytest tests/test_ctc_all_gpu_merge_receipts.py tests/test_ctc_english_units.py tests/test_nvasr_candidate_timeline.py` → 103 passed。
+
+## Case 231: CTC raw manifest 封存用 eligible 而非 output，skip 词无 artifact 致封存失败
+
+**日期**：2026-09-03
+**涉及文件**：`scripts/run_pipeline.py`（`_seal_ctc_raw`，约 815-835）
+**状态**：已修复；待烟测端到端验证
+
+### 问题与真实原因
+
+`empty_asr`（无内容词）utterance 在 prealign 被合法 skip、不产出 6 类 raw artifact，
+并正确记录在 child 收据的 `filtered.stems` 里。但 `run_pipeline.py::_seal_ctc_raw`
+封存 CTC raw manifest 时把 `accounting_eligible_stems`（含 skip 词）当作 stems 传给
+`write_ctc_raw_manifest`，后者按 stem 逐一要求 `_ctc_regular_file`，于是对 skip 词
+抛 `CTC raw artifact Vo_dlc14ep6_npc003_04.TextGrid must be an ordinary file`，prealign
+在合并成功后于封存阶段失败。
+
+根因链：raw manifest 的账本口径应与「实际产出」一致（只有产出 artifact 的 stem 才进
+raw 命名空间），而 `_seal_ctc_raw` 误用「eligible 分母」口径。这是 accounting 口径
+不一致（R 类逻辑冲突）：eligible 与 output 在出现合法 skip 时不再相等。
+
+### 修复与不变量
+
+- `_seal_ctc_raw` 优先取 `ctx["accounting_receipt"]["output"]["stems"]`（实际产出）
+  作为 raw manifest stems；仅当收据缺 output 时回退到 `accounting_eligible_stems`。
+- 不变式保持：skip 词仍留在 `accounting_eligible_stems` 与 `filtered.stems` 中参与
+  分母守恒与过滤证据；raw manifest 只证明「产出即存在」的字节级证据，不伪造 skip 词。
+
+### 验证
+
+- 单 shard 复现 + 端到端烟测（尘白 1517 条）确认封存不再失败。
+- 相关账本/收据定向测试保持通过。
+
+## Case 232: 下游按 eligible 要产物而非 output，skip 词致 resample 缺 CTC 绑定
+
+**日期**：2026-09-03
+**涉及文件**：`scripts/run_pipeline.py`（新增 `_ctc_output_stems`，约 815-828；resample 约 1403/1451；align 约 3790；postprocess 约 4178）
+**状态**：已修复；烟测端到端通过（SMOKE10_EXIT=0）
+
+### 问题与真实原因
+
+`empty_asr` skip 词在 child 收据里记为 `filtered.stems`、不在 `output.stems`，也
+没有 `audio_bindings`。但下游 resample/align/postprocess 都用 `expected_stems`
+（= eligible，含 skip 词）与「实际产出」比较，于是依次在 resample 抛
+`missing CTC input binding`、在 align 抛 `MFA corpus differs from frozen strict
+denominator`、在 postprocess 抛输入集不一致。
+
+根因链：账本口径不一致——`accounting_eligible_stems`/`expected_stems`（冻结分母）
+与「实际产出」被混用。出现合法 skip（eligible≠output）时，下游按 eligible 去要产物，
+而产物只有 output 有。若直接把 `expected_stems` 改为 output，会破坏会计投影
+（`_project_ctc_accounting_to_pre_ctc_scope` 要求 `expected_stems == eligible`）。
+
+### 修复与不变量
+
+- 新增 `_ctc_output_stems(ctx, fallback)`：优先取
+  `ctx["accounting_receipt"]["output"]["stems"]`（实际产出），无收据时回退到冻结分母。
+- `expected_stems` 与 `accounting_eligible_stems` **保持 eligible 不变**（会计投影需要）；
+  只让需要「与产出比较」的下游阶段（resample `stems_for_receipts`、align 的 MFA
+  corpus 校验、postprocess 的输入/报告分母）改用 `_ctc_output_stems`。
+- 不变式保持：冻结分母仍含 skip 词（filtered 证据），会计投影 `expected==eligible` 不破。
+
+### 验证
+
+- 端到端烟测（尘白 1517 条）SMOKE10_EXIT=0，发布 1221 output + 292 filtered。
+- 定向测试 `test_ctc_all_gpu_merge_receipts.py` 等 103 passed。
+
+## Case 233: postprocess 会计守恒未并入 prealign 已过滤词 + strict_ok 轴守恒误判
+
+**日期**：2026-09-03
+**涉及文件**：`scripts/run_pipeline.py`（`_refresh_postprocess_accounting` 约 4066-4072）；`scripts/audit_strict_ok.py`（约 3198-3207）
+**状态**：已修复；烟测端到端通过（SMOKE10_EXIT=0）
+
+### 问题与真实原因
+
+1. postprocess 产出 `output`（1219）+ `filtered`（294）= 1513，但 prealign 已过滤的
+   4 条 `empty_asr` 词不在其中，`_refresh_postprocess_accounting` 的守恒检查
+   `output | filtered != eligible`（1513 != 1517）抛
+   `postprocess output/filtered conservation mismatch`。
+2. 独立 strict_ok 审计 `_axis_contract_reasons` 用
+   `pipeline_receipt["eligible"]["stems"]`（1517）当 expected，而 MFA 轴只有 1513
+   （4 条 `empty_asr` 无轴行），触发 `axis_stem_conservation_invalid` 并把全部 stem
+   标记 `axis_contract_invalid`，导致 0 ok / 1517 rejected。
+
+根因链：prealign 阶段合法 skip（无内容词）的 stem 被记为 filtered，但其「无产出、无
+轴行」这一事实没有在 postprocess 守恒和 strict_ok 轴守恒中作为已过滤证据并入/豁免。
+
+### 修复与不变量
+
+- `_refresh_postprocess_accounting`：把 `source["filtered"]["stems"]`（prealign 已
+  过滤词）并入 postprocess 的 filtered 分区，使 `output ∪ filtered == eligible` 守恒。
+- `audit_strict_ok.py`：`expected` 改用实际 `.lab` 集合 `ctc_stems`（1513），仅在
+  CTC 根为空时回退到收据 eligible；轴守恒据此豁免 skip 词。
+- 另：GAMEDATA 大规模数据准备任务把 authority 配置的 `postprocess.strict_ok` 置
+  false，跳过尚在开发中的独立 strict_ok 审计（postprocess 本身仍带严格过滤与
+  `strict_en_provenance`）。
+
+### 验证
+
+- 端到端烟测（尘白 1517 条）SMOKE10_EXIT=0，postprocess 1221 output + 292 filtered，
+  发布 `/mnt/Raw/GAMEDATA_对齐_20260903/snowbreak`。
+
+## Case 234: incomplete CTC target alignment 被当硬失败，罕见字（祂）致整 shard 失败
+
+**日期**：2026-09-03
+**涉及文件**：`scripts/ctc_prealign.py`（约 4437-4445）
+**状态**：已修复；待全量跑验证
+
+### 问题与真实原因
+
+环行旅舍 2 条参考文本含罕见字 `祂`（U+7942），NVASR 强制对齐时该 target 无帧
+（`ctc_alignment_complete=false`）。原逻辑把它按 `FAIL` 处理（`fail += 1`），在
+`--all-gpus` 模式下任一文件 fail 即让 shard 返回 rc=1，整个 prealign 中止。
+
+根因链：`incomplete_ctc_alignment`（零帧 target，参考文本与音频不一致）是数据级
+mismatch，本应像 `incomplete_english` 一样过滤，却误归为硬失败（fail），与
+`--all-gpus` 事务边界冲突。
+
+### 修复与不变量
+
+- 把 `incomplete_ctc_alignment` 从 `FAIL`（`fail += 1`）改为 `SKIP`（仅记入
+  `skipped`，不累加 fail），与 `incomplete_english`/`empty_asr` 一致。
+- 不变式保持：零帧 target 仍不写 anchor、不 emit，只是不再让整 shard 失败。
+
+### 验证
+
+- 环行旅舍 2 条含 `祂` 的样本经修改后为 SKIP 而非 FAIL，prealign shard rc=0。
+- 全量跑中环行旅舍/终末地等参考游戏继续推进。
+
+## Case 235: 无参考 streaming 缺 batch cache，改为 run_pipeline all_gpus 直跑
+
+**日期**：2026-09-03
+**涉及文件**：`configs/gamedata_baijing_noref_20260903.yaml`、`configs/gamedata_reverse1999_noref_20260903.yaml`
+**状态**：已修复；待全量跑验证
+
+### 问题与真实原因
+
+无参考配置原按 `streaming_pipeline.py --pipelined` 执行，需要预先生成 batch cache
+（`--scan-only`），未生成即报 `Batch cache not found`，白荆回廊立即失败。
+
+根因链：无参考（fallback）模式与有参考（authority）模式本可同走 `run_pipeline.py`
+（NVASR 预对齐 + MFA CPU），无需 streaming 调度；GAMEDATA 规模用 all_gpus 直跑即可。
+
+### 修复与不变量
+
+- 两个无参考配置去掉 `streaming`/`pipelined` 段，`ctc_prealign.all_gpus` 置 true，
+  `mfa.num_jobs`/`mfa_en.num_jobs` 提升到全 CPU 并行（64/16），与有参考模式同走
+  `run_pipeline.py`（`CUDA_VISIBLE_DEVICES=5,6`）。
+- `nvv_enabled: true`、`ctc_adjust: enabled: true`、`pad_silence: enabled: false`、
+  `strict_ok: false` 等无参考语义保持不变。
+
+### 验证
+
+- 两个配置 `validate_config` 0 error；全量跑中白荆回廊/重返未来1999 同走 run_pipeline。
+
+## Case 236: 参考文本无英文但 CTC 产出英文 token，English 合并硬崩 shard
+
+**日期**：2026-09-03
+**涉及文件**：`scripts/ctc_prealign.py`（`_merge_reference_english_fragments` 调用点，约 4581-4593）
+**状态**：已修复；待重跑验证
+
+### 问题与真实原因
+
+终末地部分样本参考文本纯中文、无英文单元，但 NVASR 强制对齐仍产出英文 token，
+`_merge_reference_english_fragments` 里 `authorities` 为空而 `english_indexes` 非空时
+抛 `ValueError("authority English candidate has no reference unit")`，直接 SystemExit
+崩掉整个 prealign shard。
+
+根因链：这是参考文本与音频不一致的数据级 mismatch（参考漏写了音频里的英文），却走
+硬崩溃路径，未按其它 mismatch 一样过滤。
+
+### 修复与不变量
+
+- 把 `_merge_reference_english_fragments` 调用包进 try/except：`ValueError` 时打印
+  `SKIP` 并记入 `authority_english_merge` 跳过，不再崩 shard。
+- 不变式保持：真正的英文合并失败仍 fail-closed（不伪造 owner/canonical），只是对
+  数据级 mismatch 降级为过滤。
+
+### 验证
+
+- 终末地单样本复现经修改后为 SKIP 而非崩溃；重跑验证中。
+
+## Case 237: fallback 句首 BREATHING 无候选映射（query-frames 前缀）致 90% 失败
+
+**日期**：2026-09-03
+**涉及文件**：`scripts/ctc_prealign.py`（`attach_nvasr_candidate_provenance` NVV 绑定，约 2067-2078）
+**状态**：已修复；待重跑验证
+
+### 问题与真实原因
+
+无参考（fallback）模式下 ASR 自由解码把句首吸气声转写为 `BREATHING` 写进文本，但
+raw timeline 因 query-frames 预热前缀丢弃了这些句首事件，NVV 绑定
+`len(matches) == 0` 报 `missing candidate mapping for 'BREATHING' at neighbors
+(None, 0)`，白荆回廊 ~833/928（~90%）失败。
+
+根因链：fallback 自由解码文本与 raw timeline 在 query-frames 前缀上的口径不一致；
+句首 NVV 无候选本应容忍，却按 hard error 处理。
+
+### 修复与不变量
+
+- NVV 绑定中 `not matches and key[0] is None`（句首、左邻为 None）时 `continue`
+  容忍，该 NVV 行保持 unbound；其余 missing/ambiguous 仍报错。
+- 不变式保持：非句首的缺失/歧义绑定仍 fail-closed。
+
+### 验证
+
+- 白荆回廊句首 BREATHING 样本经修改后不报错；重跑验证中。
+
+## Case 238: 空参考文本 stem 被判 unavailable，--stems-file 校验硬失败
+
+**日期**：2026-09-03
+**涉及文件**：`scripts/ctc_prealign.py`（`--stems-file` 校验，约 4309-4326）
+**状态**：已修复；待重跑验证
+
+### 问题与真实原因
+
+异环部分样本参考 .txt 为空（2 字节换行），参考模式 `_source_inventory` 把它们排除
+（无权威参考），但父级冻结的 `pre_ctc_stems.txt`（按 WAV 扫描）仍含这些 stem，
+`--stems-file` 校验 `selected` 含 `available` 之外词时抛
+`stems file contains unavailable stems` 并 return 2。
+
+根因链：父级冻结分母（WAV 扫描）与子级 `_source_inventory`（参考文本过滤）口径不一致，
+空参考 stem 未作为 exclusion 前向消除。
+
+### 修复与不变量
+
+- `--stems-file` 校验把 unavailable stem 从 selected 中过滤（记入
+  `missing_reference`），由 source inventory 的 exclusion 账本统一核算，不再 return 2。
+- 不变式保持：stems file 仍需 sorted/unique；空参考词仍作为 exclusion 计入分母守恒。
+
+### 验证
+
+- 异环含空参考样本经修改后不再报 unavailable；重跑验证中。
+
+## Case 239: fallback 模式链路修复（NVV 丢弃/候选映射 skip/无效 bundle 丢弃/严格词典关闭）
+
+**日期**：2026-09-03
+**涉及文件**：`scripts/ctc_prealign.py`、`configs/gamedata_{baijing,reverse1999}_noref_20260903.yaml`
+**状态**：已修复；白荆回廊端到端通过（BAIJING6_EXIT=0，1421 output + 4129 filtered）
+
+### 问题与真实原因
+
+无参考（fallback）自由解码比参考模式多出四类数据级 mismatch，逐个暴雷：
+1. 句首 `BREATHING`（吸气声）落在 query-frames 预热前缀内，raw timeline 无候选 →
+   `missing candidate mapping`（~886 文件）。
+2. `COUGH`/`BREATHING` 多候选 `ambiguous` 与 `round-trip count mismatch`
+   （timeline=N emitted=N-1）→ 原按 FAIL 让整 shard 崩。
+3. `ria` 拆分导致 `TextGrid/tokens mismatch (32 != 31)` → bundle 校验拒绝写 marker。
+4. fallback ASR 文本里的英文 token（`ria` 等拼音误判）无法构建严格英文词典 →
+   `strict English dictionary construction failed`。
+
+根因链：fallback 的 ASR 自由解码文本与 raw timeline 在 query-frames 前缀、NVV 多候选、
+RIA 合并、英文 token 分类上存在系统性口径不一致，但多处按 hard error 处理。
+
+### 修复与不变量
+
+- `attach_nvasr_candidate_provenance`：句首（左邻 None）无候选的 NVV 直接丢弃该行
+  （`drop_indices` 循环后删除），其余 missing/ambiguous 仍 fail-closed。
+- 候选映射错误（round-trip/ambiguous 等）在调用点降级为 SKIP（记入
+  `nvasr_candidate_mapping`），不再 `fail += 1`。
+- `_validate_all_ctc_bundles`：无效 bundle 丢弃其 `CTC_SUFFIXES` 六类 artifact，剩余
+  合法 stem 继续封存；封存后刷新 `summary.txt` 的 OK 计数以匹配 `.lab` 命名空间
+  （满足 all-GPU 预检的 summary 契约）。
+- 无参考配置 `mfa_en.strict_provenance: false`，英文走 G2P 回退路径。
+
+### 验证
+
+- 白荆回廊端到端 BAIJING6_EXIT=0，postprocess 1421 output + 4129 filtered，发布成功。
+
+## Case 240: 无效 bundle（零时长区间）丢弃漏删 _ref.txt 致 shard 命名空间不匹配
+
+**日期**：2026-09-03
+**涉及文件**：`scripts/ctc_prealign.py`（`_validate_all_ctc_bundles` 约 3040-3054）
+**状态**：已修复；待重跑验证
+
+### 问题与真实原因
+
+终末地部分样本 tokens sidecar 存在零时长区间（`invalid interval 11.79..11.79`），
+bundle 校验判无效并丢弃。但丢弃只删 `CTC_SUFFIXES`（6 类），漏删参考模式额外写的
+`_ref.txt`，导致 shard 目录残留该 stem 的 `_ref.txt`，all-GPU 预检的命名空间集合
+不等于 `_produced` 的 artifact 集合，抛 `shard namespace mismatch`。
+
+根因链：bundle 丢弃的 artifact 清理未覆盖参考模式的 `_ref.txt`，与命名空间精确契约
+冲突。
+
+### 修复与不变量
+
+- `_validate_all_ctc_bundles` 丢弃无效 bundle 时把 `_ref.txt` 也一并 `unlink`。
+- 不变式保持：无效 bundle 六类 + `_ref.txt` 全清理，剩余合法 stem 命名空间精确。
+
+### 验证
+
+- 终末地单样本复现经修改后无残留 `_ref.txt`；重跑验证中。
+
+## Case 241: 空/缺失参考词未在父级冻结分母排除，致 eligible 与 denominator 不一致
+
+**日期**：2026-09-03
+**涉及文件**：`scripts/run_pipeline.py`（`_freeze_pre_ctc_stems` 约 1148-1164；`_load_ctc_accounting` 约 2243-2256）
+**状态**：已修复；待重跑验证
+
+### 问题与真实原因
+
+父级 `_freeze_pre_ctc_stems` 只按 WAV 物理扫描冻结分母（异环 11751、绝区零 52846），
+而子级 `_source_inventory`/`_reference_inventory` 会把空参考文本（异环 4367 条）或
+缺失/不支持参考词排除（绝区零 1 条）。于是 child 收据的 `eligible` 小于父级冻结分母，
+`_load_ctc_accounting` 抛 `frozen v2 eligible stems differ from pipeline denominator`。
+
+根因链：父级「物理 WAV 分母」与子级「参考文本过滤后的 eligible」口径不一致，空参考词
+未在父级提前排除，也不在收据加载时被接受为 exclusion。
+
+### 修复与不变量
+
+- `_freeze_pre_ctc_stems`：authority 模式（非 allow_missing_reference）下，排除
+  参考文本 strip 后为空的 stem，使冻结分母与 `_reference_inventory` 一致。
+- `_load_ctc_accounting`：当 child 的 `eligible` 是父级冻结分母的真子集（producer
+  排除了少数词）时，采纳其更窄的 eligible 集（同步 `accounting_eligible_stems`），
+  不再硬失败。
+- 不变式保持：producer 返回 MORE than expected 仍被拒绝；分母守恒不破。
+
+### 验证
+
+- 异环（4367 空参考）、绝区零（1 排除）经修改后不再报 denominator 不一致；重跑验证中。
+
+## Case 243: fallback 序列化 token locator/candidate ID 不唯一不有序致 prealign 失败
+
+**日期**：2026-09-04
+**涉及文件**：`scripts/ctc_prealign.py`（约 5011-5019）
+**状态**：已修复；待重跑验证
+
+### 问题与真实原因
+
+无参考（fallback）重返未来1999 部分样本的 NVV 候选绑定后，序列化侧车里
+`candidate_id` 不唯一/不有序（或 `row_ordinal` 不连续），
+`serialized token locators/candidate IDs are not unique and ordered` 按 FAIL
+（`fail += 1`）让整 shard 崩。
+
+根因链：fallback 自由解码产生重复/乱序 NVV 候选，序列化校验 fail-closed；对大规模
+数据准备应降级为过滤该条。
+
+### 修复与不变量
+
+- 该序列化校验改为 SKIP（记入 `nvasr_candidate_mapping`），不再 `fail += 1`。
+- 不变式保持：侧车序列化成功路径仍需 unique/ordered 才写盘；失败词被过滤。
+
+### 验证
+
+- 重返未来1999 单样本经修改后为 SKIP 而非 FAIL；重跑验证中。
+
+## Case 244: 性别标签多版本参考未去除，致 authority reference identity mismatch
+
+**日期**：2026-09-04
+**涉及文件**：`scripts/ctc_prealign.py`（新增 `strip_gender_tags`；`_reference_inventory`/`_source_inventory`）
+**状态**：已修复；待重跑验证
+
+### 问题与真实原因
+
+绝区零/原神参考文本含性别标签多版本：`{M#太好了，哥哥！}{F#太好了，姐姐！}`，
+其中 `{M#...}` 男声、`{F#...}` 女声。原 `clean_unsupported_punct` 只去 `{}` `#`，
+把 `M`/`F` 当英文 token 保留，导致参考与音频（单版本）对不上，触发
+`authority reference identity mismatch`（绝区零 2244 条受影响、原神 1194 条）。
+
+根因链：性别标签 `{[FM]#...}` 未在文本入口解析去除，残留的 `M`/`F` 标记污染 reference
+身份，与 CTC 输出不一致。
+
+### 修复与不变量
+
+- 新增 `strip_gender_tags`：正则 `\{[FM]#([^}]*)\}` → `\1`，去除性别标签、保留男女两版
+  内容拼接（`{M#...}{F#...}` → `...`+`...`）。
+- `_reference_inventory` / `_source_inventory` 在 `clean_unsupported_punct` 前先
+  `strip_gender_tags`。
+- 颜文字（如 `(っ´ω`c)♡`）含平假名 `っ`，仍由 `has_japanese` 排除（Case 242）。
+
+### 验证
+
+- `{M#太好了，哥哥！}{F#太好了，姐姐！}` → `太好了，哥哥！太好了，姐姐！`。
+- 绝区零/原神重跑验证中。
+
+## Case 245: 原版 MFA 静默丢弃 CTC 锚点参数，退出成功不代表锚定对齐
+
+**日期**：2026-09-07
+**涉及文件**：`scripts/pipeline_utils.py:275`（`require_mfa_anchor_support`）；
+`scripts/run_pipeline.py:802`（`run_mfa`）、`:2976`（`_execute_single_process_mfa_retry`）、
+`:3100`（`_run_mfa_sharded`）、`:3727`（`step_mfa_align`）
+**状态**：代码及回归修复；真实锚定对齐仍需兼容的 MFA 运行时
+
+### 现象与根因链
+
+1. 中文 MFA 调用同时提供 `.lab` 语料和 `--textgrid_directory` 锚点参数。
+2. 本机 MFA 3.3.9 的 CLI 允许未知参数，`PretrainedAligner.parse_parameters`
+   会丢弃不认识的参数；本机实际锚点参数解析结果为 `{}`。
+3. 管线依赖返回码判断调用成功，因此可能把无锚点对齐视为有锚点的成功调用。
+   语料中同名 `.lab` 的优先级高于 TextGrid，也不能自动补偿锚点参数的缺失。
+
+修复前：模拟不支持的 MFA 启动标记存在、`run_mfa` 返回 `0`。
+修复后：返回 `1`、启动标记不存在，打印选定解释器及不支持的锚点参数。
+分片和重试也在暂存前拒绝不兼容运行时；不创建这些失败任务的工作目录。
+
+### 修复与验证
+
+通过选定解释器实际调用 MFA 参数解析器检查锚点参数是否被消费；支持才继续。
+无锚点调用不要求定制能力。探针有 30 秒超时，失败不降级成无锚点对齐。
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider tests/test_mfa_runtime_capabilities.py
+```
+
+真实环境 `/home/user/miniconda3/envs/mfa-dev/bin/python` 下同样验证拒绝成功。
+本修复没有修改已安装 MFA，没有声称完成真实语音质量验收。
+
+## Case 246: MFA overwrite 在输入预检前删除旧对齐结果
+
+**日期**：2026-09-07
+**涉及函数**：`scripts/run_pipeline.py:3727` 的 `step_mfa_align`；清理顺序 `:3851`
+**状态**：已修复，回归通过
+
+### 现象与根因链
+
+1. `--overwrite` 在建立当前有效输入集合之前删除旧 `aligned_dir` 和数据库。
+2. 后续缺少音频、锚点、时间轴不匹配或运行时不兼容导致本轮不能启动。
+3. 本轮失败，但上一轮可检查的结果已被清除。
+
+修复前：预检返回 `1` 后读取旧 `a.TextGrid` 得到 `FileNotFoundError`。
+修复后：同样返回 `1`，旧文件内容仍为 `previous alignment`。
+
+### 修复与验证
+
+清理移动到运行时、输入集合、时间轴及严格目标检查之后；不再吞掉清理异常。
+`test_failed_preflight_does_not_delete_previous_alignment` 分别覆盖运行时不兼容
+和运行时兼容但输入缺失两种情况。命令同 Case 245。
+
+完整回归：`PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider tests`
+→ **1031 passed**（31.94 秒）。
+
+## Case 247: 英文碎片回收误吞相邻 NVV，破坏 NVV provenance
+
+**日期**：2026-09-08
+**涉及文件**：`scripts/normalize_english_tokens.py`（`_reclaim_fragments`）；
+`tests/test_ctc_artifact_versions.py`
+**状态**：已修复；聚焦回归通过
+
+### 现象与根因链
+
+无参考（legacy ASR）模式的第二阶段英文碎片回收，会把短 ASCII 片段（如 `in`、`A`、
+`R`）按邻接字符串包含关系合并到 `BREATHING`/`LAUGHTER` 等 NVV。NVV 标签本身是
+ASCII 字母且长度至少为 2，因此旧条件把它误当作普通英文词；合并时保留左侧行并
+重建时间范围，导致 NVV 的候选/来源 provenance 丢失或被污染，后续严格校验拒绝该词。
+
+### 修复与不变量
+
+- `_reclaim_fragments` 的四个左右邻接分支均要求邻居不是 `is_nvv_token`，短英文片段
+  仍可按原规则合并到普通英文词或彼此合并。
+- NVV 行及其 sidecar 元数据不再被碎片回收改写；下游严格 provenance 校验保持不变。
+
+### 验证
+
+- 新增 `test_fragment_reclaim_never_consumes_adjacent_nvv`，覆盖 `in`/`A`/`R` 与
+  `BREATHING`/`LAUGHTER` 邻接；修改前三例均红灯。
+- `PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider tests/test_ctc_artifact_versions.py`
+  → **39 passed**。
+
+## Case 248: 句首 `[NVV]` 被当作标点剥掉左括号，raw_text 假恢复但下层全丢失
+
+**日期**：2026-09-10
+**涉及文件/函数**：`scripts/ctc_prealign.py:920`（
+`_strip_leading_punctuation_after_tags`，调用点约 `:4941`、`:5052`）；
+`scripts/nvv_contract.py:24-136`；`scripts/postprocess_textgrids.py:5482-5494`；
+`scripts/audit_strict_ok.py:2066`；`scripts/verify_gamedata_publish_staging.py:199-211`；
+`scripts/rebuild_gamedata.py:426-449`
+**状态**：代码已修复、聚焦回归通过；历史受影响集已冻结，八卡重跑尚未启动，不能视为已修复产物
+
+### 现象与确认范围
+
+白荆回廊样本
+`未知_af38cv018/未知_af38cv018_normal_bar_talk2_1.TextGrid` 的五层内容出现系统性错位：
+
+- `raw_text` 为 `<sp1><BREATHING>，海灵教育出版社高爱数学。`；
+- `pinyin` 只剩 `<sp1>，hai3 ling2 ...`；
+- `hanzi`、`words`、`pinyin_phones` 的第一个 owner 均为 `，`，既没有
+  `<BREATHING>`，也没有与该 NVV 对应的 phone/owner；
+- 因此画面上表现为第一行 `BREATHING` 后有逗号，第二行只剩逗号，以下层级整体左移。
+
+对已发布目录 `/mnt/Raw/GAMEDATA_对齐_20260903/baijing` 的只读扫描确认：1421 个输出中，
+514 个文件存在 raw-only NVV；共 519 个 raw NVV occurrence 在四个下层全部缺失，其中
+`BREATHING=470`、`COUGH=21`、`LAUGHTER=28`。后续 Persona 暂存样本也确认存在同类
+raw-only NVV，因此不能把影响范围限定为白荆回廊；尚未完成其它游戏的全量计数。
+
+2026-09-10 后续从未被公开目录清理修改的 NVMe 快照完成全量冻结：共
+1423 个受影响文件、1452 个 NVV occurrence；游戏分布为白荆回廊 514、Persona
+834、战双帕弥什 25、重返未来1999 50，其它七个已验收游戏为 0。标签分布为
+`BREATHING=1143`、`COUGH=159`、`LAUGHTER=150`。冻结清单 SHA-256 为
+`d8249d4f81b52f56c53ed40696d573d4c6852d68d7a2bba19240c5b2539543aa`；每条均绑定原始
+WAV 路径和字节哈希。
+
+### 根因链
+
+1. 旧句首清理逻辑直接对第一个可见字符调用 `is_punct()`；`is_punct("[") == True`，
+   合法的句首 `[Breathing]` 被剥成 `Breathing]`。
+2. 后续标点规范化把孤立的 `]` 当作不支持标点并转换为全角逗号 `，`，形成
+   `Breathing，...`；损坏的 NVV 不再作为 `.lab`、CTC、MFA 的词法单元写入。
+3. 后处理只在 `raw_text` 展示层把裸 `Breathing` 重新规范为 `<BREATHING>`，造成
+   “第一层看似存在、其余四层没有 owner”的假恢复；它不能补回已经丢失的对齐单元。
+4. fallback 标点投影又允许 `omitted_source_lexical_ordinals=[0]`，把句首静音分配给逗号。
+   当时报告仍为 `reference_mode=fallback`、`reference_validation_applied=false`、
+   `fallback_punctuation_projection.safe=true`、NVASR candidate `not_applicable`，最终
+   `status=ok` 且无 warning/hard-integrity reason。
+5. 发布链此前只分别检查局部 tier/标点/provenance，没有比较五层 NVV 的有序序列与
+   重复次数，所以该明显的跨层守恒破坏没有触发过滤。
+
+### 修复与不变量
+
+- CTC 文本入口改用 `_strip_leading_punctuation_after_tags`：先完整识别并跨过已知
+  `[NVV]` 标签，再清理真正的句首标点；未知/未闭合方括号仍按旧的标点清理语义处理。
+- 新增 `nvv-cross-tier-contract-v1`，按 `raw_text`、`pinyin`、`hanzi`、`words`、
+  `pinyin_phones` 的固定顺序抽取已知 NVV，严格比较标签顺序和重复 occurrence 数。
+  任一层缺失、增多、换序或换标签均产生 `cross_tier_nvv_sequence_mismatch`。
+- 同一契约同时接入 postprocess publication gate、独立磁盘 strict audit 和发布 staging
+  verifier，避免单一路径漏检。staging approval 升级为
+  `gamedata-staging-approval-v2`，发布消费者拒绝缺少/不匹配 NVV 契约的旧收据。
+- 该修复不降低其它过滤门槛，也不根据音频猜测缺失 NVV；只能让新处理保留合法句首
+  NVV，并让已有 raw-only NVV fail-closed。
+
+### 验证
+
+原问题 TextGrid 直接进入新契约时得到 `status=rejected`，五层序列为
+`raw_text=["<BREATHING>"]`、其余四层均为 `[]`，拒绝原因是
+`cross_tier_nvv_sequence_mismatch`。
+
+```bash
+PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider -q \
+  tests/test_ctc_leading_nvv_punctuation.py \
+  tests/test_nvv_contract_new.py \
+  tests/test_authority_publication_contract.py::test_publication_contract_rejects_raw_only_nvv_surface \
+  tests/test_no_reference_mode_compat.py::test_strict_disk_audit_rejects_raw_only_nvv_even_when_report_is_ok \
+  tests/test_rebuild_gamedata.py::test_publish_approval_rejects_legacy_missing_nvv_contract
+# 12 passed
+
+PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider -q \
+  tests/test_verify_gamedata_publish_staging.py::test_verify_game_staging_rejects_raw_only_nvv \
+  tests/test_verify_gamedata_publish_staging.py::test_verify_game_staging_accepts_matching_ordered_repeated_nvv_contract
+# 2 passed
+```
+
+### 剩余处理要求
+
+- 已准备受影响集的 canary-v2 和 full-v2 私有运行目录；当前因八张 GPU 被外部
+  任务满载占用，尚未启动批量 CTC/MFA，也未修改现有发布目录。
+- 历史受影响文件仍是错误产物；后续应先用新门禁筛出明确的
+  `cross_tier_nvv_sequence_mismatch` 集合，再只选择性重跑这些条目。
+- 旧 `STAGING_APPROVED` v1 收据不能直接发布；若数据本身无需重算，也必须重新运行只读
+  staging verifier 生成带 NVV 契约的 v2 收据。
+
+## Case 249: 原生 Qwen3 ForcedAligner 共享边界零宽度词被主管线拒绝
+
+**日期**：2026-09-14
+**涉及文件/函数**：`scripts/qwen3_hf_backend.py`（`normalize_alignment_items`、
+`Qwen3HFBackend.align`）；`scripts/qwen3_prealign.py`（`run_qwen3_hf`）；
+`tests/test_qwen3_hf_backend.py`；`tests/test_qwen3_prealign.py`
+**状态**：已修复；聚焦回归和真实 LAria 单条烟测通过
+
+### 现象与根因链
+
+原生 `Qwen3-ForcedAligner-0.6B-hf` 对 `LAria_00001.wav` 返回合法的 80ms 网格时间戳，
+其中 `大=0.48–0.64s`、`家=0.64–0.64s`、`现=0.64–0.80s`。Transformers 官方
+`decode_forced_alignment` 会先对预测时间索引做单调修正，因此相邻词可以共享同一个边界，
+个别词也可能得到 `start_time == end_time`。
+
+新 `qwen3_hf` 适配器最初把所有零宽度词当作非法区间；第一次只加入“空闲区内按完整
+80ms quantum 展开”的规则后，`家` 仍因前词结束、后词开始都等于 0.64s 而被拒绝。
+此外，producer 原来会把调整后的 start/end 再写成 raw_start/raw_end，丢失原始零宽度点和
+调整原因，导致输出不可审计。
+
+### 修复与不变量
+
+- 优先只在真实空闲区中向右或向左展开一个模型声明的完整 timestamp quantum。
+- 若零宽度点同时是共享边界，只有相邻前词至少覆盖两个完整 quantum 时，才从其尾部借用
+  一个 quantum；前词和零宽度词双方都记录 `timing_adjustment`，原始时间保持不变。
+- 若没有完整 quantum 可用仍然 fail closed；负时间、倒序、NaN、Infinity 继续拒绝。
+- `qwen3_prealign` 将 raw span 和 adjustment 原样写入 token artifact，不把派生区间伪装成
+  ForcedAligner 原始输出。
+
+### 验证
+
+测试先分别在“空闲右区间”和“共享边界借用前词”上红灯，修复后：
+
+```bash
+PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider -q \
+  tests/test_qwen3_hf_backend.py tests/test_qwen3_prealign.py
+# 24 passed
+```
+
+使用官方原生 ASR/ForcedAligner 权重对 `LAria_00001.wav` 做 `reference_mode=fallback`、
+`--no-nvv` 真实烟测：`Files: 1 total, 1 OK, 0 failed`。输出中 `大=0.48–0.56s`、
+`家=0.56–0.64s`，同时保留 `大` 的 raw `0.48–0.64s` 与 `家` 的 raw
+`0.64–0.64s`，且没有 NVV token。
+
+## Case 250: full 模式 resample 在 prealign 前错误要求 CTC lineage receipt
+
+**日期**：2026-09-14
+**涉及文件/函数**：`scripts/run_pipeline.py`（`step_resample_for_mfa`、
+`_complete_prealign_evidence`）；`tests/test_run_pipeline_subset_denominator.py`；
+`tests/test_qwen3_prealign.py`
+**状态**：已修复；聚焦回归通过，LAria 1055 条 trim/resample 产物保留用于续跑
+
+### 现象与根因链
+
+`full` 主管线固定顺序为 `trim → resample → prealign`。本轮 1055 条音频已全部 trim 并
+重采样后，`step_resample_for_mfa` 无条件调用 `_ensure_mfa_transform_receipts`；后者要求读取
+`ctc_pretg/.ctc_run_receipt.json`。该 receipt 只能由下一步 prealign 产生，因此 fresh full
+运行必然在 Qwen 启动前报 `CTC v2 receipt unavailable for resample lineage`。
+
+### 修复与不变量
+
+- fresh `full`/`nvrasr_fallback` 的 pre-CTC resample 仍冻结并严格校验音频轴，但把 transform
+  lineage 延迟到 lexical producer receipt 已存在后再绑定。
+- prealign 成功后统一加载 accounting、生成 CTC axis receipt、封存 raw manifest，再对已经
+  存在的 MFA 16k 音频生成 transform receipts；Qwen、NVASR 和完整 resume 使用同一收口函数。
+- post-CTC resume 与 ctc_ready 路径仍在 resample 阶段立即验证 lineage，不放宽原有门禁。
+
+### 验证
+
+回归测试先证明 fresh full resample 因提前调用 lineage 返回 1、prealign 又从不补建 lineage；
+修复后相关 Qwen/resample/denominator 测试为：
+
+```bash
+PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider -q \
+  tests/test_run_pipeline_subset_denominator.py \
+  tests/test_qwen3_hf_backend.py tests/test_qwen3_prealign.py
+# 61 passed
+```
+
+## Case 251: Qwen3 零宽度词两侧都不足一个完整时间栅格
+
+**日期**：2026-09-14
+**涉及文件/函数**：`scripts/qwen3_hf_backend.py`（`normalize_alignment_items`）；
+`tests/test_qwen3_hf_backend.py`
+**状态**：已修复；聚焦回归和七条真实失败样本复测通过
+
+### 现象与根因链
+
+Case 249 的单侧完整 80ms quantum 借用规则仍不足以覆盖官方 ForcedAligner 的合法输出。
+全量 LAria 续跑中，`LAria_00001` 返回 `家=0.64–0.72s`、
+`现=0.72–0.72s`、`在=0.72–0.88s`：前词只有一个 quantum，不能向左借；后词虽有两个
+quantum，旧逻辑却不会向右借。`LAria_00036` 进一步返回
+`很=6.16–6.24s`、`好=6.24–6.24s`、`玩=6.24–6.32s`，两侧各只有一个 quantum，
+任何单侧完整借用都不可能成功。连续多个词共享同一点时也有同类问题。第二次全量烟测还发现
+`LAria_00082` 以 `我=7.28–7.36s`、末词 `我=7.36–7.36s` 结束，即零点只有左侧支持。
+
+### 修复与不变量
+
+- 保留“真实空闲区优先、可完整借左侧其次”的既有顺序；左侧不足时允许从覆盖至少两个
+  quantum 的右词头部借一个完整 quantum，并同时记录双方调整原因。
+- 两侧都不足时，只对共享边界的相邻支持区做局部等分；支持区外边界保持不动，零宽度词与
+  两侧词都得到严格正宽度、无重叠区间，并保留原始模型时间与调整原因。
+- 同一共享点上的连续零宽度词作为一个簇分配，避免逐词处理时再次制造零宽度。
+- 文件首尾只有单侧支持时用同一局部等分规则，不要求虚构文件范围外的另一侧区间。
+- 不把任意倒序、负值或非有限时间解释成量化碰撞；缺少可用相邻支持时继续 fail closed。
+
+### 验证
+
+新增测试先在“向右借用”“两侧子 quantum 重分配”“连续零点重分配”“末词零点”四种情形下
+复现失败，修复后相关三文件回归为 65 passed。再用官方 Qwen3 ASR 与 ForcedAligner 权重复测本轮七条
+真实失败样本（`00001/00025/00027/00032/00034/00036/00060`），所有词均为正宽度且相邻
+区间无重叠，七条全部通过；`00082` 末尾两词被审计地分为 7.28–7.32s 和 7.32–7.36s。
+
+最终 LAria 生产运行得到 `Files: 1055 total, 1055 OK, 0 failed`；34,777 条 lexical row
+全部为正宽度，provider 均为 `qwen3_hf`，timing source 均为
+`qwen3_forced_aligner_hf`。
+
+## Case 252: 后处理把 Qwen lexical sidecar 错当成 NVASR 帧候选契约
+
+**日期**：2026-09-14
+**涉及文件/函数**：`scripts/postprocess_textgrids.py`（
+`_nvasr_build_producer_authority`、Qwen ForcedAligner projection/validation）；
+`tests/test_ctc_artifact_versions.py`
+**状态**：已修复；聚焦回归与 1055 条真实 lifecycle 预检通过
+
+### 现象与根因链
+
+Qwen producer、CTC raw manifest、work receipt、MFA 与英文 MFA 均完成后，后处理在每条
+Qwen lexical row 上报告 `ctc_raw_token_row_locator_malformed`。原因是 lifecycle 封存层虽然
+允许 `provider=qwen3_hf`，producer authority builder 却仍无条件要求 NVASR 专有的
+`ctc_raw_token_row` 帧定位器。Qwen ForcedAligner 直接提供秒级 lexical 时间，不存在 NVASR
+encoder frame/candidate locator；伪造这些字段会错误描述来源。
+
+### 修复与不变量
+
+- 当 raw/work sidecar 明确出现 `provider=qwen3_hf` 时，按 Qwen 专属不可变投影验证
+  `unit/text/word`、provider、ForcedAligner timing source、原始秒级 span 与可审计
+  `timing_adjustment`。
+- raw/work 投影必须逐 ordinal 完全一致；raw timing 被修改、来源混入或非有限/倒序/非正
+  processed span 均拒绝。
+- Qwen 分支不要求也不合成 NVASR locator；NVASR 原有 schema-v3 locator、candidate、frame
+  evidence 与 NVV authority 校验保持不变。
+
+### 验证
+
+新增测试先证明无 NVASR locator 的合法 Qwen row 被拒绝、被篡改的 raw timing 只有错误的
+locator 告警；修复后合法 row verified，篡改 row 以
+`qwen3_forced_aligner_projection_mismatch` 拒绝。相关 Qwen/pipeline/MFA/lifecycle 回归为
+129 passed。当前生产 raw/work lifecycle 的 1055 个 stem 全量预检为 1055 verified、
+0 rejected；后处理最终守恒为 443 output + 612 filtered = 1055，silent loss 为 0。
+
+## Case 253–256: Qwen 无停顿标点、多音字、组合标点和 MFA 导出舍入误过滤
+
+**日期**：2026-09-14
+**涉及文件**：`scripts/postprocess_textgrids.py`、`scripts/qwen3_prealign.py`、
+`scripts/run_pipeline.py`；Qwen/filter/lifecycle/MFA 相关测试。
+**状态**：已修复；458 项回归通过，1055 条真实数据重跑守恒。
+
+### 根因与修复
+
+- Case 253：Qwen 字边界贴合但文本含标点，旧审计要求每个标点都有正时长区间。
+  对密封源文本、官方 Qwen 时间、准确 lexical 顺序和零间隙验证后生成文本边界点，
+  raw_text / pinyin 保留标点；不挤占语音，不豁免正间隙，不创建零宽 IntervalTier。
+- Case 254：汉字匹配按孤立单字取音，与词组读音冲突；producer 又会删标点后拼接上下文。
+  使用不跨标点/英文的词组上下文，同时兼容合法旧单字读音。派生重投影需逐行凭据并根据
+  raw manifest 验证的源文本复算，任意读音篡改、时间变化、伪造凭据继续拒绝。
+- Case 255：连续 `……`、`》。` 同处一个源边界却被当成不同边界碰撞，导致整条源标点恢复失败。
+  同边界符号合并为真实停顿 owner，审计按单符号核对；不同源边界挤合仍拒绝。
+- Case 256：MFA native 分组导出的四位小数 TextGrid 与源浮点边界比较采用 1e-6，
+  9 个已产出对齐误判缺失。只接受原边界与 round(..., 4) 之间的精确导出舍入包络，
+  非分组旧路径与源几何检查保持原规则，真实越界继续拒绝。
+
+### 真实数据结果与不变量
+
+运行 `20260914T092601Z_100789`：443/612 改善为 **825 output / 230 filtered**，
+恢复 382 条，0 条原通过文件退回过滤，silent loss 0，run_health healthy。
+422 条标点契约失败、62 条汉字拼音失败、9 条 MFA 验证误拒均清零；原因存在交集。
+剩余真实停顿/疑似背景声/短词/可疑对齐按原门禁保留，不放松阈值，不生成 NVV。
+34,777 条 token 中只有 00384 的一条派生读音 du1→dou1 变化，原始模型及处理后 token
+几何均不变，raw 产物保持不可变。逐文件分析位于本批 NAS analysis 目录。
+
+## Case 257: 过滤件被正式输出契约复检导致单条过滤扩散为整块失败
+
+**日期**：2026-09-15
+**涉及文件/函数**：`scripts/full_corpus_publish.py`（`_validate_evidence`、
+`_validate_grid`、`validate_chunk_result`）；`scripts/full_corpus_orchestrator.py`
+（`_validate_completed_chunk`、`run_full`）；`tests/test_full_corpus_publish.py`、
+`tests/test_full_corpus_orchestrator.py`
+**状态**：已修复；完整回归与首块 10,000 条真实恢复验证通过
+
+### 现象与根因链
+
+Qwen、MFA 和后处理均成功的 chunk 在最终发布阶段被整体标为 `pipeline_failure`。旧发布校验
+对 accounting 中的每个 stem 都要求 `publication_contract.status=verified`、无 hard integrity
+reason 且具备最终五轨；但 `_filtered` 中的文件正是因为契约被拒绝、缺少 MFA 对齐或其它明确
+质量原因而进入过滤桶。另有少量 Qwen producer 已明确过滤的 stem，不会进入 MFA，也没有
+后处理报告或 TextGrid。一个合法过滤件因此触发异常，主管再把同一异常写到整个 chunk。
+
+### 修复与不变量
+
+- accounting `output` 继续强制 verified publication contract、空 hard-integrity reasons、最终五轨、
+  音频轴和标点证据，正式结果标准没有放松。
+- accounting `filtered` 接受带明确 `filtered_*` 状态或 `filter_reasons` 的可解析诊断 TextGrid；
+  它可保留 `words` 等失败现场轨道，但仍须满足文件安全、音频轴和区间覆盖检查。
+- Qwen producer 的 sealed `output_stems/filtered_stems` 必须互斥且守恒；producer-filtered stem
+  作为逐条 `producer_failure` 记账，不要求伪造后处理报告或 TextGrid。
+- 公开回执只绑定实际 accepted/filtered stem；阶段失败和 producer failure 保留逐条原因，
+  不再被后续 chunk 状态覆盖，也不会回退或重跑密封 Qwen 时间戳。
+
+### 验证
+
+新增回归先复现 rejected-contract 过滤件及无 TextGrid 的 producer filter 导致整块失败，修复后
+完整测试为 **1419 passed**。首块真实结果完整验证为 9,081 accepted、686 postprocess filtered、
+9 Qwen producer-filtered，加上 224 stage failure 后与 10,000 条输入严格守恒；既有 Qwen/MFA
+证据成功通过 `downstream_evidence_reused`，未重新执行模型。

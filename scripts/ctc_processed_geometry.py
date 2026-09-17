@@ -227,7 +227,12 @@ def resolve_processed_english_spans(
             raise ValueError("canonical English raw span missing or owner conflict")
         start = _number(span[0], "canonical start")
         end = _number(span[1], "canonical end")
-        if start < 0 or end <= start or end > duration + 1e-6:
+        # CTC frame coordinates are serialized on a 60 ms grid while the WAV
+        # axis ends on an exact sample.  The final frame can therefore exceed
+        # the decoded duration by a sub-millisecond remainder.  Reuse the
+        # established 3 ms geometry tolerance, but keep the canonical span
+        # immutable and clamp only the derived processed span below.
+        if start < 0 or end <= start or end > duration + GEOMETRY_TOLERANCE_S:
             raise ValueError("canonical English raw span outside audio axis")
         return start, end
 
@@ -275,7 +280,7 @@ def resolve_processed_english_spans(
         if not isinstance(row.get("canonical_unit"), dict):
             continue
         raw_start, raw_end = _raw_span(row)
-        if raw_end > readable_audio_end + 1e-6:
+        if raw_end > readable_audio_end + GEOMETRY_TOLERANCE_S:
             raise ProcessedGeometryError(
                 "canonical_span_outside_readable_audio",
                 "canonical English raw span extends beyond readable audio",
@@ -377,7 +382,7 @@ def resolve_processed_english_spans(
         # failed closed when the canonical span was outside the audio.
         processed_end = max(processed_end, raw_end)
         processed_end = min(processed_end, duration, readable_audio_end)
-        if processed_end + 1e-6 < raw_end:
+        if processed_end + GEOMETRY_TOLERANCE_S < raw_end:
             raise ProcessedGeometryError(
                 "processed_span_shorter_than_canonical",
                 "processed English span would be shorter than canonical span",
@@ -387,6 +392,8 @@ def resolve_processed_english_spans(
                 stem_context=(row.get("stem") or row.get("source_stem")
                               or row.get("reference_identity")),
             )
+        if processed_end + 1e-6 < raw_end:
+            source = "raw_end_axis_clamp"
         if processed_end <= raw_start:
             raise ValueError("processed English span has no positive owner interval")
         processed_span = [raw_start, processed_end]

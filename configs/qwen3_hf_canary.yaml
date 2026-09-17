@@ -1,0 +1,22 @@
+# Main pipeline: Qwen3 ASR + ForcedAligner + fixed pause normalization.
+# Existing MFA alignment and anchor correction remain enabled.
+mode: full
+reference_mode: auto
+data_dir: /path/to/wavs
+workspace: workspace/qwen3_hf_canary
+ctc_prealign:
+  enabled: true
+  provider: qwen3_hf
+  python: /path/to/qwen3-hf/bin/python
+  model_path: /local/models/Qwen3-ASR-1.7B-hf
+  forced_aligner_model_path: /local/models/Qwen3-ForcedAligner-0.6B-hf
+  device: cuda:0
+  dtype: bfloat16
+  language: Chinese
+  context: ""
+  max_new_tokens: 2048
+  batch_size: 1
+  all_gpus: false
+  nvv_enabled: false
+  reference_nvv_enabled: false
+# MFA remains enabled with the repository's usual anchor support settings.

@@ -169,9 +169,29 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
             tok["processed_ctc_span"] = [float(tok["start_s"]), value]
             tok["processed_ctc_boundary_source"] = source
 
-    def _hard_boundary(tok: dict, next_tok: dict | None) -> float | None:
-        """Return punctuation/long-pause boundary that energy must not cross."""
-        candidates = [p["start_s"] for p in punct
+    def _owned_qwen_pause(tok: dict, next_tok: dict | None, ordinal: int):
+        # Qwen punctuation is projected onto a model-estimated gap. Its start
+        # is not an acoustic fence: a sustained vowel may continue past it.
+        from qwen3_timestamp_normalization import SCHEMA
+        if (tok.get("provider") != "qwen3_hf"
+                or tok.get("timestamp_normalization", {}).get("schema") != SCHEMA):
+            return None
+        matches = [p for p in punct
+                   if p.get("provider") == "qwen3_hf"
+                   and p.get("normalization_schema") == SCHEMA
+                   and p.get("left_lexical_ordinal") == ordinal
+                   and p.get("right_lexical_ordinal") == (
+                       ordinal + 1 if next_tok is not None else None)
+                   and abs(p["start_s"] - tok["end_s"]) < 0.03
+                   and p["end_s"] > tok["end_s"]
+                   and (next_tok is None or p["end_s"] <= next_tok["start_s"] + 1e-6)]
+        return matches[0] if len(matches) == 1 else None
+
+    def _hard_boundary(tok: dict, next_tok: dict | None, ordinal: int) -> float | None:
+        """Keep other owners fixed; allow a Qwen gap's audible head to move."""
+        owned_pause = _owned_qwen_pause(tok, next_tok, ordinal)
+        candidates = [max(tok["end_s"], p["end_s"] - 0.06)
+                      if p is owned_pause else p["start_s"] for p in punct
                       if tok["end_s"] - 0.03 <= p["start_s"]
                       and (next_tok is None or p["start_s"] <= next_tok["start_s"] + 0.03)]
         if next_tok is not None and next_tok["start_s"] - tok["end_s"] >= 0.2 - 1e-9:
@@ -239,17 +259,22 @@ def adjust_boundaries(tokens: list[dict], punct: list[dict],
             check = True
         else:
             next_tok = tokens[idx + 1]
-            check = _hard_boundary(tok, next_tok) is not None
+            check = _hard_boundary(tok, next_tok, idx) is not None
         if not check:
             continue
 
-        offset = _search_energy_fall(audio, sr, tok["end_s"], 0.35, nf)
+        owned_pause = _owned_qwen_pause(tok, next_tok, idx)
+        # Include enough of the gap to confirm the existing 30 ms sustained
+        # silence criterion after a long tail; never search into the next word.
+        search_fwd = (min(0.6, owned_pause["end_s"] - tok["end_s"])
+                      if owned_pause is not None else 0.35)
+        offset = _search_energy_fall(audio, sr, tok["end_s"], search_fwd, nf)
         if offset is None or abs(offset - tok["end_s"]) < 0.02:
             continue
 
         old_end = tok["end_s"]
         new_end = round(offset, 3)
-        hard_boundary = _hard_boundary(tok, next_tok)
+        hard_boundary = _hard_boundary(tok, next_tok, idx)
         if hard_boundary is not None:
             new_end = min(new_end, hard_boundary)
 
@@ -366,7 +391,7 @@ def _record_adjusted_candidate_spans(tokens: list[dict],
 
 
 def _processed_geometry_cache_complete(ctc_dir: Path,
-                                       stems: set[str]) -> bool:
+                                       stems: set[str], *, require_energy: bool = False) -> bool:
     """Return whether an adjusted cache has derived spans for all authority rows."""
     for stem in stems:
         token_path = ctc_dir / f"{stem}_tokens.jsonl"
@@ -377,6 +402,11 @@ def _processed_geometry_cache_complete(ctc_dir: Path,
                     token_path.read_text(encoding="utf-8").splitlines()
                     if line.strip()]
         except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        if require_energy and (not rows or any(
+                not isinstance(row, dict)
+                or row.get("energy_adjustment_schema") != "ctc-energy-adjustment-v1"
+                for row in rows)):
             return False
         for row in rows:
             if not isinstance(row, dict) or not isinstance(
@@ -578,6 +608,11 @@ def process_one(stem: str, ctc_dir: Path, audio_dir: Path,
         stats = {"start_adj": 0, "end_extend": 0, "end_shorten": 0, "punct_adj": 0}
     _protect_processed_english_geometry(adj_tokens)
     _record_adjusted_candidate_spans(adj_tokens, adj_punct)
+    for token in adj_tokens:
+        if apply_energy:
+            token["energy_adjustment_schema"] = "ctc-energy-adjustment-v1"
+        else:
+            token.pop("energy_adjustment_schema", None)
 
     # Guard: fix invalid intervals where Part 1 and Part 2 independently
     # adjusted punct start_s / end_s into a crossing state (NVV between
@@ -695,7 +730,8 @@ def main():
             if all((args.output_dir / f"{stem}{suffix}").is_file()
                    and not (args.output_dir / f"{stem}{suffix}").is_symlink()
                    for suffix in required_suffixes)
-            and _processed_geometry_cache_complete(args.output_dir, {stem})
+            and _processed_geometry_cache_complete(args.output_dir, {stem},
+                                                  require_energy=not args.geometry_only)
         }
         if existing:
             new_stems = [s for s in stems if s not in existing]
@@ -885,4 +921,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

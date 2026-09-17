@@ -1,12 +1,14 @@
 # Chinese MFA Forced Alignment Pipeline
 
-基于 Montreal Forced Aligner (MFA) + NVASR CTC 强制对齐的中文音频标注管线，输入 wav + 中文文本，输出 5 层 Praat TextGrid。
+基于 Qwen3 文本／时间戳 + Montreal Forced Aligner (MFA) 的音频标注管线。无参考文本时由 Qwen3 识别；有参考文本时直接生成时间戳。固定执行非开头 sp0 并入前词；较长停顿优先使用原标点，无标点才补省略号，开头静音不补省略号，再进入既有 MFA 和后处理。
+
+设计与迁移说明见 [Qwen3 主管线设计](docs/superpowers/specs/2026-09-14-qwen3-main-pipeline-design.md)。MFA 锚点修正和对齐算法保持；主流程不回退 FunASR/NVASR。
 
 ## 前提条件
 
 - Conda (Miniconda 或 Anaconda)
 - GPU with CUDA (可选，CPU 也可运行但较慢)
-- NVASR 模型文件 (~2.8 GB，需单独下载放入 `models/Multilingual-NVASR/`)
+- 本地原生 Qwen3-ASR 与 Qwen3-ForcedAligner 模型；纯参考文本模式只需 ForcedAligner 权重
 
 ## 移植到新机器
 
@@ -19,17 +21,11 @@
    ```
    这会创建 conda 环境 `mfa_chinese`、转换词典、下载 MFA 模型。
 
-   如需 NVASR (CTC 预对齐)，还需要一个带 `funasr` + `torch` 的 Python 环境（可以是 base conda）。
+   Qwen3 预对齐使用独立原生 Transformers 环境，依赖见 `requirements-qwen3-hf.txt`。
 
-2. **放入 NVASR 模型** — 将 Multilingual-NVASR 模型文件放入:
-   ```
-   models/Multilingual-NVASR/
-   ├── model.pt
-   ├── am.mvn
-   ├── config.yaml
-   ├── configuration.json
-   └── paralingustic_tokenizer.model
-   ```
+2. **配置本地 Qwen3 模型** — 在 `ctc_prealign` 中设置 `model_path` 和
+   `forced_aligner_model_path`，示例见 `configs/qwen3_hf_canary.yaml`。
+   使用原生 `-hf` 权重目录，不自动下载或转换模型。
 
 3. **放入数据** — 在 `data_dir/` 下按子目录放 wav + txt 文件，或通过 `--data-dir` 指定外部路径。
 
@@ -95,7 +91,7 @@ data_dir/{task_name}/
 └── ...
 ```
 
-无参考文本时管线会使用 NVASR ASR 输出作为文本，同样可用。
+无参考文本时管线使用 Qwen3 ASR 输出作为文本，随后生成并正则化时间戳。
 
 文本文件若带引擎后缀（如 `audio_001_qwen3-api.txt`），管线自动匹配同名 wav。
 
@@ -174,6 +170,29 @@ bash scripts/launch_multi_gpu.sh --config configs/batch_all.yaml --streaming --n
 ```bash
 python scripts/launch_8gpu.py --config configs/batch_all.yaml --gpus 0,1,2,3 --dry-run
 ```
+
+## Qwen3 原生识别与预对齐后端
+
+主管线默认使用 `ctc_prealign.provider: qwen3_hf`。有参考文本时跳过 ASR，直接使用
+ForcedAligner；无参考文本时先识别再生成时间戳。两种模式固定执行停顿正则化，修复后的
+文本和锚点交给原有 MFA 流程。旧主流程配置会提示并迁移到 Qwen3；失败不切换模型。
+
+示例见 [configs/qwen3_hf_canary.yaml](configs/qwen3_hf_canary.yaml)。ASR 示例选用
+`Qwen/Qwen3-ASR-1.7B-hf`，也可配置 `0.6B-hf`；对齐模型为
+`Qwen/Qwen3-ForcedAligner-0.6B-hf`。两者均须使用已下载的本地原生模型目录，
+并通过 [requirements-qwen3-hf.txt](requirements-qwen3-hf.txt) 配置独立环境。
+旧 `qwen-asr==0.0.6` 环境不需要改动。
+
+Qwen 提供词／字时间戳，MFA 继续生成音素层。新后端不提供 NVV 分类，必须关闭
+`nvv_enabled` 和 `reference_nvv_enabled`。模型仍逐条推理；`batch_size` 控制每卡待处理队列，
+`all_gpus` 启用可见 GPU 的独立模型工作线程。单条音频最长 300 秒。MFA 交接仍遵循仓库的中文／英文词条规范，
+不等于已经为官方支持的所有语言配置了音素模型。模型／文本身份变化或输出被修改时，
+必须使用新的输出目录，不能覆盖复用旧证据。
+
+详细能力分析与真实模型验收条件见
+[docs/QWEN3_UPGRADE_ANALYSIS.md](docs/QWEN3_UPGRADE_ANALYSIS.md)，配置和预检方法见
+[docs/QWEN3ASR_MODE.md](docs/QWEN3ASR_MODE.md)。此路径为主管线默认入口，实际运行需要本地
+`-hf` 权重、兼容 Transformers 环境和实际音频验收。
 
 ## 独立 Qwen3-ASR transcript-only 模式
 
@@ -316,11 +335,11 @@ data_dir/{task_name}/
 |------|------|------|------|
 | 1 | `trim` | `trim_silence_batch.py` | 内部静音裁剪 + 首尾补全到 0.5s |
 | 2 | `resample` | (内联) | 降采样到 16kHz (MFA 要求) |
-| 3 | `prealign` | `ctc_prealign.py` | NVASR CTC 强制对齐 → MFA 锚点 TextGrid |
+| 3 | `prealign` | `qwen3_prealign.py` | Qwen3 文本／时间戳 → 固定停顿正则化 → MFA 锚点 |
 | 4 | `normalize` | (内联) + `normalize_english_tokens.py` | cn2an 阿拉伯数字→中文数字 + 英文 token 规范化 |
 | 5 | `adjust` | `adjust_ctc_boundaries.py` | 能量分析修正 CTC 锚点边界 |
 | 6 | `validate` | MFA CLI | MFA 语料验证 |
-| 7 | `align` | MFA CLI | MFA 声学模型对齐 (CTC 锚点 + NVASR 语料) |
+| 7 | `align` | MFA CLI | MFA 声学模型对齐 (Qwen3 修复后的锚点和语料) |
 | 8 | `postprocess` | `postprocess_textgrids.py` | 5 层 TextGrid 构建、标点注入、质检、BGM 检测 |
 
 使用 `--list-steps` 查看所有步骤，`--skip-{step}` 跳过某步，`--skip-to {step}` 从某步开始。
@@ -364,7 +383,9 @@ workspace/
 
 ## 核心算法
 
-### 1. NVASR CTC 强制对齐 (`ctc_prealign.py`)
+### 1. 历史 NVASR CTC 强制对齐 (`ctc_prealign.py`)
+
+以下保留历史算法说明；新的主管线使用前文的 Qwen3 入口。
 
 用 NVASR (SenseVoice-Small 微调) 的 CTC logits 做强制对齐，而非自由解码:
 
@@ -424,7 +445,7 @@ NVV (如 LAUGHTER, BREATHING) 后的省略号 `...` 如果包含可听能量 (>=
 
 ## NVV 副语言标签
 
-管线支持 30 类 NVV (Non-Verbal Vocalization) 标签，由 NVASR 模型从音频中自动检测:
+历史 NVASR 路径支持 30 类 NVV (Non-Verbal Vocalization) 标签。Qwen3 主管线没有这项声学分类能力，迁移时会明确提示关闭相关选项；以下为历史标签说明:
 
 | 类别 | 标签 | 类别 | 标签 |
 |------|------|------|------|
@@ -519,9 +540,13 @@ trim:
 # ── Step 3: CTC 预对齐 ──
 ctc_prealign:
   enabled: true
-  model_path: "models/Multilingual-NVASR"
+  provider: qwen3_hf
+  model_path: "/local/models/Qwen3-ASR-1.7B-hf"
+  forced_aligner_model_path: "/local/models/Qwen3-ForcedAligner-0.6B-hf"
+  nvv_enabled: false
+  reference_nvv_enabled: false
   device: cuda:0
-  python: ""                    # NVASR Python。空 = 当前 Python
+  python: ""                    # 原生 Qwen3 Python。空 = 当前 Python
   limit: 0                      # 0 = 全部
   timeout: 3600
 
@@ -584,6 +609,47 @@ geometry freeze 之前，最终保留的内部纯静音 interval 再按 serializ
 ticks 规范化标签：`<200ms` 为 `<sp0>`、`[200,500ms)` 为 `<sp1>`、`[500,1500ms)` 为
 `<sp2>`、`>=1500ms` 为 `<sp3>`。这一步只改标签，不改区间、owner、tier 数量或过滤原因，
 也不重新开启 owner arbitration；leading `<sp1>` convention 保持不变。
+
+### 后处理批次提效与文件名契约
+
+后处理启动时只对 CTC raw manifest 和 work receipt 做一次全批结构、成员、大小与
+SHA-256 预检，并建立 `(stem, suffix)` 索引；worker 仍核验自己实际消费的字节，不能用
+缓存绕过证据校验。同一 stem 的 token、punctuation、transcript 和 reference 通过
+read-through bundle 至多物理读取/解析一次；sealed raw view 与 canonical semantic view
+使用独立对象，避免规范化反向污染原始证据。strict English 全局 manifest 同样只读取
+一次并按 stem 索引，每个 ledger 仍独立检查 path、hash 和 schema。拼音词典使用保持插入
+顺序的 `casefold()` first-match 索引，结果与旧的逐项扫描一致。
+
+words 仍是唯一几何 authority。中间 barrier 只同步 words/source-phone lineage，不再反复
+构建 display tiers；全部边界决定和 geometry freeze 完成后，raw_text、pinyin、hanzi 与
+pinyin_phones 才执行一次最终 publication transaction。每个 stem 的 RMS cache 按采样率、
+frame size 和 alignment mode 隔离：全音频 bank 使用 `global`，切片从自身起点计算时使用
+`local`，两者不会混用。最终 phone containment 使用有序线性扫描，只有异常 phone 才构建
+详细 overlap 诊断。
+
+并行调度最多保留 `max(2 * workers, 4)` 个未完成 future。报告按完成顺序写到 output
+目录内的唯一临时 JSONL，全部 worker 成功后执行 `flush`/`fsync`，再次核对 manifest 与
+receipt 的原始 bytes、hash 和 identity，最后用 `os.replace` 原子发布。worker、证据、路径
+长度或 I/O 任一失败都会删除临时文件并保留旧正式报告。
+
+路径参数使用 `PathLike`/`pathlib` 传递，不经过 shell 拼接；空格、中文、emoji、组合字符、
+多点和长父目录会保留原始拼写。生产工件仍是扁平 stem 命名空间，因此 exact duplicate、
+大小写折叠冲突以及 NFC+casefold 冲突会在封存或 worker 启动前 fail-closed，绝不静默覆盖
+或交叉绑定。Windows drive/UNC evidence 字符串在非 Windows 主机保持 opaque，不会被误当成
+本地 POSIX 相对路径。
+
+可用以下命令运行不接触生产语料的操作计数基准：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python tests/benchmark_postprocess.py \
+  --synthetic-stems 100 --repeat 5 \
+  --json-out /tmp/postprocess-efficiency-100.json
+```
+
+该脚本只测候选实现并验证 validator/read/frame/rebuild/containment/pending 上限，不声明
+真实吞吐提升。发布前仍必须在固定的 authority 与 no-reference 代表语料上分别运行
+baseline/candidate 至少三次，比较 TextGrid/tone mapping/report 语义、wall-time 中位数和
+peak RSS；输出完全等价、候选中位耗时下降且 RSS 不超过 baseline 的 105% 才可 rollout。
 
 ### English/reference canonical contract
 

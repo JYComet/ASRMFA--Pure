@@ -100,6 +100,7 @@ def test_primary_mfa_command_and_shard_contract_explicitly_disable_dither(
         return 0
 
     monkeypatch.setattr(run_pipeline, "_guard_mfa_axis", lambda *_args: 0)
+    monkeypatch.setattr(run_pipeline, "require_mfa_anchor_support", lambda *_args: None)
     monkeypatch.setattr(run_pipeline, "_run_mfa_sharded", fake_sharded)
     monkeypatch.setattr(run_pipeline, "run_mfa", fake_run)
     monkeypatch.setattr(

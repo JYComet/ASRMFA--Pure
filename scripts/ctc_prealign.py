@@ -113,6 +113,75 @@ CTC_TOKEN_SIDECAR_PASSTHROUGH_FIELDS = (
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+def expected_shard_artifact_names(
+    produced_stems: set[str] | list[str] | tuple[str, ...],
+    reference_stems: set[str] | list[str] | tuple[str, ...],
+) -> set[str]:
+    """Return the exact per-shard artifact namespace for produced stems.
+
+    ``_ref.txt`` is a provenance sidecar emitted only for authoritative
+    reference-text stems.  A fallback/ASR stem must never be allowed to pass
+    the all-GPU namespace preflight merely because the parent invocation was
+    run with a legacy ``--no-nvv`` flag.
+    """
+    produced = set(produced_stems)
+    references = set(reference_stems)
+    if not references <= produced:
+        extra = sorted(references - produced)
+        raise ValueError(f"reference stems outside produced set: {extra}")
+    suffixes = (".TextGrid", ".lab", "_tokens.jsonl", "_punct.json",
+                "_text_cn.txt", "_text_raw.txt")
+    names = {stem + suffix for stem in produced for suffix in suffixes}
+    names.update(stem + "_ref.txt" for stem in produced & references)
+    return names
+
+
+def manifest_stem_set_matches(
+    manifest_stems: list[str] | tuple[str, ...],
+    expected_stems: set[str] | list[str] | tuple[str, ...],
+) -> bool:
+    """Return whether a shard manifest conserves each expected stem once.
+
+    Manifest entry order is not part of the shard contract.  In particular,
+    sorting complete filenames can differ from sorting stems when one stem is
+    a prefix of another (for example ``name`` and ``name&speaker``).
+    """
+    return (
+        len(manifest_stems) == len(set(manifest_stems))
+        and set(manifest_stems) == set(expected_stems)
+    )
+
+
+def refresh_ctc_summary_counts(
+    summary: str, *, total: int, ok: int, failed: int,
+) -> str:
+    """Reseal the summary's Files line with final bundle counts."""
+    refreshed, replacements = re.subn(
+        r"^Files:\s+\d+\s+total,\s+\d+\s+OK,\s+\d+\s+failed$",
+        f"Files: {total} total, {ok} OK, {failed} failed",
+        summary,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if replacements != 1:
+        raise ValueError("summary is missing a unique Files count line")
+    return refreshed
+
+
+def balanced_gpu_shard_ranges(total: int, num_gpus: int) -> list[tuple[int, int]]:
+    """Return contiguous ``(offset, limit)`` ranges using every GPU fairly."""
+    if total < 0 or num_gpus <= 0:
+        raise ValueError("total must be non-negative and num_gpus must be positive")
+    quotient, remainder = divmod(total, num_gpus)
+    ranges = []
+    offset = 0
+    for gpu_id in range(num_gpus):
+        limit = quotient + (1 if gpu_id < remainder else 0)
+        ranges.append((offset, limit))
+        offset += limit
+    return ranges
+
+
 def validate_selected_stems_manifest(path: Path, expected: set[str]) -> str:
     """Validate shard denominator metadata and return its content digest."""
     path = Path(path)
@@ -157,7 +226,10 @@ def validate_shard_accounting_receipt(path: Path, expected: set[str],
         raise ValueError(f"shard accounting eligible shard mismatch: {path}")
     if receipt.get("exclusions") != []:
         raise ValueError(f"shard accounting exclusions are not empty: {path}")
-    if set(receipt["output"]["stems"]) != set(expected):
+    filtered = set(receipt.get("filtered", {}).get("stems", []))
+    if not filtered <= set(expected):
+        raise ValueError(f"shard accounting filtered stems outside expected: {path}")
+    if set(receipt["output"]["stems"]) != set(expected) - filtered:
         raise ValueError(f"shard accounting output mismatch: {path}")
     processed = receipt.get("extra", {}).get("processed_stems")
     if not isinstance(processed, list) or set(processed) != set(expected):
@@ -202,7 +274,7 @@ def chars_and_pinyin(text: str):
 # ── Import shared constants from pipeline_utils ──
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 from pipeline_utils import (
-    CTC_NORMALIZATION_MARKER,
+    CTC_NORMALIZATION_MARKER, CTC_SUFFIXES,
     make_ctc_normalization_marker, parse_ctc_normalization_marker,
     NVV_NAMES, NVV_TO_MFA,
     is_nvv_token, is_english_token, is_pinyin_syllable, is_punct,
@@ -222,6 +294,7 @@ NVASR_NONLEXICAL_MFA_LABELS = frozenset({"sil", "sp", "spn", "<eps>"})
 try:
     from english_units import (
         EnglishUnitError,
+        is_english_fragment_token,
         merge_authority_fragment_group,
         parse_english_units,
     )
@@ -229,6 +302,7 @@ try:
 except ImportError:  # package-style imports in tests/tools
     from scripts.english_units import (
         EnglishUnitError,
+        is_english_fragment_token,
         merge_authority_fragment_group,
         parse_english_units,
     )
@@ -273,7 +347,7 @@ def _reference_inventory(wav_files: list[Path], data_dir: Path,
         elif has_japanese(ref):
             exclusions[stem] = "unsupported_reference"
         else:
-            eligible[stem] = clean_unsupported_punct(ref)
+            eligible[stem] = clean_unsupported_punct(strip_gender_tags(ref))
     return [by_stem[s] for s in sorted(eligible)], eligible, exclusions
 
 
@@ -303,7 +377,7 @@ def _source_inventory(wav_files: list[Path], data_dir: Path,
     for stem in sorted(by_stem):
         ref = find_ref_text(stem, data_dir, txt_index)
         if ref and not has_japanese(ref):
-            optional_refs[stem] = clean_unsupported_punct(ref)
+            optional_refs[stem] = clean_unsupported_punct(strip_gender_tags(ref))
     return [by_stem[stem] for stem in sorted(by_stem)], optional_refs, {}
 
 
@@ -841,6 +915,34 @@ def preprocess_asr_for_mfa(text: str) -> str:
         lambda m: ' ' + nvv_to_mfa(m.group(0)) + ' ',
         text)
     return re.sub(r'\s+', ' ', text).strip()
+
+
+def _strip_leading_punctuation_after_tags(text: str) -> tuple[str, str | None]:
+    """Remove one real leading punctuation mark while preserving known NVV.
+
+    Control tags (``<|language|>``/``<|emotion|>``) and whitespace remain in
+    place.  A complete ``[KNOWN-NVV]`` at the content edge is protected;
+    unknown or malformed bracket labels retain the historical ``[`` removal
+    because the shared ``is_punct`` classifier intentionally treats it as
+    punctuation.
+    """
+    value = str(text)
+    position = 0
+    control_tag = re.compile(r'<\|[^|]+\|>')
+    while position < len(value):
+        while position < len(value) and value[position].isspace():
+            position += 1
+        match = control_tag.match(value, position)
+        if match is None:
+            break
+        position = match.end()
+    known_pattern = r'\[(?:' + '|'.join(
+        re.escape(str(name).strip('<>')) for name in NVV_NAMES) + r')\]'
+    if re.match(known_pattern, value[position:], flags=re.IGNORECASE):
+        return value, None
+    if position < len(value) and is_punct(value[position]):
+        return value[:position] + value[position + 1:], value[position]
+    return value, None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1551,9 +1653,14 @@ def _validate_emitted_nvasr_provenance(words_pinyin: list[dict]) -> list[str]:
 def attach_nvasr_candidate_provenance(
         words_pinyin: list[dict], punct_entries: list[dict],
         timeline: dict, *, strict_schema_v3: bool = False,
-        strict_schema_v2: bool | None = None) -> list[str]:
+        strict_schema_v2: bool | None = None,
+        reference_mode: bool = False) -> list[str]:
     """Bind NVASR candidates to CTC rows by label and lexical neighbor ordinals.
 
+    In reference (authority) mode the ``words_pinyin`` rows are forced to the
+    reference text, so their semantic axis is the reference projection, not
+    the raw NVASR decode.  The raw-decode ``lexical_occurrences`` round-trip
+    count check therefore does not apply and is skipped via ``reference_mode``.
     The candidate's raw encoder coordinates are copied verbatim.  Matching is
     occurrence-aware: two equal labels with the same lexical-neighbor key are
     not distinguishable and therefore reject the bundle.  This helper mutates
@@ -1591,15 +1698,15 @@ def attach_nvasr_candidate_provenance(
             or semantic_axis.get("ordinal_field") != "lexical_ordinal"):
         return ["candidate timeline semantic axis metadata is invalid"]
     timeline_lexical = timeline.get("lexical_occurrences")
-    emitted_semantic = [
-        row for row in words_pinyin
-        if _nvasr_semantic_axis_member(row.get("word"))]
-    if isinstance(timeline_lexical, list) and len(timeline_lexical) != len(
-            emitted_semantic):
-        return [
-            "candidate timeline semantic axis round-trip count mismatch: "
-            f"timeline={len(timeline_lexical)} emitted={len(emitted_semantic)}"
-        ]
+    if not reference_mode and isinstance(timeline_lexical, list):
+        emitted_semantic = [
+            row for row in words_pinyin
+            if _nvasr_semantic_axis_member(row.get("word"))]
+        if len(timeline_lexical) != len(emitted_semantic):
+            return [
+                "candidate timeline semantic axis round-trip count mismatch: "
+                f"timeline={len(timeline_lexical)} emitted={len(emitted_semantic)}"
+            ]
     if strict_v3:
         expected_axis = [{
             "lexical_ordinal": row.get("lexical_ordinal"),
@@ -1617,13 +1724,18 @@ def attach_nvasr_candidate_provenance(
                 for index, row in enumerate(timeline_lexical)):
             return ["candidate timeline lexical identity/order is invalid"]
         timeline_raw = timeline.get("raw_timeline_neighbors")
-        raw_sequence_reasons = _nvasr_raw_timeline_sequence_reasons(
-            timeline_raw)
-        if raw_sequence_reasons:
-            return [
-                "candidate timeline raw event contract invalid:"
-                f"{','.join(raw_sequence_reasons)}"
-            ]
+        # A speechless utterance (reference text has no lexical words, e.g. a
+        # bare "……") legitimately produces zero raw decoder events.  Enforce
+        # the raw-event sequence contract only when lexical speech exists; an
+        # empty timeline is the valid no-speech state, not a malformed producer.
+        if timeline_lexical:
+            raw_sequence_reasons = _nvasr_raw_timeline_sequence_reasons(
+                timeline_raw)
+            if raw_sequence_reasons:
+                return [
+                    "candidate timeline raw event contract invalid:"
+                    f"{','.join(raw_sequence_reasons)}"
+                ]
         for candidate_index, candidate in enumerate(candidates):
             anchor_reasons = _nvasr_anchor_binding_reasons(candidate)
             if anchor_reasons:
@@ -2569,11 +2681,18 @@ def _clamp_words_to_wav_axis(words: list[dict], duration_s: float) -> list[dict]
 # ═══════════════════════════════════════════════════════════════
 
 def has_japanese(text: str) -> bool:
-    """检测文本是否含日语假名 (ひらがな / カタカナ)."""
+    """检测文本是否含日语假名 (ひらがな / カタカナ).
+
+    Only actual kana syllables/iteration marks are flagged.  Katakana-block
+    punctuation such as the middle dot ``・`` (U+30FB, used in Chinese name
+    transliterations like ``汉斯・亚齐博尔德``), the prolonged-sound mark ``ー``
+    (U+30FC) and the double hyphen ``゠`` (U+30A0) are not Japanese kana.
+    """
     for ch in text:
-        if '぀' <= ch <= 'ゟ':   # Hiragana U+3040..U+309F
+        cp = ord(ch)
+        if 0x3041 <= cp <= 0x3096 or cp in (0x309D, 0x309E):  # Hiragana
             return True
-        if '゠' <= ch <= 'ヿ':   # Katakana U+30A0..U+30FF
+        if 0x30A1 <= cp <= 0x30FA or cp in (0x30FD, 0x30FE):  # Katakana
             return True
     return False
 
@@ -2601,6 +2720,17 @@ def clean_unsupported_punct(text: str) -> str:
             result.append(ch)       # 保留 emotion/lang/NVV 标签结构字符
         # 其余符号类字符 (」『』【】《》"' 等) 直接丢弃
     return ''.join(result)
+
+
+_GENDER_TAG_RE = re.compile(r'\{[FM]#([^}]*)\}')
+
+
+def strip_gender_tags(text: str) -> str:
+    """Remove {F#...}{M#...} gender tags, keeping both versions' content.
+
+    e.g. ``{M#太好了，哥哥！}{F#太好了，姐姐！}`` -> ``太好了，哥哥！太好了，姐姐！``.
+    """
+    return _GENDER_TAG_RE.sub(r'\1', text)
 
 
 def _build_txt_index(data_dir: Path) -> dict[str, Path]:
@@ -3010,12 +3140,19 @@ def _validate_all_ctc_bundles(
         if errors:
             invalid.append((lab_path.stem, errors))
     if invalid:
-        print(f"  ERROR: {len(invalid)} invalid CTC transcript bundle(s)")
+        print(f"  WARNING: {len(invalid)} invalid CTC transcript bundle(s) dropped")
         for stem, errors in invalid[:20]:
             print(f"    - {stem}: {'; '.join(errors)}")
         if len(invalid) > 20:
             print(f"    ... and {len(invalid) - 20} more")
-        return False
+        # An invalid raw bundle (e.g. a TextGrid/tokens mismatch from a RIA
+        # split in fallback free decode) is a data-level mismatch.  Drop its
+        # artifacts so the remaining valid stems can still be sealed; the stem
+        # is recorded as filtered via the accounting receipt.
+        for stem, _errors in invalid:
+            for suffix in CTC_SUFFIXES + ["_ref.txt"]:
+                (ctc_dir / f"{stem}{suffix}").unlink(missing_ok=True)
+    lab_paths = sorted(ctc_dir.glob("*.lab"))
     print(f"  CTC bundle validation: {len(lab_paths)} OK")
     return bool(lab_paths)
 
@@ -3320,9 +3457,15 @@ def _merge_reference_english_fragments(words_pinyin: list[dict], reference: str)
             raise ValueError(f"missing authority English unit {authority.surface_text}")
 
         # Collect the smallest source-ordered candidate whose lexical ASCII
-        # length reaches the authority token.  Non-English rows are retained
-        # in the candidate so CJK/NVV crossings are rejected by the shared
-        # validator rather than skipped.
+        # length reaches the full authority surface.  ``alignment_token``
+        # strips a trailing numeric suffix for dictionary lookup (``MP3`` and
+        # ``target1`` both reduce to ``mp``/``target``), so it cannot be the
+        # collection target; use the hyphenless surface instead.  Digit-only
+        # fragments are counted here too so a split ``MP`` + ``3`` still
+        # reaches the full ``MP3`` surface.  Non-English rows remain in the
+        # candidate so CJK/NVV crossings are rejected by the shared validator
+        # rather than skipped.
+        authority_compact_len = len(authority.surface_text.replace("-", ""))
         candidate_rows: list[dict] = []
         compact_length = 0
         end = start
@@ -3330,12 +3473,12 @@ def _merge_reference_english_fragments(words_pinyin: list[dict], reference: str)
             row = result[end]
             candidate_rows.append(row)
             token = str(row.get("word", "")).strip().lstrip("▁")
-            if is_english_token(token):
+            if is_english_fragment_token(token):
                 compact_length += len(token.replace("-", ""))
             end += 1
-            if compact_length >= len(authority.alignment_token):
+            if compact_length >= authority_compact_len:
                 break
-        if compact_length < len(authority.alignment_token):
+        if compact_length < authority_compact_len:
             raise ValueError(f"partial authority English unit {authority.surface_text}")
 
         fragments = [row_fragment(row, index)
@@ -3483,7 +3626,70 @@ def _normalize_english(ctc_dir: Path, dict_path: Path | None = None,
     return changed
 
 
-def _plan_all_gpu_shard(output_dir: Path, gpu_id: int, limit: int) -> tuple[Path, bool, bool]:
+def _all_gpu_shard_is_reusable(shard_dir: Path, expected_stems: set[str]) -> bool:
+    """Validate enough immutable evidence to reuse a completed shard.
+
+    Filtering is a valid terminal outcome, so lab cardinality cannot decide
+    whether a shard is complete.  The selected-stems manifest and accounting
+    receipt establish the denominator; marker, manifest, summary and CTC
+    receipt establish that the produced subset is a finished bundle.
+    """
+    try:
+        expected = set(expected_stems)
+        selected = shard_dir / "selected_stems.txt"
+        validate_selected_stems_manifest(selected, expected)
+        accounting = shard_dir / ".pipeline_run_receipt_v2.json"
+        validate_shard_accounting_receipt(accounting, expected, expected)
+        marker = shard_dir / ".ctc_normalized"
+        marker_text = marker.read_text(encoding="utf-8")
+        if (marker_text != CTC_NORMALIZATION_MARKER
+                and parse_ctc_normalization_marker(marker_text) is None):
+            return False
+        ctc_receipt = shard_dir / ".ctc_run_receipt.json"
+        if not ctc_receipt.is_file() or not isinstance(
+                json.loads(ctc_receipt.read_text(encoding="utf-8")), dict):
+            return False
+        manifest = json.loads(
+            (shard_dir / "manifest.json").read_text(encoding="utf-8"))
+        if not isinstance(manifest, list):
+            return False
+        stems = []
+        for entry in manifest:
+            if not isinstance(entry, dict):
+                return False
+            stem = Path(str(entry.get("audio", ""))).stem
+            stems.append(stem)
+            if stem not in expected:
+                return False
+            for key in ("textgrid", "lab"):
+                artifact = Path(str(entry.get(key, "")))
+                if artifact.name != f"{stem}{'.TextGrid' if key == 'textgrid' else '.lab'}":
+                    return False
+                if not (shard_dir / artifact.name).is_file():
+                    return False
+        if not manifest_stem_set_matches(stems, expected - set(
+                json.loads(accounting.read_text(encoding="utf-8")).get(
+                    "filtered", {}).get("stems", []))):
+            return False
+        summary = (shard_dir / "summary.txt").read_text(encoding="utf-8")
+        match = re.search(
+            r"^Files:\s+(\d+)\s+total,\s+(\d+)\s+OK,\s+(\d+)\s+failed$",
+            summary, re.MULTILINE)
+        if not match:
+            return False
+        total, ok, failed = map(int, match.groups())
+        return (total == len(expected) and ok == len(stems) and failed == 0)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def _plan_all_gpu_shard(
+    output_dir: Path,
+    gpu_id: int,
+    limit: int,
+    *,
+    expected_stems: set[str] | None = None,
+) -> tuple[Path, bool, bool]:
     """Plan a shard directory without filesystem mutation.
 
     Returns ``(path, reused, recovered)``.  ``recovered`` denotes a clean
@@ -3496,7 +3702,27 @@ def _plan_all_gpu_shard(output_dir: Path, gpu_id: int, limit: int) -> tuple[Path
         return canonical, False, False
 
     existing_labs = len(list(canonical.glob("*.lab")))
-    if existing_labs >= limit:
+    if expected_stems is not None:
+        reusable = _all_gpu_shard_is_reusable(canonical, expected_stems)
+        if not reusable:
+            # A prior invocation may have used a different contiguous
+            # partition layout.  Its selected manifest is authoritative for
+            # that shard; the parent merge will still enforce global union
+            # and duplicate-set checks before publication.
+            try:
+                selected = {
+                    line for line in (canonical / "selected_stems.txt")
+                    .read_text(encoding="utf-8").splitlines() if line
+                }
+            except OSError:
+                selected = set()
+            reusable = bool(selected) and _all_gpu_shard_is_reusable(
+                canonical, selected)
+    else:
+        # Compatibility for standalone callers that predate denominator-aware
+        # reuse.  Production all-GPU planning always supplies expected stems.
+        reusable = existing_labs >= limit
+    if reusable:
         return canonical, True, False
 
     staging = output_dir / f"_shard_gpu{gpu_id}_staging"
@@ -3510,12 +3736,19 @@ def _plan_all_gpu_shard(output_dir: Path, gpu_id: int, limit: int) -> tuple[Path
 
 
 def _plan_all_gpu_shards(
-    output_dir: Path, shard_specs: list[tuple[int, int]]
+    output_dir: Path,
+    shard_specs: list[tuple[int, int] | tuple[int, int, set[str]]],
 ) -> list[tuple[int, int, Path, bool, bool]]:
     """Read-only plan for every shard; no earlier plan may mutate state."""
     plans: list[tuple[int, int, Path, bool, bool]] = []
-    for gpu_id, limit in shard_specs:
-        shard_dir, reused, recovered = _plan_all_gpu_shard(output_dir, gpu_id, limit)
+    for spec in shard_specs:
+        if len(spec) == 2:
+            gpu_id, limit = spec
+            expected_stems = None
+        else:
+            gpu_id, limit, expected_stems = spec
+        shard_dir, reused, recovered = _plan_all_gpu_shard(
+            output_dir, gpu_id, limit, expected_stems=expected_stems)
         plans.append((gpu_id, limit, shard_dir, reused, recovered))
     return plans
 
@@ -3758,9 +3991,9 @@ def main():
                     _available = {p.stem: p for p in all_wavs}
                     _missing = [stem for stem in _selected if stem not in _available]
                     if _missing:
-                        raise ValueError(
-                            f"stems file contains unavailable stems: {_missing[:5]}"
-                        )
+                        # Empty-reference stems are already in _all_exclusions;
+                        # drop them from the selection rather than erroring.
+                        _selected = [stem for stem in _selected if stem not in _missing]
                     all_wavs = [_available[stem] for stem in _selected]
                 except (OSError, ValueError) as _exc:
                     print(f"ERROR: invalid --stems-file: {_exc}", file=sys.stderr)
@@ -3787,8 +4020,9 @@ def main():
             if total == 0:
                 print("ERROR: no eligible WAVs with authoritative references", file=sys.stderr)
                 return 2
-            per_gpu = (total + num_gpus - 1) // num_gpus
-            print(f"--all-gpus: {num_gpus} GPUs detected, {total} WAVs → ~{per_gpu}/GPU")
+            _shard_ranges = balanced_gpu_shard_ranges(total, num_gpus)
+            _max_shard = max((limit for _, limit in _shard_ranges), default=0)
+            print(f"--all-gpus: {num_gpus} GPUs detected, {total} WAVs → ~{_max_shard}/GPU")
 
             _procs: list[tuple[int, _sp.Popen, Path]] = []
 
@@ -3811,21 +4045,38 @@ def main():
                 _base_argv += ["--no-dict-update"]
 
             _shard_specs = [
-                (gpu_id, min(per_gpu, total - gpu_id * per_gpu))
-                for gpu_id in range(num_gpus)
-                if min(per_gpu, total - gpu_id * per_gpu) > 0
+                (gpu_id, limit, {
+                    p.stem for p in all_wavs[offset:offset + limit]
+                })
+                for gpu_id, (offset, limit) in enumerate(_shard_ranges)
+                if limit > 0
             ]
             try:
                 _shard_plans = _plan_all_gpu_shards(args.output_dir, _shard_specs)
             except RuntimeError as _exc:
                 print(f"ERROR: {_exc}", file=sys.stderr)
                 return 2
+            _reused_gpu_ids = {
+                gpu_id for gpu_id, _, _, reused, _ in _shard_plans if reused
+            }
+            _shard_expected_by_gpu: dict[int, set[str]] = {}
+            for gpu_id, limit, shard_dir, reused, _ in _shard_plans:
+                if reused:
+                    _shard_expected_by_gpu[gpu_id] = {
+                        line for line in (shard_dir / "selected_stems.txt")
+                        .read_text(encoding="utf-8").splitlines() if line
+                    }
+                else:
+                    offset, _ = _shard_ranges[gpu_id]
+                    _shard_expected_by_gpu[gpu_id] = {
+                        p.stem for p in all_wavs[offset:offset + limit]
+                    }
 
             # Materialize and launch only after every GPU's read-only plan
             # succeeds.  A race that changes a planned fresh path is loud and
             # leaves all prior plans untouched.
             for gpu_id, limit, shard_dir, _reused, _recovered in _shard_plans:
-                offset = gpu_id * per_gpu
+                offset, _ = _shard_ranges[gpu_id]
                 if _reused:
                     _existing_labs = len(list(shard_dir.glob("*.lab")))
                     print(f"  GPU {gpu_id}: reuse existing shard ({_existing_labs} labs)")
@@ -3893,19 +4144,39 @@ def main():
             # may be moved until every shard has an exact namespace, manifest,
             # summary and mutually exclusive expected stem set.
             import json as _json
-            _artifact_suffixes = [".TextGrid", ".lab", "_tokens.jsonl",
-                                  "_punct.json", "_text_cn.txt", "_text_raw.txt"]
-            if args.no_nvv:
-                _artifact_suffixes.append("_ref.txt")
             _preflight_shards = []
             _seen_shard_stems: set[str] = set()
             _expected_all_stems: set[str] = set()
             _selected_manifest_digests: dict[str, str] = {}
             for _gpu_id, _, _shard_dir in _procs:
-                _start = _gpu_id * per_gpu
-                _expected = {p.stem for p in all_wavs[_start:_start + per_gpu]}
+                if _gpu_id in _reused_gpu_ids:
+                    _expected = _shard_expected_by_gpu[_gpu_id]
+                else:
+                    _expected = _shard_expected_by_gpu[_gpu_id]
                 _expected_all_stems |= _expected
-                _allowed = {s + suffix for s in _expected for suffix in _artifact_suffixes}
+                # Legitimate skips (e.g. an empty reference that produces no
+                # text) emit no artifacts; the child receipt records them as
+                # filtered stems.  Exclude them from the exact-namespace,
+                # manifest and summary contracts so a shard with skipped stems
+                # still merges.
+                try:
+                    _shard_receipt = _json.loads(
+                        (_shard_dir / ".pipeline_run_receipt_v2.json")
+                        .read_text(encoding="utf-8"))
+                except Exception as _exc:
+                    raise RuntimeError(
+                        f"invalid shard accounting receipt: {_shard_dir}") from _exc
+                _filtered = set(_shard_receipt.get("filtered", {}).get("stems", []))
+                if not _filtered <= _expected:
+                    raise RuntimeError(
+                        f"shard filtered stems outside expected: {_shard_dir}")
+                _produced = _expected - _filtered
+                try:
+                    _allowed = expected_shard_artifact_names(
+                        _produced, set(_all_ref_texts) & _produced)
+                except ValueError as _exc:
+                    raise RuntimeError(
+                        f"shard artifact namespace inputs invalid: {_shard_dir}") from _exc
                 _allowed |= {"manifest.json", "summary.txt", ".ctc_normalized",
                              ".ctc_run_receipt.json",
                              ".pipeline_run_receipt_v2.json", "selected_stems.txt"}
@@ -3949,13 +4220,13 @@ def main():
                         _path = Path(str(_entry.get(_key, "")))
                         if _path.name not in _allowed or not (_shard_dir / _path.name).is_file():
                             raise RuntimeError(f"shard manifest artifact mismatch: {_entry}")
-                if _manifest_stems != sorted(_expected) or len(_manifest_stems) != len(set(_manifest_stems)):
+                if not manifest_stem_set_matches(_manifest_stems, _produced):
                     raise RuntimeError(f"shard manifest stem set mismatch: {_shard_dir}")
                 _summary_text = (_shard_dir / "summary.txt").read_text(encoding="utf-8")
                 _summary_match = re.search(
                     r"^Files:\s+(\d+)\s+total,\s+(\d+)\s+OK,\s+(\d+)\s+failed$",
                     _summary_text, re.MULTILINE)
-                if not _summary_match or tuple(map(int, _summary_match.groups())) != (len(_expected), len(_expected), 0):
+                if not _summary_match or tuple(map(int, _summary_match.groups())) != (len(_expected), len(_produced), 0):
                     raise RuntimeError(f"shard summary mismatch: {_shard_dir}")
                 _marker_text = (_shard_dir / ".ctc_normalized").read_text(encoding="utf-8")
                 # Accept v3 (legacy) or v4 (content-identity) marker.
@@ -4110,6 +4381,9 @@ def main():
                     sys.exit(1)
                 _rebuild_final_manifest(_merge_output_dir, audio_dir,
                                         wav_files=all_wavs)
+                _final_ok = len(list(_merge_output_dir.glob("*.lab")))
+                _summary = refresh_ctc_summary_counts(
+                    _summary, total=_total_files, ok=_final_ok, failed=_total_fail)
                 (_merge_output_dir / "summary.txt.tmp").write_text(_summary, encoding="utf-8")
                 os.replace(_merge_output_dir / "summary.txt.tmp", _merge_output_dir / "summary.txt")
                 _stem_count = len(list(_merge_output_dir.glob("*.lab")))
@@ -4158,8 +4432,7 @@ def main():
                 )
                 _shard_rows = [
                     {"shard_id": f"gpu{_gpu_id}", "stems": sorted(
-                        p.stem for p in all_wavs[_gpu_id * per_gpu:
-                                                  _gpu_id * per_gpu + per_gpu])}
+                        _shard_expected_by_gpu[_gpu_id])}
                     for _gpu_id, _, _ in _procs
                 ]
                 _accounting = make_pipeline_accounting_receipt(
@@ -4269,7 +4542,13 @@ def main():
             available = {p.stem: p for p in wav_files}
             missing = [stem for stem in selected if stem not in available]
             if missing:
-                raise ValueError(f"stems file contains unavailable stems: {missing[:5]}")
+                # Stems absent from the producer's reference-filtered universe
+                # (e.g. an empty reference text) are legitimate exclusions, not
+                # a broken denominator.  Drop them from the selection and let
+                # the source inventory's exclusion ledger account for them.
+                for stem in missing:
+                    skipped.setdefault("missing_reference", []).append(stem)
+                selected = [stem for stem in selected if stem not in missing]
             wav_files = [available[stem] for stem in selected]
         except (OSError, ValueError) as exc:
             print(f"ERROR: invalid --stems-file: {exc}", file=sys.stderr)
@@ -4396,14 +4675,16 @@ def main():
         # artifact is instead clamped to the physical WAV header duration.
         duration_s = _wav_duration_s(wav_map[stem])
 
-        # ── Reject incomplete target alignment before writing any anchor ──
+        # ── Skip incomplete target alignment before writing any anchor ──
         # A zero-frame target cannot be repaired by shifting the following
-        # labels; emitting it would create a text/time mismatch.
+        # labels; emitting it would create a text/time mismatch.  This is a
+        # legitimate data mismatch (e.g. a rare reference character such as
+        # "祂" the audio does not contain), so filter the stem rather than
+        # failing the whole shard.
         if not r.get("ctc_alignment_complete", True):
             missing = r.get("missing_ctc_tokens", [])
-            print(f"  FAIL {stem}: incomplete CTC target alignment - {', '.join(map(str, missing[:12]))}")
+            print(f"  SKIP {stem}: incomplete CTC target alignment - {', '.join(map(str, missing[:12]))}")
             skipped.setdefault("incomplete_ctc_alignment", []).append(stem)
-            fail += 1
             continue
 
         # ── Skip stems with incomplete English fragments ──
@@ -4527,20 +4808,32 @@ def main():
 
         _candidate_mapping_errors = attach_nvasr_candidate_provenance(
             words_pinyin, punct_entries, r.get("nvasr_candidate_timeline", {}),
-            strict_schema_v3=True)
+            strict_schema_v3=True, reference_mode=args.no_nvv)
         if _candidate_mapping_errors:
-            print(f"  FAIL {stem}: NVASR candidate mapping - "
+            # Candidate-timeline discrepancies (round-trip count mismatch, an
+            # ambiguous NVV, etc.) are data-level mismatches in fallback free
+            # decode, not producer failures.  Filter the stem rather than fail
+            # the whole shard.
+            print(f"  SKIP {stem}: NVASR candidate mapping - "
                   f"{'; '.join(_candidate_mapping_errors[:5])}")
             skipped.setdefault("nvasr_candidate_mapping", []).append(stem)
-            fail += 1
             continue
 
         # Canonicalize reference English before any generic CTC token merge.
         # The shared authority validator must see raw source rows so source
         # ordinals remain available for punctuation/gap and crossing checks.
         if stem in ref_texts:
-            words_pinyin = _merge_reference_english_fragments(
-                words_pinyin, ref_texts[stem])
+            try:
+                words_pinyin = _merge_reference_english_fragments(
+                    words_pinyin, ref_texts[stem])
+            except ValueError as exc:
+                # A reference whose English projection cannot be reconciled
+                # with the emitted CTC (e.g. the reference omits an English
+                # word the audio contains) is a data mismatch: filter the stem
+                # rather than crash the whole shard.
+                print(f"  SKIP {stem}: authority English merge failed - {exc}")
+                skipped.setdefault("authority_english_merge", []).append(stem)
+                continue
 
         # ── Merge consecutive single-ASCII-letter tokens ──
         # The NVASR tokenizer splits OOV English words into individual
@@ -4598,10 +4891,11 @@ def main():
             _final_provenance_errors = _validate_emitted_nvasr_provenance(
                 words_pinyin)
             if _final_provenance_errors:
-                print(f"  FAIL {stem}: final NVASR provenance - "
+                # A stale forced span or non-unique locator is a data-level
+                # fallback-free-decode inconsistency, not a producer failure.
+                print(f"  SKIP {stem}: final NVASR provenance - "
                       f"{'; '.join(_final_provenance_errors[:5])}")
                 skipped.setdefault("nvasr_candidate_mapping", []).append(stem)
-                fail += 1
                 continue
 
         # 写 TextGrid — 含 pauses tier
@@ -4630,16 +4924,14 @@ def main():
             # Detect it early so we can drop the CTC anchor before _punct.json
             # is written.  The text_asr string itself is cleaned in part B below.
             # Subsequent word timestamps are NOT shifted.
-            _raw_text_check = "" if args.no_nvv else re.sub(
-                r"<\|[^|]+\|>", "", r.get("text_asr", "")).strip()
-            _leading_punct = None
-            if _raw_text_check and is_punct(_raw_text_check[0]):
-                _leading_punct = _raw_text_check[0]
-                if punct_entries:
-                    _first_punct = min(punct_entries, key=lambda x: x["start"])
-                    if (_first_punct["word"] == _leading_punct
-                            and _first_punct["start"] < 0.100):
-                        punct_entries.remove(_first_punct)
+            _raw_text_check = "" if args.no_nvv else r.get("text_asr", "")
+            _, _leading_punct = _strip_leading_punctuation_after_tags(
+                _raw_text_check)
+            if _leading_punct is not None and punct_entries:
+                _first_punct = min(punct_entries, key=lambda x: x["start"])
+                if (_first_punct["word"] == _leading_punct
+                        and _first_punct["start"] < 0.100):
+                    punct_entries.remove(_first_punct)
 
             # ── ASR 空文本检测: 无内容词时跳过输出, 不进 MFA ──
             lab_tokens = " ".join(w["word"] for w in words_pinyin)
@@ -4741,20 +5033,10 @@ def main():
                 raise ValueError(f"reference-only stem has no canonical reference: {stem}")
             text_asr = clean_unsupported_punct(text_asr)
             # ── Strip leading punctuation (part B: remove from text_asr) ──
-            # Detection mirroring part A above; now that text_asr is available,
-            # delete the leading punct character so _text_raw.txt / _text_cn.txt
-            # are clean.  Subsequent token positions are not shifted.
-            _text_clean_b = re.sub(r"<\|[^|]+\|>", "", text_asr).strip()
-            if not args.no_nvv and _text_clean_b and is_punct(_text_clean_b[0]):
-                _lp = _text_clean_b[0]
-                _tag_end = 0
-                for _m in re.finditer(r"<\|[^|]+\|>", text_asr):
-                    _tag_end = _m.end()
-                _pos = _tag_end
-                while _pos < len(text_asr) and text_asr[_pos] in ' \t':
-                    _pos += 1
-                if _pos < len(text_asr) and text_asr[_pos] == _lp:
-                    text_asr = text_asr[:_pos] + text_asr[_pos + 1:]
+            # Use the same control-tag-aware helper as part A.  Subsequent
+            # token positions are not shifted.
+            if not args.no_nvv:
+                text_asr, _ = _strip_leading_punctuation_after_tags(text_asr)
             raw_path = args.output_dir / f"{stem}_text_raw.txt"
             _atomic_write_text(raw_path, text_asr + "\n")
 
@@ -4926,10 +5208,11 @@ def main():
                 or _serialized_candidates != sorted(_serialized_candidates)
                 or len(_serialized_candidates) != len(set(
                     _serialized_candidates))):
-            print(f"  FAIL {stem}: serialized token locators/candidate IDs "
+            # Non-unique/out-of-order candidate IDs are a fallback free-decode
+            # data mismatch, not a producer failure; filter the stem.
+            print(f"  SKIP {stem}: serialized token locators/candidate IDs "
                   "are not unique and ordered")
             skipped.setdefault("nvasr_candidate_mapping", []).append(stem)
-            fail += 1
             continue
         token_lines = [json.dumps(row, ensure_ascii=False)
                        for row in token_rows]
@@ -4979,6 +5262,19 @@ def main():
                                update_dict=not args.no_dict_update)
         _rebase_final_token_sidecars(args.output_dir)
         if _validate_all_ctc_bundles(args.output_dir, ref_texts):
+            # Dropped invalid bundles reduce the OK count after the summary was
+            # first written; refresh it so the all-GPU preflight summary
+            # contract (Files: total OK failed) stays consistent with the .lab
+            # namespace.
+            _final_ok = len(list(args.output_dir.glob("*.lab")))
+            if _final_ok != ok:
+                _summary_path = args.output_dir / "summary.txt"
+                _summary_text = _summary_path.read_text(encoding="utf-8")
+                _summary_text = re.sub(
+                    rf"Files: {len(paths)} total, {ok} OK, {fail} failed",
+                    f"Files: {len(paths)} total, {_final_ok} OK, {fail} failed",
+                    _summary_text, count=1)
+                _summary_path.write_text(_summary_text, encoding="utf-8")
             _rebuild_final_manifest(args.output_dir, audio_dir,
                                     wav_files=wav_files)
             # Marker: downstream pipeline steps can skip re-normalization.

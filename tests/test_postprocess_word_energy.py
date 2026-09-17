@@ -14,6 +14,8 @@ from scripts.postprocess_textgrids import (
     _word_rms,
     load_audio,
 )
+import scripts.audio_energy as audio_energy
+from scripts.audio_energy import frame_rms, word_rms
 
 
 def _args(**overrides):
@@ -252,3 +254,83 @@ def test_memory_and_wav_audio_use_the_same_energy_helper(tmp_path):
     assert memory["items"][0]["classification"] == from_wav["items"][0]["classification"]
     assert np.isclose(memory["noise_model"]["threshold"],
                       from_wav["noise_model"]["threshold"], rtol=1e-3)
+
+
+def test_frame_rms_cache_reuses_only_the_same_global_bank():
+    audio = np.linspace(-1.0, 1.0, 1600, dtype=np.float32)
+    cache = audio_energy.FrameRmsCache("stem-a")
+
+    first = cache.global_frames(audio, 16000, frame_ms=5.0)
+    again = cache.global_frames(audio, 16000, frame_ms=5.0)
+    assert first[0] is again[0]
+    assert cache.computation_count == 1
+
+    cache.global_frames(audio, 16000, frame_ms=10.0)
+    cache.frames(audio, 16000, frame_ms=5.0, alignment="local")
+    cache.global_frames(audio, 16001, frame_ms=5.0)
+    cache.global_frames(np.array(audio, copy=True), 16000, frame_ms=5.0)
+    assert cache.computation_count == 5
+
+
+def test_frame_rms_cache_is_scoped_to_its_stem_instance():
+    audio = np.ones(1600, dtype=np.float32)
+    first = audio_energy.FrameRmsCache("stem-a")
+    second = audio_energy.FrameRmsCache("stem-b")
+
+    first.global_frames(audio, 16000)
+    second.global_frames(audio, 16000)
+
+    assert first.computation_count == 1
+    assert second.computation_count == 1
+    assert first.global_frames(audio, 16000)[0] is not \
+        second.global_frames(audio, 16000)[0]
+
+
+@pytest.mark.parametrize("sr, frame_ms", [
+    (8000, 5.0), (22050, 10.0), (11025, 7.25), (16001, 0.35),
+])
+@pytest.mark.parametrize("make_audio", [
+    lambda: np.array([], dtype=np.float32),
+    lambda: np.arange(7, dtype=np.float32),
+    lambda: np.arange(3000, dtype=np.float32)[::2],
+    lambda: np.arange(3000, dtype=np.float32),
+])
+def test_frame_rms_cache_matches_uncached_global_and_local_frames(
+        sr, frame_ms, make_audio):
+    audio = make_audio()
+    cache = audio_energy.FrameRmsCache("edge-stem")
+
+    expected_global = frame_rms(audio, sr, frame_ms=frame_ms)
+    actual_global = cache.global_frames(audio, sr, frame_ms=frame_ms)
+    np.testing.assert_array_equal(actual_global[0], expected_global[0])
+    assert actual_global[1] == expected_global[1]
+
+    segment = audio[1:-1]
+    expected_local = frame_rms(segment, sr, frame_ms=frame_ms)
+    actual_local = cache.local_frames(segment, sr, frame_ms=frame_ms)
+    np.testing.assert_array_equal(actual_local[0], expected_local[0])
+    assert actual_local[1] == expected_local[1]
+
+
+def test_frame_rms_cache_keeps_global_alignment_separate_from_local_slices():
+    audio = np.arange(1600, dtype=np.float32)
+    segment = audio[80:880]
+    cache = audio_energy.FrameRmsCache("alignment-stem")
+
+    global_values, _ = cache.global_frames(audio, 16000, frame_ms=10.0)
+    local_values, _ = cache.local_frames(segment, 16000, frame_ms=10.0)
+
+    np.testing.assert_array_equal(
+        global_values, frame_rms(audio, 16000, frame_ms=10.0)[0])
+    np.testing.assert_array_equal(
+        local_values, frame_rms(segment, 16000, frame_ms=10.0)[0])
+    assert cache.computation_count == 2
+
+
+def test_cached_frame_rms_does_not_change_word_rms_semantics():
+    audio = np.tile(np.array([0.0, 1.0], dtype=np.float32), 80)
+    cache = audio_energy.FrameRmsCache("word-semantics")
+
+    cached, _ = frame_rms(audio, 16000, frame_ms=10.0, cache=cache)
+    assert np.isclose(cached[0], 2 ** -0.5)
+    assert word_rms(audio, 16000, 0.0, 0.01) == 0.5
