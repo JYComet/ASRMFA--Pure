@@ -1,0 +1,21 @@
+# Default for every path: let git sniff whether the file is text, and store
+# text as LF in the repository.  How it lands on disk is decided by the more
+# specific rules below (the *last* matching rule wins, so `*.bat` overrides
+# this one).  Binary files are detected and left untouched.
+#
+# Without this, a file committed with CRLF keeps CRLF forever, and any editor
+# roundtrip rewrites the whole file — an 11-line edit showed up as a 1000-line
+# diff on README.md before this rule existed.
+* text=auto
+
+# Normalise line endings on checkout so shell scripts stay executable.
+#
+# setup.sh was committed with CRLF terminators, which makes bash abort with
+# "syntax error: unexpected end of file" before running a single line — the
+# Linux/macOS setup path was dead on arrival.  Bash scripts must be LF.
+*.sh   text eol=lf
+*.bash text eol=lf
+
+# Windows batch files require CRLF.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
