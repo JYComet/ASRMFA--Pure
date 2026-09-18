@@ -3805,6 +3805,12 @@ def _commit_all_gpu_candidate(
     The two filesystem namespaces cannot be made one OS-level atomic rename.
     Keep the old output and dictionary as recoverable backups and quarantine
     the new candidate on any failure, restoring the old pair before raising.
+
+    On success the output backup is returned for the caller to retain as
+    partial shard evidence, but the dictionary backup is removed: it exists
+    only to restore the pre-merge dictionary on failure, and keeping it leaked
+    one ``.<dict>.previous-<pid>`` per successful run.  Returns
+    ``(old_output_backup, None)``.
     """
     dict_backup = (dict_path.with_name(
         f".{dict_path.name}.previous-{os.getpid()}"
@@ -3834,7 +3840,6 @@ def _commit_all_gpu_candidate(
             dictionary_moved = True
             os.replace(dict_candidate, dict_path)
             dictionary_published = True
-        return old_output_backup, dict_backup
     except Exception:
         # Preserve every newly-created artifact; never delete user data.
         if output_published and live_output.exists():
@@ -3853,6 +3858,20 @@ def _commit_all_gpu_candidate(
                 and dict_backup.exists() and not dict_path.exists():
             os.replace(dict_backup, dict_path)
         raise
+
+    # Publish succeeded, so the dictionary backup has no further purpose.  The
+    # unlink sits outside the try block on purpose: a cleanup failure must not
+    # roll back a pair that is already committed, so it warns instead of
+    # raising.
+    if dict_backup is not None:
+        try:
+            dict_backup.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"  WARNING: dictionary backup not removed: "
+                  f"{dict_backup}: {exc}", file=sys.stderr)
+    return old_output_backup, None
 
 
 def main():
@@ -4476,7 +4495,6 @@ def main():
                 except OSError:
                     pass
             print(f"完成! 输出: {args.output_dir}")
-            sys.exit(0)
             sys.exit(0)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)

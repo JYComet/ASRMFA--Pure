@@ -262,10 +262,11 @@
 | 252 | 2026-09-14 | scripts/postprocess_textgrids.py（_nvasr_build_producer_authority、Qwen ForcedAligner projection/validation）, tests/test_ctc_artifact_versions.py | 后处理把 Qwen lexical sidecar 错当成 NVASR 帧候选契约 |
 | 253–256 | 2026-09-14 | scripts/postprocess_textgrids.py, scripts/qwen3_prealign.py, scripts/run_pipeline.py, Qwen/filter/lifecycle/MFA 相关测试 | Qwen 无停顿标点、多音字、组合标点和 MFA 导出舍入误过滤 |
 | 257 | 2026-09-15 | scripts/full_corpus_publish.py（_validate_evidence、_validate_grid、validate_chunk_result）, scripts/full_corpus_orchestrator.py （_validate_completed_chunk、run_full）, tests/test_full_corpus_publish.py, tests/test_full_corpus_orchestrator.py | 过滤件被正式输出契约复检导致单条过滤扩散为整块失败 |
+| 258 | 2026-09-18 | scripts/ctc_prealign.py, tests/test_ctc_dictionary_transaction.py | 成功的 all-GPU 提交每次泄漏一个词典备份文件 |
 
 ### 索引完整性与非 Case 章节
 
-截至 2026-09-15，Case 索引已覆盖 Case 1–257，每个存在的编号各出现一次；Case 标题与
+截至 2026-09-18，Case 索引已覆盖 Case 1–258，每个存在的编号各出现一次；Case 标题与
 正文均可按同一编号定位。Case 242 在正文中不存在（编号直接由 241 跳到 243），是真实
 空缺而非索引遗漏；Case 253–256 在正文中以单个合并章节书写，索引按同一形式记一行。
 除 Case 条目外，文档还包含以下纳入索引范围的专题章节：
@@ -13397,3 +13398,111 @@ reason 且具备最终五轨；但 `_filtered` 中的文件正是因为契约被
 完整测试为 **1419 passed**。首块真实结果完整验证为 9,081 accepted、686 postprocess filtered、
 9 Qwen producer-filtered，加上 224 stage failure 后与 10,000 条输入严格守恒；既有 Qwen/MFA
 证据成功通过 `downstream_evidence_reused`，未重新执行模型。
+
+## Case 258: 成功的 all-GPU 提交每次泄漏一个词典备份文件
+
+**日期**: 2026-09-18
+**涉及文件**: `scripts/ctc_prealign.py`、`tests/test_ctc_dictionary_transaction.py`
+**涉及函数**: `_commit_all_gpu_candidate`、`_prepare_dictionary_candidate`、`main`
+**触发样本**: 任意一次成功的 `ctc_prealign.py --all-gpus` 运行
+
+### 现象
+
+修复前：每次成功提交都会在 `dict/` 留下一个 `.mfa_ipa.dict.previous-<pid>`。
+仓库中已累积 **9 个**（pid 259147 / 336928 / 632006 / 859836 / 1207924 / 1780312 /
+2324052 / 2922021 / 3678721），共 2.2 MB。关键旁证：`dict/` 中**没有任何**
+`.candidate-` 或 `.FAILED-` 残留 —— 失败路径会把候选隔离成 `.FAILED-`，
+所以这 9 个全部来自成功路径，而不是失败路径。
+
+修复后：成功提交返回 `(old_output_backup, None)`，`dict/` 不再产生
+`.previous-<pid>`。失败路径行为不变，仍把 `.previous-<pid>` 还原回 `dict_path`。
+
+### 根因链
+
+1. `_commit_all_gpu_candidate`（`:3796`）把输出与词典当作一对做可恢复提交：
+   `os.replace(dict_path, dict_backup)` 暂存旧词典（`:3833`），
+   `os.replace(dict_candidate, dict_path)` 发布新词典（`:3835`）。
+2. `dict_backup` 的**唯一**用途是发布失败时还原（`:3852-3854`）。而成功路径在
+   `:3837` 直接 `return old_output_backup, dict_backup`，从不删除它 —— 提前返回
+   让 `:3852` 的还原逻辑成了唯一消费点。
+3. 调用方 `:4481` 丢弃返回值，只保留 `old_output_backup`：`:4490` 打印
+   `partial shard evidence retained at ...`。所以 `old_output_backup` 的保留是
+   **有意设计**（保留分片证据），`dict_backup` 的残留则无人消费。
+4. 备份名内嵌 `os.getpid()`。跨进程只是不断堆积；同一进程内重跑则会撞上
+   `:3814` 的 `dictionary backup already exists` 守卫而直接失败。
+
+### 修改点
+
+**1. `_commit_all_gpu_candidate`（`:3796`）—— 成功路径删除词典备份**
+
+`return` 移出 `try` 块并前置清理。
+
+修复前：
+```python
+        if dict_candidate and dict_path and dict_backup:
+            os.replace(dict_path, dict_backup)
+            dictionary_moved = True
+            os.replace(dict_candidate, dict_path)
+            dictionary_published = True
+        return old_output_backup, dict_backup
+    except Exception:
+```
+
+修复后：
+```python
+        if dict_candidate and dict_path and dict_backup:
+            os.replace(dict_path, dict_backup)
+            dictionary_moved = True
+            os.replace(dict_candidate, dict_path)
+            dictionary_published = True
+    except Exception:
+        ...
+        raise
+
+    # Publish succeeded, so the dictionary backup has no further purpose.  The
+    # unlink sits outside the try block on purpose: a cleanup failure must not
+    # roll back a pair that is already committed, so it warns instead of
+    # raising.
+    if dict_backup is not None:
+        try:
+            dict_backup.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"  WARNING: dictionary backup not removed: "
+                  f"{dict_backup}: {exc}", file=sys.stderr)
+    return old_output_backup, None
+```
+
+清理刻意放在 `try` 块**之外**：走到这里提交已经成功，unlink 失败不允许回滚已提交的
+一对，只告警。删除是安全的 —— `dict/mfa_ipa.dict` 本身被 git 跟踪，合并前的词典内容
+可从历史恢复。
+
+**2. `main`（`:4497`）—— 删除重复的 `sys.exit(0)`**
+
+连续两行 `sys.exit(0)`，第二行不可达。
+
+### 验证
+
+```bash
+python3 -m pytest -q -p no:cacheprovider tests/test_ctc_dictionary_transaction.py
+```
+
+- `test_all_gpu_commit_success_publishes_validated_pair` 原断言
+  `dict_backup is not None and dict_backup.read_text(encoding="utf-8") == "old old\n"`，
+  即把这个泄漏写成了**期望行为**；改为断言 `dict_backup is None` 且
+  `list(tmp_path.glob(".*.previous-*")) == []`。
+- 新增 `test_successful_commits_do_not_accumulate_dictionary_backups`：同一进程内
+  连续提交两次。备份名内嵌 pid，若第一次的备份未被删除，第二次会被 `:3814` 的
+  `dictionary backup already exists` 守卫拒绝。把修复前的 `ctc_prealign.py`
+  换回去跑，该文件为 **2 failed, 2 passed**；修复后 **4 passed**。
+- 失败路径的两条用例（输出发布失败、词典发布失败）仍断言旧对还原，未改动。
+
+本 Case 属 CLAUDE.md 触发条件中的**处理顺位（phase ordering）**类：
+`:3837` 的提前返回使 `:3852` 的还原逻辑成为 `dict_backup` 的唯一消费点，
+成功路径因此无人清理。
+
+### 关联样本
+
+- `dict/.mfa_ipa.dict.previous-*`（9 个，已 untrack 并在 `.gitignore` 中加
+  `dict/.*.previous-*`、`dict/.*.candidate-*`、`dict/.*.FAILED-*`）
