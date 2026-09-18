@@ -5,7 +5,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.run_pipeline import (MFA_RETRY_SCHEMA, prepare_mfa_retry_packet,
                                   reconcile_mfa_outputs, mfa_retry_state_machine,
                                   run_mfa_retry_coordinator)

@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from finalize_gamedata_speakers import (  # noqa: E402
     GameSpec,

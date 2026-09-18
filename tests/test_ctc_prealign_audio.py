@@ -5,7 +5,6 @@ import sys
 import wave
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.ctc_prealign import _build_txt_index, _wav_duration_s
 

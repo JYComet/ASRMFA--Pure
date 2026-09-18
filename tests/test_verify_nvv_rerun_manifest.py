@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from postprocess_textgrids import Interval, TextGrid, Tier, write_textgrid  # noqa: E402
 from verify_nvv_rerun_manifest import verify_nvv_rerun_manifest  # noqa: E402

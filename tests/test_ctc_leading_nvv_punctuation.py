@@ -1,7 +1,6 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from ctc_prealign import (  # noqa: E402
     _strip_leading_punctuation_after_tags,

@@ -8,7 +8,6 @@ import pytest
 import yaml
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from materialize_nvv_rerun_inputs import materialize_nvv_rerun_inputs  # noqa: E402
 from run_pipeline import validate_config  # noqa: E402

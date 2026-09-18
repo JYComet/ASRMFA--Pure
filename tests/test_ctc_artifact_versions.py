@@ -15,7 +15,6 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
 
 from scripts import audit_strict_ok as audit  # noqa: E402
 from scripts import adjust_ctc_boundaries as adjust  # noqa: E402

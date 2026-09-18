@@ -11,7 +11,6 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
 
 from collect_nvv_rerun_outputs import collect_nvv_rerun_outputs  # noqa: E402
 from pipeline_utils import (  # noqa: E402

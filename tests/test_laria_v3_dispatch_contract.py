@@ -11,8 +11,6 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 V2_CONFIG = ROOT / "configs/laria_v5_no_reference_strict_8gpu_20260825.yaml"
 V1_CONFIG = ROOT / "configs/laria_v5_no_reference_8gpu_20260825.yaml"
 V3_CONFIG = ROOT / "configs/laria_v5_no_reference_strict_8gpu_20260826_v3.yaml"
