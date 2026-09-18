@@ -831,11 +831,16 @@ python scripts/add_english_to_dict.py --root <path> --dict <path> --dry-run  # �
 运行仓库测试（禁用字节码和 pytest 缓存）：
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider tests
+PYTHONDONTWRITEBYTECODE=1 pytest -q -p no:cacheprovider tests
 ```
 
-默认 `pytest` 可能遍历模型资产；仓库配置将测试根限定为 `tests/`，因此
-`--collect-only` 也只收集测试目录。`tests/run_*` 是专项 fixture/旧 runner；仅已确认重复的 runner 会移除。
+`tests/conftest.py` 会把仓库根与 `scripts/` 一起放进 `sys.path`，因此
+`pytest` 和 `python -m pytest` 等价，也不要求从仓库根目录启动。
+（此前只有 `python -m pytest` 能跑通 —— 它顺带把 CWD 放进 `sys.path`，
+而 `pytest` 控制台脚本会以 `ModuleNotFoundError: No module named 'scripts'` 收集失败。）
+
+`pytest.ini` 已将测试根限定为 `tests/`，`--collect-only` 只收集测试目录。
+`tests/run_*` 是专项 fixture/旧 runner；仅已确认重复的 runner 会移除。
 
 ### English v2 provenance and replay
 
