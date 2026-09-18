@@ -234,11 +234,41 @@
 | 223 | 2026-08-31 | scripts/pipeline_utils.py, scripts/run_pipeline.py, scripts/align_english_mfa.py, scripts/gpu1000_orchestrate.py, config.yaml, README.md, tests/test_run_pipeline_mfa_root.py, tests/test_mfa_retry.py, tests/test_laria_mfa_retry_contract.py, tests/test_align_english_mfa_canonical_units.py, tests/test_gpu1000_singleton_mfa.py, tests/test_gpu1000_continuation.py, configs/laria_v5_no_reference_strict_8gpu_20260831_logic_audit_r21_300.yaml | MFA 模型默认随机 MFCC dither 导致同输入边界波动；全路径固定 dither=0 并完成 r21 300 条确定性闭环 |
 | 224 | 2026-08-31 | scripts/postprocess_textgrids.py, scripts/run_pipeline.py, config.yaml, README.md, ANALYSIS_LONG_PHONE_FIX.md, tests/test_postprocess_geometry.py | r21 long-phone/source-acoustic QC 实验经 U1=0/3、U2=0/13 审核拒绝并撤回；保留短音素整数 tick 与既有 structural/breathing gates |
 | 225 | 2026-08-31 | scripts/ctc_prealign.py, scripts/postprocess_textgrids.py, README.md, tests/test_postprocess_geometry.py, tests/test_boundary_punctuation_display_regressions.py | BREATHING 60ms 误读/2–3 帧压缩修复；分离 physical frame support 与非声学 display/owner-required span，并完成 strict 真实 300 回放与审计 |
+| 226 | 2026-09-03 | scripts/pipeline_utils.py, scripts/ctc_prealign.py, dict/mfa_ipa.dict, dict/fullpinyin_enword.dict, scripts/verify_hecheng_english_ctc_ready_v4.py, scripts/verify_reference_authority.py, tests/test_english_units.py, tests/test_ctc_english_units.py, tests/test_laria_fallback_mapping.py, tests/test_gpu1000_postprocess_audit.py, tests/test_boundary_punctuation_display_regressions.py | 移除疑问/惊讶/确认语气词 NVV 标签，仅保留生理发声类 |
+| 227 | 2026-09-03 | scripts/ctc_prealign.py（_merge_reference_english_fragments，约 3336-3352） | authority 字母数字后缀收集只到 alpha 基（MP3 → partial_fragment_match） |
+| 228 | 2026-09-03 | scripts/ctc_prealign.py（attach_nvasr_candidate_provenance，约 1597-1606；调用点 4541-4543） | 参考文本模式语义轴 round-trip 计数校验误拒（raw decode vs 强制参考文本） |
+| 229 | 2026-09-03 | scripts/ctc_prealign.py（attach_nvasr_candidate_provenance，约 1626-1635） | 无语音 utterance 空 raw timeline 被误判为 malformed |
+| 230 | 2026-09-03 | scripts/ctc_prealign.py（--all-gpus 合并预检约 3928-4000；validate_shard_accounting_receipt 约 160-164） | all-GPU shard 预检把合法 skip 当命名空间不匹配 |
+| 231 | 2026-09-03 | scripts/run_pipeline.py（_seal_ctc_raw，约 815-835） | CTC raw manifest 封存用 eligible 而非 output，skip 词无 artifact 致封存失败 |
+| 232 | 2026-09-03 | scripts/run_pipeline.py（新增 _ctc_output_stems，约 815-828；resample 约 1403/1451；align 约 3790；postprocess 约 4178） | 下游按 eligible 要产物而非 output，skip 词致 resample 缺 CTC 绑定 |
+| 233 | 2026-09-03 | scripts/run_pipeline.py（_refresh_postprocess_accounting 约 4066-4072）, scripts/audit_strict_ok.py（约 3198-3207） | postprocess 会计守恒未并入 prealign 已过滤词 + strict_ok 轴守恒误判 |
+| 234 | 2026-09-03 | scripts/ctc_prealign.py（约 4437-4445） | incomplete CTC target alignment 被当硬失败，罕见字（祂）致整 shard 失败 |
+| 235 | 2026-09-03 | configs/gamedata_baijing_noref_20260903.yaml, configs/gamedata_reverse1999_noref_20260903.yaml | 无参考 streaming 缺 batch cache，改为 run_pipeline all_gpus 直跑 |
+| 236 | 2026-09-03 | scripts/ctc_prealign.py（_merge_reference_english_fragments 调用点，约 4581-4593） | 参考文本无英文但 CTC 产出英文 token，English 合并硬崩 shard |
+| 237 | 2026-09-03 | scripts/ctc_prealign.py（attach_nvasr_candidate_provenance NVV 绑定，约 2067-2078） | fallback 句首 BREATHING 无候选映射（query-frames 前缀）致 90% 失败 |
+| 238 | 2026-09-03 | scripts/ctc_prealign.py（--stems-file 校验，约 4309-4326） | 空参考文本 stem 被判 unavailable，--stems-file 校验硬失败 |
+| 239 | 2026-09-03 | scripts/ctc_prealign.py, configs/gamedata_{baijing,reverse1999}_noref_20260903.yaml | fallback 模式链路修复（NVV 丢弃/候选映射 skip/无效 bundle 丢弃/严格词典关闭） |
+| 240 | 2026-09-03 | scripts/ctc_prealign.py（_validate_all_ctc_bundles 约 3040-3054） | 无效 bundle（零时长区间）丢弃漏删 _ref.txt 致 shard 命名空间不匹配 |
+| 241 | 2026-09-03 | scripts/run_pipeline.py（_freeze_pre_ctc_stems 约 1148-1164；_load_ctc_accounting 约 2243-2256） | 空/缺失参考词未在父级冻结分母排除，致 eligible 与 denominator 不一致 |
+| 243 | 2026-09-04 | scripts/ctc_prealign.py（约 5011-5019） | fallback 序列化 token locator/candidate ID 不唯一不有序致 prealign 失败 |
+| 244 | 2026-09-04 | scripts/ctc_prealign.py（新增 strip_gender_tags；_reference_inventory/_source_inventory） | 性别标签多版本参考未去除，致 authority reference identity mismatch |
+| 245 | 2026-09-07 | scripts/pipeline_utils.py:275（require_mfa_anchor_support）, scripts/run_pipeline.py:802（run_mfa）, :2976（_execute_single_process_mfa_retry）, :3100（_run_mfa_sharded）, :3727（step_mfa_align） | 原版 MFA 静默丢弃 CTC 锚点参数，退出成功不代表锚定对齐 |
+| 246 | 2026-09-07 | scripts/run_pipeline.py:3727 的 step_mfa_align, 清理顺序 :3851 | MFA overwrite 在输入预检前删除旧对齐结果 |
+| 247 | 2026-09-08 | scripts/normalize_english_tokens.py（_reclaim_fragments）, tests/test_ctc_artifact_versions.py | 英文碎片回收误吞相邻 NVV，破坏 NVV provenance |
+| 248 | 2026-09-10 | scripts/ctc_prealign.py:920（_strip_leading_punctuation_after_tags，调用点约 :4941、:5052）, scripts/nvv_contract.py:24-136, scripts/postprocess_textgrids.py:5482-5494, scripts/audit_strict_ok.py:2066, scripts/verify_gamedata_publish_staging.py:199-211, scripts/rebuild_gamedata.py:426-449 | 句首 `[NVV]` 被当作标点剥掉左括号，raw_text 假恢复但下层全丢失 |
+| 249 | 2026-09-14 | scripts/qwen3_hf_backend.py（normalize_alignment_items、Qwen3HFBackend.align）, scripts/qwen3_prealign.py（run_qwen3_hf）, tests/test_qwen3_hf_backend.py, tests/test_qwen3_prealign.py | 原生 Qwen3 ForcedAligner 共享边界零宽度词被主管线拒绝 |
+| 250 | 2026-09-14 | scripts/run_pipeline.py（step_resample_for_mfa、_complete_prealign_evidence）, tests/test_run_pipeline_subset_denominator.py, tests/test_qwen3_prealign.py | full 模式 resample 在 prealign 前错误要求 CTC lineage receipt |
+| 251 | 2026-09-14 | scripts/qwen3_hf_backend.py（normalize_alignment_items）, tests/test_qwen3_hf_backend.py | Qwen3 零宽度词两侧都不足一个完整时间栅格 |
+| 252 | 2026-09-14 | scripts/postprocess_textgrids.py（_nvasr_build_producer_authority、Qwen ForcedAligner projection/validation）, tests/test_ctc_artifact_versions.py | 后处理把 Qwen lexical sidecar 错当成 NVASR 帧候选契约 |
+| 253–256 | 2026-09-14 | scripts/postprocess_textgrids.py, scripts/qwen3_prealign.py, scripts/run_pipeline.py, Qwen/filter/lifecycle/MFA 相关测试 | Qwen 无停顿标点、多音字、组合标点和 MFA 导出舍入误过滤 |
+| 257 | 2026-09-15 | scripts/full_corpus_publish.py（_validate_evidence、_validate_grid、validate_chunk_result）, scripts/full_corpus_orchestrator.py （_validate_completed_chunk、run_full）, tests/test_full_corpus_publish.py, tests/test_full_corpus_orchestrator.py | 过滤件被正式输出契约复检导致单条过滤扩散为整块失败 |
 
 ### 索引完整性与非 Case 章节
 
-截至 2026-08-31，Case 索引已覆盖 Case 1–225，每个编号各出现一次；Case 标题与正文
-均可按同一编号定位。除 Case 条目外，文档还包含以下纳入索引范围的专题章节：
+截至 2026-09-15，Case 索引已覆盖 Case 1–257，每个存在的编号各出现一次；Case 标题与
+正文均可按同一编号定位。Case 242 在正文中不存在（编号直接由 241 跳到 243），是真实
+空缺而非索引遗漏；Case 253–256 在正文中以单个合并章节书写，索引按同一形式记一行。
+除 Case 条目外，文档还包含以下纳入索引范围的专题章节：
 
 | 章节 | 内容 |
 |------|------|
@@ -248,6 +278,40 @@
 
 索引中的日期、文件和标题是导航信息；每个 Case 的实际状态、验证结果和未闭环项以对应
 正文为准。`filtered`、`rejected`、`missing` 或“待修复/待复跑”条目不代表成功通过。
+
+### 2026-09-18 文档整理记录
+
+下列文档已从仓库删除，内容已由本档对应 Case 覆盖：`hanzi-tier-bugfix.md`（Case 10）、
+`ANALYSIS_LONG_PHONE_FIX.md`（其 RC1／RC2／RC3 分别对应 Case 46／44／45）。
+
+另有两份**一度计划删除、核对后改为归档**，因为它们并未被本档覆盖 —— 移入 `docs/archive/`：
+
+- `FILTER_ANALYSIS_REPORT.md`：2026-07-13 对 100,929 个文件／161 个数据集的过滤原因统计
+  （`word_in_silence` 2,686 条／94.0%、`bgm_suspect`、`mid_sp`、`sp3`、`unexpected_silence`
+  的分布与子原因拆解）。起初按 Case 16 归类，但 Case 16 讲的是 MFA `--fine_tune` 默认值，
+  与本文不是同一主题；该分布表在本档中不存在。
+- `CROSS_CASE_ANALYSIS.md`：Cases 1–13 的综合视图，含「六大共同根因」「案例全景矩阵」
+  「Case 间直接因果链」，这三节在本档中均无对应内容。该文第 240 行还指出
+  `FILTER_ANALYSIS_REPORT` 中 `mid_sp` 的子原因 (a)「长停顿无标点」与 (c)「CTC 锚点错位」
+  **尚未**在本档中有系统性修复 —— 即本档在这里是不完整的一方，不能反过来覆盖它。
+
+`NVME_CACHE_MANIFEST.md` 不同：它是事实错误而非被覆盖，因此不留复本、只留更正。该文声称
+缓存为 54,000 个 WAV／约 48 GB、含 `ria`／`花礼`／`雪狐桑` 三位主播、源目录为
+`/mnt/Raw/新版合成英文数据`，并自称“自动生成”。实测
+`/mnt/nvme3/mfa_audio_cache/cache_manifest.json`：源目录 `/mnt/Raw/shayi_huali_wav`，
+**84,788 个 WAV／84.28 GiB**，只有 `纱依`（43,040 个／42.43 GiB）与 `花礼`（41,748 个／
+41.85 GiB）两位主播，两份之和与总数吻合，没有 `ria` 和 `雪狐桑`。`scripts/cache_audio_to_nvme.py` 只写
+`cache_manifest.json`，从不生成该 `.md`，所以那些数字无法由任何脚本复现。在此留档，以免
+错误数字被重新推导。索引中引用 `ANALYSIS_LONG_PHONE_FIX.md` 的历史行保留原样，它记录的
+是当时的事实。
+
+### 2026-09-18 配置整理记录
+
+`configs/` 已拆分：13 个仍留在 `configs/`，10 个 `laria_v5_*` 测试夹具移入
+`tests/fixtures/configs/`，86 个历史运行配置移入
+`configs/archive/{2026-08,2026-09,undated}/`。本索引与正文中的 `configs/...` 路径写于
+当时，未随此次移动改写；按文件名在 `configs/archive/` 下即可找到。
+
 
 ---
 
