@@ -14,6 +14,12 @@ soundfile==0.13.1
 pypinyin==0.55.0
 pyyaml==6.0.3
 
+# === Setup-time model download ===
+# Used only by scripts/download_models.py to fetch the Qwen3-ASR and
+# Qwen3-ForcedAligner weights from HuggingFace Hub.  Not imported by the
+# pipeline at run time.
+huggingface_hub==1.24.0
+
 # === MFA runtime dependencies ===
 kalpy-kaldi==0.9.0
 praatio==6.2.2

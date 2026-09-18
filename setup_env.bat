@@ -43,22 +43,23 @@ if %errorlevel% neq 0 (
     echo   Run manually: python scripts\convert_dict_to_ipa.py
 )
 
-:: Step 3: Download MFA Chinese models
+:: Step 3: Download pretrained models (MFA + Qwen3) from official sources
 echo.
-echo [3/3] Downloading MFA Chinese models...
+echo [3/3] Downloading pretrained models (MFA acoustic/g2p/dictionary + Qwen3)...
+echo   Qwen3 weights are several GB - this can take a while.
 set "MFA_ROOT_DIR=%~dp0models\mfa"
 call "%CONDA_ACTIVATE%" mfa_chinese
 
-mfa model download acoustic mandarin_mfa 2>&1
+python "%~dp0scripts\download_models.py"
 if %errorlevel% neq 0 (
-    echo [WARNING] Acoustic model 'mandarin_mfa' download failed.
-    echo   Run manually: mfa model download acoustic mandarin_mfa
+    echo [WARNING] Model download incomplete.
+    echo   Re-run to resume ^(already-downloaded models are skipped^):
+    echo     python scripts\download_models.py
 )
-
-mfa model download dictionary mandarin_china_mfa 2>&1
-if %errorlevel% neq 0 (
-    echo [WARNING] Dictionary download failed (non-critical).
-)
+echo.
+echo   Behind a slow/blocked HuggingFace, use a mirror:
+echo     set HF_ENDPOINT=https://hf-mirror.com
+echo     python scripts\download_models.py
 
 echo.
 echo ============================================
@@ -67,12 +68,15 @@ echo.
 echo   Environment:  mfa_chinese
 echo   Configuration: config.yaml
 echo   Dictionary:    dict/mfa_ipa.dict
-echo   Models:        models/mfa/
+echo   Models:        models/mfa/  +  models/qwen3/
 echo.
 echo   Quick start:
 echo     1. Edit config.yaml - set 'workspace' path
 echo     2. conda activate mfa_chinese
 echo     3. python scripts\run_pipeline.py --data-dir E:\path\to\audio
+echo.
+echo   Check what is installed:
+echo     python scripts\download_models.py --check
 echo.
 echo   See README.md for detailed usage.
 echo ============================================
