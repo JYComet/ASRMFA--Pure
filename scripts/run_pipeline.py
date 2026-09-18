@@ -4749,29 +4749,40 @@ def step_mfa_align_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     output_dir = Path(ctx.get("en_phones_dir", ctx["workspace"] / "en_phones"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Resolve English model paths
-    en_acoustic = en_cfg.get("acoustic_model", str(PROJECT_ROOT / "pretrained_models" / "acoustic" / "english_us_arpa.zip"))
-    en_dict = en_cfg.get("dictionary", str(PROJECT_ROOT / "dict" / "cmudict.dict"))
-    en_g2p = en_cfg.get("g2p_model", str(PROJECT_ROOT / "pretrained_models" / "g2p" / "english_us_arpa.zip"))
+    # Resolve English model paths.  Defaults are kept *relative* so the
+    # candidate-root search below actually runs for them; an absolute path is
+    # honoured verbatim when it exists.
+    en_acoustic = en_cfg.get("acoustic_model", "pretrained_models/acoustic/english_us_arpa.zip")
+    en_dict = en_cfg.get("dictionary", "dict/cmudict.dict")
+    en_g2p = en_cfg.get("g2p_model", "pretrained_models/g2p/english_us_arpa.zip")
 
-    # Resolve relative paths, with fallback to PROJECT_ROOT.parent/pretrained_models
-    for val, key in [(en_acoustic, "acoustic_model"), (en_dict, "dictionary"), (en_g2p, "g2p_model")]:
+    # Candidate roots for the ``pretrained_models/...`` layout, in priority
+    # order:
+    #   1. PROJECT_ROOT           — legacy in-repo layout
+    #   2. PROJECT_ROOT/models/mfa — where `mfa model download` and
+    #      scripts/download_models.py place models (MFA_ROOT_DIR = models/mfa)
+    #   3. PROJECT_ROOT.parent    — pretrained_models kept beside the repo
+    #      (e.g. /mnt/project/MFA_Pause/pretrained_models/)
+    en_model_roots = [PROJECT_ROOT, PROJECT_ROOT / "models" / "mfa", PROJECT_ROOT.parent]
+
+    def _resolve_en_model(val: str) -> str:
+        """First existing candidate wins; otherwise the root-relative path.
+
+        The final fallback names a PROJECT_ROOT-relative location so a
+        missing-model error still points at a concrete, intended path.
+        """
         p = Path(val)
-        if not p.is_absolute():
-            resolved = PROJECT_ROOT / val
-            # Fallback: pretrained_models may live one level above the repo
-            # (e.g. /mnt/project/MFA_Pause/pretrained_models/ instead of
-            #  /mnt/project/MFA_Pause/repo/pretrained_models/)
-            if not resolved.exists() and "pretrained_models" in val:
-                _parent_resolved = PROJECT_ROOT.parent / val
-                if _parent_resolved.exists():
-                    resolved = _parent_resolved
-            if key == "acoustic_model":
-                en_acoustic = str(resolved)
-            elif key == "dictionary":
-                en_dict = str(resolved)
-            else:
-                en_g2p = str(resolved)
+        if p.is_absolute():
+            return val
+        for root in en_model_roots:
+            candidate = root / val
+            if candidate.exists():
+                return str(candidate)
+        return str(PROJECT_ROOT / val)
+
+    en_acoustic = _resolve_en_model(en_acoustic)
+    en_dict = _resolve_en_model(en_dict)
+    en_g2p = _resolve_en_model(en_g2p)
 
     # English MFA produces one TextGrid per extracted segment.  A configured
     # global temp directory (historically /tmp/mfa_temp) can contain outputs
