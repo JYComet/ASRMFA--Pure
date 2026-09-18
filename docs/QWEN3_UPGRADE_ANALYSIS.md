@@ -32,7 +32,9 @@ ForcedAligner 可以直接对齐已有参考文本，也可以对齐任意 ASR �
 
 采用显式 `ctc_prealign.provider: qwen3_hf`，让 Qwen ASR 与 Qwen ForcedAligner 替换新路径上的 NVASR／FunASR 识别和词／字预对齐职责。已有参考文本保持文本权威性；无参考文本先识别再对齐。保持六文件预对齐交接格式和现有 MFA 音素阶段，结果记录真实 provider，不伪造 CTC 帧或音素时间戳。
 
-新路径不生成 NVV，启用相关选项时应明确拒绝。已有 `anchored_nvv` 保留为需要旧事件候选时的兼容路径。旧生产配置不隐式切换，避免将未知精度的新结果混入现有批任务。
+新路径不生成 NVV，启用相关选项时应明确拒绝。已有 `anchored_nvv` 保留为需要旧事件候选时的兼容路径。
+
+本段最初还写了「旧生产配置不隐式切换，避免将未知精度的新结果混入现有批任务」。该约束随后被撤销：`migrate_main_prealign_config` 现在会对 `mode` 为 `full` 或 `nvrasr_fallback` 的配置主动改写成 Qwen3，详见下方「实施边界」的更正说明。`mode` 本身不变，变的是 `ctc_prealign.provider` 及其配套字段。
 
 ## 运行条件与验收
 
@@ -41,6 +43,29 @@ ForcedAligner 可以直接对齐已有参考文本，也可以对齐任意 ASR �
 代码测试应覆盖：原生 API 调用、参考文本优先、英文词与中文字顺序、时间区间合法性、六文件交接、provider／模型身份变更、断点续跑、NVV 拒绝和旧路径回归。
 
 生产切换前仍需用实际 `-hf` 权重，在全新输出目录上分别运行一条有参考文本和一条无参考文本的短音频，检查词／字区间、MFA 音素层以及结果溯源。单元测试通过不代表模型精度已经验收。
+
+## 实施边界（合并自 `superpowers/plans/2026-09-14-qwen3-hf-upgrade.md`）
+
+> 该计划写作时称「保留 legacy `nvasr` 作为默认 provider」。此说法已失效：
+> `scripts/run_pipeline.py:799` 的 `migrate_main_prealign_config` 在 `mode` 为
+> `full` 或 `nvasr_fallback` 时，先把 provider 默认值取为 `qwen3_hf`，再将
+> `nvasr`／`funasr`／`qwen3`／`qwen3_hf` 四者一律归一为 `qwen3_hf`。同一函数还会把
+> NVASR 的 `model_path` 与 ASR 解释器替换为 Qwen3 对应值，把 `nvv_enabled` 和
+> `reference_nvv_enabled` 置 false，并删除 NVASR 专用的 `nvv_bias` 与
+> `pause_threshold`。保留的 CTC／replay 输入维持其历史 provider；MFA 段落从不改写。
+
+**生产者契约** — 生产者接收管线当前的 `--audio-dir`、参考文本根、输出根和冻结的 stem
+选择器。参考权威 stem 跳过 ASR 推理，直接对齐给定文本；无参考 stem 先跑 Qwen ASR，
+再对齐其转写。两条路径都产出下游归一化、边界修正与 MFA 所需的六件 CTC 产物。该
+provider 拒绝 NVV 标志。
+
+**环境与运行参数** — 原生环境隔离在 `requirements-qwen3-hf.txt`，旧的
+`qwen-asr==0.0.6` 环境不原地升级。canary 配置指向两棵转换后的 `-hf` 模型树，并使用
+`batch_size: 1`，因为当前管线每次生产者调用只喂一条音频。
+
+**验证边界** — 生产者拒绝缺失的模型树、非有限或非正的词／字区间，以及超过
+ForcedAligner 五分钟上限的音频。模型树、运行时、设置、输入／参考与输出产物身份都会
+留存以做断点续跑校验。单元测试使用注入的假后端，不下载权重、不执行生产运行。
 
 ## 官方资料
 
