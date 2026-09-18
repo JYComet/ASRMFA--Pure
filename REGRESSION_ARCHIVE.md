@@ -6146,7 +6146,7 @@ _ref_cjk = [c for c in re.sub(r'<sp\d+>', '', _orig_txt) if CJK(c)]
 
 - 临时回归：目录同时存在 demo_ref.txt = “参考 life” 和错误的 _text_cn.txt = “参考 live” 时，英文归一化输出为 life。
 - 临时回归：find_original_text("demo", ...) 正确返回 demo_ref.txt。
-- python3 -W error -m compileall -q scripts check_ipa_mapping.py verify_risks.py 通过。
+- python3 -W error -m compileall -q scripts 通过。
 - git -c core.whitespace=cr-at-eol diff --check 通过。
 
 ### 关联问题
@@ -8587,7 +8587,7 @@ assert any('all_gpus' in e and 'full' in e for e in errors)
 
 ```bash
 python3 scripts/verify_reference_authority.py
-python3 -B -m compileall -q scripts check_ipa_mapping.py verify_risks.py
+python3 -B -m compileall -q scripts
 ```
 
 独立 128 条 canary 的最终结果：`70/128 = 54.69%` 进入 strict-ok 发布集；其余 58 条

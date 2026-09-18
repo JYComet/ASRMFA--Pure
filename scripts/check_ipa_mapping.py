@@ -4,7 +4,7 @@ import json, sys
 from pathlib import Path
 from collections import Counter
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pipeline_utils import _EN_IPA_TO_ARPABET, en_ipa_to_arpabet
 
 en_dir = Path("output/test_en_mfa/en_phones")
