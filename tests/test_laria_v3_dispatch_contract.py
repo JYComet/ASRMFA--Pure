@@ -11,9 +11,10 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
-V2_CONFIG = ROOT / "configs/laria_v5_no_reference_strict_8gpu_20260825.yaml"
-V1_CONFIG = ROOT / "configs/laria_v5_no_reference_8gpu_20260825.yaml"
-V3_CONFIG = ROOT / "configs/laria_v5_no_reference_strict_8gpu_20260826_v3.yaml"
+CONFIG_ROOT = ROOT / "tests" / "fixtures" / "configs"
+V2_CONFIG = CONFIG_ROOT / "laria_v5_no_reference_strict_8gpu_20260825.yaml"
+V1_CONFIG = CONFIG_ROOT / "laria_v5_no_reference_8gpu_20260825.yaml"
+V3_CONFIG = CONFIG_ROOT / "laria_v5_no_reference_strict_8gpu_20260826_v3.yaml"
 V2_CACHE = ROOT / "cache/laria_v5_no_reference_strict_8gpu_20260825.cache.json"
 V3_CACHE = ROOT / "cache/laria_v5_no_reference_strict_8gpu_20260826_v3.cache.json"
 

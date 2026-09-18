@@ -15,6 +15,11 @@ from scripts import run_pipeline
 from scripts.pipeline_utils import write_ctc_raw_manifest, write_ctc_run_receipt
 
 
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_ROOT = ROOT / "tests" / "fixtures" / "configs"
+CACHE_ROOT = ROOT / "cache"
+
+
 def _receipt(stems: list[str], output: list[str], filtered: list[str]) -> dict:
     return streaming.make_pipeline_accounting_receipt(
         stems, stems, [], output, filtered,
@@ -211,8 +216,8 @@ def test_implementation_fingerprint_is_persisted_in_batch_and_dataset_receipts(
 def test_r15_enables_zero_filtered_policy():
     import yaml
 
-    config = yaml.safe_load(Path(
-        "configs/laria_v5_no_reference_strict_8gpu_20260828_logic_audit_r15_300.yaml"
+    config = yaml.safe_load((
+        CONFIG_ROOT / "laria_v5_no_reference_strict_8gpu_20260828_logic_audit_r15_300.yaml"
     ).read_text(encoding="utf-8"))
     assert config["pipelined"]["require_zero_filtered"] is True
 
@@ -412,8 +417,8 @@ def test_publication_receipt_rejects_overlap_and_missing_stems(tmp_path):
 def test_laria_config_and_cache_contract():
     import yaml
 
-    config_path = Path("configs/laria_v5_no_reference_8gpu_20260825.yaml")
-    cache_path = Path("cache/laria_v5_no_reference_8gpu_20260825.cache.json")
+    config_path = CONFIG_ROOT / "laria_v5_no_reference_8gpu_20260825.yaml"
+    cache_path = CACHE_ROOT / "laria_v5_no_reference_8gpu_20260825.cache.json"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     cache = json.loads(cache_path.read_text(encoding="utf-8"))
     assert not run_pipeline.validate_config(config, "nvrasr_fallback")
@@ -434,8 +439,8 @@ def test_laria_config_and_cache_contract():
 def test_laria_strict_config_and_cache_publish_to_same_v2_root():
     import yaml
 
-    config_path = Path("configs/laria_v5_no_reference_strict_8gpu_20260825.yaml")
-    cache_path = Path("cache/laria_v5_no_reference_strict_8gpu_20260825.cache.json")
+    config_path = CONFIG_ROOT / "laria_v5_no_reference_strict_8gpu_20260825.yaml"
+    cache_path = CACHE_ROOT / "laria_v5_no_reference_strict_8gpu_20260825.cache.json"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     cache = json.loads(cache_path.read_text(encoding="utf-8"))
     assert not run_pipeline.validate_config(config, "nvrasr_fallback")
@@ -450,10 +455,10 @@ def test_laria_r13_config_uses_fresh_paths_and_retention_without_semantic_drift(
     import copy
     import yaml
 
-    r12_path = Path(
-        "configs/laria_v5_no_reference_strict_8gpu_20260828_ria_r12_500.yaml")
-    r13_path = Path(
-        "configs/laria_v5_no_reference_strict_8gpu_20260828_logic_audit_r13_300.yaml")
+    r12_path = (
+        CONFIG_ROOT / "laria_v5_no_reference_strict_8gpu_20260828_ria_r12_500.yaml")
+    r13_path = (
+        CONFIG_ROOT / "laria_v5_no_reference_strict_8gpu_20260828_logic_audit_r13_300.yaml")
     r12 = yaml.safe_load(r12_path.read_text(encoding="utf-8"))
     r13 = yaml.safe_load(r13_path.read_text(encoding="utf-8"))
 
@@ -492,10 +497,10 @@ def test_laria_r17_config_is_r16_semantics_equivalent_with_fresh_namespaces():
     import copy
     import yaml
 
-    r16_path = Path(
-        "configs/laria_v5_no_reference_strict_8gpu_20260828_logic_audit_r16_300.yaml")
-    r17_path = Path(
-        "configs/laria_v5_no_reference_strict_8gpu_20260831_logic_audit_r17_300.yaml")
+    r16_path = (
+        CONFIG_ROOT / "laria_v5_no_reference_strict_8gpu_20260828_logic_audit_r16_300.yaml")
+    r17_path = (
+        CONFIG_ROOT / "laria_v5_no_reference_strict_8gpu_20260831_logic_audit_r17_300.yaml")
     r16 = yaml.safe_load(r16_path.read_text(encoding="utf-8"))
     r17 = yaml.safe_load(r17_path.read_text(encoding="utf-8"))
 
@@ -531,10 +536,10 @@ def test_laria_r18_config_is_r17_semantics_equivalent_with_fresh_namespaces():
     import copy
     import yaml
 
-    r17_path = Path(
-        "configs/laria_v5_no_reference_strict_8gpu_20260831_logic_audit_r17_300.yaml")
-    r18_path = Path(
-        "configs/laria_v5_no_reference_strict_8gpu_20260831_logic_audit_r18_300.yaml")
+    r17_path = (
+        CONFIG_ROOT / "laria_v5_no_reference_strict_8gpu_20260831_logic_audit_r17_300.yaml")
+    r18_path = (
+        CONFIG_ROOT / "laria_v5_no_reference_strict_8gpu_20260831_logic_audit_r18_300.yaml")
     r17 = yaml.safe_load(r17_path.read_text(encoding="utf-8"))
     r18 = yaml.safe_load(r18_path.read_text(encoding="utf-8"))
 
@@ -567,10 +572,10 @@ def test_laria_r19_config_is_r18_semantics_equivalent_with_fresh_namespaces():
     import copy
     import yaml
 
-    r18_path = Path(
-        "configs/laria_v5_no_reference_strict_8gpu_20260831_logic_audit_r18_300.yaml")
-    r19_path = Path(
-        "configs/laria_v5_no_reference_strict_8gpu_20260831_logic_audit_r19_300.yaml")
+    r18_path = (
+        CONFIG_ROOT / "laria_v5_no_reference_strict_8gpu_20260831_logic_audit_r18_300.yaml")
+    r19_path = (
+        CONFIG_ROOT / "laria_v5_no_reference_strict_8gpu_20260831_logic_audit_r19_300.yaml")
     r18 = yaml.safe_load(r18_path.read_text(encoding="utf-8"))
     r19 = yaml.safe_load(r19_path.read_text(encoding="utf-8"))
 
