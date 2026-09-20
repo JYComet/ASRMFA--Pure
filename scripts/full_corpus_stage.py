@@ -8,6 +8,7 @@ import os
 import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Mapping
 
 import numpy as np
 import soundfile as sf
@@ -134,10 +135,16 @@ class StageReceipt:
     text_sha256: str | None
     normalized_text: str | None
     source_sha256: str | None = None
+    # Bound to the resolution table that produced ``normalized_text``.  A stage
+    # receipt carrying the wrong digest is stale and must be re-normalized from
+    # source, which is how the macro repair invalidates frozen artifacts.
+    macro_resolution_digest: str | None = None
 
 
 def stage_item(item: InventoryItem, chunk_input: Path,
-               gamesl_stage: Path | None = None) -> StageReceipt:
+               gamesl_stage: Path | None = None, *,
+               resolutions: Mapping[str, str] | None = None,
+               resolution_digest: str | None = None) -> StageReceipt:
     chunk_input = Path(chunk_input)
     chunk_input.mkdir(parents=True, exist_ok=True)
     pipeline = chunk_input / f"{item.run_stem}.wav"
@@ -150,8 +157,11 @@ def stage_item(item: InventoryItem, chunk_input: Path,
         if reference_hash != item.reference_sha256:
             raise ValueError(f"frozen reference hash drift: {item.reference_path}")
         expected_normalized_text = normalize_qwen_reference_text(
-            item.reference_path.read_text(encoding="utf-8"), speaker=item.speaker)
+            item.reference_path.read_text(encoding="utf-8"), speaker=item.speaker,
+            resolutions=resolutions)
     else:
+        if resolutions is not None:
+            raise ValueError("resolution table supplied for a fallback item")
         expected_normalized_text = None
     if pipeline.exists() and receipt_path.is_file():
         try:
@@ -168,7 +178,8 @@ def stage_item(item: InventoryItem, chunk_input: Path,
                 if (not text_saved.is_file()
                         or saved.get("text_sha256") != _sha256(text_saved)
                         or text_saved.read_text(encoding="utf-8") != expected_normalized_text
-                        or saved.get("normalized_text") != expected_normalized_text):
+                        or saved.get("normalized_text") != expected_normalized_text
+                        or saved.get("macro_resolution_digest") != resolution_digest):
                     temporary_text = text_saved.with_name(text_saved.name + ".tmp")
                     temporary_text.write_text(expected_normalized_text, encoding="utf-8")
                     with temporary_text.open("rb") as handle:
@@ -178,6 +189,7 @@ def stage_item(item: InventoryItem, chunk_input: Path,
                     saved["text_path"] = str(text_saved)
                     saved["text_sha256"] = _sha256(text_saved)
                     saved["normalized_text"] = expected_normalized_text
+                    saved["macro_resolution_digest"] = resolution_digest
                     temporary_receipt = receipt_path.with_name(receipt_path.name + ".tmp")
                     temporary_receipt.write_text(
                         json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -191,7 +203,8 @@ def stage_item(item: InventoryItem, chunk_input: Path,
                                 pipeline, gamesl_saved, saved["pipeline_wav_sha256"],
                                 saved.get("gamesl_wav_sha256"),
                                 text_saved,
-                                saved.get("text_sha256"), saved.get("normalized_text"), source_hash)
+                                saved.get("text_sha256"), saved.get("normalized_text"),
+                                source_hash, saved.get("macro_resolution_digest"))
         except (OSError, KeyError, json.JSONDecodeError) as exc:
             raise ValueError(f"invalid stage resume receipt: {receipt_path}") from exc
     if pipeline.exists() or pipeline.is_symlink():
@@ -265,13 +278,14 @@ def stage_item(item: InventoryItem, chunk_input: Path,
         receipt.run_stem, receipt.source_id, receipt.game, receipt.speaker,
         receipt.pipeline_wav, receipt.gamesl_wav, receipt.pipeline_wav_sha256,
         receipt.gamesl_wav_sha256, receipt.text_path, receipt.text_sha256,
-        receipt.normalized_text, source_hash)
+        receipt.normalized_text, source_hash, resolution_digest)
     payload = {"run_stem": receipt.run_stem, "source_sha256": source_hash,
                "pipeline_wav": str(receipt.pipeline_wav), "pipeline_wav_sha256": receipt.pipeline_wav_sha256,
                "gamesl_wav": str(receipt.gamesl_wav) if receipt.gamesl_wav else None,
                "gamesl_wav_sha256": receipt.gamesl_wav_sha256,
                "text_path": str(receipt.text_path) if receipt.text_path else None,
-               "text_sha256": receipt.text_sha256, "normalized_text": receipt.normalized_text}
+               "text_sha256": receipt.text_sha256, "normalized_text": receipt.normalized_text,
+               "macro_resolution_digest": resolution_digest}
     temporary_receipt = receipt_path.with_name(receipt_path.name + ".tmp")
     temporary_receipt.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     with temporary_receipt.open("rb") as handle:

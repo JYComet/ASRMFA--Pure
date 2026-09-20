@@ -245,7 +245,7 @@ def test_chunk_staging_isolates_one_bad_item(tmp_path):
               "terminal": {chunk.chunk_id:"producer_failure"}}
     stale = tmp_path / "chunk" / "input" / "u2.wav"
     stale.parent.mkdir(parents=True); stale.write_bytes(b"stale")
-    def stage_one(item, input_dir, gamesl_dir):
+    def stage_one(item, input_dir, gamesl_dir, **kwargs):
         if item.run_stem == "u2":
             raise ValueError("no speech")
         return "receipt-" + item.run_stem

@@ -677,8 +677,15 @@ def _publish_completed_chunk(current: dict, root: Path, config: dict,
     }
 
 
-def _load_frozen_stage_receipt(item, input_dir: Path, *, verify_content: bool = True):
-    """Reuse a frozen, NVMe-local stage artifact without rereading its NAS source."""
+def _load_frozen_stage_receipt(item, input_dir: Path, *, verify_content: bool = True,
+                               resolution_digest: str | None = None):
+    """Reuse a frozen, NVMe-local stage artifact without rereading its NAS source.
+
+    The reuse is only valid for the resolution table that produced the artifact.
+    When a repair supplies its own table, a receipt bound to a different one is
+    rejected here so the item is re-normalized from source instead of silently
+    keeping the stale text.
+    """
     input_dir = Path(input_dir)
     stem = _get(item, "run_stem")
     receipt_path = input_dir / f"{stem}.stage_receipt.json"
@@ -707,6 +714,9 @@ def _load_frozen_stage_receipt(item, input_dir: Path, *, verify_content: bool = 
             return None
         if _get(item, "needs_gamesl_padding", False) != (gamesl is not None):
             return None
+        if resolution_digest is not None and (
+                saved.get("macro_resolution_digest") != resolution_digest):
+            return None
         text_path = Path(saved["text_path"]) if saved.get("text_path") else None
         if _get(item, "reference_path") is not None:
             expected_text = input_dir / f"{stem}.txt"
@@ -723,13 +733,14 @@ def _load_frozen_stage_receipt(item, input_dir: Path, *, verify_content: bool = 
             _get(item, "speaker"), pipeline, gamesl,
             saved["pipeline_wav_sha256"], saved.get("gamesl_wav_sha256"),
             text_path, saved.get("text_sha256"), saved.get("normalized_text"),
-            saved["source_sha256"])
+            saved["source_sha256"], saved.get("macro_resolution_digest"))
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
 
 
 def _collect_stage_chunk_items(chunk: Chunk, frozen: dict, base: Path, stage_fn, *,
-                               verify_content: bool = True):
+                               verify_content: bool = True, resolutions=None,
+                               resolution_digest: str | None = None):
     """Stage a chunk privately; the caller later merges terminal status."""
     ready_items, receipts, failure_rows = [], [], []
     input_dir = Path(base) / "input"
@@ -737,9 +748,12 @@ def _collect_stage_chunk_items(chunk: Chunk, frozen: dict, base: Path, stage_fn,
         stem = _get(item, "run_stem")
         try:
             receipt = _load_frozen_stage_receipt(
-                frozen[stem], input_dir, verify_content=verify_content)
+                frozen[stem], input_dir, verify_content=verify_content,
+                resolution_digest=resolution_digest)
             if receipt is None:
-                receipt = stage_fn(frozen[stem], input_dir, Path(base) / "gamesl_stage")
+                receipt = stage_fn(frozen[stem], input_dir, Path(base) / "gamesl_stage",
+                                   resolutions=resolutions,
+                                   resolution_digest=resolution_digest)
         except Exception as exc:
             for suffix in (".wav", ".txt", ".stage_receipt.json"):
                 (input_dir / f"{stem}{suffix}").unlink(missing_ok=True)

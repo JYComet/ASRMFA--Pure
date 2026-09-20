@@ -11,9 +11,12 @@ import json
 import math
 import re
 import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 SCHEMA = "qwen3-timestamp-normalization-v2"
+MACRO_SCHEMA = "qwen3-reference-macro-resolutions-v1"
 ELLIPSIS = "…"
 _QWEN_MARKUP_RE = re.compile(
     r"<(?:sp[0-3]|[A-Za-z][A-Za-z0-9_-]*)>|\[[A-Za-z][A-Za-z0-9 _-]*\]",
@@ -36,6 +39,185 @@ _REFERENCE_CONDITIONAL_ITEM_RE = re.compile(
 _REFERENCE_PUNCTUATION = frozenset("，。！？…、")
 _CN_DIGITS = "零一二三四五六七八九"
 _MAX_QUANTIZED_OVERSHOOT_TICKS = 80_000
+
+# GAMEDATA authority text embeds localization macros.  Braces and `#` are
+# stripped by the character filter below while their ASCII letters survive, so
+# an unresolved macro reaches the aligner as a bare token such as NICKNAME and
+# is then G2P'd into nonsense phonemes.  `{M#…}{F#…}` was already handled; the
+# families below were not.  Only single-level braces are recognised, so an
+# adjacent `…}{NICKNAME}` cannot be swallowed by its neighbour.
+_REFERENCE_MACRO_RE = re.compile(
+    r"\{(?![FfMm]#)([A-Za-z][A-Za-z0-9_]*)([^{}]*)\}")
+_REFERENCE_ALIAS_RE = re.compile(r"(?<![A-Za-z0-9])(player|TA)(?![A-Za-z0-9])")
+_REFERENCE_BRACKET_RE = re.compile(r"\[([^\[\]]*)\]")
+_REFERENCE_PARAM_RE = re.compile(r"#\s*([A-Za-z0-9_]+)")
+# `{RUBY#[S]希望}` is a ruby gloss: `杜麦{RUBY#[S]希望}尼` reads as the base
+# text 杜麦尼 with 希望 typeset above it.  The whole macro is dropped so the
+# base text survives intact; the gloss is never spoken.
+_REFERENCE_RUBY_MACRO = "RUBY"
+# Macros whose whole value is the player's chosen name.
+_REFERENCE_NAME_MACROS = frozenset({"NICKNAME", "REALNAME"})
+# Label suffix token -> spoken replacement.  Keyed on the pronoun token, never
+# on the INFO_MALE_/INFO_FEMALE_ prefix: the corpus contains
+# `[INFO_MALE_PRONOUN_SHE|INFO_FEMALE_PRONOUN_HE]`, so the prefix contradicts
+# the pronoun it labels.
+_SEXPRO_WORDS = {
+    "HE": "他", "SHE": "她",
+    "BROTHER": "哥哥", "SISTER": "姐姐", "SISTERA": "姐姐",
+    "BOY": "男孩", "BOYD": "男孩",
+    "GIRL": "女孩", "GIRLD": "女孩", "GIRLC": "女孩",
+    "YING": "荧", "KONG": "空",
+}
+# 他/她/它 are indistinguishable to an acoustic model, so the branch is chosen
+# by fixed policy rather than by ASR.  Any other pair is audibly distinct and
+# must be resolved from evidence.
+_HOMOPHONE_GROUPS = (frozenset({"他", "她", "它"}),)
+_HOMOPHONE_POLICY = "他"
+# A resolution that reintroduces one of these would leak exactly as the bug did.
+_REFERENCE_WORD_RE = re.compile(r"[A-Za-z]+")
+_REFERENCE_RESERVED_WORDS = frozenset({
+    "nickname", "playeravatar", "mateavatar", "textjoin", "realname",
+    "ruby", "gender", "sexpro",
+})
+
+
+@dataclass(frozen=True)
+class ReferenceMacroSlot:
+    """One localization macro occurrence and the choices it presents."""
+
+    literal: str
+    macro: str
+    param: str | None
+    labels: tuple[str, ...]
+    alternatives: tuple[str, ...]
+    start: int
+    end: int
+
+    @property
+    def audibly_distinct(self) -> bool:
+        return len(self.alternatives) > 1 and not _same_homophone_group(
+            self.alternatives)
+
+    @property
+    def default(self) -> str | None:
+        """The value implied by policy alone, without ASR evidence.
+
+        A sole alternative is unambiguous.  A homophone set is resolved by
+        policy rather than by its first member, so an ordered
+        `[SHE|HE]` branch list still yields 他.
+        """
+        if len(self.alternatives) == 1:
+            return self.alternatives[0]
+        if self.alternatives and not self.audibly_distinct:
+            return _HOMOPHONE_POLICY
+        return None
+
+    @property
+    def key(self) -> str:
+        return self.literal
+
+
+def _same_homophone_group(words) -> bool:
+    return any(set(words) <= group for group in _HOMOPHONE_GROUPS)
+
+
+def _label_word(label: str) -> str | None:
+    """Map one SEXPRO alternative label to its spoken word, if known."""
+    tokens = [token for token in re.split(r"[^A-Za-z0-9]+", label.upper()) if token]
+    for token in reversed(tokens):
+        if token in _SEXPRO_WORDS:
+            return _SEXPRO_WORDS[token]
+    return None
+
+
+def reference_macro_slots(text: str) -> tuple[ReferenceMacroSlot, ...]:
+    """Locate localization macros; returns () for macro-free text."""
+    if "{" not in text:
+        return ()
+    slots = []
+    for match in _REFERENCE_MACRO_RE.finditer(text):
+        macro, body = match.group(1), match.group(2)
+        param_match = _REFERENCE_PARAM_RE.search(body)
+        bracket = _REFERENCE_BRACKET_RE.search(body)
+        labels: tuple[str, ...] = ()
+        alternatives: tuple[str, ...] = ()
+        if bracket is not None:
+            labels = tuple(part.strip() for part in bracket.group(1).split("|")
+                           if part.strip())
+            alternatives = tuple(
+                word for word in (_label_word(label) for label in labels)
+                if word is not None)
+        slots.append(ReferenceMacroSlot(
+            literal=match.group(0), macro=macro,
+            param=param_match.group(1) if param_match else None,
+            labels=labels, alternatives=alternatives,
+            start=match.start(), end=match.end()))
+    return tuple(slots)
+
+
+def _resolve_reference_macros(text: str, slot: ReferenceMacroSlot,
+                              resolutions: Mapping[str, str] | None) -> str:
+    """Return the spoken replacement for one macro, or raise if unresolvable."""
+    if slot.macro == _REFERENCE_RUBY_MACRO:
+        return ""
+    if slot.macro in _REFERENCE_NAME_MACROS:
+        resolved = resolutions.get(slot.key) if resolutions else None
+        if resolved is None:
+            raise ValueError(
+                f"unresolved Qwen reference macro (no resolution): {slot.literal!r}")
+        return resolved
+    if slot.macro.endswith("AVATAR") or _REFERENCE_BRACKET_RE.search(slot.literal):
+        if not slot.alternatives:
+            raise ValueError(
+                f"unrecognized Qwen reference macro labels: {slot.literal!r}")
+        implied = slot.default
+        if implied is not None:
+            return implied
+        resolved = resolutions.get(slot.key) if resolutions else None
+        if resolved is None:
+            raise ValueError(
+                f"unresolved Qwen reference macro (ambiguous branch): {slot.literal!r}")
+        if resolved not in slot.alternatives:
+            raise ValueError(
+                f"Qwen reference macro resolution is not one of its branches: {slot.literal!r}")
+        return resolved
+    raise ValueError(f"unrecognized Qwen reference macro: {slot.literal!r}")
+
+
+def _reference_replacement_is_spoken(value: str) -> bool:
+    """Reject a substitution that would be altered by, or re-leak through, the filter.
+
+    A replacement must consist only of units that survive the reference filter
+    verbatim, so punctuation that would be silently stripped fails closed.  It
+    must also not reintroduce a macro-shaped token: an all-caps run or a known
+    macro name would leak exactly as the original bug did.
+    """
+    if not value:
+        return False
+    for char in value:
+        codepoint = ord(char)
+        is_cjk = (0x3400 <= codepoint <= 0x4DBF
+                  or 0x4E00 <= codepoint <= 0x9FFF
+                  or 0xF900 <= codepoint <= 0xFAFF)
+        if not (is_cjk or (char.isascii() and char.isalpha())
+                or char in _REFERENCE_PUNCTUATION or char.isspace()):
+            return False
+    for token in _REFERENCE_WORD_RE.findall(value):
+        if len(token) >= 3 and token.isupper():
+            return False
+        if token.casefold() in _REFERENCE_RESERVED_WORDS:
+            return False
+    return True
+
+
+def _resolve_reference_alias(word: str, resolutions: Mapping[str, str]) -> str:
+    """Resolve a bare `player`/`TA` alias; only reachable with a table."""
+    resolved = resolutions.get(f"alias:{word}")
+    if resolved is None:
+        raise ValueError(f"unresolved Qwen reference alias: {word!r}")
+    if not _reference_replacement_is_spoken(resolved):
+        raise ValueError(f"unsafe Qwen reference alias resolution: {word!r}")
+    return resolved
 
 
 def normalize_qwen_input_text(text: str) -> str:
@@ -129,8 +311,17 @@ def _reference_integer(digits: str) -> str:
     return "".join(result)
 
 
-def normalize_qwen_reference_text(text: str, *, speaker: str | None = None) -> str:
-    """Normalize authority text to Qwen/MFA-supported spoken units."""
+def normalize_qwen_reference_text(
+        text: str, *, speaker: str | None = None,
+        resolutions: Mapping[str, str] | None = None) -> str:
+    """Normalize authority text to Qwen/MFA-supported spoken units.
+
+    ``resolutions`` maps a macro literal (see :func:`reference_macro_slots`) to
+    the spoken word chosen for it.  It is only consulted for branches that
+    policy cannot decide; homophone branches are always taken to the fixed
+    policy value so an acoustic model is never asked to distinguish them.
+    Macro-free text is returned byte-identical to the previous behaviour.
+    """
     if not isinstance(text, str):
         raise TypeError("Qwen reference text must be a string")
     # NFKC expands U+2026 to three ASCII periods; protect the canonical
@@ -151,6 +342,28 @@ def normalize_qwen_reference_text(text: str, *, speaker: str | None = None) -> s
                      if label.upper() == preferred), variants[0][1])
 
     text = _REFERENCE_CONDITIONAL_RUN_RE.sub(conditional_run, text)
+
+    # Macro resolution must precede _REFERENCE_EVENT_RE, which would otherwise
+    # delete a SEXPRO branch list before it can be read, and precede number
+    # verbalization, which would turn `{TEXTJOIN#54}` into `TEXTJOIN五十四`.
+    slots = reference_macro_slots(text)
+    if slots:
+        pieces: list[str] = []
+        cursor = 0
+        for slot in slots:
+            pieces.append(text[cursor:slot.start])
+            replacement = _resolve_reference_macros(text, slot, resolutions)
+            if replacement and not _reference_replacement_is_spoken(replacement):
+                raise ValueError(
+                    f"unsafe Qwen reference macro resolution: {slot.literal!r}")
+            pieces.append(replacement)
+            cursor = slot.end
+        pieces.append(text[cursor:])
+        text = "".join(pieces)
+    if resolutions is not None:
+        text = _REFERENCE_ALIAS_RE.sub(
+            lambda match: _resolve_reference_alias(match.group(1), resolutions), text)
+
     text = _REFERENCE_TAG_RE.sub("", text)
     text = _REFERENCE_EVENT_RE.sub("", text)
 

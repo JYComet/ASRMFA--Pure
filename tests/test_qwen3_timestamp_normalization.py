@@ -69,6 +69,97 @@ def test_reference_normalization_selects_one_conditional_gender_branch(speaker, 
     assert normalize_qwen_reference_text(source, speaker=speaker) == expected
 
 
+@pytest.mark.parametrize(("source", "expected"), [
+    # `{RUBY#[X]gloss}` is a ruby annotation: the surrounding text is the base
+    # and the gloss is typeset above it, never spoken.
+    ("杜麦{RUBY#[S]希望}尼，这就是他的古名。", "杜麦尼，这就是他的古名。"),
+    ("「库塔{RUBY#[S]月之少女}尔」…我听说过你。", "库塔尔…我听说过你。"),
+    ("花{RUBY#[D]   特拉洛坎}羽会的战士向来高傲", "花羽会的战士向来高傲"),
+    ("把它转移到我的剑{RUBY#[S]钢铁的爪牙}里就行。", "把它转移到我的剑里就行。"),
+    ("我的「古名」…「庇{RUBY#[D]奉献}笛」。", "我的古名…庇笛。"),
+])
+def test_reference_ruby_gloss_is_dropped_leaving_the_base_text(source, expected):
+    assert normalize_qwen_reference_text(source) == expected
+
+
+@pytest.mark.parametrize("branch", [
+    "[INFO_MALE_PRONOUN_HE|INFO_FEMALE_PRONOUN_SHE]",
+    "[INFO_FEMALE_PRONOUN_SHE|INFO_MALE_PRONOUN_HE]",
+    # The corpus contains labels whose INFO_MALE_/INFO_FEMALE_ prefix
+    # contradicts the pronoun it carries, so only the pronoun token may decide.
+    "[INFO_MALE_PRONOUN_SHE|INFO_FEMALE_PRONOUN_HE]",
+    "[INFO_MALE_PRONOUN_SHE|INFO_MALE_PRONOUN_HE]",
+])
+@pytest.mark.parametrize("macro", ["PLAYERAVATAR", "MATEAVATAR"])
+def test_sexpro_homophone_branch_always_takes_the_fixed_policy(macro, branch):
+    source = f"{{{macro}#SEXPRO{branch}}}好"
+    assert normalize_qwen_reference_text(source) == "他好"
+
+
+def test_sexpro_homophone_policy_cannot_be_overridden_by_a_table():
+    source = "{PLAYERAVATAR#SEXPRO[INFO_MALE_PRONOUN_HE|INFO_FEMALE_PRONOUN_SHE]}好"
+    assert normalize_qwen_reference_text(source, resolutions={source[:58]: "她"}) == "他好"
+
+
+def test_macro_literal_spanning_a_gloss_does_not_swallow_its_neighbour():
+    # `{PLAYERAVATAR#SEXPRO[…INFO_FEMALE}{NICKNAME}` must resolve as two macros.
+    source = ("{NICKNAME}"
+              "{PLAYERAVATAR#SEXPRO[INFO_MALE_PRONOUN_HE|INFO_FEMALE_PRONOUN_SHE]}们认识的")
+    assert normalize_qwen_reference_text(
+        source, resolutions={"{NICKNAME}": "旅行者"}) == "旅行者他们认识的"
+
+
+def test_audibly_distinct_branch_requires_evidence_and_honours_it():
+    source = "{PLAYERAVATAR#SEXPRO[INFO_MALE_PRONOUN_BROTHER|INFO_FEMALE_PRONOUN_SISTERA]}"
+    with pytest.raises(ValueError, match="ambiguous branch"):
+        normalize_qwen_reference_text(source)
+    assert normalize_qwen_reference_text(source, resolutions={source: "哥哥"}) == "哥哥"
+    with pytest.raises(ValueError, match="not one of its branches"):
+        normalize_qwen_reference_text(source, resolutions={source: "姐姐的好朋友"})
+
+
+def test_name_macro_requires_a_resolution_and_never_leaks_its_ascii_name():
+    with pytest.raises(ValueError, match="no resolution"):
+        normalize_qwen_reference_text("{NICKNAME}，好久不见。")
+    assert normalize_qwen_reference_text(
+        "{NICKNAME}，好久不见。", resolutions={"{NICKNAME}": "旅行者"}) == "旅行者，好久不见。"
+
+
+@pytest.mark.parametrize("source", [
+    "看来{TEXTJOIN#54}也已经准备好了。",                       # runtime join id
+    "{PLAYERAVATAR#SEXPRO[INFO_MALE_PRONOUN_XIABOY|INFO_FEMALE_PRONOUN_XIAGIRL]}",
+    "{REALNAME[ID(1)|HOSTONLY(true)]}",
+    "{SOMETHINGNEW#1}",
+])
+def test_unrecognized_macros_fail_closed_instead_of_leaking(source):
+    with pytest.raises(ValueError):
+        normalize_qwen_reference_text(source)
+
+
+def test_macro_free_text_is_byte_identical_with_or_without_a_table():
+    for text in ("你好，世界。", "AR214和Z7小队，1999年。", "概率低于0.0003%~",
+                 "「你」~（好）！", "don't open-ai foo_bar $50 50%"):
+        assert (normalize_qwen_reference_text(text)
+                == normalize_qwen_reference_text(text, resolutions={}))
+
+
+def test_bare_aliases_are_inert_until_a_table_opts_in():
+    # `player`/`TA` are ordinary words unless the run supplies a resolution, so
+    # a normalizer call without a table cannot alter them.
+    for text in ("player 你好", "TA 你好"):
+        assert normalize_qwen_reference_text(text) == text
+    assert normalize_qwen_reference_text(
+        "TA 你好", resolutions={"alias:TA": "他"}) == "他 你好"
+    with pytest.raises(ValueError, match="unresolved Qwen reference alias"):
+        normalize_qwen_reference_text("TA 你好", resolutions={})
+
+
+def test_unsafe_macro_resolution_is_rejected():
+    with pytest.raises(ValueError, match="unsafe Qwen reference"):
+        normalize_qwen_reference_text(
+            "{NICKNAME}好", resolutions={"{NICKNAME}": "NICKNAME"})
+
+
 def test_short_pause_extends_previous_word_and_long_pause_preserves_punctuation():
     original = rows(("你", 0.1, 0.3), ("好", 0.4, 0.6), ("啊", 1.1, 1.3))
     before = copy.deepcopy(original)
