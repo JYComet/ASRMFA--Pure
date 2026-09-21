@@ -785,7 +785,7 @@ def _enrich_merged_alignment(config: Mapping[str, Any], root: Path, alignment: M
             if not isinstance(token_id, str) or not token_id:
                 _fail("native_basic_mapping_ambiguous", "bound native phone token identity is required", f"$.{uid}.native_phones")
             for mora_id in phone.get("mora_ids", []):
-                relations.append({"mora_id": f"{uid}:{token_id}:{mora_id}", "phone_id": phone.get("phone_id")})
+                relations.append({"mora_id": mora_id, "phone_id": phone.get("phone_id")})
         graph = dict(enriched["mora_graph"])
         graph["relations"] = relations
         enriched["mora_graph"] = graph
@@ -872,24 +872,69 @@ def _stage_json(root: Path, stage: str, name: str) -> Mapping[str, Any] | None:
     return payload
 
 
-def _frontend_for_graph(frontend: Mapping[str, Any], token_id: str | None) -> Mapping[str, Any]:
-    """Select unit-scoped contextual evidence without reconstructing it."""
-    if "accent_evidence" in frontend or token_id is None:
-        return frontend
+_OCCURRENCE_FIELDS = ("uid", "token_id", "token_alias", "alias", "candidate_id",
+                      "occurrence", "occurrence_index", "token_index", "unit_index", "index")
+
+
+def _graph_occurrence(uid: str, graph: Mapping[str, Any]) -> dict[str, Any]:
+    result = {"uid": uid, "locked_reading_digest": graph.get("locked_reading_digest")}
+    for field in _OCCURRENCE_FIELDS[1:]:
+        if graph.get(field) is not None:
+            result[field] = graph[field]
+    aliases = {row.get("alias") for row in graph.get("native_phone_templates", [])
+               if isinstance(row, Mapping) and row.get("alias") is not None}
+    if "alias" not in result and len(aliases) == 1:
+        result["alias"] = aliases.pop()
+    return result
+
+
+def _row_matches_occurrence(row: Mapping[str, Any], occurrence: Mapping[str, Any]) -> bool:
+    return all(row.get(field) is None or (occurrence.get(field) is not None and row.get(field) == occurrence.get(field))
+               for field in _OCCURRENCE_FIELDS)
+
+
+def _select_occurrence_evidence(rows: Sequence[Mapping[str, Any]], occurrence: Mapping[str, Any], occurrences: Sequence[Mapping[str, Any]], *, code: str, name: str) -> Mapping[str, Any]:
+    candidates = []
+    for row in rows:
+        if not _row_matches_occurrence(row, occurrence):
+            continue
+        if len([item for item in occurrences if _row_matches_occurrence(row, item)]) != 1:
+            _fail(code, f"{name} occurrence scope is ambiguous", f"$.{name}")
+        candidates.append(row)
+    if len(candidates) != 1:
+        _fail(code, f"{name} does not bind exactly one occurrence", f"$.{name}")
+    return candidates[0]
+
+
+def _frontend_for_occurrence(frontend: Mapping[str, Any], occurrence: Mapping[str, Any], occurrences: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+    # Reopen real frontend contracts through their producer validator; this
+    # recomputes root and unit evidence digests instead of trusting a flag.
+    if isinstance(frontend.get("contextual_accent_evidence"), Mapping) and isinstance(frontend.get("units"), list):
+        try:
+            from .ja_frontend import validate_frontend_contract
+        except ImportError:  # pragma: no cover
+            from ja_frontend import validate_frontend_contract
+        frontend = validate_frontend_contract(frontend)
     units = frontend.get("units")
-    if not isinstance(units, list):
+    if isinstance(units, list):
+        rows = [{**dict(item), "uid": item.get("uid", frontend.get("uid", occurrence["uid"]))} for item in units if isinstance(item, Mapping)]
+    elif "accent_evidence" in frontend:
+        rows = [{**dict(frontend), "uid": frontend.get("uid", occurrence["uid"])}]
+    else:
         _fail("accent_phrase_unresolved", "frontend record has no unit evidence", "$.frontend")
-    unit = next((item for item in units if isinstance(item, Mapping) and item.get("token_id") == token_id), None)
-    if not isinstance(unit, Mapping):
-        _fail("accent_phrase_unresolved", "frontend token is absent", f"$.frontend.{token_id}")
-    return {
-        "accent_evidence_valid": unit.get("accent_evidence_valid", False),
-        "locked_reading_digest": unit.get("locked_reading_digest"),
-        "accent_evidence": unit.get("accent_evidence"),
-    }
+    selected = _select_occurrence_evidence(rows, occurrence, occurrences, code="accent_phrase_unresolved", name="frontend")
+    evidence = selected.get("accent_evidence")
+    if isinstance(evidence, Mapping) and evidence.get("unit_evidence_sha256") is not None and "njd_rows" in evidence and "full_context_labels" in evidence:
+        try:
+            from .ja_frontend import _unit_evidence_digest
+        except ImportError:  # pragma: no cover
+            from ja_frontend import _unit_evidence_digest
+        if evidence.get("unit_evidence_sha256") != _unit_evidence_digest(evidence):
+            _fail("tone_provenance_missing", "frontend unit evidence digest differs", "$.frontend.accent_evidence")
+    return {"accent_evidence_valid": selected.get("accent_evidence_valid", False), "locked_reading_digest": selected.get("locked_reading_digest"), "accent_evidence": selected.get("accent_evidence")}
 
 
-def _resource_for_uid(config: Mapping[str, Any], key: str, uid: str) -> Mapping[str, Any] | None:
+def _resource_for_occurrence(config: Mapping[str, Any], key: str, occurrence: Mapping[str, Any], occurrences: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
     settings = config.get("prosody") if isinstance(config.get("prosody"), Mapping) else {}
     value = settings.get(key)
     if value is None:
@@ -906,10 +951,19 @@ def _resource_for_uid(config: Mapping[str, Any], key: str, uid: str) -> Mapping[
         _fail("tone_provenance_missing", f"prosody {key} resource must be an object", f"$.prosody.{key}")
     entries = value.get("entries")
     if entries is None:
-        return value
-    if not isinstance(entries, Mapping) or not isinstance(entries.get(uid), Mapping):
+        entries = [value]
+    elif isinstance(entries, Mapping):
+        scoped = entries.get(str(occurrence["uid"]))
+        entries = scoped if isinstance(scoped, list) else ([scoped] if isinstance(scoped, Mapping) else [])
+    if not isinstance(entries, list):
+        _fail("tone_provenance_missing", f"prosody {key} entries must be objects", f"$.prosody.{key}")
+    rows = [{**dict(row), "uid": row.get("uid", occurrence["uid"])} for row in entries if isinstance(row, Mapping)]
+    if not rows:
         return None
-    return entries[uid]
+    selected = _select_occurrence_evidence(rows, occurrence, occurrences, code="tone_provenance_missing", name=key)
+    if selected.get("locked_reading_digest") is not None and selected.get("locked_reading_digest") != occurrence.get("locked_reading_digest"):
+        _fail("tone_provenance_missing", f"prosody {key} digest differs from occurrence", f"$.prosody.{key}")
+    return selected
 
 
 def _namespace_graph(uid: str, source: Mapping[str, Any], phones: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -919,15 +973,39 @@ def _namespace_graph(uid: str, source: Mapping[str, Any], phones: Sequence[Mappi
     mora_map = {str(row.get("mora_id")): prefix + str(row.get("mora_id")) for row in source.get("mora_nodes", []) if isinstance(row, Mapping)}
     basic_map = {str(row.get("basic_phone_id")): prefix + str(row.get("basic_phone_id")) for row in source.get("basic_phone_nodes", []) if isinstance(row, Mapping)}
     template_map = {str(row.get("native_phone_id")): prefix + str(row.get("native_phone_id")) for row in source.get("native_phone_templates", []) if isinstance(row, Mapping)}
-    graph = copy.deepcopy(dict(source))
-    graph["mora_nodes"] = [{**dict(row), "mora_id": mora_map[str(row.get("mora_id"))]} for row in source.get("mora_nodes", []) if isinstance(row, Mapping)]
-    graph["basic_phone_nodes"] = [{**dict(row), "basic_phone_id": basic_map[str(row.get("basic_phone_id"))],
-                                    "mora_id": mora_map.get(str(row.get("mora_id")), row.get("mora_id"))}
-                                  for row in source.get("basic_phone_nodes", []) if isinstance(row, Mapping)]
-    graph["native_phone_templates"] = [{**dict(row), "native_phone_id": template_map[str(row.get("native_phone_id"))],
-                                         "mora_ids": [mora_map.get(str(value), value) for value in row.get("mora_ids", [])],
-                                         "basic_phone_ids": [basic_map.get(str(value), value) for value in row.get("basic_phone_ids", [])]}
-                                        for row in source.get("native_phone_templates", []) if isinstance(row, Mapping)]
+    openjtalk_map = {str(row.get("id")): prefix + str(row.get("id")) for row in source.get("frontend_phone_nodes", [])
+                     if isinstance(row, Mapping) and row.get("id") is not None}
+    all_map = {**mora_map, **basic_map, **template_map, **openjtalk_map}
+
+    def remap(value: Any, field: str | None = None, kind: Any = None) -> Any:
+        if isinstance(value, list):
+            return [remap(item, field, kind) for item in value]
+        if isinstance(value, Mapping):
+            row_kind = value.get("kind", kind)
+            return {key: remap(item, key, row_kind) for key, item in value.items()}
+        if not isinstance(value, str):
+            return value
+        if field in {"mora_id", "mora_ids"}:
+            return mora_map.get(value, value)
+        if field in {"basic_phone_id", "basic_phone_ids"}:
+            return basic_map.get(value, value)
+        if field in {"native_phone_id", "native_phone_template_id", "native_phone_ids"}:
+            return template_map.get(value, value)
+        if field in {"source_openjtalk_ids", "source_ids"}:
+            return openjtalk_map.get(value, all_map.get(value, value))
+        if field in {"target_ids", "target", "source_id", "target_id", "phone_id"}:
+            return all_map.get(value, value)
+        if field == "id":
+            if kind == "mora":
+                return mora_map.get(value, value)
+            if kind == "semantic_phone":
+                return template_map.get(value, value)
+            if kind == "openjtalk_phone":
+                return openjtalk_map.get(value, value)
+            return all_map.get(value, value)
+        return value
+
+    graph = remap(copy.deepcopy(dict(source)))
     bound = [{**dict(phone), "mora_ids": [mora_map.get(str(value), value) for value in phone.get("mora_ids", [])],
               "basic_phone_ids": [basic_map.get(str(value), value) for value in phone.get("basic_phone_ids", [])],
               "native_phone_template_id": template_map.get(str(phone.get("native_phone_template_id")), phone.get("native_phone_template_id"))}
@@ -970,7 +1048,7 @@ def assemble_prosody_rows(
         uid = str(row.get("uid", value.get("uid", "")))
         if not uid:
             _fail("reading_unresolved", "locked reading UID binding is missing", "$.reading")
-        reading_by_uid.setdefault(uid, []).append(value)
+        reading_by_uid.setdefault(uid, []).append({**dict(value), **{field: value.get(field, row.get(field)) for field in _OCCURRENCE_FIELDS if value.get(field) is None and row.get(field) is not None}, "uid": uid})
     try:
         from .ja_prosody import build_prosody_alignment
     except ImportError:  # pragma: no cover
@@ -1004,12 +1082,14 @@ def assemble_prosody_rows(
             if not isinstance(phone, Mapping) or phone.get("language") != "ja":
                 continue
             template = next((item for item in templates if item.get("native_phone_id") == phone.get("native_phone_template_id")
-                             and item.get("token_id") == phone.get("token_id") and item.get("alias") == phone.get("alias")), None)
+                             and item.get("token_id") == phone.get("token_id") and item.get("alias") == phone.get("alias")
+                             and (phone.get("candidate_id") is None or item.get("candidate_id") == phone.get("candidate_id"))), None)
             if template is None or template.get("token_id") != phone.get("token_id") or template.get("alias") != phone.get("alias"):
                 _fail("native_basic_mapping_ambiguous", "native phone does not bind its semantic UID/token/alias template", f"$.{uid}.native_phones")
             if str(phone.get("alias")) not in aliases:
                 _fail("native_basic_mapping_ambiguous", "native alias binding is invalid", f"$.{uid}.native_phones")
         partials: list[dict[str, Any]] = []
+        occurrences = [_graph_occurrence(uid, graph) for graph in selected]
         for source in selected:
             token_id = source.get("token_id")
             graph_phones = [phone for phone in phones if isinstance(phone, Mapping) and phone.get("language") == "ja" and phone.get("token_id") == token_id]
@@ -1017,18 +1097,20 @@ def assemble_prosody_rows(
                 continue
             graph, graph_phones = _namespace_graph(uid, source, graph_phones)
             graph["uid"] = uid
-            locks = reading_by_uid[uid]
-            lock = next((item for item in locks if token_id is None or item.get("token_id") in {None, token_id}), None)
+            occurrence = _graph_occurrence(uid, source)
+            lock = _select_occurrence_evidence(reading_by_uid[uid], occurrence, occurrences, code="reading_unresolved", name="reading")
             selected_reading = lock.get("selected_reading", lock.get("chosen_reading")) if isinstance(lock, Mapping) else None
             if not isinstance(selected_reading, str) or stable_digest(selected_reading) != graph.get("locked_reading_digest"):
                 _fail("reading_unresolved", "semantic locked reading does not match its UID/token lock", f"$.{uid}.{token_id}")
-            scoped_frontend = _frontend_for_graph(frontend, str(token_id) if token_id is not None else None)
+            if lock.get("locked_reading_digest") is not None and lock.get("locked_reading_digest") != graph.get("locked_reading_digest"):
+                _fail("reading_unresolved", "locked reading digest differs from semantic lock", f"$.{uid}.{token_id}")
+            scoped_frontend = _frontend_for_occurrence(frontend, occurrence, occurrences)
             if scoped_frontend.get("locked_reading_digest") != graph.get("locked_reading_digest"):
                 _fail("tone_provenance_missing", "frontend tone evidence digest differs from semantic lock", f"$.{uid}.{token_id}")
             partials.append(build_prosody_alignment({**alignment, "native_phones": graph_phones}, graph,
                                                     scoped_frontend,
-                                                    _resource_for_uid(config, "manual_overrides", uid),
-                                                    _resource_for_uid(config, "accent_lexicon", uid)))
+                                                    _resource_for_occurrence(config, "manual_overrides", occurrence, occurrences),
+                                                    _resource_for_occurrence(config, "accent_lexicon", occurrence, occurrences)))
         non_japanese = [phone for phone in phones if isinstance(phone, Mapping) and phone.get("language") != "ja"]
         if non_japanese:
             partials.append(build_prosody_alignment({**alignment, "native_phones": non_japanese},
@@ -1048,11 +1130,17 @@ def assemble_prosody_rows(
             _fail("native_basic_mapping_ambiguous", "prosody projection lost a native phone", f"$.{uid}.native_phones")
         # Carry receipt-bound timing/provenance forward; the prosody layer only
         # adds tone/mora graph fields and never replaces source authority.
-        for key in ("train_wav", "alignment_wav", "audio_receipt", "locked_aliases", "raw_mfa",
+        for key in ("train_wav", "alignment_wav", "audio_receipt", "locked_aliases", "raw_mfa", "selected_reading", "selected_readings",
                     "reading_evidence", "partition", "native_inventory", "frontend", "model_ids",
                     "dict_ids", "seams", "source_receipt", "display_attachments"):
             if key in alignment:
                 built[key] = alignment[key]
+        # This compatibility relation is derived solely from the authoritative
+        # prosody-v1 graph; no list position or label joins are reintroduced.
+        built["mora_graph"] = {"moras": copy.deepcopy(built["moras"]), "relations": [
+            {"mora_id": mora_id, "phone_id": phone.get("phone_id")}
+            for phone in built["native_phones"] for mora_id in phone.get("mora_ids", [])
+        ]}
         built["schema"] = PROSODY_ROW_SCHEMA
         result.append(built)
     return result
@@ -1121,6 +1209,9 @@ def assemble_tts_rows(config: Mapping[str, Any], workspace: str | os.PathLike[st
             from ja_tts_export import build_training_record
         enriched = dict(alignment)
         enriched["uid"] = uid
+        # Task 7 owns v2 serialization.  The v1 exporter currently consumes
+        # this exact authoritative native timeline as its legacy field name.
+        enriched["phones"] = list(alignment.get("native_phones", []))
         record = build_training_record(enriched, train_wav=train_ref["path"], alignment_wav=align_ref["path"],
                                        speaker=manifest[uid].get("speaker"),
                                        text_layers=alignment.get("frontend") or manifest[uid].get("frontend"),

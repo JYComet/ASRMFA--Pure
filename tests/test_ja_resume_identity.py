@@ -109,6 +109,31 @@ def test_mfa_dictionary_invalidates_align_and_all_downstream(tmp_path: Path):
     assert all(before[stage] != after[stage] for stage in ("align", "merge", "prosody", "tts", "verify"))
 
 
+def test_real_identity_scopes_assets_to_their_first_consuming_stage(tmp_path: Path):
+    config_path, config = _config(tmp_path)
+    dictionary, frontend_model, tones = (tmp_path / "dictionary", tmp_path / "frontend.model", tmp_path / "tones.json")
+    dictionary.write_text("dictionary-a", encoding="utf-8"); frontend_model.write_text("frontend-a", encoding="utf-8"); tones.write_text("tones-a", encoding="utf-8")
+    config["mfa"] = {"japanese_dictionary": str(dictionary)}
+    config["frontend"]["accent_model"] = str(frontend_model)
+    config["prosody"] = {"manual_overrides": str(tones)}
+    manifest_path = Path(config["input_manifest"])
+    rows = [{"uid": "u1", "wav": "/mnt/source/read-only.wav", "text": "さくら"}]
+    workspace = Path(config["workspace"])
+    before = config_identity(config, manifest_path, rows)
+    dictionary.write_text("dictionary-b", encoding="utf-8")
+    after_dictionary = config_identity(config, manifest_path, rows)
+    assert _stage_cache_identity("semantic", before, config, workspace) == _stage_cache_identity("semantic", after_dictionary, config, workspace)
+    assert _stage_cache_identity("align", before, config, workspace) != _stage_cache_identity("align", after_dictionary, config, workspace)
+    dictionary.write_text("dictionary-a", encoding="utf-8"); frontend_model.write_text("frontend-b", encoding="utf-8")
+    after_frontend = config_identity(config, manifest_path, rows)
+    assert _stage_cache_identity("reading", before, config, workspace) == _stage_cache_identity("reading", after_frontend, config, workspace)
+    assert _stage_cache_identity("frontend", before, config, workspace) != _stage_cache_identity("frontend", after_frontend, config, workspace)
+    frontend_model.write_text("frontend-a", encoding="utf-8"); tones.write_text("tones-b", encoding="utf-8")
+    after_tones = config_identity(config, manifest_path, rows)
+    assert _stage_cache_identity("merge", before, config, workspace) == _stage_cache_identity("merge", after_tones, config, workspace)
+    assert _stage_cache_identity("prosody", before, config, workspace) != _stage_cache_identity("prosody", after_tones, config, workspace)
+
+
 def test_workspace_override_rejects_nonempty_target_without_resume(tmp_path: Path):
     config_path, config = _config(tmp_path)
     config_path.write_text(json.dumps(config), encoding="utf-8")

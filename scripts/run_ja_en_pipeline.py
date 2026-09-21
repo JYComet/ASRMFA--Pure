@@ -230,7 +230,7 @@ def config_identity(config: Mapping[str, Any], manifest_path: Path, manifest: li
             if isinstance(value, str):
                 source_artifacts.append(path_identity(value))
     model_artifacts = {
-        key: path_identity(value)
+        f"{section}.{key}": path_identity(value)
         for section in ("asr", "mfa", "frontend")
         for key, value in (config.get(section, {}) or {}).items()
         if key.endswith(("_model", "_acoustic", "_dictionary", "_wheel", "_binary", "_aligner", "_runtime", "_runtime_python"))
@@ -525,20 +525,22 @@ def _stage_cache_identity(stage: str, identity: Mapping[str, Any], config: Mappi
     # it here defeats the per-stage resource scoping below.
     scoped_identity.pop("config_digest", None)
     stage_index = PRODUCTION_STAGES.index(stage) if stage in PRODUCTION_STAGES else len(PRODUCTION_STAGES)
-    if stage_index < PRODUCTION_STAGES.index("align"):
+    # Cache scope is an explicit dependency graph, not a substring heuristic:
+    # e.g. `mfa.japanese_dictionary` has no "mfa" in its leaf key.
+    dependency_starts = {"asr": "asr", "frontend": "frontend", "mfa": "align", "prosody": "prosody"}
+    for section, first_stage in dependency_starts.items():
+        if stage_index >= PRODUCTION_STAGES.index(first_stage):
+            continue
         if isinstance(scoped_identity.get("config"), Mapping):
-            scoped_identity["config"].pop("mfa", None)
-        if isinstance(scoped_identity.get("model_artifacts"), Mapping):
-            scoped_identity["model_artifacts"] = {key: value for key, value in scoped_identity["model_artifacts"].items() if "mfa" not in str(key)}
-        if isinstance(scoped_identity.get("config_artifacts"), Mapping):
-            scoped_identity["config_artifacts"] = {key: value for key, value in scoped_identity["config_artifacts"].items() if "mfa" not in str(key)}
-    if stage_index < PRODUCTION_STAGES.index("prosody"):
-        if isinstance(scoped_identity.get("config"), Mapping):
-            scoped_identity["config"].pop("prosody", None)
-        if isinstance(scoped_identity.get("config_artifacts"), Mapping):
-            scoped_identity["config_artifacts"] = {key: value for key, value in scoped_identity["config_artifacts"].items() if not str(key).startswith("prosody.")}
-        if isinstance(scoped_identity.get("implementation_files"), list):
-            scoped_identity["implementation_files"] = [row for row in scoped_identity["implementation_files"] if not str(row.get("path", "")).endswith("ja_prosody.py")]
+            scoped_identity["config"].pop(section, None)
+        for identity_field in ("model_artifacts", "config_artifacts"):
+            if isinstance(scoped_identity.get(identity_field), Mapping):
+                scoped_identity[identity_field] = {
+                    key: value for key, value in scoped_identity[identity_field].items()
+                    if not str(key).startswith(f"{section}.")
+                }
+    if stage_index < PRODUCTION_STAGES.index("prosody") and isinstance(scoped_identity.get("implementation_files"), list):
+        scoped_identity["implementation_files"] = [row for row in scoped_identity["implementation_files"] if not str(row.get("path", "")).endswith("ja_prosody.py")]
     payload: dict[str, Any] = {"stage": stage, "global_identity": scoped_identity, "upstream_receipts": upstream}
     if stage == "julius":
         payload["diagnostic_config"] = config.get("julius_diagnostic", {})

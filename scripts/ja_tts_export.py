@@ -57,6 +57,35 @@ def _file_info(path: str | Path) -> dict[str, Any]:
     return info
 
 
+def validate_prosody_alignment(alignment: Mapping[str, Any]) -> None:
+    """Validate the complete v1 graph before any TTS compatibility export.
+
+    Merely renaming ``native_phones`` to ``phones`` would bypass the graph
+    contract.  Keep this narrow validation here until Task 7 replaces the v1
+    serialization with the v2 writer.
+    """
+    required = ("words", "moras", "basic_phones", "native_phones", "tone_sources", "duration_groups")
+    if alignment.get("schema") != "ja-prosody-alignment-v1" or any(not isinstance(alignment.get(key), list) for key in required):
+        raise ValueError("TTS requires a complete ja-prosody-alignment-v1 artifact")
+    moras = {row.get("mora_id") for row in alignment["moras"] if isinstance(row, Mapping)}
+    basics = {row.get("basic_phone_id") for row in alignment["basic_phones"] if isinstance(row, Mapping)}
+    phones = {row.get("phone_id") for row in alignment["native_phones"] if isinstance(row, Mapping)}
+    if not phones or (any(row.get("language") == "ja" for row in alignment["native_phones"] if isinstance(row, Mapping)) and (not moras or not basics)):
+        raise ValueError("prosody artifact has incomplete mora/basic/native graph")
+    for basic in alignment["basic_phones"]:
+        if not isinstance(basic, Mapping) or basic.get("mora_id") not in moras:
+            raise ValueError("prosody basic phone references an unknown mora")
+    for phone in alignment["native_phones"]:
+        if (not isinstance(phone, Mapping) or not isinstance(phone.get("mora_ids"), list)
+                or not isinstance(phone.get("basic_phone_ids"), list)
+                or not set(phone["mora_ids"]) <= moras or not set(phone["basic_phone_ids"]) <= basics):
+            raise ValueError("prosody native phone references an unknown mora/basic phone")
+    for group in alignment["duration_groups"]:
+        if (not isinstance(group, Mapping) or group.get("native_phone_id") not in phones
+                or not set(group.get("basic_phone_ids", [])) <= basics):
+            raise ValueError("prosody duration group references an unknown node")
+
+
 def build_quality_masks(prosody: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Build explicit, independent masks for text accent and measured F0."""
     prosody = prosody or {}
@@ -322,25 +351,23 @@ def handle_tts(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
     try:
         for line in source.read_text(encoding="utf-8").splitlines():
             if line.strip(): rows.append(json.loads(line))
-        outputs = []
+        alignments = []
         for row in rows:
             alignment = row.get("alignment", row)
-            # The pipeline bridge always declares this stage input.  Keep the
-            # standalone legacy helper usable for Task 7's fixture migration.
-            if isinstance(config.get("stage_inputs"), Mapping) and alignment.get("schema") != "ja-prosody-alignment-v1":
-                raise ValueError("TTS requires ja-prosody-alignment-v1 input")
-            if alignment.get("schema") == "ja-prosody-alignment-v1":
-                # Transitional v1 exporter adapter: consume only authoritative
-                # native rows; do not consult a legacy `phones` field.
-                alignment = {**alignment, "phones": list(alignment.get("native_phones", []))}
-            train_wav = row.get("train_wav") or alignment.get("train_wav")
-            alignment_wav = row.get("alignment_wav") or alignment.get("alignment_wav")
-            if not train_wav or not alignment_wav:
-                raise ValueError("alignment row must bind train_wav and alignment_wav")
-            record = build_training_record(alignment, train_wav=train_wav, alignment_wav=alignment_wav,
-                                            speaker=row.get("speaker", alignment.get("speaker")),
-                                            text_layers=row.get("text_layers", alignment.get("text_layers")),
-                                            audio_receipt=row.get("audio_receipt"))
+            if not isinstance(alignment, Mapping):
+                raise ValueError("TTS alignment row must be an object")
+            validate_prosody_alignment(alignment)
+            alignments.append(dict(alignment))
+        # Registered production TTS always crosses the authoritative assembler
+        # (identity/receipt/partition validation); it never exports a shallow
+        # schema-labelled alignment directly.
+        try:
+            from .ja_en_stage_inputs import assemble_tts_rows
+        except ImportError:  # pragma: no cover
+            from ja_en_stage_inputs import assemble_tts_rows
+        assembled = assemble_tts_rows(config, workspace, alignments)
+        outputs = []
+        for record in assembled:
             produced = export_tts_artifacts(record, stage_dir)
             outputs.extend(produced.values())
         receipt = make_receipt(stage="tts", status="COMPLETE", inputs={"artifacts": [{"path": str(source), "exists": True, "size": source.stat().st_size, "sha256": sha256_file(source)}]}, outputs=sorted({str(p) for p in outputs}), params={"implementation": "tts-training-record-v1"})
@@ -365,4 +392,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["build_quality_masks", "build_training_record", "export_tts_artifacts", "export_training_record", "handle_tts", "register_stages", "render_textgrid", "write_textgrid"]
+__all__ = ["build_quality_masks", "build_training_record", "export_tts_artifacts", "export_training_record", "handle_tts", "register_stages", "render_textgrid", "validate_prosody_alignment", "write_textgrid"]

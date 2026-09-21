@@ -1,4 +1,5 @@
 import json
+import hashlib
 import wave
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import pytest
 
 from scripts.ja_tts_export import export_tts_artifacts, build_training_record, handle_tts
 from scripts.ja_audio import make_audio_receipt
+from scripts.ja_en_schema import make_receipt
 
 
 def _wav(path: Path, frames: int = 16000) -> None:
@@ -49,17 +51,36 @@ def test_export_writes_native_jsonl_and_three_textgrid_tiers(tmp_path: Path):
 def test_tts_stage_consumes_authoritative_alignment_and_declares_real_outputs(tmp_path: Path):
     train, alignment_wav = tmp_path / "train.wav", tmp_path / "alignment.wav"
     _wav(train); _wav(alignment_wav)
+    raw_grid = tmp_path / "raw.TextGrid"; raw_grid.write_text('File type = "ooTextFile"\n', encoding="utf-8")
     alignment = _alignment()
-    alignment.update({"uid": "stage-1", "selected_reading": "さくら", "locked_aliases": [{"alias": "ju_000000", "pronunciation": ["s", "a"]}], "native_inventory": {"ja": ["s", "a"], "en": []}, "raw_mfa": {"textgrid_path": str(tmp_path / "stage" / "stage-1.TextGrid"), "phones": [{"phone_id": "p0", "raw_interval_id": 1, "unit_id": "w0"}, {"phone_id": "p1", "raw_interval_id": 2, "unit_id": "w0"}]}, "reading_evidence": {"selected_reading": "さくら", "status": "manual_verified"}, "partition": {"verified": ["stage-1"], "rejected": [], "unresolved": []}, "train_wav": str(train), "alignment_wav": str(alignment_wav)})
+    alignment.update({"uid": "stage-1", "selected_reading": "さくら", "locked_aliases": [{"alias": "ju_000000", "unit_id": "w0", "pronunciation": ["s", "a"]}], "native_inventory": {"ja": ["s", "a"], "en": []}, "raw_mfa": {"runs": [{"run_id": "ja-fixture", "raw_textgrid": {"path": str(raw_grid), "sha256": hashlib.sha256(raw_grid.read_bytes()).hexdigest()}}]}, "reading_evidence": {"selected_reading": "さくら", "status": "manual_verified"}, "partition": {"verified": ["w0"], "rejected": [], "unresolved": []}, "train_wav": str(train), "alignment_wav": str(alignment_wav)})
     alignment["audio_receipt"] = make_audio_receipt("stage-1", train, train, alignment_wav, alignment_transform={"method": "identity_fixture_v1", "source_start": 0, "source_end": 16000, "output_start": 0, "output_frames": 16000})
+    alignment["train_wav"] = alignment["audio_receipt"]["train"]
+    alignment["alignment_wav"] = alignment["audio_receipt"]["alignment"]
     alignment["schema"] = "ja-prosody-alignment-v1"
     alignment["native_phones"] = alignment.pop("phones")
+    for phone in alignment["native_phones"]:
+        phone.update({"token_id": "w0", "mora_ids": ["m0"], "basic_phone_ids": ["bp0"], "phone_kana": "さ", "phone_tone": "H"})
+    alignment.update({
+        "moras": [{"mora_id": "m0", "kana": "さ", "tone": "H"}],
+        "basic_phones": [{"basic_phone_id": "bp0", "mora_id": "m0", "symbol": "s"}],
+        "duration_groups": [], "tone_sources": [{"entry_id": "fixture"}],
+        "mora_graph": {"moras": [{"mora_id": "m0"}], "relations": [{"mora_id": "m0", "phone_id": "p0"}, {"mora_id": "m0", "phone_id": "p1"}]},
+        "frontend": {"fixture": True}, "model_ids": {"mfa": "fixture"}, "dict_ids": {"ja": "fixture"}, "seams": [],
+        "source_receipt": make_receipt(stage="merge", status="COMPLETE"),
+    })
     source = tmp_path / "alignment.jsonl"; source.write_text(json.dumps(alignment) + "\n", encoding="utf-8")
     stage = tmp_path / "stage"; stage.mkdir()
-    result = handle_tts({"tts": {"alignment_jsonl": str(source)}, "stage_inputs": {"tts": {"alignment_jsonl": str(source)}}}, stage)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"items": [{"uid": "stage-1", "wav": str(train), "text": "さくら", "reading_lock": {"uid": "stage-1", "status": "COMPLETE", "selected_reading": "さくら"}}]}), encoding="utf-8")
+    result = handle_tts({"input_manifest": str(manifest), "workspace": str(tmp_path), "tts": {"alignment_jsonl": str(source)}, "stage_inputs": {"tts": {"alignment_jsonl": str(source)}}}, stage)
     assert result.status == "COMPLETE"
     receipt = json.loads((stage / "receipt.json").read_text())
     assert {Path(row["path"]).name for row in receipt["outputs"]} == {"tts_training_records.jsonl", "stage-1.TextGrid"}
+    tampered = {**alignment, "basic_phones": []}
+    source.write_text(json.dumps(tampered) + "\n", encoding="utf-8")
+    rejected = handle_tts({"input_manifest": str(manifest), "workspace": str(tmp_path), "tts": {"alignment_jsonl": str(source)}, "stage_inputs": {"tts": {"alignment_jsonl": str(source)}}}, tmp_path / "tampered")
+    assert rejected.status == "REJECTED"
 
 
 def test_tts_stage_rejects_merge_v3_on_production_path(tmp_path: Path):

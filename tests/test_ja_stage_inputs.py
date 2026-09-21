@@ -10,6 +10,7 @@ import pytest
 from scripts.ja_en_schema import JAContractError, artifact_record
 from scripts.ja_en_stage_inputs import (
     _namespace_graph,
+    _select_occurrence_evidence,
     assemble_prosody_rows,
     assemble_tts_rows,
     prepare_alignment_requests,
@@ -18,6 +19,7 @@ from scripts.ja_en_stage_inputs import (
 )
 from scripts.ja_prosody import handle_prosody
 from scripts.ja_en_schema import stable_digest
+from scripts.ja_phone_adapter import openjtalk_to_semantic, split_mora
 
 
 def _wav(path: Path, frames: int = 3200) -> Path:
@@ -322,19 +324,93 @@ def test_prosody_aggregate_unions_expected_and_blocked_merge_uid_ledger(tmp_path
 
 
 def test_two_token_producer_local_ids_are_namespaced_with_resolving_refs():
-    base = _prosody_graph("u")
-    other = _prosody_graph("u")
-    other["token_id"] = "tok-2"
-    for row in other["native_phone_templates"]:
-        row.update(token_id="tok-2", alias="ju-2")
-    phones = [{"phone_id": "p", "native_phone_template_id": "np-1", "mora_ids": ["m-1"], "basic_phone_ids": ["bp-1"]}]
+    def producer(token, alias):
+        return openjtalk_to_semantic({
+            "uid": "u", "token_id": token, "candidate_id": f"cand-{token}", "alias": alias,
+            "locked_reading": "コー", "locked_openjtalk_phones": ["k", "o", "o"],
+            "locked_mora_count": len(split_mora("コー")),
+        })
+    base = producer("tok-1", "ju-1")
+    other = producer("tok-2", "ju-2")
+    # Real producer compatibility views and edge forms must be rewritten too.
+    base["target"] = {"phone_id": "np_0000", "source_ids": ["oj_0000"]}
+    other["target"] = {"phone_id": "np_0000", "source_ids": ["oj_0000"]}
+    phones = [{"phone_id": "p", "native_phone_template_id": "np_0000", "mora_ids": ["mora_0000"], "basic_phone_ids": ["bp_0000"]}]
     first, first_phones = _namespace_graph("u", base, phones)
     second, second_phones = _namespace_graph("u", other, phones)
     mora_ids = {row["mora_id"] for row in first["mora_nodes"] + second["mora_nodes"]}
     basic_ids = {row["basic_phone_id"] for row in first["basic_phone_nodes"] + second["basic_phone_nodes"]}
     template_ids = {row["native_phone_id"] for row in first["native_phone_templates"] + second["native_phone_templates"]}
-    assert len(mora_ids) == 4 and len(basic_ids) == 4 and len(template_ids) == 4
+    assert len(mora_ids) == 4 and len(basic_ids) == 6 and len(template_ids) == 4
     for phone in first_phones + second_phones:
         assert set(phone["mora_ids"]) <= mora_ids
         assert set(phone["basic_phone_ids"]) <= basic_ids
         assert phone["native_phone_template_id"] in template_ids
+    for graph in (first, second):
+        moras = {row["mora_id"] for row in graph["mora_nodes"]}
+        basics = {row["basic_phone_id"] for row in graph["basic_phone_nodes"]}
+        templates = {row["native_phone_id"] for row in graph["native_phone_templates"]}
+        openjtalk = {row["id"] for row in graph["frontend_phone_nodes"]}
+        assert all(row["mora_id"] in moras and row.get("native_phone_id") in templates | {None} for row in graph["basic_phone_nodes"])
+        assert all(set(row["mora_ids"]) <= moras and set(row["basic_phone_ids"]) <= basics for row in graph["native_phone_templates"])
+        assert all(set(row["mora_ids"]) <= moras and set(row["basic_phone_ids"]) <= basics for row in graph["semantic_phone_nodes"])
+        assert all((not edge.get("source_ids") or set(edge["source_ids"]) <= openjtalk) for edge in graph["edges"] if edge["relation"] == "openjtalk_to_native_template")
+        assert all((not edge.get("target_ids") or set(edge["target_ids"]) <= templates) for edge in graph["edges"])
+        assert graph["target"]["phone_id"] in templates and set(graph["target"]["source_ids"]) <= openjtalk
+
+
+def test_duplicate_occurrences_reject_unscoped_or_mismatched_evidence(tmp_path: Path):
+    alignment = _prosody_alignment("mixed-1")
+    config = _write_prosody_sources(tmp_path, alignment)
+    first, second = _prosody_graph(), _prosody_graph()
+    first["candidate_id"] = "cand-1"
+    for row in first["native_phone_templates"]:
+        row["candidate_id"] = "cand-1"
+    second["token_id"] = "tok-2"; second["candidate_id"] = "cand-2"
+    for row in second["native_phone_templates"]:
+        row["token_id"] = "tok-2"; row["alias"] = "ju-2"; row["candidate_id"] = "cand-2"
+    second_phone = dict(alignment["native_phones"][0], phone_id="p-tok2", token_id="tok-2", alias="ju-2")
+    alignment["native_phones"] = [alignment["native_phones"][0], second_phone]
+    alignment["native_phones"][0]["candidate_id"] = "cand-1"
+    second_phone["candidate_id"] = "cand-2"
+    semantic = tmp_path / "stages" / "semantic" / "semantic_graphs.jsonl"
+    semantic.write_text("\n".join(json.dumps({"uid": "mixed-1", "semantic_graph": row}, ensure_ascii=False) for row in (first, second)) + "\n", encoding="utf-8")
+    # One UID-only lock must not be silently reused for two repeated readings.
+    reading = tmp_path / "stages" / "reading" / "locked_readings.jsonl"
+    reading.write_text(json.dumps({"uid": "mixed-1", "reading_lock": {"uid": "mixed-1", "selected_reading": "コー"}}) + "\n", encoding="utf-8")
+    with pytest.raises(JAContractError, match="reading_unresolved"):
+        assemble_prosody_rows(config, tmp_path, [alignment])
+
+
+@pytest.mark.parametrize("field", ("candidate_id", "occurrence_index", "alias"))
+def test_occurrence_selector_rejects_each_wrong_discriminator(field: str):
+    occurrences = [
+        {"uid": "u", "token_id": "t0", "candidate_id": "c0", "alias": "a0", "occurrence_index": 0},
+        {"uid": "u", "token_id": "t1", "candidate_id": "c1", "alias": "a1", "occurrence_index": 1},
+    ]
+    wrong = dict(occurrences[0]); wrong[field] = "wrong" if field != "occurrence_index" else 9
+    with pytest.raises(JAContractError, match="reading_unresolved"):
+        _select_occurrence_evidence([wrong], occurrences[0], occurrences, code="reading_unresolved", name="reading")
+
+
+@pytest.mark.parametrize("lock", (
+    {"selected_reading": "キット"},
+    {"selected_reading": "コー", "locked_reading_digest": "wrong"},
+))
+def test_reading_selection_rejects_wrong_reading_or_digest(tmp_path: Path, lock: dict):
+    alignment = _prosody_alignment()
+    config = _write_prosody_sources(tmp_path, alignment)
+    (tmp_path / "stages" / "reading" / "locked_readings.jsonl").write_text(
+        json.dumps({"uid": "mixed-1", "reading_lock": {"uid": "mixed-1", "token_id": "tok-1", **lock}}, ensure_ascii=False) + "\n", encoding="utf-8")
+    with pytest.raises(JAContractError, match="reading_unresolved"):
+        assemble_prosody_rows(config, tmp_path, [alignment])
+
+
+def test_frontend_digest_mismatch_rejects_bound_occurrence(tmp_path: Path):
+    alignment = _prosody_alignment()
+    config = _write_prosody_sources(tmp_path, alignment)
+    frontend = _prosody_frontend(); frontend["locked_reading_digest"] = "wrong"
+    (tmp_path / "stages" / "frontend" / "frontend_contracts.jsonl").write_text(
+        json.dumps({"uid": "mixed-1", "frontend": frontend}, ensure_ascii=False) + "\n", encoding="utf-8")
+    with pytest.raises(JAContractError, match="tone_provenance_missing"):
+        assemble_prosody_rows(config, tmp_path, [alignment])
