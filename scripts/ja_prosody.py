@@ -97,14 +97,14 @@ def _resource_provenance(name: str, resource: Mapping[str, Any], digest: str, mo
     }
 
 
-def _frontend_provenance(frontend: Mapping[str, Any], digest: str, mora_count: int) -> tuple[list[str], dict[str, Any]]:
+def _frontend_provenance(frontend: Mapping[str, Any], digest: str, nodes: Sequence[Mapping[str, Any]]) -> tuple[list[str], dict[str, Any]]:
     if not frontend.get("accent_evidence_valid") or frontend.get("locked_reading_digest") != digest:
         raise JAContractError("accent_phrase_unresolved", "contextual frontend evidence is not valid for the locked reading", "$.frontend")
     evidence = _mapping(frontend.get("accent_evidence"), "tone_provenance_missing", "frontend accent evidence is missing", "$.frontend.accent_evidence")
     phrases = evidence.get("accent_phrases")
     if not isinstance(phrases, list) or not phrases:
         raise JAContractError("accent_phrase_unresolved", "frontend accent phrases are missing", "$.frontend.accent_evidence.accent_phrases")
-    tones: list[str] = []
+    by_phrase: dict[str, list[str]] = {}
     for index, phrase in enumerate(phrases):
         phrase = _mapping(phrase, "accent_phrase_unresolved", "frontend phrase is invalid", f"$.frontend.accent_evidence.accent_phrases[{index}]")
         count, nucleus = phrase.get("mora_count"), phrase.get("nucleus")
@@ -114,9 +114,29 @@ def _frontend_provenance(frontend: Mapping[str, Any], digest: str, mora_count: i
         expected = phrase.get("expected_tones")
         if expected is not None and expected != phrase_tones:
             raise JAContractError("accent_phrase_unresolved", "frontend phrase tones do not match its nucleus", f"$.frontend.accent_evidence.accent_phrases[{index}]")
-        tones.extend(phrase_tones)
-    if len(tones) != mora_count:
-        raise JAContractError("tone_cardinality_mismatch", "frontend phrase cardinality does not cover semantic morae", "$.frontend.accent_evidence.accent_phrases")
+        phrase_id = phrase.get("accent_phrase_id")
+        if not isinstance(phrase_id, str) or not phrase_id or phrase_id in by_phrase:
+            raise JAContractError("accent_phrase_unresolved", "frontend phrase identity is invalid", f"$.frontend.accent_evidence.accent_phrases[{index}]")
+        by_phrase[phrase_id] = phrase_tones
+    evidence_moras = evidence.get("moras")
+    if not isinstance(evidence_moras, list):
+        raise JAContractError("accent_phrase_unresolved", "frontend mora positions are missing", "$.frontend.accent_evidence.moras")
+    evidence_positions: dict[tuple[str, int], Mapping[str, Any]] = {}
+    for row in evidence_moras:
+        row = _mapping(row, "accent_phrase_unresolved", "frontend mora position is invalid", "$.frontend.accent_evidence.moras")
+        phrase_id, position = row.get("accent_phrase_id"), row.get("mora_index_in_phrase")
+        if not isinstance(phrase_id, str) or not isinstance(position, int) or (phrase_id, position) in evidence_positions:
+            raise JAContractError("accent_phrase_unresolved", "frontend mora position is invalid", "$.frontend.accent_evidence.moras")
+        evidence_positions[(phrase_id, position)] = row
+    for phrase_id, phrase_tones in by_phrase.items():
+        if {position for (item_id, position) in evidence_positions if item_id == phrase_id} != set(range(1, len(phrase_tones) + 1)):
+            raise JAContractError("tone_cardinality_mismatch", "frontend phrase positions are incomplete", "$.frontend.accent_evidence.moras")
+    tones: list[str] = []
+    for node in nodes:
+        phrase_id, position = node.get("accent_phrase_id"), node.get("mora_index_in_phrase")
+        if not isinstance(phrase_id, str) or not isinstance(position, int) or phrase_id not in by_phrase or (phrase_id, position) not in evidence_positions:
+            raise JAContractError("tone_cardinality_mismatch", "semantic mora has no explicit frontend phrase position", "$.mora_nodes")
+        tones.append(by_phrase[phrase_id][position - 1])
     identity = _mapping(evidence.get("provider_identity"), "tone_provenance_missing", "frontend provider identity is missing", "$.frontend.accent_evidence.provider_identity")
     provider_revision = identity.get("provider_revision")
     adapter_version = evidence.get("adapter_version")
@@ -148,25 +168,21 @@ def resolve_mora_tones(
     nodes = graph.get("mora_nodes")
     if not isinstance(nodes, list):
         raise JAContractError("tone_cardinality_mismatch", "semantic graph mora nodes are missing", "$.mora_nodes")
-    source = "unknown"
-    tones: list[str] | None = None
-    provenance: dict[str, Any] | None = None
+    candidates: list[dict[str, Any]] = []
     if _resource_matches(manual_overrides, digest):
-        source, tones, provenance = "manual_override", *_resource_provenance("manual_overrides", manual_overrides, digest, len(nodes))
-    elif _resource_matches(accent_lexicon, digest):
-        source, tones, provenance = "fixed_accent_lexicon", *_resource_provenance("accent_lexicon", accent_lexicon, digest, len(nodes))
-    elif isinstance(frontend, Mapping) and frontend.get("accent_evidence_valid") and frontend.get("locked_reading_digest") == digest:
-        source, tones, provenance = "contextual_frontend_prediction", *_frontend_provenance(frontend, digest, len(nodes))
-    candidates: list[str] = []
-    if source == "manual_override":
-        if _resource_matches(accent_lexicon, digest):
-            candidates.append("fixed_accent_lexicon")
-        if isinstance(frontend, Mapping) and frontend.get("accent_evidence_valid") and frontend.get("locked_reading_digest") == digest:
-            candidates.append("contextual_frontend_prediction")
-    elif source == "fixed_accent_lexicon" and isinstance(frontend, Mapping) and frontend.get("accent_evidence_valid") and frontend.get("locked_reading_digest") == digest:
-        candidates.append("contextual_frontend_prediction")
-    if tones is None:
-        tones = ["UNK"] * len(nodes)
+        candidate_tones, candidate_provenance = _resource_provenance("manual_overrides", manual_overrides, digest, len(nodes))
+        candidates.append({"source": "manual_override", "tones": candidate_tones, "provenance": candidate_provenance})
+    if _resource_matches(accent_lexicon, digest):
+        candidate_tones, candidate_provenance = _resource_provenance("accent_lexicon", accent_lexicon, digest, len(nodes))
+        candidates.append({"source": "fixed_accent_lexicon", "tones": candidate_tones, "provenance": candidate_provenance})
+    if isinstance(frontend, Mapping) and frontend.get("accent_evidence_valid") and frontend.get("locked_reading_digest") == digest:
+        candidate_tones, candidate_provenance = _frontend_provenance(frontend, digest, nodes)
+        candidates.append({"source": "contextual_frontend_prediction", "tones": candidate_tones, "provenance": candidate_provenance})
+    chosen = candidates[0] if candidates else None
+    source = chosen["source"] if chosen else "unknown"
+    tones = list(chosen["tones"]) if chosen else ["UNK"] * len(nodes)
+    provenance = chosen["provenance"] if chosen else None
+    overridden = [{**copy.deepcopy(candidate), "overridden_by": source} for candidate in candidates[1:]]
     result: list[dict[str, Any]] = []
     for index, node_value in enumerate(nodes):
         node = _mapping(node_value, "tone_cardinality_mismatch", "semantic mora is invalid", f"$.mora_nodes[{index}]")
@@ -179,7 +195,7 @@ def resolve_mora_tones(
             "mora_index": node.get("mora_index", index), "tone": tone, "tone_known": tone in {"H", "L"},
             # Textual accent is retained even where acoustic F0 is unobservable.
             "tone_source": source, "f0_observed": bool(node.get("f0_observed", False)),
-            "tone_provenance": copy.deepcopy(provenance), "overridden_sources": list(candidates),
+            "tone_provenance": copy.deepcopy(provenance), "overridden_sources": copy.deepcopy(overridden),
         })
     return result
 
@@ -190,6 +206,8 @@ def _is_non_mora_phone(phone: Mapping[str, Any]) -> bool:
 
 def _display_for_native(phone: Mapping[str, Any], mora_by_id: Mapping[str, Mapping[str, Any]]) -> tuple[str, str]:
     if _is_non_mora_phone(phone):
+        if phone.get("mora_ids") or phone.get("basic_phone_ids"):
+            raise JAContractError("phone_tone_projection_lossy", "non-Japanese/event phone has semantic ownership", "$.native_phones")
         return "", "NA"
     ids = phone.get("mora_ids")
     if not isinstance(ids, list) or not ids or not all(isinstance(item, str) and item in mora_by_id for item in ids):
@@ -205,7 +223,22 @@ def _duration_group(phone: Mapping[str, Any]) -> dict[str, Any] | None:
     start, end = phone.get("start_sample"), phone.get("end_sample")
     if not isinstance(start, int) or not isinstance(end, int) or end < start:
         raise JAContractError("phone_tone_projection_lossy", "multi-basic native phone has invalid interval", "$.native_phones")
-    return {"basic_phone_ids": list(basic_ids), "group_sum": end - start, "internal_boundaries_known": False}
+    phone_id = phone.get("phone_id")
+    if not isinstance(phone_id, str) or not phone_id:
+        raise JAContractError("phone_tone_projection_lossy", "multi-basic native phone has no identity", "$.native_phones")
+    return {"duration_group_id": f"duration-group-{phone_id}", "native_phone_id": phone_id,
+            "basic_phone_ids": list(basic_ids), "total_duration_samples": end - start,
+            "internal_boundaries_known": False, "boundary_source": "unknown_inside_mfa_interval",
+            "duration_loss_mode": "group_sum"}
+
+
+def _assert_template_authority(phone: Mapping[str, Any], template: Mapping[str, Any]) -> None:
+    fields = ("native_phone", "mora_ids", "basic_phone_ids", "transform")
+    if any(phone.get(field) != template.get(field) for field in fields):
+        raise JAContractError("phone_tone_projection_lossy", "alignment phone differs from semantic native template", "$.native_phones")
+    for field in ("token_id", "alias"):
+        if template.get(field) is not None and phone.get(field) != template.get(field):
+            raise JAContractError("phone_tone_projection_lossy", "alignment phone identity differs from semantic native template", "$.native_phones")
 
 
 def validate_projected_phone(phone: Mapping[str, Any], mora_rows: Sequence[Mapping[str, Any]]) -> None:
@@ -215,7 +248,7 @@ def validate_projected_phone(phone: Mapping[str, Any], mora_rows: Sequence[Mappi
     if phone.get("phone_kana") != expected_kana or phone.get("phone_tone") != expected_tone:
         raise JAContractError("phone_tone_projection_lossy", "projected phone tone/kana is not the ordered mora vector", "$.native_phones")
     expected_group = _duration_group(phone)
-    if expected_group is not None and phone.get("duration_group") != expected_group:
+    if expected_group is not None and phone.get("duration_group_id") != expected_group["duration_group_id"]:
         raise JAContractError("phone_tone_projection_lossy", "multi-basic duration group is incomplete", "$.native_phones")
 
 
@@ -226,16 +259,26 @@ def project_native_phone_tones(
     phones = alignment.get("native_phones")
     if not isinstance(phones, list):
         raise JAContractError("phone_tone_projection_lossy", "alignment native phones are missing", "$.native_phones")
+    templates = graph.get("native_phone_templates", [])
+    if not isinstance(templates, list):
+        raise JAContractError("phone_tone_projection_lossy", "semantic native templates are missing", "$.native_phone_templates")
+    template_by_id = {item.get("native_phone_id"): item for item in templates if isinstance(item, Mapping)}
     mora_by_id = {row.get("mora_id"): row for row in mora_rows if isinstance(row, Mapping)}
     projected: list[dict[str, Any]] = []
     for index, raw in enumerate(phones):
         phone = _mapping(raw, "phone_tone_projection_lossy", "native phone is invalid", f"$.native_phones[{index}]")
+        if phone.get("language") == "ja":
+            template_id = phone.get("native_phone_template_id")
+            template = template_by_id.get(template_id) if isinstance(template_id, str) else (templates[index] if index < len(templates) else None)
+            if not isinstance(template, Mapping):
+                raise JAContractError("phone_tone_projection_lossy", "Japanese phone has no semantic native template", f"$.native_phones[{index}]")
+            _assert_template_authority(phone, template)
         kana, tone = _display_for_native(phone, mora_by_id)
         row = copy.deepcopy(dict(phone))
         row["phone_kana"], row["phone_tone"] = kana, tone
         group = _duration_group(phone)
         if group is not None:
-            row["duration_group"] = group
+            row["duration_group_id"] = group["duration_group_id"]
         validate_projected_phone(row, mora_rows)
         projected.append(row)
     return projected
@@ -263,6 +306,7 @@ def build_prosody_alignment(
                     "f0_observed": mora["f0_observed"]})
         basic_rows.append(row)
     native_rows = project_native_phone_tones(alignment, graph, mora_rows)
+    duration_groups = [group for phone in native_rows if (group := _duration_group(phone)) is not None]
     sources: list[dict[str, Any]] = []
     for row in mora_rows:
         provenance = row["tone_provenance"]
@@ -271,7 +315,7 @@ def build_prosody_alignment(
     return {
         "schema": "ja-prosody-alignment-v1", "uid": alignment.get("uid", graph.get("uid")),
         "words": copy.deepcopy(alignment.get("words", [])), "moras": mora_rows,
-        "basic_phones": basic_rows, "native_phones": native_rows, "tone_sources": sources,
+        "basic_phones": basic_rows, "native_phones": native_rows, "duration_groups": duration_groups, "tone_sources": sources,
     }
 
 

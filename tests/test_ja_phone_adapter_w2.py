@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from scripts.ja_frontend import run_frontend
-from scripts.ja_en_schema import JAContractError
+from scripts.ja_en_schema import JAContractError, stable_digest
 from scripts.ja_phone_adapter import (
     DEFAULT_DICTIONARY,
     DEFAULT_METADATA,
@@ -20,6 +20,7 @@ from scripts.ja_phone_adapter import (
     semantic_stage,
     split_mora,
 )
+from scripts.ja_prosody import resolve_mora_tones
 
 
 _FRONTEND_PHONE_FIXTURES = {
@@ -102,6 +103,28 @@ def test_final_sokuon_exists_only_when_locked_reading_contains_it():
     graph = openjtalk_to_semantic(frontend_unit("アッ"))
     assert graph["mora_nodes"][-1]["kind"] == "final_sokuon"
     assert graph["basic_phone_nodes"][-1]["role"] == "final_sokuon"
+
+
+def test_semantic_graph_binds_exact_locked_reading_digest():
+    unit = frontend_unit("コー")
+    graph = openjtalk_to_semantic(unit)
+    assert graph["locked_reading_digest"] == stable_digest("コー")
+    unit["locked_reading_digest"] = stable_digest("キット")
+    with pytest.raises(JAContractError, match="semantic_parse_failed"):
+        openjtalk_to_semantic(unit)
+
+
+def test_producer_digest_is_consumed_by_tone_resolver_without_fabrication():
+    unit = frontend_unit("コー")
+    evidence = {"adapter_version": "adapter-v1", "provider_identity": {"provider": "test", "provider_revision": "r1"},
+                "provider_evidence_sha256": "provider", "unit_evidence_sha256": "unit",
+                "accent_phrases": [{"accent_phrase_id": "ap0", "mora_count": 2, "nucleus": 1}],
+                "moras": [{"accent_phrase_id": "ap0", "mora_index_in_phrase": 1, "mora_count": 2, "nucleus": 1},
+                          {"accent_phrase_id": "ap0", "mora_index_in_phrase": 2, "mora_count": 2, "nucleus": 1}]}
+    unit.update(accent_evidence_valid=True, accent_evidence=evidence, locked_reading_digest=stable_digest("コー"))
+    graph = openjtalk_to_semantic(unit)
+    frontend = {"accent_evidence_valid": True, "locked_reading_digest": graph["locked_reading_digest"], "accent_evidence": evidence}
+    assert [row["tone"] for row in resolve_mora_tones(graph, frontend)] == ["H", "L"]
 
 
 def _analysis(text="東京 学校 こんにちは さくら"):

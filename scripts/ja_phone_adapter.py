@@ -353,6 +353,10 @@ def openjtalk_to_semantic(unit: Mapping[str, Any]) -> dict[str, Any]:
     reading = str(unit.get("locked_reading", unit.get("read", unit.get("reading", ""))))
     if not phones or not reading:
         raise JAContractError("semantic_parse_failed", "frontend unit has no reading or phones")
+    locked_reading_digest = stable_digest(reading)
+    supplied_digest = unit.get("locked_reading_digest")
+    if supplied_digest is not None and supplied_digest != locked_reading_digest:
+        raise JAContractError("semantic_parse_failed", "locked reading digest differs from locked reading")
     morae = _split_mora_preserving_kana(reading)
     if not morae:
         raise JAContractError("semantic_parse_failed", "reading has no mora")
@@ -386,6 +390,7 @@ def openjtalk_to_semantic(unit: Mapping[str, Any]) -> dict[str, Any]:
             "mora_id": f"mora_{index:04d}", "token_id": unit.get("token_id"),
             "kana": kana, "kind": kind, "mora_index": index,
             "accent_phrase_id": evidence.get("accent_phrase_id") if evidence else None,
+            "mora_index_in_phrase": evidence.get("mora_index_in_phrase") if evidence else None,
             "tone": tone, "tone_known": tone in {"H", "L"},
             "tone_source": "contextual_frontend_prediction" if evidence else "unknown",
             "f0_observed": kind not in {"devoiced", "elided"},
@@ -466,7 +471,7 @@ def openjtalk_to_semantic(unit: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "schema": SEMANTIC_VERSION, "version": SEMANTIC_VERSION, "uid": unit.get("uid"),
         "token_id": unit.get("token_id"), "candidate_id": unit.get("candidate_id"),
-        "surface": unit.get("surface", ""), "reading": reading, "source_phones": phones,
+        "surface": unit.get("surface", ""), "reading": reading, "locked_reading_digest": locked_reading_digest, "source_phones": phones,
         "mora_nodes": mora_nodes, "basic_phone_nodes": basic_nodes,
         "native_phone_templates": templates, "edges": edges,
         "semantic_phone_nodes": semantic_phone_nodes, "frontend_phone_nodes": frontend_phone_nodes,

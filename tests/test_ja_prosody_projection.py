@@ -27,7 +27,8 @@ def graph_for(reading, *, groups=None, kinds=None):
             "token_id": "tok-ja", "locked_reading": reading,
             "locked_reading_digest": digest,
             "mora_nodes": [{"mora_id": f"m-{index}", "kana": value, "kind": kinds[index],
-                            "mora_index": index, "f0_observed": kinds[index] not in {"devoiced", "elided"}}
+                            "mora_index": index, "accent_phrase_id": "ap0", "mora_index_in_phrase": index + 1,
+                            "f0_observed": kinds[index] not in {"devoiced", "elided"}}
                            for index, value in enumerate(kana)],
             "basic_phone_nodes": basics, "native_phone_templates": templates}
 
@@ -37,7 +38,7 @@ def native_phone(index, *, mora_ids, basic_ids, language="ja", label=None, start
     end = start + 160 if end is None else end
     return {"phone_id": f"phone-{index}", "uid": "u-prosody", "language": language,
             "native_phone": label or f"p{index}", "mora_ids": list(mora_ids),
-            "basic_phone_ids": list(basic_ids), "start_sample": start, "end_sample": end,
+            "basic_phone_ids": list(basic_ids), "transform": "identity", "start_sample": start, "end_sample": end,
             "source_axis": {"start_sample": start, "end_sample": end},
             "alignment_axis": {"start_sample": start, "end_sample": end},
             "training_axis": {"start_sample": start, "end_sample": end}}
@@ -48,6 +49,7 @@ def alignment_for(graph):
     for index, template in enumerate(graph["native_phone_templates"]):
         phones.append(native_phone(index, mora_ids=template["mora_ids"], basic_ids=template["basic_phone_ids"],
                                   label=template["native_phone"]))
+        phones[-1]["native_phone_template_id"] = template["native_phone_id"]
     return {"schema": "ja-en-alignment-v3", "uid": "u-prosody", "words": [],
             "languages": ["ja"], "native_phones": phones, "raw_mfa": {"phones": copy.deepcopy(phones)}}
 
@@ -59,7 +61,10 @@ def valid_frontend(reading, *, nucleus=0):
                 "provider_evidence_sha256": "frontend-evidence",
                 "unit_evidence_sha256": "unit-evidence",
                 "accent_phrases": [{"accent_phrase_id": "ap0", "mora_count": len(reading),
-                                    "nucleus": nucleus}]}
+                                    "nucleus": nucleus}],
+                "moras": [{"accent_phrase_id": "ap0", "mora_index_in_phrase": index + 1,
+                           "mora_count": len(reading), "nucleus": nucleus}
+                          for index in range(len(reading))]}
     return {"accent_evidence_valid": True, "locked_reading_digest": digest,
             "accent_evidence": evidence}
 
@@ -89,7 +94,7 @@ def test_source_priority_is_not_voting():
     )
     assert [row["tone"] for row in rows] == ["H", "L"]
     assert {row["tone_source"] for row in rows} == {"manual_override"}
-    assert all(row["overridden_sources"] == ["fixed_accent_lexicon", "contextual_frontend_prediction"] for row in rows)
+    assert all([item["source"] for item in row["overridden_sources"]] == ["fixed_accent_lexicon", "contextual_frontend_prediction"] for row in rows)
     assert set(rows[0]["tone_provenance"]) == {
         "resource_path", "resource_sha256", "entry_id", "provider_revision",
         "locked_reading_digest", "adapter_version", "evidence_digest",
@@ -97,17 +102,22 @@ def test_source_priority_is_not_voting():
 
 
 def test_long_vowel_projects_vector_without_splitting_interval():
-    graph = graph_for("コー", groups=[(0,), (1,)])
+    graph = graph_for("コー", groups=[(0,), (0, 1)])
     alignment = alignment_for(graph)
     alignment["native_phones"][1] = native_phone(1, mora_ids=["m-0", "m-1"], basic_ids=["bp-0", "bp-1"],
                                                   label="oː", start=160, end=480)
+    alignment["native_phones"][1]["native_phone_template_id"] = "np-1"
+    graph["native_phone_templates"][1]["native_phone"] = "oː"
     result = build_prosody_alignment(alignment, graph, valid_frontend("コー", nucleus=1))
     phone = next(row for row in result["native_phones"] if row["native_phone"] == "oː")
     assert phone["phone_kana"] == "コ|ー"
     assert phone["phone_tone"] == "H|L"
     assert (phone["start_sample"], phone["end_sample"]) == (160, 480)
-    assert phone["duration_group"] == {"basic_phone_ids": ["bp-0", "bp-1"], "group_sum": 320,
-                                       "internal_boundaries_known": False}
+    assert phone["duration_group_id"] == "duration-group-phone-1"
+    assert result["duration_groups"] == [{"duration_group_id": "duration-group-phone-1", "native_phone_id": "phone-1",
+        "basic_phone_ids": ["bp-0", "bp-1"], "total_duration_samples": 320,
+        "internal_boundaries_known": False, "boundary_source": "unknown_inside_mfa_interval",
+        "duration_loss_mode": "group_sum"}]
 
 
 def test_projection_does_not_change_any_alignment_boundary_evidence():
@@ -132,7 +142,8 @@ def test_cross_mora_native_phone_preserves_ordered_tone_vector(reading, groups):
     assert cross["phone_kana"] == "|".join(reading[index] for index in
                                                [int(item.split("-")[1]) for item in cross["mora_ids"]])
     assert cross["phone_tone"].count("|") == 1
-    assert cross["duration_group"]["internal_boundaries_known"] is False
+    group = next(item for item in result["duration_groups"] if item["duration_group_id"] == cross["duration_group_id"])
+    assert group["internal_boundaries_known"] is False
 
 
 def test_devoicing_and_elision_keep_textual_tone_without_fake_basic_timing():
@@ -205,3 +216,56 @@ def test_digest_mismatch_cannot_use_known_resource():
     result = resolve_mora_tones(graph, valid_frontend("サク"), override, None)
     assert [row["tone"] for row in result] == ["L", "H"]
     assert {row["tone_source"] for row in result} == {"contextual_frontend_prediction"}
+
+
+def test_multiword_phrase_selects_explicit_positions_across_unit_boundary():
+    first, second = graph_for("ア"), graph_for("イ")
+    digest = stable_digest("shared-reading")
+    for graph, index in ((first, 1), (second, 2)):
+        graph["locked_reading_digest"] = digest
+        graph["mora_nodes"][0]["accent_phrase_id"] = "ap-shared"
+        graph["mora_nodes"][0]["mora_index_in_phrase"] = index
+    evidence = {"adapter_version": "openjtalk-fullcontext-accent-v1",
+                "provider_identity": {"provider": "test", "provider_revision": "r1"},
+                "provider_evidence_sha256": "provider", "unit_evidence_sha256": "unit",
+                "accent_phrases": [{"accent_phrase_id": "ap-shared", "mora_count": 2, "nucleus": 1}],
+                "moras": [{"accent_phrase_id": "ap-shared", "mora_index_in_phrase": 1, "mora_count": 2, "nucleus": 1},
+                          {"accent_phrase_id": "ap-shared", "mora_index_in_phrase": 2, "mora_count": 2, "nucleus": 1}]}
+    frontend = {"accent_evidence_valid": True, "locked_reading_digest": digest, "accent_evidence": evidence}
+    assert [row["tone"] for row in resolve_mora_tones(first, frontend)] == ["H"]
+    assert [row["tone"] for row in resolve_mora_tones(second, frontend)] == ["L"]
+
+
+def test_non_japanese_phone_with_mora_or_basic_ownership_is_rejected():
+    alignment = {"native_phones": [native_phone(0, mora_ids=["m-0"], basic_ids=["bp-0"], language="en", label="AH")]}
+    with pytest.raises(JAContractError, match="phone_tone_projection_lossy"):
+        build_prosody_alignment(alignment, {"mora_nodes": [], "basic_phone_nodes": []}, {})
+
+
+def test_native_template_tampering_is_rejected_including_reversed_ids():
+    graph = graph_for("コー", groups=[(0,), (0, 1)])
+    alignment = alignment_for(graph)
+    alignment["native_phones"][1]["mora_ids"] = ["m-1", "m-0"]
+    with pytest.raises(JAContractError, match="phone_tone_projection_lossy"):
+        build_prosody_alignment(alignment, graph, valid_frontend("コー"))
+
+
+def test_matching_incomplete_lower_priority_resource_is_a_contract_failure():
+    graph = graph_for("サク")
+    lexicon = closed_resource(graph, ["L", "H"], source="lexicon")
+    lexicon.pop("resource_sha256")
+    with pytest.raises(JAContractError, match="tone_provenance_missing"):
+        resolve_mora_tones(graph, valid_frontend("サク"), closed_resource(graph, ["H", "L"]), lexicon)
+
+
+def test_mixed_and_all_unknown_rows_keep_exact_special_vectors():
+    graph = graph_for("コー", groups=[(0,), (0, 1)])
+    graph["native_phone_templates"][1]["native_phone"] = "oː"
+    alignment = alignment_for(graph)
+    alignment["native_phones"][1].update(native_phone="oː")
+    alignment["native_phones"].append(native_phone(9, mora_ids=[], basic_ids=[], language="en", label="OW"))
+    result = build_prosody_alignment(alignment, graph, {})
+    japanese = next(row for row in result["native_phones"] if row["native_phone"] == "oː")
+    english = next(row for row in result["native_phones"] if row["language"] == "en")
+    assert (japanese["phone_kana"], japanese["phone_tone"]) == ("コ|ー", "UNK|UNK")
+    assert (english["phone_kana"], english["phone_tone"]) == ("", "NA")
