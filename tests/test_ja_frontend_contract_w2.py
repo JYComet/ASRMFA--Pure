@@ -16,6 +16,7 @@ from scripts.ja_frontend import (
     probe_provider,
     reconstruct_locked_reading,
     run_frontend,
+    validate_frontend_contract,
     bind_asr_candidates,
     project_blind_asr_candidates,
     unit_candidate_analysis,
@@ -120,7 +121,34 @@ def test_literal_multiword_phrase_keeps_one_phrase_id_and_evidence_digest():
     ]
     result = extract_contextual_accent_evidence(rows, labels)
     assert [row["accent_phrase_id"] for row in result["moras"]] == ["ap0", "ap0", "ap0", "ap0"]
-    assert result["provider_evidence_sha256"] == stable_digest({"njd_rows": rows, "full_context_labels": labels})
+    assert result["provider_evidence_sha256"] == stable_digest({
+        "adapter_version": "openjtalk-fullcontext-accent-v1", "njd_rows": rows,
+        "full_context_labels": labels, "provider_identity": {},
+        "accent_phrases": result["accent_phrases"], "moras": result["moras"],
+    })
+
+
+def test_accent_evidence_reopens_sources_and_binds_provider_identity():
+    rows, labels = _ACCENT_CASES["flat"]
+    identity = {"provider": "pyopenjtalk-plus", "provider_revision": "pinned", "options_digest": "flags", "model_identity": {"accent_model": "rule-based"}}
+    evidence = extract_contextual_accent_evidence(rows, labels, identity)
+    assert evidence["njd_rows"] == rows
+    assert evidence["full_context_labels"] == labels
+    assert evidence["provider_identity"] == identity
+    changed = extract_contextual_accent_evidence(rows, labels, {**identity, "provider_revision": "tampered"})
+    assert changed["provider_evidence_sha256"] != evidence["provider_evidence_sha256"]
+
+
+@pytest.mark.parametrize("tamper", [
+    lambda evidence: evidence["provider_identity"].update({"provider_revision": "tampered"}),
+    lambda evidence: evidence["full_context_labels"].__setitem__(0, "tampered"),
+])
+def test_tampered_contextual_evidence_or_identity_is_invalidated(tamper):
+    contract = run_frontend("さくら", _config())
+    tamper(contract["contextual_accent_evidence"])
+    checked = validate_frontend_contract(contract)
+    assert checked["units"][0]["accent_evidence_valid"] is False
+    assert checked["units"][0]["accent_evidence_invalid_reason"] == "accent_evidence_digest_mismatch"
 
 
 def test_label_cardinality_mismatch_is_rejected_without_guessing():
@@ -203,6 +231,7 @@ def test_pinned_frontend_accent_evidence_digest_is_deterministic():
     assert first["contextual_accent_evidence"]["provider_evidence_sha256"] == second["contextual_accent_evidence"]["provider_evidence_sha256"]
     assert first["units"][0]["accent_evidence_valid"] is True
     assert first["units"][0]["accent_evidence"]["provider_evidence_sha256"] == first["contextual_accent_evidence"]["provider_evidence_sha256"]
+    assert first["units"][0]["accent_evidence"]["full_context_labels"] == first["contextual_accent_evidence"]["full_context_labels"]
 
 
 def test_locked_reading_requires_exact_digest_and_candidate_id():
@@ -220,6 +249,9 @@ def test_locked_reading_requires_exact_digest_and_candidate_id():
     assert reconstructed["schema"] == "ja-frontend-contract-v2"
     assert reconstructed["units"][0]["locked_reading"] == "とうきょう"
     assert reconstructed["units"][0]["accent_provenance"] == "invalidated_by_locked_reading"
+    assert reconstructed["reconstruction_digest"] == stable_digest({
+        "canonical_sha256": reconstructed["canonical_sha256"], "units": reconstructed["units"],
+    })
     bad = dict(request, canonical_sha256="bad")
     with pytest.raises(JAContractError) as exc:
         reconstruct_locked_reading(analysis, bad, _config())

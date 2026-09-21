@@ -411,18 +411,38 @@ def _phrase_summaries(moras: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]
     return summaries
 
 
-def extract_contextual_accent_evidence(njd_rows: Sequence[Mapping[str, Any]], labels: Sequence[str]) -> dict[str, Any]:
+def _provider_evidence_digest(evidence: Mapping[str, Any]) -> str:
+    return stable_digest({
+        "adapter_version": evidence["adapter_version"],
+        "njd_rows": evidence["njd_rows"],
+        "full_context_labels": evidence["full_context_labels"],
+        "provider_identity": evidence["provider_identity"],
+        "accent_phrases": evidence["accent_phrases"],
+        "moras": evidence["moras"],
+    })
+
+
+def _unit_evidence_digest(evidence: Mapping[str, Any]) -> str:
+    return stable_digest({key: value for key, value in evidence.items() if key != "unit_evidence_sha256"})
+
+
+def extract_contextual_accent_evidence(
+    njd_rows: Sequence[Mapping[str, Any]], labels: Sequence[str], provider_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Normalize pinned OpenJTalk phrase evidence without re-predicting text."""
     rows = [dict(row) for row in njd_rows]
     copied_labels = list(labels)
     moras = _bind_full_context_moras(_accent_groups(rows), copied_labels)
-    return {
+    evidence = {
         "adapter_version": "openjtalk-fullcontext-accent-v1",
         "accent_phrases": _phrase_summaries(moras),
         "moras": moras,
+        "njd_rows": rows,
         "full_context_labels": copied_labels,
-        "provider_evidence_sha256": stable_digest({"njd_rows": rows, "full_context_labels": copied_labels}),
+        "provider_identity": dict(provider_identity or {}),
     }
+    evidence["provider_evidence_sha256"] = _provider_evidence_digest(evidence)
+    return evidence
 
 
 def _attach_contextual_accent_evidence(units: list[dict[str, Any]], evidence: Mapping[str, Any] | None) -> None:
@@ -438,12 +458,18 @@ def _attach_contextual_accent_evidence(units: list[dict[str, Any]], evidence: Ma
         unit_moras = all_moras[cursor:cursor + count]
         cursor += count
         phrase_ids = {row["accent_phrase_id"] for row in unit_moras}
-        unit["accent_evidence"] = None if evidence is None else {
+        unit_evidence = None if evidence is None else {
             "adapter_version": evidence["adapter_version"],
             "provider_evidence_sha256": evidence["provider_evidence_sha256"],
+            "provider_identity": evidence["provider_identity"],
+            "njd_rows": evidence["njd_rows"],
+            "full_context_labels": evidence["full_context_labels"],
             "accent_phrases": [summaries[phrase_id] for phrase_id in sorted(phrase_ids)],
             "moras": unit_moras,
         }
+        if unit_evidence is not None:
+            unit_evidence["unit_evidence_sha256"] = _unit_evidence_digest(unit_evidence)
+        unit["accent_evidence"] = unit_evidence
         unit["accent_evidence_valid"] = evidence is not None
         if evidence is None:
             unit["accent_evidence_invalid_reason"] = "contextual_accent_unavailable"
@@ -454,19 +480,47 @@ def _attach_contextual_accent_evidence(units: list[dict[str, Any]], evidence: Ma
 def validate_frontend_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     """Recompute the validity gate for contextual evidence after a reading lock."""
     payload = dict(contract)
+    contextual_evidence = payload.get("contextual_accent_evidence")
+    evidence_digest_matches = (
+        isinstance(contextual_evidence, Mapping)
+        and all(key in contextual_evidence for key in (
+            "adapter_version", "njd_rows", "full_context_labels", "provider_identity",
+            "accent_phrases", "moras", "provider_evidence_sha256",
+        ))
+        and contextual_evidence["provider_evidence_sha256"] == _provider_evidence_digest(contextual_evidence)
+    )
     checked_units: list[dict[str, Any]] = []
     for unit in contract.get("units", []):
         checked = dict(unit)
-        contextual_digest = checked.get("contextual_reading_digest", stable_digest(str(checked.get("contextual_reading", checked.get("read", "")))))
-        locked_digest = checked.get("locked_reading_digest", contextual_digest)
-        checked["contextual_reading_digest"] = contextual_digest
-        checked["locked_reading_digest"] = locked_digest
-        if locked_digest != contextual_digest:
+        contextual_reading = str(checked.get("contextual_reading", checked.get("read", "")))
+        locked_reading = str(checked.get("locked_reading", contextual_reading))
+        expected_contextual_digest = stable_digest(contextual_reading)
+        expected_locked_digest = stable_digest(locked_reading)
+        contextual_digest_matches = checked.get("contextual_reading_digest", expected_contextual_digest) == expected_contextual_digest
+        locked_digest_matches = checked.get("locked_reading_digest", expected_locked_digest) == expected_locked_digest
+        checked["contextual_reading_digest"] = expected_contextual_digest
+        checked["locked_reading_digest"] = expected_locked_digest
+        unit_evidence = checked.get("accent_evidence")
+        unit_evidence_matches = (
+            isinstance(unit_evidence, Mapping)
+            and "unit_evidence_sha256" in unit_evidence
+            and unit_evidence["unit_evidence_sha256"] == _unit_evidence_digest(unit_evidence)
+        )
+        if not contextual_digest_matches:
+            checked["accent_evidence_valid"] = False
+            checked["accent_evidence_invalid_reason"] = "contextual_reading_digest_mismatch"
+        elif not locked_digest_matches:
+            checked["accent_evidence_valid"] = False
+            checked["accent_evidence_invalid_reason"] = "locked_reading_digest_mismatch"
+        elif expected_locked_digest != expected_contextual_digest:
             checked["accent_evidence_valid"] = False
             checked["accent_evidence_invalid_reason"] = "locked_reading_changed"
-        elif checked.get("accent_evidence") is None:
+        elif unit_evidence is None:
             checked["accent_evidence_valid"] = False
             checked["accent_evidence_invalid_reason"] = "contextual_accent_unavailable"
+        elif not evidence_digest_matches or not unit_evidence_matches:
+            checked["accent_evidence_valid"] = False
+            checked["accent_evidence_invalid_reason"] = "accent_evidence_digest_mismatch"
         else:
             checked["accent_evidence_valid"] = True
             checked.pop("accent_evidence_invalid_reason", None)
@@ -591,6 +645,25 @@ def _candidate_unit(row: Mapping[str, Any], index: int, layer: Mapping[str, Any]
     }
 
 
+def _accent_provider_identity(settings: FrontendConfig, provider_info: Mapping[str, Any]) -> dict[str, Any]:
+    options = dict(settings.options)
+    uses_model = any(options[name] for name in ("run_marine", "use_tsqyomi", "predict_nani"))
+    return {
+        "provider": provider_info.get("provider", settings.provider),
+        "provider_revision": provider_info.get("version"),
+        "frontend_commit": settings.commit,
+        "options": options,
+        "options_digest": stable_digest(options),
+        "build_provenance": provider_info.get("build_provenance"),
+        "model_identity": {
+            "accent_model": "provider_managed" if uses_model else "openjtalk_rule_based",
+            "run_marine": options["run_marine"],
+            "use_tsqyomi": options["use_tsqyomi"],
+            "predict_nani": options["predict_nani"],
+        },
+    }
+
+
 def run_frontend(caller_text: str, config: Mapping[str, Any] | FrontendConfig | None = None, provider: Callable[..., Any] | None = None) -> dict[str, Any]:
     settings = config if isinstance(config, FrontendConfig) else FrontendConfig.from_mapping(config)
     layer = canonicalize_text(caller_text, settings.options["normalize_mode"])
@@ -598,9 +671,12 @@ def run_frontend(caller_text: str, config: Mapping[str, Any] | FrontendConfig | 
         probe = probe_provider(settings)
         bridge = _run_bridge(settings.runtime_python, {"op": "mapping", "text": layer["canonical_text"], "options": {**settings.options, "normalize_mode": "None"}})
         rows = bridge.get("rows", [])
-        accent_evidence = extract_contextual_accent_evidence(bridge.get("njd_rows", []), bridge.get("full_context_labels", []))
         provider_info = {key: bridge.get(key) for key in ("provider", "version", "module", "distributions", "capabilities")}
         provider_info["build_provenance"] = probe.get("build_provenance")
+        accent_evidence = extract_contextual_accent_evidence(
+            bridge.get("njd_rows", []), bridge.get("full_context_labels", []),
+            _accent_provider_identity(settings, provider_info),
+        )
     else:
         rows = provider(layer["canonical_text"], **{**settings.options, "normalize_mode": "None"})
         accent_evidence = None
@@ -777,8 +853,11 @@ def reconstruct_locked_reading(analysis: Mapping[str, Any], request: Mapping[str
     payload["units"] = result_units
     payload["analysis_provenance"] = "reconstructed_from_locked_reading_request"
     payload["locked_reading_request_digest"] = stable_digest(request)
-    payload["reconstruction_digest"] = stable_digest({"canonical_sha256": payload["canonical_sha256"], "units": result_units})
-    return validate_frontend_contract(payload)
+    checked = validate_frontend_contract(payload)
+    checked["reconstruction_digest"] = stable_digest({
+        "canonical_sha256": checked["canonical_sha256"], "units": checked["units"],
+    })
+    return checked
 
 
 def reconstruct_locked_readings(analysis: Mapping[str, Any], request: Mapping[str, Any], config: Mapping[str, Any] | FrontendConfig | None = None) -> dict[str, Any]:

@@ -1,3 +1,5 @@
+import pytest
+
 from scripts.ja_asr_crossval import select_reading
 from scripts.ja_en_schema import stable_digest
 from scripts.ja_frontend import validate_frontend_contract
@@ -14,6 +16,23 @@ def test_reading_override_invalidates_contextual_accent():
     checked = validate_frontend_contract(contract)
     assert checked["units"][0]["accent_evidence_valid"] is False
     assert checked["units"][0]["accent_evidence_invalid_reason"] == "locked_reading_changed"
+
+
+@pytest.mark.parametrize(("field", "value", "reason"), [
+    ("locked_reading_digest", stable_digest("トーキョー"), "locked_reading_digest_mismatch"),
+    ("contextual_reading_digest", stable_digest("トウキョウ"), "contextual_reading_digest_mismatch"),
+])
+def test_stale_reading_digest_cannot_keep_contextual_accent_valid(field, value, reason):
+    contract = {"schema": "ja-frontend-contract-v2", "units": [{
+        "read": "トーキョー", "contextual_reading": "トーキョー",
+        "contextual_reading_digest": stable_digest("トーキョー"),
+        "locked_reading": "トウキョウ", "locked_reading_digest": stable_digest("トウキョウ"),
+        "accent_evidence": {"adapter_version": "openjtalk-fullcontext-accent-v1"},
+    }]}
+    contract["units"][0][field] = value
+    checked = validate_frontend_contract(contract)
+    assert checked["units"][0]["accent_evidence_valid"] is False
+    assert checked["units"][0]["accent_evidence_invalid_reason"] == reason
 
 
 def test_selector_precedence_manual_origin_consensus_medoid_none():
