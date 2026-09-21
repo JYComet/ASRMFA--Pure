@@ -3,6 +3,7 @@ import copy
 import pytest
 
 from scripts.ja_en_schema import JAContractError, stable_digest
+from scripts.ja_frontend import _scoped_unit_evidence
 from scripts.ja_prosody import (
     build_prosody_alignment,
     mora_tones_from_phrase,
@@ -75,6 +76,16 @@ def closed_resource(graph, tones, *, entry="entry-1", source="manual"):
             "tones": tones, "entry_id": entry, "resource_path": f"/{source}.json",
             "resource_sha256": f"{source}-sha", "provider_revision": "r1",
             "adapter_version": "resource-adapter-v1", "evidence_digest": f"{source}-evidence"}
+
+
+def scoped_evidence(*, phrase_id, count, nucleus, positions):
+    phrase = {"accent_phrase_id": phrase_id, "mora_count": count, "nucleus": nucleus}
+    moras = [{"accent_phrase_id": phrase_id, "mora_index_in_phrase": index,
+              "mora_count": count, "nucleus": nucleus} for index in range(1, count + 1)]
+    root = {"adapter_version": "openjtalk-fullcontext-accent-v1", "provider_evidence_sha256": "provider",
+            "provider_identity": {"provider": "test", "provider_revision": "r1"}, "njd_rows": [],
+            "full_context_labels": [], "accent_phrases": [phrase], "moras": moras}
+    return _scoped_unit_evidence(root, [moras[index - 1] for index in positions])
 
 
 @pytest.mark.parametrize(("count", "nucleus", "tones"), [
@@ -225,15 +236,9 @@ def test_multiword_phrase_selects_explicit_positions_across_unit_boundary():
         graph["locked_reading_digest"] = digest
         graph["mora_nodes"][0]["accent_phrase_id"] = "ap-shared"
         graph["mora_nodes"][0]["mora_index_in_phrase"] = index
-    evidence = {"adapter_version": "openjtalk-fullcontext-accent-v1",
-                "provider_identity": {"provider": "test", "provider_revision": "r1"},
-                "provider_evidence_sha256": "provider", "unit_evidence_sha256": "unit",
-                "accent_phrases": [{"accent_phrase_id": "ap-shared", "mora_count": 2, "nucleus": 1}],
-                "moras": [{"accent_phrase_id": "ap-shared", "mora_index_in_phrase": 1, "mora_count": 2, "nucleus": 1}]}
+    evidence = scoped_evidence(phrase_id="ap-shared", count=2, nucleus=1, positions=[1])
     first_frontend = {"accent_evidence_valid": True, "locked_reading_digest": digest, "accent_evidence": evidence}
-    second_evidence = copy.deepcopy(evidence)
-    second_evidence["unit_evidence_sha256"] = "unit-2"
-    second_evidence["moras"] = [{"accent_phrase_id": "ap-shared", "mora_index_in_phrase": 2, "mora_count": 2, "nucleus": 1}]
+    second_evidence = scoped_evidence(phrase_id="ap-shared", count=2, nucleus=1, positions=[2])
     second_frontend = {"accent_evidence_valid": True, "locked_reading_digest": digest, "accent_evidence": second_evidence}
     assert [row["tone"] for row in resolve_mora_tones(first, first_frontend)] == ["H"]
     assert [row["tone"] for row in resolve_mora_tones(second, second_frontend)] == ["L"]
@@ -246,12 +251,21 @@ def test_scoped_phrase_evidence_selects_flat_and_middle_subsets(nucleus, positio
     graph = graph_for("アイ")
     graph["mora_nodes"] = [dict(graph["mora_nodes"][0], mora_index_in_phrase=positions[0]),
                            dict(graph["mora_nodes"][1], mora_index_in_phrase=positions[1])]
-    evidence = valid_frontend("アイ", nucleus=nucleus)["accent_evidence"]
-    evidence["accent_phrases"][0]["mora_count"] = 4
-    evidence["moras"] = [{"accent_phrase_id": "ap0", "mora_index_in_phrase": position, "mora_count": 4, "nucleus": nucleus}
-                         for position in positions]
+    evidence = scoped_evidence(phrase_id="ap0", count=4, nucleus=nucleus, positions=positions)
     assert [row["tone"] for row in resolve_mora_tones(graph, {"accent_evidence_valid": True,
         "locked_reading_digest": graph["locked_reading_digest"], "accent_evidence": evidence})] == tones
+
+
+def test_scoped_evidence_rejects_extra_or_metadata_tampered_positions():
+    graph = graph_for("ア")
+    evidence = scoped_evidence(phrase_id="ap0", count=2, nucleus=1, positions=[1, 2])
+    frontend = {"accent_evidence_valid": True, "locked_reading_digest": graph["locked_reading_digest"], "accent_evidence": evidence}
+    with pytest.raises(JAContractError, match="tone_cardinality_mismatch"):
+        resolve_mora_tones(graph, frontend)
+    evidence = scoped_evidence(phrase_id="ap0", count=1, nucleus=0, positions=[1])
+    evidence["moras"][0]["nucleus"] = 1
+    with pytest.raises(JAContractError, match="tone_cardinality_mismatch"):
+        resolve_mora_tones(graph, {**frontend, "accent_evidence": evidence})
 
 
 def test_non_japanese_phone_with_mora_or_basic_ownership_is_rejected():
