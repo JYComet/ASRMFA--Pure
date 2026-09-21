@@ -27,12 +27,17 @@ SCHEMAS = frozenset(
         "ja-reading-selection-v2",
         "ja-frontend-contract-v2",
         "ja-semantic-phone-graph-v1",
+        "ja-semantic-phone-graph-v2",
         "ja-en-alignment-plan-v2",
         "strict-ja-mfa-v2",
         "strict-en-mfa-v2",
         "julius-diagnostic-v1",
         "ja-en-alignment-v2",
+        "ja-en-alignment-v3",
+        "ja-prosody-alignment-v1",
         "tts-training-record-v1",
+        "tts-training-record-v2",
+        "five-track-textgrid-v1",
         "audio-transform-receipt-v2",
         "ja-pipeline-receipt-v1",
     }
@@ -99,6 +104,12 @@ ERROR_CODES = frozenset(
         "mora_phone_relation_unresolved",
         "anchor_conflict",
         "alignment_invalid",
+        "accent_phrase_unresolved",
+        "tone_cardinality_mismatch",
+        "native_basic_mapping_ambiguous",
+        "phone_tone_projection_lossy",
+        "five_track_boundary_mismatch",
+        "tone_provenance_missing",
         "publish_blocked",
     }
 )
@@ -113,6 +124,7 @@ PRODUCTION_STAGES = (
     "anchors",
     "align",
     "merge",
+    "prosody",
     "tts",
     "verify",
 )
@@ -128,15 +140,35 @@ SCHEMA_REQUIRED_FIELDS: dict[str, frozenset[str]] = {
     "ja-reading-selection-v2": frozenset({"schema", "uid", "status", "candidates", "selected_reading"}),
     "ja-frontend-contract-v2": frozenset({"schema", "caller_text", "text_layer_digest", "frontend_commit", "options", "units"}),
     "ja-semantic-phone-graph-v1": frozenset({"schema", "uid", "nodes", "edges"}),
+    "ja-semantic-phone-graph-v2": frozenset(
+        {"schema", "uid", "mora_nodes", "basic_phone_nodes", "native_phone_templates", "edges"}
+    ),
     "ja-en-alignment-plan-v2": frozenset({"schema", "uid", "runs", "seams"}),
     "strict-ja-mfa-v2": frozenset({"schema", "uid", "language", "runs", "ledger"}),
     "strict-en-mfa-v2": frozenset({"schema", "uid", "language", "runs", "ledger"}),
     "julius-diagnostic-v1": frozenset({"schema", "uid", "status", "production_write_back"}),
     "ja-en-alignment-v2": frozenset({"schema", "uid", "words", "phones", "languages"}),
+    "ja-en-alignment-v3": frozenset(
+        {"schema", "uid", "words", "native_phones", "languages", "raw_mfa"}
+    ),
+    "ja-prosody-alignment-v1": frozenset(
+        {"schema", "uid", "words", "moras", "basic_phones", "native_phones", "tone_sources"}
+    ),
     "tts-training-record-v1": frozenset({"schema", "uid", "train_wav", "alignment_wav", "phones", "durations", "mora_graph", "quality_masks"}),
+    "tts-training-record-v2": frozenset(
+        {"schema", "uid", "train_wav", "alignment_wav", "words", "native_phones", "moras", "basic_phones", "quality_masks"}
+    ),
+    "five-track-textgrid-v1": frozenset(
+        {"schema", "uid", "sample_rate", "frame_count", "tiers", "source_json_sha256"}
+    ),
     "audio-transform-receipt-v2": frozenset({"schema", "uid", "source", "train", "alignment", "sample_transform"}),
     "ja-pipeline-receipt-v1": frozenset({"schema", "stage", "status", "inputs", "outputs", "params", "tools", "commands", "errors"}),
 }
+
+PROSODY_KEYS = frozenset({
+    "algorithm_version", "manual_overrides", "accent_lexicon",
+    "allow_unknown_tones",
+})
 
 ALIAS_PREFIXES = {"ja": "ju_", "en": "eu_"}
 
@@ -386,7 +418,7 @@ def validate_config(config: Any, *, config_path: os.PathLike[str] | str | None =
         "asr", "frontend", "mfa", "mixed", "julius_diagnostic", "publish",
         "stage_inputs", "synthetic_fixture", "inventory", "audio", "reading",
         "semantic", "anchors", "align", "merge", "tts", "verify", "cache",
-        "mapping_file", "gold_manifest", "manual_overrides", "code_root",
+        "prosody", "mapping_file", "gold_manifest", "manual_overrides", "code_root",
     }
     unknown_top = sorted(set(config) - allowed_top)
     if unknown_top:
@@ -399,7 +431,7 @@ def validate_config(config: Any, *, config_path: os.PathLike[str] | str | None =
     for field in ("input_manifest", "supply_chain_lock"):
         if not isinstance(config.get(field), str) or not config[field].strip():
             raise JAContractError("config_malformed", f"{field} must be a path", f"$.{field}")
-    for key in ("asr", "frontend", "mfa", "mixed", "julius_diagnostic", "publish"):
+    for key in ("asr", "frontend", "mfa", "mixed", "julius_diagnostic", "publish", "prosody"):
         if key in config and not isinstance(config[key], Mapping):
             raise JAContractError("config_malformed", "section must be a mapping", f"$.{key}")
     asr = config.get("asr", {})
@@ -439,6 +471,31 @@ def validate_config(config: Any, *, config_path: os.PathLike[str] | str | None =
         raise JAContractError("config_malformed", "write_back must be boolean", "$.julius_diagnostic.write_back")
     if julius.get("enabled", False) and julius.get("write_back", False):
         raise JAContractError("julius_writeback_forbidden", "Julius write_back is forbidden", "$.julius_diagnostic.write_back")
+    if "prosody" in config:
+        prosody = config["prosody"]
+        unknown_prosody = sorted(set(prosody) - PROSODY_KEYS)
+        if unknown_prosody:
+            raise JAContractError("config_unknown_key", f"unknown prosody keys: {unknown_prosody}", "$.prosody")
+        missing_prosody = sorted(PROSODY_KEYS - set(prosody))
+        if missing_prosody:
+            raise JAContractError("config_malformed", f"missing prosody keys: {missing_prosody}", "$.prosody")
+        algorithm_version = prosody.get("algorithm_version")
+        if not isinstance(algorithm_version, str) or not algorithm_version.strip():
+            raise JAContractError("config_malformed", "prosody algorithm_version must be a non-empty string", "$.prosody.algorithm_version")
+        for resource_key in ("manual_overrides", "accent_lexicon"):
+            resource = prosody.get(resource_key)
+            if resource is not None and (not isinstance(resource, str) or not resource.strip()):
+                raise JAContractError("config_malformed", "prosody resource must be a path or null", f"$.prosody.{resource_key}")
+            if isinstance(resource, str) and resource.strip():
+                # Normalize only for validation.  Resolution relative to a
+                # config file remains the responsibility of preflight.
+                candidate = _absolute(resource)
+                if candidate.is_symlink():
+                    raise JAContractError("config_path_invalid", "prosody resource may not be a symlink", f"$.prosody.{resource_key}")
+                if candidate.exists() and not candidate.is_file():
+                    raise JAContractError("config_path_invalid", "prosody resource must be a file", f"$.prosody.{resource_key}")
+        if type(prosody.get("allow_unknown_tones")) is not bool:
+            raise JAContractError("config_malformed", "allow_unknown_tones must be boolean", "$.prosody.allow_unknown_tones")
     # config_path is deliberately only used to reject a symlink config; source
     # manifests and source WAVs may be outside the workspace.
     if config_path is not None:

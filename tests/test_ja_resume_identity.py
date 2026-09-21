@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.ja_en_schema import JAContractError, atomic_write_json, make_receipt
+from scripts.ja_en_schema import JAContractError, atomic_write_json, make_receipt, stable_digest
 from scripts.run_ja_en_pipeline import (
     config_identity,
     _stage_cache_identity,
@@ -64,3 +64,20 @@ def test_reading_cache_binds_candidate_analysis_not_rewritten_frontend_receipt(t
     changed = make_receipt(stage="frontend", status="COMPLETE", outputs=[analysis], params={"reconstruction": "changed"})
     atomic_write_json(frontend_receipt, changed, workspace=workspace)
     assert _stage_cache_identity("reading", identity, {}, workspace) == first
+
+
+def test_legacy_workspace_is_stale_after_prosody_stage_is_added(tmp_path: Path):
+    config_path, config = _config(tmp_path)
+    workspace = Path(config["workspace"])
+    workspace.mkdir(parents=True)
+    legacy_identity = {"schema": "ja-en-run-identity-v1", "production_stages": [
+        "inventory", "audio", "asr", "reading", "frontend", "semantic",
+        "anchors", "align", "merge", "tts", "verify",
+    ]}
+    atomic_write_json(workspace / ".ja_en_run_identity.json", {
+        **legacy_identity, "identity_digest": stable_digest(legacy_identity)
+    }, workspace=workspace)
+    _, manifest_path, rows, _ = preflight(config, config_path=config_path)
+    with pytest.raises(JAContractError) as error:
+        validate_resume(workspace, config_identity(config, manifest_path, rows), allow_new=False)
+    assert error.value.code in {"resume_identity_drift", "resume_stale"}

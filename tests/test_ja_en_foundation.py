@@ -4,7 +4,10 @@ from pathlib import Path
 import pytest
 
 from scripts.ja_en_schema import (
+    ERROR_CODES,
     JAContractError,
+    PRODUCTION_STAGES,
+    SCHEMAS,
     atomic_write_json,
     cache_key,
     make_receipt,
@@ -56,6 +59,34 @@ julius_diagnostic:
         encoding="utf-8",
     )
     return config_path, _load_yaml(config_path)
+
+
+def test_five_track_contract_versions_and_stage_order():
+    assert {
+        "ja-semantic-phone-graph-v2", "ja-en-alignment-v3",
+        "ja-prosody-alignment-v1", "tts-training-record-v2",
+        "five-track-textgrid-v1",
+    } <= SCHEMAS
+    assert PRODUCTION_STAGES[-4:] == ("merge", "prosody", "tts", "verify")
+    assert {
+        "accent_phrase_unresolved", "tone_cardinality_mismatch",
+        "native_basic_mapping_ambiguous", "phone_tone_projection_lossy",
+        "five_track_boundary_mismatch", "tone_provenance_missing",
+    } <= ERROR_CODES
+
+
+def test_prosody_config_has_closed_keys(tmp_path):
+    _, config = _config(tmp_path)
+    config["prosody"] = {
+        "algorithm_version": "ja-mora-tone-v1",
+        "manual_overrides": None,
+        "accent_lexicon": None,
+        "allow_unknown_tones": True,
+    }
+    assert validate_config(config)["prosody"]["algorithm_version"] == "ja-mora-tone-v1"
+    config["prosody"]["nearest_neighbor_fill"] = True
+    with pytest.raises(JAContractError, match="config_unknown_key"):
+        validate_config(config)
 
 
 def test_partition_is_exact_and_rejects_overlap():

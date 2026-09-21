@@ -7,6 +7,12 @@ manual_overrides: /data/manifests/ja_manual_overrides.json
 gold_manifest: /data/manifests/ja_en_gold.json
 stage_inputs: {}
 
+prosody:
+  algorithm_version: ja-mora-tone-v1
+  manual_overrides: null
+  accent_lexicon: null
+  allow_unknown_tones: true
+
 asr:
   profile: baseline_3family
   family_vote_policy: one_per_family
@@ -60,6 +66,7 @@ julius_diagnostic:
 publish:
   require_supply_chain_licenses: true
   require_all_resolved: true
+  require_all_tones: false
   require_independent_verifier: true
 
 verify:
