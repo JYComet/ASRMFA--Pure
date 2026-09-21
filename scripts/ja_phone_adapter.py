@@ -203,9 +203,23 @@ def _target_phones(source: Sequence[str], reading: str) -> tuple[list[str], list
         if token == "N" and index + 1 < len(source):
             following = source[index + 1]
             following_vowel = source[index + 2] if index + 2 < len(source) else None
-            nasal = "ɲ" if following in {"ny", "j"} or (following == "n" and following_vowel in {"i", "I"}) else ("m" if following in {"b", "p", "m", "by", "py", "my"} else ("ŋ" if following in {"k", "g", "ky", "gy"} else ("ɰ̃" if following in {"w", "y"} else ("n" if following in {"n", "t", "d", "s", "z", "ts", "ch", "sh"} else "ɴ"))))
-            mapped.append(nasal + ("ː" if following in {"n", "ny"} else ""))
-            if following in {"n", "ny"}:
+            if following == "ny" or (following == "n" and following_vowel in {"i", "I"}):
+                nasal = "ɲ"
+            elif following == "my" or (following == "m" and following_vowel in {"i", "I"}):
+                nasal = "mʲ"
+            elif following in {"b", "p", "m", "by", "py"}:
+                nasal = "m"
+            elif following in {"k", "g", "ky", "gy"}:
+                nasal = "ŋ"
+            elif following in {"w", "y"}:
+                nasal = "ɰ̃"
+            elif following in {"n", "t", "d", "s", "z", "ts", "ch", "sh"}:
+                nasal = "n"
+            else:
+                nasal = "ɴ"
+            coalesced_nasal = following in {"n", "ny", "m", "my"}
+            mapped.append(nasal + ("ː" if coalesced_nasal else ""))
+            if coalesced_nasal:
                 groups.append([index, index + 2])
                 index += 2
             else:
@@ -345,7 +359,12 @@ def openjtalk_to_semantic(unit: Mapping[str, Any]) -> dict[str, Any]:
     declared_mora_count = int(unit.get("locked_mora_count", unit.get("mora_count", len(morae))) or 0)
     if declared_mora_count != len(morae):
         raise JAContractError("native_basic_mapping_ambiguous", "locked mora count differs from locked reading")
-    source_mora = _source_mora_indices(phones, declared_mora_count)
+    try:
+        source_mora = _source_mora_indices(phones, declared_mora_count)
+    except JAContractError as exc:
+        if exc.code in {"semantic_relation_ambiguous", "mora_phone_relation_unresolved"}:
+            raise JAContractError("native_basic_mapping_ambiguous", "native/basic mora coverage is unresolved") from exc
+        raise
     elided_indices = _elided_phone_indices(unit, len(phones))
     evidence_rows = _mora_evidence(unit, len(morae))
 

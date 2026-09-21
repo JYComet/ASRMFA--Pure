@@ -9,6 +9,22 @@ from scripts.ja_frontend import run_frontend
 from scripts.ja_phone_adapter import load_japanese_mfa_inventory, openjtalk_to_semantic, semantic_to_japanese_mfa_v3
 
 
+def test_v2_basic_phone_coverage_is_exact_after_elision():
+    graph = openjtalk_to_semantic({
+        "uid": "u-graph", "token_id": "tok-graph", "candidate_id": "cand-graph",
+        "locked_reading": "スキ", "locked_mora_count": 2,
+        "locked_openjtalk_phones": ["s", "u", "k", "i"],
+        "elided_openjtalk_phone_indices": [1],
+    })
+    basic = graph["basic_phone_nodes"]
+    all_basic_ids = {row["basic_phone_id"] for row in basic}
+    covered = {basic_id for template in graph["native_phone_templates"] for basic_id in template["basic_phone_ids"]}
+    elided = {row["basic_phone_id"] for row in basic if row["realization"] == "elided"}
+    assert len(all_basic_ids) == len(basic)
+    assert {row["mora_id"] for row in basic} <= {row["mora_id"] for row in graph["mora_nodes"]}
+    assert covered | elided == all_basic_ids
+
+
 def test_long_vowel_keeps_many_to_many_mora_relation():
     runtime = os.environ.get("JA_FRONTEND_PYTHON")
     if not runtime:

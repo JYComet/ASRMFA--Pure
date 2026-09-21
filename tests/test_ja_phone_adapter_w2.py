@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from scripts.ja_frontend import run_frontend
+from scripts.ja_en_schema import JAContractError
 from scripts.ja_phone_adapter import (
     DEFAULT_DICTIONARY,
     DEFAULT_METADATA,
@@ -66,6 +67,28 @@ def test_each_basic_phone_has_exactly_one_mora():
     assert graph["basic_phone_nodes"]
     assert all(isinstance(row["mora_id"], str) for row in graph["basic_phone_nodes"])
     assert len({row["basic_phone_id"] for row in graph["basic_phone_nodes"]}) == len(graph["basic_phone_nodes"])
+
+
+def test_nasal_coalescence_keeps_ordered_mora_and_basic_phones_without_internal_split():
+    graph = openjtalk_to_semantic(frontend_unit("ウンメー"))
+    template = next(row for row in graph["native_phone_templates"] if row["native_phone"] == "mː")
+    basic = {row["basic_phone_id"]: row for row in graph["basic_phone_nodes"]}
+    mora = {row["mora_id"]: row for row in graph["mora_nodes"]}
+    assert [basic[key]["symbol"] for key in template["basic_phone_ids"]] == ["N", "m"]
+    assert [mora[key]["kana"] for key in template["mora_ids"]] == ["ン", "メ"]
+    assert template["transform"] == "nasal_coalescence"
+    assert all("start_sample" not in basic[key] and "end_sample" not in basic[key] for key in template["basic_phone_ids"])
+
+
+@pytest.mark.parametrize("phones", [["a", "a"], ["a"]])
+def test_native_basic_relation_failures_use_v2_ambiguity_code(phones):
+    reading = "ア" if len(phones) == 2 else "アイ"
+    with pytest.raises(JAContractError, match="native_basic_mapping_ambiguous"):
+        openjtalk_to_semantic({
+            "uid": "u-graph", "token_id": "tok-graph", "candidate_id": "cand-graph",
+            "locked_reading": reading, "locked_mora_count": len(split_mora(reading)),
+            "locked_openjtalk_phones": phones,
+        })
 
 
 def test_elided_vowel_has_no_native_interval():
