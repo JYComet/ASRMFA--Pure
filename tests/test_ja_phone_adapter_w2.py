@@ -17,7 +17,68 @@ from scripts.ja_phone_adapter import (
     write_locked_alias_artifacts,
     load_japanese_mfa_inventory,
     semantic_stage,
+    split_mora,
 )
+
+
+_FRONTEND_PHONE_FIXTURES = {
+    "コー": ["k", "o", "o"],
+    "キット": ["k", "i", "cl", "t", "o"],
+    "オンナ": ["o", "N", "n", "a"],
+    "グッズ": ["g", "u", "cl", "dz", "u"],
+    "ウンメー": ["u", "N", "m", "e", "e"],
+    "スキ": ["s", "u", "k", "i"],
+    "アッ": ["a", "cl"],
+}
+
+
+def frontend_unit(reading, *, elide=None):
+    """Literal locked-phone fixtures for semantic graph behavior."""
+    phones = _FRONTEND_PHONE_FIXTURES[reading]
+    unit = {
+        "uid": "u-graph", "token_id": "tok-graph", "candidate_id": "cand-graph",
+        "surface": reading, "locked_reading": reading,
+        "locked_openjtalk_phones": phones, "locked_mora_count": len(split_mora(reading)),
+    }
+    if elide is not None:
+        unit["elided_openjtalk_phone_indices"] = [phones.index(elide)]
+    return unit
+
+
+@pytest.mark.parametrize(("reading", "native", "symbols", "moras", "transform"), [
+    ("コー", "oː", ["o", "o"], ["コ", "ー"], "long_vowel_merge"),
+    ("キット", "tː", ["Q", "t"], ["ッ", "ト"], "geminate_merge"),
+    ("オンナ", "nː", ["N", "n"], ["ン", "ナ"], "nasal_coalescence"),
+    ("グッズ", "dzː", ["Q", "dz"], ["ッ", "ズ"], "geminate_merge"),
+])
+def test_native_template_preserves_order(reading, native, symbols, moras, transform):
+    graph = openjtalk_to_semantic(frontend_unit(reading))
+    template = next(row for row in graph["native_phone_templates"] if row["native_phone"] == native)
+    basic = {row["basic_phone_id"]: row for row in graph["basic_phone_nodes"]}
+    mora = {row["mora_id"]: row for row in graph["mora_nodes"]}
+    assert [basic[key]["symbol"] for key in template["basic_phone_ids"]] == symbols
+    assert [mora[key]["kana"] for key in template["mora_ids"]] == moras
+    assert template["transform"] == transform
+
+
+def test_each_basic_phone_has_exactly_one_mora():
+    graph = openjtalk_to_semantic(frontend_unit("ウンメー"))
+    assert graph["basic_phone_nodes"]
+    assert all(isinstance(row["mora_id"], str) for row in graph["basic_phone_nodes"])
+    assert len({row["basic_phone_id"] for row in graph["basic_phone_nodes"]}) == len(graph["basic_phone_nodes"])
+
+
+def test_elided_vowel_has_no_native_interval():
+    graph = openjtalk_to_semantic(frontend_unit("スキ", elide="u"))
+    vowel = next(row for row in graph["basic_phone_nodes"] if row["symbol"] == "u")
+    assert vowel["realization"] == "elided"
+    assert vowel["native_phone_id"] is None
+
+
+def test_final_sokuon_exists_only_when_locked_reading_contains_it():
+    graph = openjtalk_to_semantic(frontend_unit("アッ"))
+    assert graph["mora_nodes"][-1]["kind"] == "final_sokuon"
+    assert graph["basic_phone_nodes"][-1]["role"] == "final_sokuon"
 
 
 def _analysis(text="東京 学校 こんにちは さくら"):
@@ -42,7 +103,7 @@ def test_semantic_graph_preserves_many_to_many_mora_edges_and_golden_inventory()
     analysis = run_frontend("東京", _analysis_config())
     unit = analysis["units"][0]
     graph = openjtalk_to_semantic(unit)
-    assert graph["schema"] == "ja-semantic-phone-graph-v1"
+    assert graph["schema"] == "ja-semantic-phone-graph-v2"
     target = semantic_to_japanese_mfa_v3(graph, load_japanese_mfa_inventory(Path(__file__).parent / "fixtures" / "ja_mfa_portable_metadata.json"), dictionary_path=Path(__file__).parent / "fixtures" / "ja_mfa_portable.dict")
     assert target["phones"] == ["t", "oː", "c", "oː"]
     assert any(edge["relation"] == "mora_phone" for edge in graph["edges"])

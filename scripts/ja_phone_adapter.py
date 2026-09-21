@@ -32,7 +32,21 @@ except ImportError:  # direct script execution
 DEFAULT_METADATA = None
 DEFAULT_DICTIONARY = None
 DEFAULT_EN_METADATA = None
-SEMANTIC_VERSION = "ja-semantic-phone-graph-v1"
+SEMANTIC_VERSION = "ja-semantic-phone-graph-v2"
+
+MORA_KINDS = frozenset({
+    "regular", "long_extension", "sokuon", "nasal_mora",
+    "final_sokuon", "devoiced", "elided",
+})
+BASIC_ROLES = frozenset({
+    "onset", "nucleus", "long_extension", "sokuon",
+    "nasal_mora", "final_sokuon",
+})
+TRANSFORMS = frozenset({
+    "identity", "long_vowel_merge", "geminate_merge",
+    "nasal_coalescence", "devoiced_realization", "final_sokuon",
+})
+_BASIC_REALIZATIONS = frozenset({"observed", "merged", "devoiced", "elided", "unresolved"})
 
 _MFA_PHONES = frozenset({
     "a", "aː", "b", "bʲ", "bʲː", "bː", "c", "cː", "d", "dz", "dzː", "dʑ", "dʑː", "dʲ", "dʲː", "dː", "e", "eː", "h", "hː", "i", "iː", "i̥", "j", "k", "kː", "m", "mʲ", "mʲː", "mː", "n", "nː", "o", "oː", "p", "pʲ", "pʲː", "pː", "s", "sː", "t", "ts", "tsː", "tɕ", "tɕː", "tʲ", "tʲː", "tː", "v", "vʲ", "w", "wː", "z", "ç", "çː", "ŋ", "ɕ", "ɕː", "ɟ", "ɟː", "ɡ", "ɡː", "ɨ", "ɨː", "ɨ̥", "ɯ", "ɯː", "ɯ̥", "ɰ̃", "ɲ", "ɲː", "ɴ", "ɴː", "ɸ", "ɸʲ", "ɸʲː", "ɸː", "ɾ", "ɾʲ", "ɾʲː", "ɾː", "ʑ", "ʔ",
@@ -47,7 +61,7 @@ _FRONTEND_TO_MFA = {
     "t": "t", "w": "w", "y": "j", "z": "z", "ts": "ts", "ch": "tɕ",
     "sh": "ɕ", "ky": "c", "gy": "ɟ", "ny": "ɲ", "hy": "ç", "my": "mʲ",
     "by": "bʲ", "py": "pʲ", "ry": "ɾʲ", "dy": "dʲ", "ty": "tʲ",
-    "N": "ɴ", "cl": "cl", "q": "ʔ",
+    "N": "ɴ", "cl": "cl", "q": "ʔ", "dz": "dz",
 }
 _GOLDEN = {
     "サクラ": ("s", "a", "k", "ɯ", "ɾ", "a"),
@@ -70,6 +84,30 @@ def split_mora(reading: str) -> list[str]:
         else:
             result.append(char)
     return result
+
+
+def _split_mora_preserving_kana(reading: str) -> list[str]:
+    """Split locked kana without changing the script stored in the graph."""
+    result: list[str] = []
+    for char in reading:
+        if result and char in _SMALL:
+            result[-1] += char
+        else:
+            result.append(char)
+    return result
+
+
+def _basic(node_id: str, symbol: str, role: str, mora_id: str, realization: str = "observed") -> dict[str, Any]:
+    if role not in BASIC_ROLES or realization not in _BASIC_REALIZATIONS:
+        raise JAContractError("schema_invalid", "invalid basic phone role or realization")
+    return {
+        "basic_phone_id": node_id,
+        "symbol": symbol,
+        "role": role,
+        "mora_id": mora_id,
+        "realization": realization,
+        "native_phone_id": None,
+    }
 
 
 def load_japanese_mfa_inventory(metadata_path: Path | str | None = None, *, acoustic_archive_path: Path | str | None = None, acoustic_archive_sha256: str | None = None) -> dict[str, Any]:
@@ -151,7 +189,10 @@ def _target_phones(source: Sequence[str], reading: str) -> tuple[list[str], list
         token = source[index]
         if token == "cl":
             if index + 1 >= len(source):
-                raise JAContractError("semantic_parse_failed", "word-final geminate has no onset")
+                # A locked final ッ is a semantic basic phone with no
+                # corresponding native MFA interval.
+                index += 1
+                continue
             onset = _FRONTEND_TO_MFA.get(source[index + 1])
             if onset is None:
                 raise JAContractError("semantic_parse_failed", f"unsupported geminate onset {source[index + 1]!r}")
@@ -161,7 +202,8 @@ def _target_phones(source: Sequence[str], reading: str) -> tuple[list[str], list
             continue
         if token == "N" and index + 1 < len(source):
             following = source[index + 1]
-            nasal = "ɲ" if following in {"n", "ny", "j"} else ("m" if following in {"b", "p", "m", "by", "py", "my"} else ("ŋ" if following in {"k", "g", "ky", "gy"} else ("ɰ̃" if following in {"w", "y"} else ("n" if following in {"t", "d", "s", "z", "ts", "ch", "sh"} else "ɴ"))))
+            following_vowel = source[index + 2] if index + 2 < len(source) else None
+            nasal = "ɲ" if following in {"ny", "j"} or (following == "n" and following_vowel in {"i", "I"}) else ("m" if following in {"b", "p", "m", "by", "py", "my"} else ("ŋ" if following in {"k", "g", "ky", "gy"} else ("ɰ̃" if following in {"w", "y"} else ("n" if following in {"n", "t", "d", "s", "z", "ts", "ch", "sh"} else "ɴ"))))
             mapped.append(nasal + ("ː" if following in {"n", "ny"} else ""))
             if following in {"n", "ny"}:
                 groups.append([index, index + 2])
@@ -220,51 +262,197 @@ def _source_mora_indices(source: Sequence[str], mora_count: int) -> list[int]:
     return result
 
 
+def _elided_phone_indices(unit: Mapping[str, Any], phone_count: int) -> frozenset[int]:
+    raw = unit.get("elided_openjtalk_phone_indices", unit.get("elided_phone_indices", []))
+    if raw is None:
+        return frozenset()
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        raise JAContractError("native_basic_mapping_ambiguous", "elided phone indices must be an explicit sequence")
+    indices: list[int] = []
+    for item in raw:
+        if not isinstance(item, int) or isinstance(item, bool) or item < 0 or item >= phone_count:
+            raise JAContractError("native_basic_mapping_ambiguous", "elided phone index is invalid")
+        indices.append(item)
+    if len(set(indices)) != len(indices):
+        raise JAContractError("native_basic_mapping_ambiguous", "elided phone index is duplicated")
+    return frozenset(indices)
+
+
+def _basic_symbol_and_role(source: Sequence[str], index: int, reading: str) -> tuple[str, str]:
+    token = source[index]
+    if token == "cl":
+        return "Q", "sokuon"
+    if token == "N":
+        return "N", "nasal_mora"
+    if token in {"a", "i", "u", "e", "o", "I", "U"}:
+        return token.lower(), "nucleus"
+    if token == "j":
+        return ("dʑ" if any(mark in _hiragana(reading) for mark in ("じ", "ぢ")) else "j"), "onset"
+    if token == "h" and index + 1 < len(source) and source[index + 1] == "I":
+        return "ç", "onset"
+    if token == "m" and index + 1 < len(source) and source[index + 1] in {"i", "I"}:
+        return "mʲ", "onset"
+    if token == "k" and index + 1 < len(source) and source[index + 1] in {"i", "I"}:
+        return "c", "onset"
+    symbol = _FRONTEND_TO_MFA.get(token)
+    if symbol is None or symbol == "cl":
+        raise JAContractError("native_basic_mapping_ambiguous", f"unsupported basic phone {token!r}")
+    return symbol, "onset"
+
+
+def _ordered_unique(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    return [value for value in values if not (value in seen or seen.add(value))]
+
+
+def _mora_evidence(unit: Mapping[str, Any], mora_count: int) -> list[Mapping[str, Any] | None]:
+    evidence = unit.get("accent_evidence")
+    rows = evidence.get("moras") if isinstance(evidence, Mapping) and unit.get("accent_evidence_valid") else None
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        return [None] * mora_count
+    if len(rows) != mora_count or not all(isinstance(row, Mapping) for row in rows):
+        raise JAContractError("accent_phrase_unresolved", "frontend accent mora cardinality is unresolved")
+    return list(rows)
+
+
+def _template_transform(source: Sequence[str], group: Sequence[int], basics: Sequence[Mapping[str, Any]]) -> str:
+    tokens = [source[index] for index in group]
+    if "cl" in tokens:
+        return "geminate_merge"
+    if "N" in tokens and len(tokens) == 2 and basics[1]["role"] == "onset":
+        return "nasal_coalescence"
+    if any(basic["realization"] == "devoiced" for basic in basics):
+        return "devoiced_realization"
+    if len(basics) == 2 and {basic["role"] for basic in basics} <= {"nucleus", "long_extension"}:
+        return "long_vowel_merge"
+    return "identity"
+
+
 def openjtalk_to_semantic(unit: Mapping[str, Any]) -> dict[str, Any]:
+    """Create the authoritative Japanese mora/basic/native-phone graph.
+
+    The frontend stream establishes the only permissible basic-phone order.
+    Model-native phones are selected by ``_target_phones`` but never used to
+    infer missing basic-phone or mora ownership.
+    """
     phones = list(unit.get("locked_openjtalk_phones", unit.get("phones", unit.get("phonemes", []))))
     reading = str(unit.get("locked_reading", unit.get("read", unit.get("reading", ""))))
     if not phones or not reading:
         raise JAContractError("semantic_parse_failed", "frontend unit has no reading or phones")
-    morae = split_mora(reading)
+    morae = _split_mora_preserving_kana(reading)
     if not morae:
         raise JAContractError("semantic_parse_failed", "reading has no mora")
+    declared_mora_count = int(unit.get("locked_mora_count", unit.get("mora_count", len(morae))) or 0)
+    if declared_mora_count != len(morae):
+        raise JAContractError("native_basic_mapping_ambiguous", "locked mora count differs from locked reading")
+    source_mora = _source_mora_indices(phones, declared_mora_count)
+    elided_indices = _elided_phone_indices(unit, len(phones))
+    evidence_rows = _mora_evidence(unit, len(morae))
+
+    mora_nodes: list[dict[str, Any]] = []
+    for index, kana in enumerate(morae):
+        kind = "long_extension" if kana in {"ー"} else ("nasal_mora" if kana in {"ン", "ん"} else "regular")
+        if kana in {"ッ", "っ"}:
+            kind = "final_sokuon" if index == len(morae) - 1 else "sokuon"
+        owned = [phone_index for phone_index, mora_index in enumerate(source_mora) if mora_index == index]
+        if any(phone_index in elided_indices for phone_index in owned):
+            kind = "elided"
+        elif any(phones[phone_index] in {"I", "U"} for phone_index in owned):
+            kind = "devoiced"
+        if kind not in MORA_KINDS:
+            raise JAContractError("schema_invalid", "invalid mora kind")
+        evidence = evidence_rows[index]
+        tone = str(evidence.get("tone", "UNK")) if evidence else "UNK"
+        mora_nodes.append({
+            "mora_id": f"mora_{index:04d}", "token_id": unit.get("token_id"),
+            "kana": kana, "kind": kind, "mora_index": index,
+            "accent_phrase_id": evidence.get("accent_phrase_id") if evidence else None,
+            "tone": tone, "tone_known": tone in {"H", "L"},
+            "tone_source": "contextual_frontend_prediction" if evidence else "unknown",
+            "f0_observed": kind not in {"devoiced", "elided"},
+            "source_span": unit.get("canonical_span"), "source_span_domain": "canonical_text",
+        })
+    mora_by_id = {node["mora_id"]: node for node in mora_nodes}
+
+    basic_nodes: list[dict[str, Any]] = []
+    for index, _phone in enumerate(phones):
+        symbol, role = _basic_symbol_and_role(phones, index, reading)
+        mora_id = f"mora_{source_mora[index]:04d}"
+        mora = mora_by_id[mora_id]
+        if role == "sokuon" and mora["kind"] == "final_sokuon":
+            role = "final_sokuon"
+        elif role == "nucleus" and mora["kind"] == "long_extension":
+            role = "long_extension"
+        realization = "elided" if index in elided_indices else ("devoiced" if phones[index] in {"I", "U"} else "observed")
+        node = _basic(f"bp_{index:04d}", symbol, role, mora_id, realization)
+        node.update({"tone": mora["tone"], "tone_known": mora["tone_known"]})
+        basic_nodes.append(node)
+
     target, source_groups = _target_phones(phones, reading)
-    source_mora = _source_mora_indices(phones, int(unit.get("locked_mora_count", unit.get("mora_count", len(split_mora(reading)))) or 0))
-    nodes: list[dict[str, Any]] = []
-    for index, mora in enumerate(morae):
-        nodes.append({"id": f"mora_{index:04d}", "kind": "mora", "surface": mora, "reading": mora, "mora_index": index, "source_span": unit.get("canonical_span"), "source_span_domain": "canonical_text"})
-    for index, phone in enumerate(phones):
-        nodes.append({"id": f"oj_{index:04d}", "kind": "openjtalk_phone", "phone": phone, "devoiced_candidate": phone in {"I", "U"}, "source_span": unit.get("canonical_span"), "source_span_domain": "canonical_text"})
-    phone_nodes: list[dict[str, Any]] = []
-    edges: list[dict[str, Any]] = []
     if len(target) != len(source_groups):
-        raise JAContractError("semantic_relation_ambiguous", "semantic phone/source relation cardinality is unresolved")
-    for index in range(len(target)):
-        phone = target[index]
-        group = source_groups[index]
-        related_indices = sorted(set(source_mora[group[0]:group[1]]))
-        if not related_indices:
-            raise JAContractError("mora_phone_relation_unresolved", "phone has no explicit source mora relation")
-        mora_ids = [f"mora_{mora_index:04d}" for mora_index in related_indices]
-        node_id = f"sem_{index:04d}"
-        phone_nodes.append({"id": node_id, "kind": "semantic_phone", "phone": phone, "devoiced_candidate": any(phones[i] in {"I", "U"} for i in range(group[0], group[1])), "source_openjtalk_ids": [f"oj_{i:04d}" for i in range(group[0], group[1])], "mora_ids": mora_ids, "source_span": unit.get("canonical_span"), "source_span_domain": "canonical_text"})
-        edges.append({"relation": "openjtalk_to_semantic", "source_ids": [f"oj_{i:04d}" for i in range(group[0], group[1])], "target_ids": [node_id]})
+        raise JAContractError("native_basic_mapping_ambiguous", "native/basic template cardinality is unresolved")
+    templates: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    for index, (native_phone, span) in enumerate(zip(target, source_groups, strict=True)):
+        if len(span) != 2 or span[0] < 0 or span[1] > len(phones) or span[0] >= span[1]:
+            raise JAContractError("native_basic_mapping_ambiguous", "native source span is invalid")
+        group = list(range(span[0], span[1]))
+        if any(phone_index in elided_indices for phone_index in group):
+            if len(group) != 1:
+                raise JAContractError("native_basic_mapping_ambiguous", "elided phone shares a native template")
+            continue
+        basics = [basic_nodes[phone_index] for phone_index in group]
+        template_id = f"np_{index:04d}"
+        transform = _template_transform(phones, group, basics)
+        if transform not in TRANSFORMS:
+            raise JAContractError("schema_invalid", "invalid native phone transform")
+        if transform != "identity":
+            for basic in basics:
+                if basic["realization"] == "observed":
+                    basic["realization"] = "merged"
+        for basic in basics:
+            basic["native_phone_id"] = template_id
+        basic_ids = [basic["basic_phone_id"] for basic in basics]
+        mora_ids = _ordered_unique(basic["mora_id"] for basic in basics)
+        if not mora_ids:
+            raise JAContractError("native_basic_mapping_ambiguous", "native template has no ordered morae")
+        template = {
+            "native_phone_id": template_id, "native_phone": native_phone,
+            "language": "ja", "token_id": unit.get("token_id"),
+            "candidate_id": unit.get("candidate_id"), "alias": unit.get("alias"),
+            "basic_phone_ids": basic_ids, "mora_ids": mora_ids, "transform": transform,
+            "source_openjtalk_ids": [f"oj_{phone_index:04d}" for phone_index in group],
+        }
+        templates.append(template)
+        edges.append({"relation": "openjtalk_to_native_template", "source_ids": template["source_openjtalk_ids"], "target_ids": [template_id]})
+        for basic_id in basic_ids:
+            edges.append({"relation": "basic_phone_to_native_template", "basic_phone_id": basic_id, "native_phone_id": template_id})
         for mora_id in mora_ids:
-            edges.append({"relation": "mora_phone", "mora_id": mora_id, "phone_id": node_id})
+            edges.append({"relation": "mora_phone", "mora_id": mora_id, "phone_id": template_id})
+
+    # Compatibility views retain the v1 consumer shape without becoming a
+    # second source of semantic truth.
+    semantic_phone_nodes = [
+        {"id": template["native_phone_id"], "kind": "semantic_phone", "phone": template["native_phone"],
+         "mora_ids": list(template["mora_ids"]), "basic_phone_ids": list(template["basic_phone_ids"]),
+         "transform": template["transform"]}
+        for template in templates
+    ]
+    frontend_phone_nodes = [
+        {"id": f"oj_{index:04d}", "kind": "openjtalk_phone", "phone": phone,
+         "devoiced_candidate": phone in {"I", "U"}, "source_span": unit.get("canonical_span"),
+         "source_span_domain": "canonical_text"}
+        for index, phone in enumerate(phones)
+    ]
     return {
-        "schema": SEMANTIC_VERSION,
-        "version": SEMANTIC_VERSION,
-        "token_id": unit.get("token_id"),
-        "candidate_id": unit.get("candidate_id"),
-        "surface": unit.get("surface", ""),
-        "reading": reading,
-        "source_phones": phones,
-        "mora_nodes": [node for node in nodes if node["kind"] == "mora"],
-        "frontend_phone_nodes": [node for node in nodes if node["kind"] == "openjtalk_phone"],
-        "semantic_phone_nodes": phone_nodes,
-        "nodes": nodes + phone_nodes,
-        "edges": edges,
-        "relation_semantics": "many_to_many_no_synthetic_mora_timing",
+        "schema": SEMANTIC_VERSION, "version": SEMANTIC_VERSION, "uid": unit.get("uid"),
+        "token_id": unit.get("token_id"), "candidate_id": unit.get("candidate_id"),
+        "surface": unit.get("surface", ""), "reading": reading, "source_phones": phones,
+        "mora_nodes": mora_nodes, "basic_phone_nodes": basic_nodes,
+        "native_phone_templates": templates, "edges": edges,
+        "semantic_phone_nodes": semantic_phone_nodes, "frontend_phone_nodes": frontend_phone_nodes,
+        "nodes": mora_nodes + basic_nodes + frontend_phone_nodes + semantic_phone_nodes,
+        "relation_semantics": "ordered_basic_to_native_templates_no_synthetic_mora_timing",
         "provenance": {"frontend": "pyopenjtalk-plus", "adapter": SEMANTIC_VERSION},
         "source_spans": {"canonical": unit.get("canonical_span"), "original": unit.get("orig_span")},
     }
@@ -283,10 +471,16 @@ def semantic_to_japanese_mfa_v3(graph: Mapping[str, Any], inventory: Mapping[str
     else:
         phones = set(inventory)
         inventory_info = {"coverage_status": "caller_supplied_unverified", "phones": sorted(phones)}
-    result = [dict(node) for node in graph.get("semantic_phone_nodes", [])]
-    unknown = [node["phone"] for node in result if node.get("phone") not in phones]
+    templates = [dict(node) for node in graph.get("native_phone_templates", [])]
+    unknown = [node["native_phone"] for node in templates if node.get("native_phone") not in phones]
     if unknown:
         raise JAContractError("mfa_phone_unsupported", f"phones are outside Japanese MFA inventory: {unknown!r}")
+    result = [
+        {"id": node["native_phone_id"], "kind": "semantic_phone", "phone": node["native_phone"],
+         "mora_ids": list(node["mora_ids"]), "basic_phone_ids": list(node["basic_phone_ids"]),
+         "transform": node["transform"]}
+        for node in templates
+    ]
     dictionary_status = verify_dictionary_roundtrip(graph, [node["phone"] for node in result], dictionary_path)
     return {
         "schema": SEMANTIC_VERSION,
