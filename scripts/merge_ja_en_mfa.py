@@ -12,13 +12,131 @@ MERGED_ALIGNMENT_JSONL_FILENAME = "ja_en_alignment.jsonl"
 MERGE_REQUIRED_PHONE_KEYS = frozenset({"alias", "language", "phone", "start_sample", "end_sample"})
 
 try:
-    from .ja_en_schema import StageResult, atomic_write_json, make_receipt
+    from .ja_en_schema import JAContractError, StageResult, atomic_write_json, make_receipt
 except ImportError:  # pragma: no cover
-    from ja_en_schema import StageResult, atomic_write_json, make_receipt
+    from ja_en_schema import JAContractError, StageResult, atomic_write_json, make_receipt
 
 
 class MergeRejected(ValueError):
     """A raw MFA interval cannot be published on the global sample axis."""
+
+
+def _native_label(phone: Mapping[str, Any]) -> str:
+    """Return the literal native MFA label, rejecting unqualified labels."""
+    label = phone.get("native_phone")
+    if not isinstance(label, str) or not label:
+        raise JAContractError("native_basic_mapping_ambiguous", "raw MFA native label is required", "$.native_phones")
+    return label
+
+
+def _locked_aliases(alignment: Mapping[str, Any], uid: str) -> dict[tuple[str, str, str], dict[str, Any]]:
+    """Index the locked dictionary evidence by its stable composite identity."""
+    rows = alignment.get("locked_aliases")
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)) or not rows:
+        raise JAContractError("native_basic_mapping_ambiguous", "locked alias evidence is required", "$.locked_aliases")
+    indexed: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for index, source in enumerate(rows):
+        if not isinstance(source, Mapping):
+            raise JAContractError("native_basic_mapping_ambiguous", "locked alias row is invalid", f"$.locked_aliases[{index}]")
+        alias, token_id = source.get("alias"), source.get("token_id")
+        pronunciation = source.get("pronunciation")
+        if not isinstance(alias, str) or not alias or not isinstance(token_id, str) or not token_id:
+            raise JAContractError("native_basic_mapping_ambiguous", "locked alias/token identity is required", f"$.locked_aliases[{index}]")
+        if not isinstance(pronunciation, Sequence) or isinstance(pronunciation, (str, bytes)) or not pronunciation or not all(isinstance(phone, str) and phone for phone in pronunciation):
+            raise JAContractError("native_basic_mapping_ambiguous", "locked pronunciation is required", f"$.locked_aliases[{index}]")
+        key = (uid, token_id, alias)
+        if key in indexed:
+            raise JAContractError("native_basic_mapping_ambiguous", "locked alias identity is duplicated", f"$.locked_aliases[{index}]")
+        indexed[key] = {**dict(source), "pronunciation": list(pronunciation)}
+    return indexed
+
+
+def _axis_boundaries(phone: Mapping[str, Any], path: str) -> None:
+    """Require declared axes; coordinates are copied, never inferred or equated."""
+    for axis in ("source_axis", "alignment_axis", "training_axis"):
+        if phone.get(axis) is None:
+            raise JAContractError("alignment_invalid", f"{axis} evidence is required", path)
+    for boundary in ("start_sample", "end_sample"):
+        if type(phone.get(boundary)) is not int:
+            raise JAContractError("alignment_invalid", f"{boundary} must be an integer", path)
+    if phone["start_sample"] < 0 or phone["end_sample"] <= phone["start_sample"]:
+        raise JAContractError("alignment_invalid", "native interval bounds are invalid", path)
+    if phone.get("raw_interval_id") is None or not isinstance(phone.get("run_id"), str) or not phone["run_id"]:
+        raise JAContractError("alignment_invalid", "raw interval provenance is required", path)
+
+
+def bind_native_phone_graph(alignment: Mapping[str, Any], semantic_graphs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Bind raw native MFA intervals to locked semantic templates without fallbacks.
+
+    The only match key is ``(uid, token_id, alias)`` and repeated labels are
+    paired by their pronunciation occurrence.  Native labels merely validate
+    the already-selected template; they are never a search key.
+    """
+    uid = alignment.get("uid")
+    if not isinstance(uid, str) or not uid:
+        raise JAContractError("native_basic_mapping_ambiguous", "alignment UID is required", "$.uid")
+    raw_phones = alignment.get("native_phones")
+    if not isinstance(raw_phones, Sequence) or isinstance(raw_phones, (str, bytes)) or not raw_phones:
+        raise JAContractError("native_basic_mapping_ambiguous", "raw native MFA phones are required", "$.native_phones")
+    locks = _locked_aliases(alignment, uid)
+    templates: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for graph_index, graph in enumerate(semantic_graphs):
+        if not isinstance(graph, Mapping) or graph.get("uid") != uid:
+            raise JAContractError("native_basic_mapping_ambiguous", "semantic graph UID differs from alignment", f"$.semantic_graphs[{graph_index}]")
+        graph_token = graph.get("token_id")
+        for template_index, source in enumerate(graph.get("native_phone_templates") or []):
+            if not isinstance(source, Mapping):
+                raise JAContractError("native_basic_mapping_ambiguous", "semantic native template is invalid", f"$.semantic_graphs[{graph_index}].native_phone_templates[{template_index}]")
+            template = dict(source)
+            token_id = template.get("token_id") or graph_token
+            if not isinstance(token_id, str) or not token_id or (template.get("token_id") and graph_token and template["token_id"] != graph_token):
+                raise JAContractError("native_basic_mapping_ambiguous", "semantic template token identity is invalid", f"$.semantic_graphs[{graph_index}].native_phone_templates[{template_index}]")
+            alias = template.get("alias") or graph.get("alias")
+            if alias is None:
+                matching = [key[2] for key in locks if key[:2] == (uid, token_id)]
+                if len(matching) != 1:
+                    raise JAContractError("native_basic_mapping_ambiguous", "semantic template has no unique locked alias", f"$.semantic_graphs[{graph_index}].native_phone_templates[{template_index}]")
+                alias = matching[0]
+            key = (uid, token_id, alias)
+            if key not in locks or not isinstance(template.get("native_phone"), str) or not template["native_phone"]:
+                raise JAContractError("native_basic_mapping_ambiguous", "semantic template does not bind locked identity", f"$.semantic_graphs[{graph_index}].native_phone_templates[{template_index}]")
+            template["alias"] = alias
+            templates.setdefault(key, []).append(template)
+    for key, locked in locks.items():
+        candidates = templates.get(key, [])
+        if [template.get("native_phone") for template in candidates] != locked["pronunciation"]:
+            raise JAContractError("native_basic_mapping_ambiguous", "semantic templates differ from locked pronunciation", "$.semantic_graphs")
+
+    ordered = sorted((dict(phone) for phone in raw_phones), key=lambda phone: (phone.get("start_sample", -1), phone.get("end_sample", -1), str(phone.get("run_id", "")), str(phone.get("raw_interval_id", ""))))
+    occurrences: dict[tuple[str, str, str], int] = {}
+    native: list[dict[str, Any]] = []
+    for index, phone in enumerate(ordered):
+        path = f"$.native_phones[{index}]"
+        _axis_boundaries(phone, path)
+        token_id, alias = phone.get("token_id"), phone.get("alias")
+        if phone.get("uid", uid) != uid or not isinstance(token_id, str) or not token_id or not isinstance(alias, str) or not alias:
+            raise JAContractError("native_basic_mapping_ambiguous", "raw phone composite identity is invalid", path)
+        key = (uid, token_id, alias)
+        candidates = templates.get(key, [])
+        occurrence = occurrences.get(key, 0)
+        if occurrence >= len(candidates):
+            raise JAContractError("native_basic_mapping_ambiguous", "no ordered semantic template", path)
+        template = candidates[occurrence]
+        if _native_label(phone) != template["native_phone"]:
+            raise JAContractError("native_basic_mapping_ambiguous", "raw native label differs from locked template occurrence", path)
+        occurrences[key] = occurrence + 1
+        native.append({**phone, "uid": uid, "native_phone": _native_label(phone),
+                       "basic_phone_ids": list(template.get("basic_phone_ids") or []),
+                       "mora_ids": list(template.get("mora_ids") or []),
+                       "transform": template.get("transform"),
+                       "native_phone_template_id": template.get("native_phone_id"),
+                       "boundary_source": "mfa_native_interval"})
+    for key, candidates in templates.items():
+        if occurrences.get(key, 0) != len(candidates):
+            raise JAContractError("native_basic_mapping_ambiguous", "raw MFA intervals do not cover locked pronunciation", "$.native_phones")
+    raw_mfa = dict(alignment.get("raw_mfa") or {})
+    raw_mfa["phones"] = [dict(phone) for phone in ordered]
+    return {**dict(alignment), "schema": "ja-en-alignment-v3", "native_phones": native, "raw_mfa": raw_mfa}
 
 
 def _dedupe_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -200,6 +318,11 @@ def handle_merge(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
             phone = row.get("phone", row.get("native_phone"))
             if isinstance(phone, str) and not phone.startswith(("ja:", "en:")):
                 row["phone"] = namespace + phone
+            # ``phone`` is the raw MFA tier label in historical ledgers.  It
+            # may be normalised with its language namespace, but never used to
+            # select a semantic template.
+            if not row.get("native_phone") and isinstance(phone, str):
+                row["native_phone"] = phone.removeprefix(namespace)
         return rows
 
     try:
@@ -229,19 +352,30 @@ def handle_merge(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
             result = merge_with_seam_retries(japanese, english, ownership=ownership, sample_rate=int(raw.get("sample_rate", 16000)), expected_languages=expected, seam_id=str(raw.get("seam_id", "seam_0000")), initial_padding_samples=int(raw.get("initial_padding_samples", 0)), max_retries=int(raw.get("max_retries", 0)), rerun=rerun, reject_edge_touch=bool(raw.get("reject_edge_touch", True)), run_ownership=raw.get("run_ownership"))
         if result.get("status") != "VERIFIED" or not isinstance(result.get("intervals"), list):
             raise MergeRejected(str(result.get("reason", "merge rejected")))
-        payload = {
-            "schema": "ja-en-alignment-v2", "uid": str(raw.get("uid", config.get("uid", ""))),
-            "words": list(raw.get("words", [])), "phones": result["intervals"],
+        uid = str(raw.get("uid", config.get("uid", "")))
+        semantic_graphs = raw.get("semantic_graphs")
+        if not isinstance(semantic_graphs, Sequence) or isinstance(semantic_graphs, (str, bytes)):
+            semantic_graph = raw.get("semantic_graph")
+            semantic_graphs = [semantic_graph] if isinstance(semantic_graph, Mapping) else []
+        locked_aliases = raw.get("locked_aliases", raw.get("expected_units"))
+        raw_mfa = dict(raw.get("raw_mfa") or {})
+        if "runs" not in raw_mfa and isinstance(raw.get("runs"), Sequence):
+            raw_mfa["runs"] = list(raw["runs"])
+        seed = {
+            "schema": "ja-en-alignment-v2", "uid": uid,
+            "words": list(raw.get("words", [])), "native_phones": result["intervals"],
+            "locked_aliases": locked_aliases, "raw_mfa": raw_mfa,
             "languages": list(raw.get("languages", [{"language": "ja", "unit_ids": sorted({row["alias"] for row in japanese})}, {"language": "en", "unit_ids": sorted({row["alias"] for row in english})}])),
             "seams": list(raw.get("seams", [])), "retry": result.get("retries", []),
         }
+        payload = bind_native_phone_graph(seed, list(semantic_graphs))
         output = stage_dir / MERGED_ALIGNMENT_FILENAME
         output_jsonl = stage_dir / MERGED_ALIGNMENT_JSONL_FILENAME
         atomic_write_json(output, payload, workspace=stage_dir.parent.parent)
         atomic_write_json(output_jsonl, {"alignment": payload, **payload}, workspace=stage_dir.parent.parent)
-        receipt = make_receipt(stage="merge", status="COMPLETE", inputs={"uid": payload["uid"], "phone_count": len(payload["phones"])}, outputs=[output, output_jsonl], params={"implementation": "strict-integer-sample-ja-en-v2", "retry_count": len(result.get("retries", []))})
+        receipt = make_receipt(stage="merge", status="COMPLETE", inputs={"uid": payload["uid"], "phone_count": len(payload["native_phones"])}, outputs=[output, output_jsonl], params={"implementation": "strict-integer-sample-ja-en-v3", "retry_count": len(result.get("retries", []))})
     except Exception as exc:
-        receipt = make_receipt(stage="merge", status="REJECTED", params={"implementation": "strict-integer-sample-ja-en-v2"}, errors=[{"code": "seam_rejected", "message": str(exc)}])
+        receipt = make_receipt(stage="merge", status="REJECTED", params={"implementation": "strict-integer-sample-ja-en-v3"}, errors=[{"code": "seam_rejected", "message": str(exc)}])
     atomic_write_json(receipt_path, receipt, workspace=stage_dir.parent.parent)
     return StageResult(stage="merge", status=receipt["status"], receipt_path=str(receipt_path))
 
@@ -251,6 +385,6 @@ def register_stages(registrar: Callable[..., Any]) -> None:
 
 
 __all__ = [
-    "MergeRejected", "handle_merge", "merge_global_sample_axis", "merge_with_seam_retries",
+    "MergeRejected", "bind_native_phone_graph", "handle_merge", "merge_global_sample_axis", "merge_with_seam_retries",
     "register_stages", "retry_seam_both_sides", "MERGED_ALIGNMENT_FILENAME", "MERGED_ALIGNMENT_JSONL_FILENAME", "MERGE_REQUIRED_PHONE_KEYS",
 ]

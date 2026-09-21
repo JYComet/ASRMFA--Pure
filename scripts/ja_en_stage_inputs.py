@@ -239,11 +239,11 @@ def _load_manifest(config: Mapping[str, Any], root: Path) -> list[dict[str, Any]
                 unit.setdefault("text", unit.get("caller_surface") or unit.get("surface") or "")
                 unit.setdefault("char_span", unit.get("canonical_span"))
             merged["lexical_units"] = units
-        graphs = [source for source in semantic_rows if source.get("schema") == "ja-semantic-phone-graph-v1"]
+        graphs = [source for source in semantic_rows if source.get("schema") in {"ja-semantic-phone-graph-v1", "ja-semantic-phone-graph-v2"}]
         if graphs:
             merged["semantic_graphs"] = graphs
         for source in semantic_rows:
-            if source.get("schema") == "ja-semantic-phone-graph-v1":
+            if source.get("schema") in {"ja-semantic-phone-graph-v1", "ja-semantic-phone-graph-v2"}:
                 merged.setdefault("semantic_graph", source)
         if alias_rows:
             merged["alias_rows"] = alias_rows
@@ -382,6 +382,7 @@ def _prepare_anchor_requests_impl(config: Mapping[str, Any], workspace: str | os
             "qwen": {"model": str(model), "device": qwen.get("device", "cpu"), "dtype": qwen.get("dtype", "float32")},
             "source_receipt": row.get("source_receipt") or row.get("asr_receipt"),
             "frontend": dict(row.get("frontend") or {}), "semantic_graph": row.get("semantic_graph"),
+            "semantic_graphs": list(row.get("semantic_graphs") or []),
             "speaker": row.get("speaker"),
         }
         request["request_digest"] = hashlib.sha256(canonical_json(request)).hexdigest()
@@ -450,7 +451,7 @@ def _runs(anchor: Mapping[str, Any], root: Path, config: Mapping[str, Any]) -> l
         directory = _output(root, "stages", "align", "requests", uid)
         crop_path = directory / f"{index:04d}-{language}.wav"
         crop = _crop_wav(audio_path, crop_path, context_start, context_end)
-        aliases = [{"alias": unit["alias"], "unit_id": unit["unit_id"],
+        aliases = [{"alias": unit["alias"], "unit_id": unit["unit_id"], "token_id": unit.get("token_id", unit["unit_id"]),
                     "language": language, "pronunciation": list(unit["pronunciation"])} for unit in group]
         lab_path = directory / f"{index:04d}-{language}.lab"
         dict_path = directory / f"{index:04d}-{language}.dict"
@@ -508,6 +509,7 @@ def _prepare_alignment_requests_impl(config: Mapping[str, Any], workspace: str |
                    "route": normalized["route"], "runs": runs,
                    "reading_lock": dict(normalized["reading_lock"]), "source_receipt": normalized.get("source_receipt"),
                    "frontend": dict(normalized.get("frontend") or source_row.get("frontend") or {}), "semantic_graph": normalized.get("semantic_graph") or source_row.get("semantic_graph"),
+                   "semantic_graphs": list(normalized.get("semantic_graphs") or source_row.get("semantic_graphs") or []),
                    "qwen": dict(normalized.get("qwen") or {})}
         _write(root, f"stages/align/requests/{uid}.json", request)
         result.append(request)
@@ -556,7 +558,7 @@ def _prepare_merge_requests_impl(config: Mapping[str, Any], workspace: str | os.
                                  "expected_aliases": [a["alias"] for a in run_aliases]}
         if len({a["alias"] for a in aliases}) != len(aliases):
             _fail("dictionary_roundtrip_failed", "occurrence aliases must be globally unique per UID", f"$.{uid}.aliases")
-        expected_units = [{"alias": a["alias"], "unit_id": a.get("unit_id"), "language": a["language"],
+        expected_units = [{"alias": a["alias"], "unit_id": a.get("unit_id"), "token_id": a.get("token_id"), "language": a["language"],
                            "pronunciation": list(a["pronunciation"])} for a in aliases]
         rerun = {"kind": "two_sided_context_rerun_v1", "initial_padding_samples": initial_padding,
                  "left": {"run_ids": [str(runs[0]["run_id"])], "padding_samples": initial_padding * 2},
@@ -564,7 +566,7 @@ def _prepare_merge_requests_impl(config: Mapping[str, Any], workspace: str | os.
                  "max_attempts": 2, "ownership": ownership}
         merge = {"schema": MERGE_REQUEST_SCHEMA, "uid": uid,
                  "expected_languages": expected_languages, "expected_aliases": [a["alias"] for a in aliases],
-                 "expected_units": expected_units, "ownership": ownership,
+                 "expected_units": expected_units, "locked_aliases": expected_units, "ownership": ownership,
                  "seams": list(request.get("seams") or []), "raw_ledger": raw_ledger,
                  "native_inventory": inventory, "runs": list(runs),
                  "source_receipt": request.get("source_receipt") or request.get("audio_receipt"),
@@ -572,7 +574,7 @@ def _prepare_merge_requests_impl(config: Mapping[str, Any], workspace: str | os.
                  "rerun_plan": rerun, "initial_padding_samples": initial_padding,
                  "audio_receipt": request.get("audio_receipt"),
                  "route": request.get("route"), "frontend": request.get("frontend"),
-                 "semantic_graph": request.get("semantic_graph"), "qwen": request.get("qwen")}
+                 "semantic_graph": request.get("semantic_graph"), "semantic_graphs": list(request.get("semantic_graphs") or []), "qwen": request.get("qwen")}
         _write(root, f"stages/merge/requests/{uid}.json", merge)
         result.append(merge)
     _write(root, "stages/merge/requests.json", {"schema": MERGE_REQUEST_SCHEMA, "uids": [r["uid"] for r in result]})
@@ -631,19 +633,19 @@ def prepare_merge_requests(config: Mapping[str, Any], workspace: str | os.PathLi
 
 
 def _validate_phone_identity(alignment: Mapping[str, Any], uid: str, aliases: set[str]) -> None:
-    phones = alignment.get("phones")
+    phones = alignment.get("native_phones")
     if not isinstance(phones, Sequence) or not phones:
-        _fail("publish_blocked", "verified phones are required", f"$.{uid}.phones")
+        _fail("publish_blocked", "verified native phones are required", f"$.{uid}.native_phones")
     seen: set[str] = set()
     for index, phone in enumerate(phones):
         if not isinstance(phone, Mapping) or phone.get("uid", uid) != uid:
-            _fail("publish_blocked", "phone crosses UID boundary", f"$.{uid}.phones[{index}]")
+            _fail("publish_blocked", "phone crosses UID boundary", f"$.{uid}.native_phones[{index}]")
         alias = phone.get("alias")
         if alias not in aliases:
-            _fail("publish_blocked", "phone alias was not frozen upstream", f"$.{uid}.phones[{index}]")
+            _fail("publish_blocked", "phone alias was not frozen upstream", f"$.{uid}.native_phones[{index}]")
         phone_id = str(phone.get("phone_id") or "")
         if not phone_id or phone_id in seen:
-            _fail("publish_blocked", "phone IDs must be unique and namespaced", f"$.{uid}.phones[{index}]")
+            _fail("publish_blocked", "phone IDs must be unique and namespaced", f"$.{uid}.native_phones[{index}]")
         seen.add(phone_id)
 
 
@@ -768,27 +770,18 @@ def _enrich_merged_alignment(config: Mapping[str, Any], root: Path, alignment: M
         enriched["selected_reading"] = enriched["reading_evidence"]["selected_reading"]
         enriched["selected_readings"] = selected
     enriched.setdefault("mora_graph", _mora_graph(manifest_row, uid))
-    # Resolve semantic phone nodes to the actual merged phone IDs by ordered
-    # token occurrence.  IDs from the frontend graph are never copied into the
-    # final record without a UID/token namespace.
-    source_graphs = list(manifest_row.get("semantic_graphs") or [])
-    if not source_graphs and isinstance(manifest_row.get("semantic_graph"), Mapping):
-        source_graphs = [manifest_row["semantic_graph"]]
-    actual_phones = list(enriched.get("phones") or [])
-    if source_graphs and actual_phones:
+    # MFA-native rows are already bound to semantic templates by the merge
+    # stage.  Reconstruct relations from those bound IDs only; a semantic node
+    # may never acquire a timing interval through list position or label.
+    actual_phones = list(enriched.get("native_phones") or [])
+    if actual_phones:
         relations: list[dict[str, Any]] = []
-        for source_graph in source_graphs:
-            token_id = str(source_graph.get("token_id") or "")
-            candidates = [phone for phone in actual_phones if str(phone.get("unit_id")) == token_id]
-            if not candidates:
-                candidates = actual_phones
-            for index, node in enumerate(source_graph.get("semantic_phone_nodes") or []):
-                if index >= len(candidates):
-                    break
-                phone = candidates[index]
-                for mora_id in node.get("mora_ids", []):
-                    relations.append({"mora_id": f"{uid}:{token_id or phone.get('unit_id')}:{mora_id}",
-                                      "phone_id": phone.get("phone_id")})
+        for phone in actual_phones:
+            token_id = phone.get("token_id")
+            if not isinstance(token_id, str) or not token_id:
+                _fail("native_basic_mapping_ambiguous", "bound native phone token identity is required", f"$.{uid}.native_phones")
+            for mora_id in phone.get("mora_ids", []):
+                relations.append({"mora_id": f"{uid}:{token_id}:{mora_id}", "phone_id": phone.get("phone_id")})
         graph = dict(enriched["mora_graph"])
         graph["relations"] = relations
         enriched["mora_graph"] = graph
@@ -825,7 +818,7 @@ def _enrich_merged_alignment(config: Mapping[str, Any], root: Path, alignment: M
     # phones to pass, so compare the ordered sequences exactly.
     semantic_aliases = {str(row.get("alias")): row for row in manifest_row.get("alias_rows", []) if isinstance(row, Mapping) and row.get("alias")}
     observed = {}
-    for phone in enriched.get("phones", []):
+    for phone in enriched.get("native_phones", []):
         if isinstance(phone, Mapping) and phone.get("alias"):
             observed.setdefault(str(phone["alias"]), []).append(str(phone.get("native_phone") or phone.get("phone")))
     for alias_row in enriched.get("locked_aliases", []):

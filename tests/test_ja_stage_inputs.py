@@ -117,6 +117,26 @@ def test_merge_expected_aliases_and_serializable_two_sided_retry(tmp_path: Path)
     assert mixed["expected_units"]
 
 
+def test_merge_request_preserves_locked_token_alias_and_all_semantic_graphs(tmp_path: Path):
+    graph = {
+        "schema": "ja-semantic-phone-graph-v2", "uid": "u1", "token_id": "tok-1",
+        "native_phone_templates": [{"native_phone_id": "np0", "native_phone": "a",
+                                    "token_id": "tok-1", "basic_phone_ids": ["bp0"],
+                                    "mora_ids": ["m0"], "transform": "identity"}],
+    }
+    request = {
+        "uid": "u1", "runs": [{"run_id": "ja-run", "language": "ja",
+            "ownership_start_sample": 0, "ownership_end_sample": 100,
+            "aliases": [{"alias": "ju_000001", "unit_id": "unit-1", "token_id": "tok-1",
+                         "language": "ja", "pronunciation": ["a"]}]}],
+        "semantic_graphs": [graph],
+    }
+    merge = prepare_merge_requests({"merge": {"initial_padding_ms": 40}}, tmp_path, [request])[0]
+    assert merge["locked_aliases"] == [{"alias": "ju_000001", "unit_id": "unit-1", "token_id": "tok-1",
+                                         "language": "ja", "pronunciation": ["a"]}]
+    assert merge["semantic_graphs"] == [graph]
+
+
 def _merged_row(tmp_path: Path, uid: str = "u-ja") -> dict:
     wav_path = _wav(tmp_path / f"{uid}-merged.wav", 3200)
     alias = "ju_000001"
@@ -131,10 +151,12 @@ def _merged_row(tmp_path: Path, uid: str = "u-ja") -> dict:
     receipt = {"schema": "audio-transform-receipt-v2", "uid": uid, "source": audio,
                "train": audio, "alignment": audio,
                "sample_transform": {"kind": "identity", "source_rate": 16000, "target_rate": 16000}}
-    return {"schema": "ja-en-alignment-v2", "uid": uid,
+    return {"schema": "ja-en-alignment-v3", "uid": uid,
             "words": [{"unit_id": f"{uid}:unit_0000", "alias": alias, "text": "東京",
                         "language": "ja", "start_sample": 0, "end_sample": 1000}],
-            "phones": [phone], "languages": ["ja"], "durations": [200],
+            # ``phones`` remains only as the legacy TTS-v1 adapter input; the
+            # production identity validator consumes native_phones.
+            "phones": [phone], "native_phones": [dict(phone, token_id=f"{uid}:unit_0000")], "languages": ["ja"], "durations": [200],
             "locked_aliases": [{"alias": alias, "unit_id": f"{uid}:unit_0000", "language": "ja", "pronunciation": ["t"]}],
             "native_inventory": {"language": "ja", "phones": ["t"], "source": "fixture"},
             "raw_mfa": {"runs": [{"run_id": "ja-run", "raw_textgrid": phone["raw_artifact"]}]},
@@ -160,12 +182,12 @@ def test_authoritative_tts_assembly_rejects_missing_tampered_and_cross_uid(tmp_p
     assert rows[0]["reading_evidence"]["selected_reading"] == "東京"
 
     bad = dict(row)
-    bad["phones"] = []
+    bad["native_phones"] = []
     with pytest.raises((JAContractError, ValueError)):
         assemble_tts_rows(config, tmp_path, [bad])
 
     bad_uid = dict(row)
-    bad_uid["phones"] = [dict(row["phones"][0], uid="other")]
+    bad_uid["native_phones"] = [dict(row["native_phones"][0], uid="other")]
     with pytest.raises((JAContractError, ValueError)):
         assemble_tts_rows(config, tmp_path, [bad_uid])
 
