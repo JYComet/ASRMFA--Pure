@@ -52,12 +52,21 @@ def test_tts_stage_consumes_authoritative_alignment_and_declares_real_outputs(tm
     alignment = _alignment()
     alignment.update({"uid": "stage-1", "selected_reading": "さくら", "locked_aliases": [{"alias": "ju_000000", "pronunciation": ["s", "a"]}], "native_inventory": {"ja": ["s", "a"], "en": []}, "raw_mfa": {"textgrid_path": str(tmp_path / "stage" / "stage-1.TextGrid"), "phones": [{"phone_id": "p0", "raw_interval_id": 1, "unit_id": "w0"}, {"phone_id": "p1", "raw_interval_id": 2, "unit_id": "w0"}]}, "reading_evidence": {"selected_reading": "さくら", "status": "manual_verified"}, "partition": {"verified": ["stage-1"], "rejected": [], "unresolved": []}, "train_wav": str(train), "alignment_wav": str(alignment_wav)})
     alignment["audio_receipt"] = make_audio_receipt("stage-1", train, train, alignment_wav, alignment_transform={"method": "identity_fixture_v1", "source_start": 0, "source_end": 16000, "output_start": 0, "output_frames": 16000})
+    alignment["schema"] = "ja-prosody-alignment-v1"
+    alignment["native_phones"] = alignment.pop("phones")
     source = tmp_path / "alignment.jsonl"; source.write_text(json.dumps(alignment) + "\n", encoding="utf-8")
     stage = tmp_path / "stage"; stage.mkdir()
-    result = handle_tts({"tts": {"alignment_jsonl": str(source)}}, stage)
+    result = handle_tts({"tts": {"alignment_jsonl": str(source)}, "stage_inputs": {"tts": {"alignment_jsonl": str(source)}}}, stage)
     assert result.status == "COMPLETE"
     receipt = json.loads((stage / "receipt.json").read_text())
     assert {Path(row["path"]).name for row in receipt["outputs"]} == {"tts_training_records.jsonl", "stage-1.TextGrid"}
+
+
+def test_tts_stage_rejects_merge_v3_on_production_path(tmp_path: Path):
+    source = tmp_path / "merge.jsonl"
+    source.write_text('{"schema":"ja-en-alignment-v3"}\n', encoding="utf-8")
+    stage = tmp_path / "stage"; stage.mkdir()
+    assert handle_tts({"tts": {"alignment_jsonl": str(source)}, "stage_inputs": {"tts": {}}}, stage).status == "REJECTED"
 
 
 def test_export_rejects_missing_authoritative_alias_and_audio_receipts(tmp_path: Path):

@@ -94,3 +94,11 @@ fixture path remains until Task 7 migrates the exporter contract.
 - Finding 5: `test_resume_compatibility_rejects_stage_order_drift` went RED then GREEN; immutable compatibility now contains exact ordered `production_stages` while mutable resources remain cache-scoped.
 - Focused: `pytest -q tests/test_ja_stage_inputs.py tests/test_ja_resume_identity.py tests/test_ja_tts_export.py` — 21 passed. `compileall` and `git diff --check` passed.
 - Full: `pytest -q` — 1677 passed, 37 skipped, 1 known Task 8 verifier-fixture failure in 32.70s.
+
+## Fix Round 3/5
+
+- A: `test_two_token_producer_local_ids_are_namespaced_with_resolving_refs` checks colliding producer-local mora/basic/template IDs and rewritten phone references.
+- B: token-scoped reading/frontend digest checks remain fail-closed; ambiguous occurrence hardening remains a follow-up concern.
+- C: `test_tts_stage_consumes_authoritative_alignment_and_declares_real_outputs` exercises a prosody-v1 row through production `stage_inputs`; `test_tts_stage_rejects_merge_v3_on_production_path` rejects merge-v3.
+- D: stage cache removes complete `config_digest` before stage-scoped resource calculation; compatibility pins ordered production stages.
+- Focused: 23 passed; compile/diff passed. Full: 1679 passed, 37 skipped, 1 identical known Task 8 verifier fixture failure in 32.55s.

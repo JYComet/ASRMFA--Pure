@@ -329,6 +329,10 @@ def handle_tts(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
             # standalone legacy helper usable for Task 7's fixture migration.
             if isinstance(config.get("stage_inputs"), Mapping) and alignment.get("schema") != "ja-prosody-alignment-v1":
                 raise ValueError("TTS requires ja-prosody-alignment-v1 input")
+            if alignment.get("schema") == "ja-prosody-alignment-v1":
+                # Transitional v1 exporter adapter: consume only authoritative
+                # native rows; do not consult a legacy `phones` field.
+                alignment = {**alignment, "phones": list(alignment.get("native_phones", []))}
             train_wav = row.get("train_wav") or alignment.get("train_wav")
             alignment_wav = row.get("alignment_wav") or alignment.get("alignment_wav")
             if not train_wav or not alignment_wav:

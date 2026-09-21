@@ -9,6 +9,7 @@ import pytest
 
 from scripts.ja_en_schema import JAContractError, artifact_record
 from scripts.ja_en_stage_inputs import (
+    _namespace_graph,
     assemble_prosody_rows,
     assemble_tts_rows,
     prepare_alignment_requests,
@@ -318,3 +319,22 @@ def test_prosody_aggregate_unions_expected_and_blocked_merge_uid_ledger(tmp_path
     assert ledger["expected_uids"] == ["blocked", "good"]
     assert ledger["blocked_uids"] == ["blocked"]
     assert ledger["errors"][0]["uid"] == "blocked"
+
+
+def test_two_token_producer_local_ids_are_namespaced_with_resolving_refs():
+    base = _prosody_graph("u")
+    other = _prosody_graph("u")
+    other["token_id"] = "tok-2"
+    for row in other["native_phone_templates"]:
+        row.update(token_id="tok-2", alias="ju-2")
+    phones = [{"phone_id": "p", "native_phone_template_id": "np-1", "mora_ids": ["m-1"], "basic_phone_ids": ["bp-1"]}]
+    first, first_phones = _namespace_graph("u", base, phones)
+    second, second_phones = _namespace_graph("u", other, phones)
+    mora_ids = {row["mora_id"] for row in first["mora_nodes"] + second["mora_nodes"]}
+    basic_ids = {row["basic_phone_id"] for row in first["basic_phone_nodes"] + second["basic_phone_nodes"]}
+    template_ids = {row["native_phone_id"] for row in first["native_phone_templates"] + second["native_phone_templates"]}
+    assert len(mora_ids) == 4 and len(basic_ids) == 4 and len(template_ids) == 4
+    for phone in first_phones + second_phones:
+        assert set(phone["mora_ids"]) <= mora_ids
+        assert set(phone["basic_phone_ids"]) <= basic_ids
+        assert phone["native_phone_template_id"] in template_ids

@@ -521,6 +521,9 @@ def _stage_cache_identity(stage: str, identity: Mapping[str, Any], config: Mappi
         if reading_receipt is not None:
             upstream["reading_locked_reconstruction"] = stable_digest(reading_receipt)
     scoped_identity = copy.deepcopy(dict(identity))
+    # `config_digest` is the complete mutable configuration digest.  Including
+    # it here defeats the per-stage resource scoping below.
+    scoped_identity.pop("config_digest", None)
     stage_index = PRODUCTION_STAGES.index(stage) if stage in PRODUCTION_STAGES else len(PRODUCTION_STAGES)
     if stage_index < PRODUCTION_STAGES.index("align"):
         if isinstance(scoped_identity.get("config"), Mapping):
