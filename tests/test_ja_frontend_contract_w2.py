@@ -141,6 +141,17 @@ def test_accent_evidence_reopens_sources_and_binds_provider_identity():
     assert changed["provider_evidence_sha256"] != evidence["provider_evidence_sha256"]
 
 
+def test_live_rule_frontend_binds_unverified_build_to_actual_installed_bytes():
+    contract = run_frontend("さくら", _config())
+    identity = contract["contextual_accent_evidence"]["provider_identity"]
+    files = identity["installed_distribution_files"]
+    assert identity["build_provenance"] == {"status": "unverified"}
+    assert files and files == sorted(files, key=lambda row: (row["path"], row["size"], row["sha256"]))
+    assert identity["installed_distribution_digest"] == stable_digest(files)
+    assert identity["model_identity"]["mode"] == "rule_based"
+    assert identity["model_identity"]["installed_distribution_digest"] == identity["installed_distribution_digest"]
+
+
 @pytest.mark.parametrize("tamper", [
     lambda evidence: evidence["provider_identity"].update({"provider_revision": "tampered"}),
     lambda evidence: evidence["full_context_labels"].__setitem__(0, "tampered"),
@@ -166,9 +177,23 @@ def test_self_consistent_unit_evidence_from_another_contract_is_invalidated():
     assert checked["units"][0]["accent_evidence_invalid_reason"] == "accent_evidence_digest_mismatch"
 
 
-def test_accent_model_identity_is_exact_and_binds_build_and_options():
+def _provider_identity_info(*, build_provenance=None):
+    return {
+        "provider": "pyopenjtalk-plus",
+        "version": "pinned-revision",
+        "build_provenance": build_provenance or {"status": "unverified"},
+        # Deliberately unsorted: the identity must be independent of bridge
+        # enumeration order while still binding the installed bytes.
+        "distribution_files": [
+            {"path": "/site/b.py", "size": 2, "sha256": "b" * 64},
+            {"path": "/site/a.py", "size": 1, "sha256": "a" * 64},
+        ],
+    }
+
+
+def test_accent_model_identity_is_exact_and_binds_build_options_and_installed_bytes():
     settings = FrontendConfig.from_mapping(_config())
-    provider_info = {"provider": "pyopenjtalk-plus", "version": "pinned-revision", "build_provenance": {"status": "verified", "receipt_sha256": "build-a"}}
+    provider_info = _provider_identity_info(build_provenance={"status": "unverified"})
     identity = _accent_provider_identity(settings, provider_info)
     model = identity["model_identity"]
     assert model["mode"] == "rule_based"
@@ -176,17 +201,105 @@ def test_accent_model_identity_is_exact_and_binds_build_and_options():
     assert model["frontend_commit"] == settings.commit
     assert model["build_provenance_digest"] == stable_digest(provider_info["build_provenance"])
     assert model["options_digest"] == stable_digest(dict(settings.options))
+    expected_files = sorted(provider_info["distribution_files"], key=lambda row: row["path"])
+    assert identity["installed_distribution_files"] == expected_files
+    assert identity["installed_distribution_digest"] == stable_digest(expected_files)
+    assert model["installed_distribution_digest"] == identity["installed_distribution_digest"]
     changed_build = _accent_provider_identity(settings, {**provider_info, "build_provenance": {"status": "verified", "receipt_sha256": "build-b"}})
     changed_options = _accent_provider_identity(FrontendConfig.from_mapping({**_config(), "normalize_mode": "NFC"}), provider_info)
+    changed_files = _accent_provider_identity(settings, {**provider_info, "distribution_files": [{"path": "/site/a.py", "size": 1, "sha256": "c" * 64}]})
     assert changed_build["model_identity"]["build_provenance_digest"] != model["build_provenance_digest"]
     assert changed_options["model_identity"]["options_digest"] != model["options_digest"]
+    assert changed_files["model_identity"]["installed_distribution_digest"] != model["installed_distribution_digest"]
+
+
+@pytest.mark.parametrize("distribution_files", [None, [], [{"path": "/site/a.py", "size": 1, "sha256": "not-a-sha"}]])
+def test_accent_model_identity_requires_actual_installed_distribution_bytes(distribution_files):
+    provider_info = _provider_identity_info()
+    provider_info["distribution_files"] = distribution_files
+    with pytest.raises(JAContractError) as exc:
+        _accent_provider_identity(FrontendConfig.from_mapping(_config()), provider_info)
+    assert exc.value.code == "frontend_capability_missing"
 
 
 def test_learned_accent_requires_reopenable_model_identity():
     settings = FrontendConfig.from_mapping({**_config(), "run_marine": True})
     with pytest.raises(JAContractError) as exc:
-        _accent_provider_identity(settings, {"provider": "pyopenjtalk-plus", "version": "pinned", "build_provenance": {"status": "verified"}})
+        _accent_provider_identity(settings, _provider_identity_info())
     assert exc.value.code == "frontend_capability_missing"
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda feature: feature.pop("model_name"),
+    lambda feature: feature.pop("model_revision"),
+    lambda feature: feature.update({"artifact_sha256": "not-a-sha"}),
+])
+def test_learned_accent_requires_complete_feature_asset_identity(mutation):
+    settings = FrontendConfig.from_mapping({**_config(), "run_marine": True})
+    provider_info = _provider_identity_info()
+    feature = {
+        "model_name": "marine",
+        "model_revision": "marine-2026-09-21",
+        "artifact_sha256": "c" * 64,
+        "provider_revision": provider_info["version"],
+        "frontend_commit": settings.commit,
+        "build_provenance_digest": stable_digest(provider_info["build_provenance"]),
+        "options_digest": stable_digest(dict(settings.options)),
+        "installed_distribution_digest": stable_digest(sorted(provider_info["distribution_files"], key=lambda row: row["path"])),
+    }
+    mutation(feature)
+    provider_info["learned_model_identities"] = {"run_marine": feature}
+    with pytest.raises(JAContractError) as exc:
+        _accent_provider_identity(settings, provider_info)
+    assert exc.value.code == "frontend_capability_missing"
+
+
+@pytest.mark.parametrize("key, value", [
+    ("provider_revision", "other-provider"),
+    ("frontend_commit", "other-commit"),
+    ("build_provenance_digest", "0" * 64),
+    ("options_digest", "1" * 64),
+    ("installed_distribution_digest", "2" * 64),
+])
+def test_learned_accent_requires_feature_identity_to_match_actual_provider(key, value):
+    settings = FrontendConfig.from_mapping({**_config(), "run_marine": True})
+    provider_info = _provider_identity_info()
+    feature = {
+        "model_name": "marine",
+        "model_revision": "marine-2026-09-21",
+        "artifact_sha256": "c" * 64,
+        "provider_revision": provider_info["version"],
+        "frontend_commit": settings.commit,
+        "build_provenance_digest": stable_digest(provider_info["build_provenance"]),
+        "options_digest": stable_digest(dict(settings.options)),
+        "installed_distribution_digest": stable_digest(sorted(provider_info["distribution_files"], key=lambda row: row["path"])),
+    }
+    feature[key] = value
+    provider_info["learned_model_identities"] = {"run_marine": feature}
+    with pytest.raises(JAContractError) as exc:
+        _accent_provider_identity(settings, provider_info)
+    assert exc.value.code == "frontend_capability_missing"
+
+
+def test_learned_accent_binds_complete_per_feature_model_assets():
+    settings = FrontendConfig.from_mapping({**_config(), "run_marine": True, "use_tsqyomi": True})
+    provider_info = _provider_identity_info()
+    common = {
+        "provider_revision": provider_info["version"],
+        "frontend_commit": settings.commit,
+        "build_provenance_digest": stable_digest(provider_info["build_provenance"]),
+        "options_digest": stable_digest(dict(settings.options)),
+        "installed_distribution_digest": stable_digest(sorted(provider_info["distribution_files"], key=lambda row: row["path"])),
+    }
+    provider_info["learned_model_identities"] = {
+        "run_marine": {**common, "model_name": "marine", "model_revision": "marine-2026-09-21", "artifact_sha256": "c" * 64},
+        "use_tsqyomi": {**common, "model_name": "tsqyomi", "checkpoint": "tsqyomi-2026-09-21", "artifact_sha256": "d" * 64},
+    }
+    identity = _accent_provider_identity(settings, provider_info)
+    model = identity["model_identity"]
+    assert model["mode"] == "learned"
+    assert model["enabled_features"] == ["run_marine", "use_tsqyomi"]
+    assert model["feature_assets"] == provider_info["learned_model_identities"]
 
 
 def test_label_cardinality_mismatch_is_rejected_without_guessing():

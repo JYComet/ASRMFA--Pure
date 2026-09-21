@@ -150,6 +150,7 @@ try:
             distribution_files.append({"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "size": path.stat().st_size})
 except Exception:
     distribution_files = []
+distribution_files.sort(key=lambda row: (row["path"], row["size"], row["sha256"]))
 if request.get("op") == "probe":
     print(json.dumps({"provider": "pyopenjtalk-plus", "distributions": dists, "version": md.version("pyopenjtalk-plus"), "module": pyopenjtalk.__file__, "capabilities": capabilities, "distribution_files": distribution_files}, ensure_ascii=False))
     raise SystemExit(0)
@@ -675,33 +676,84 @@ def _candidate_unit(row: Mapping[str, Any], index: int, layer: Mapping[str, Any]
     }
 
 
+def _normalized_distribution_files(provider_info: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return the exact, canonicalized installed provider file records.
+
+    A build receipt is useful provenance, but it cannot identify an installed
+    frontend by itself.  These records are collected inside the pinned bridge
+    process and bind this evidence to its currently installed package bytes.
+    """
+    raw_files = provider_info.get("distribution_files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise JAContractError("frontend_capability_missing", "frontend accent identity lacks installed distribution file hashes")
+    normalized: list[dict[str, Any]] = []
+    for index, row in enumerate(raw_files):
+        if not isinstance(row, Mapping):
+            raise JAContractError("frontend_capability_missing", "frontend distribution file record is malformed", f"$.distribution_files[{index}]")
+        path = row.get("path")
+        size = row.get("size")
+        digest = row.get("sha256")
+        if (not isinstance(path, str) or not path or type(size) is not int or size < 0
+                or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest)):
+            raise JAContractError("frontend_capability_missing", "frontend distribution file record is malformed", f"$.distribution_files[{index}]")
+        normalized.append({"path": path, "size": size, "sha256": digest.lower()})
+    normalized.sort(key=lambda row: (row["path"], row["size"], row["sha256"]))
+    if len({row["path"] for row in normalized}) != len(normalized):
+        raise JAContractError("frontend_capability_missing", "frontend distribution file records have duplicate paths")
+    return normalized
+
+
 def _accent_provider_identity(settings: FrontendConfig, provider_info: Mapping[str, Any]) -> dict[str, Any]:
     options = dict(settings.options)
     enabled_features = [name for name in ("run_marine", "use_tsqyomi", "predict_nani") if options[name]]
     provider_revision = provider_info.get("version")
     build_provenance = provider_info.get("build_provenance")
-    if not isinstance(provider_revision, str) or not provider_revision or not isinstance(build_provenance, Mapping):
+    if (not isinstance(provider_revision, str) or not provider_revision
+            or not isinstance(build_provenance, Mapping)
+            or build_provenance.get("status") not in {"verified", "unverified"}):
         raise JAContractError("frontend_capability_missing", "frontend accent identity lacks provider revision/build provenance")
+    installed_distribution_files = _normalized_distribution_files(provider_info)
+    installed_distribution_digest = stable_digest(installed_distribution_files)
     common_identity = {
         "provider_revision": provider_revision,
         "frontend_commit": settings.commit,
         "build_provenance_digest": stable_digest(build_provenance),
         "options_digest": stable_digest(options),
+        "installed_distribution_digest": installed_distribution_digest,
     }
     if enabled_features:
-        learned_identity = provider_info.get("learned_model_identity")
-        if not isinstance(learned_identity, Mapping) or any(
-            not isinstance(learned_identity.get(key), str) or not learned_identity[key]
-            for key in ("provider_revision", "build_provenance_digest", "options_digest")
-        ):
+        learned_identities = provider_info.get("learned_model_identities")
+        if not isinstance(learned_identities, Mapping):
             raise JAContractError("frontend_capability_missing", "enabled learned frontend behavior lacks reopenable model identity")
+        feature_assets: dict[str, dict[str, Any]] = {}
+        for feature_name in enabled_features:
+            asset = learned_identities.get(feature_name)
+            if not isinstance(asset, Mapping):
+                raise JAContractError("frontend_capability_missing", f"enabled learned feature {feature_name} lacks model asset identity")
+            model_name = asset.get("model_name")
+            model_revision = asset.get("model_revision")
+            checkpoint = asset.get("checkpoint")
+            artifact_sha256 = asset.get("artifact_sha256")
+            if (not isinstance(model_name, str) or not model_name
+                    or not (isinstance(model_revision, str) and model_revision
+                            or isinstance(checkpoint, str) and checkpoint)
+                    or not isinstance(artifact_sha256, str)
+                    or not re.fullmatch(r"[0-9a-fA-F]{64}", artifact_sha256)):
+                raise JAContractError("frontend_capability_missing", f"enabled learned feature {feature_name} has incomplete model asset identity")
+            if any(asset.get(key) != value for key, value in common_identity.items()):
+                raise JAContractError("frontend_capability_missing", f"enabled learned feature {feature_name} identity disagrees with installed frontend")
+            feature_assets[feature_name] = {
+                "model_name": model_name,
+                **({"model_revision": model_revision} if isinstance(model_revision, str) and model_revision else {}),
+                **({"checkpoint": checkpoint} if isinstance(checkpoint, str) and checkpoint else {}),
+                "artifact_sha256": artifact_sha256.lower(),
+                **common_identity,
+            }
         model_identity = {
             "mode": "learned",
             "enabled_features": enabled_features,
-            "provider_revision": learned_identity["provider_revision"],
-            "build_provenance_digest": learned_identity["build_provenance_digest"],
-            "options_digest": learned_identity["options_digest"],
-            "frontend_commit": learned_identity.get("frontend_commit", settings.commit),
+            **common_identity,
+            "feature_assets": feature_assets,
         }
     else:
         model_identity = {"mode": "rule_based", **common_identity}
@@ -713,6 +765,8 @@ def _accent_provider_identity(settings: FrontendConfig, provider_info: Mapping[s
         "options_digest": stable_digest(options),
         "build_provenance": dict(build_provenance),
         "build_provenance_digest": stable_digest(build_provenance),
+        "installed_distribution_files": installed_distribution_files,
+        "installed_distribution_digest": installed_distribution_digest,
         "model_identity": model_identity,
     }
 
@@ -724,8 +778,10 @@ def run_frontend(caller_text: str, config: Mapping[str, Any] | FrontendConfig | 
         probe = probe_provider(settings)
         bridge = _run_bridge(settings.runtime_python, {"op": "mapping", "text": layer["canonical_text"], "options": {**settings.options, "normalize_mode": "None"}})
         rows = bridge.get("rows", [])
-        provider_info = {key: bridge.get(key) for key in ("provider", "version", "module", "distributions", "capabilities")}
+        provider_info = {key: bridge.get(key) for key in ("provider", "version", "module", "distributions", "capabilities", "distribution_files")}
         provider_info["build_provenance"] = probe.get("build_provenance")
+        if _normalized_distribution_files(provider_info) != _normalized_distribution_files(probe):
+            raise JAContractError("frontend_representation_drift", "probe and mapping bridge installed distribution files differ")
         accent_evidence = extract_contextual_accent_evidence(
             bridge.get("njd_rows", []), bridge.get("full_context_labels", []),
             _accent_provider_identity(settings, provider_info),
