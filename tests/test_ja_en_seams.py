@@ -15,12 +15,12 @@ from scripts.merge_ja_en_mfa import (
 def _receipt():
     return {
         "schema": "audio-transform-receipt-v2", "uid": "u1",
-        "source": {"path": "/source.wav", "sha256": "source", "sample_rate": 16000},
-        "alignment": {"path": "/align.wav", "sha256": "align", "sample_rate": 16000},
-        "train": {"path": "/train.wav", "sha256": "train", "sample_rate": 16000},
-        "sample_transform": {"source_start": 0, "output_start": 0, "source_rate": 16000, "target_rate": 16000},
-        "alignment_transform": {"source_start": 0, "output_start": 0, "source_rate": 16000, "target_rate": 16000},
-        "train_transform": {"source_start": 0, "output_start": 0, "source_rate": 16000, "target_rate": 16000},
+        "source": {"path": "/source.wav", "sha256": "source", "sample_rate": 16000, "frames": 4000},
+        "alignment": {"path": "/align.wav", "sha256": "align", "sample_rate": 16000, "frames": 4000},
+        "train": {"path": "/train.wav", "sha256": "train", "sample_rate": 16000, "frames": 4000},
+        "sample_transform": {"source_start": 0, "source_end": 4000, "output_start": 0, "output_frames": 4000, "source_rate": 16000, "target_rate": 16000},
+        "alignment_transform": {"source_start": 0, "source_end": 4000, "output_start": 0, "output_frames": 4000, "source_rate": 16000, "target_rate": 16000},
+        "train_transform": {"source_start": 0, "source_end": 4000, "output_start": 0, "output_frames": 4000, "source_rate": 16000, "target_rate": 16000},
     }
 
 
@@ -152,6 +152,54 @@ def test_binder_rejects_axis_bound_transform_and_artifact_tampering(field, repla
         )
 
 
+@pytest.mark.parametrize("receipt_uid", ["missing", None, "other"])
+def test_binder_requires_exact_receipt_uid(receipt_uid):
+    phone = _native_phone("p0", "a", "ju_000001", 1, token_id="tok")
+    alignment = _alignment([phone], [{"alias": "ju_000001", "token_id": "tok", "language": "ja", "pronunciation": ["a"]}])
+    if receipt_uid == "missing":
+        alignment["audio_receipt"].pop("uid")
+    else:
+        alignment["audio_receipt"]["uid"] = receipt_uid
+    with pytest.raises(JAContractError, match="alignment_invalid"):
+        merge_module.bind_native_phone_graph(alignment, [_semantic_graph("ju_000001", "tok", ["a"])])
+
+
+def test_binder_requires_native_phone_uid_to_match_receipt_and_alignment():
+    phone = _native_phone("p0", "a", "ju_000001", 1, token_id="tok")
+    phone["uid"] = "other"
+    alignment = _alignment([phone], [{"alias": "ju_000001", "token_id": "tok", "language": "ja", "pronunciation": ["a"]}])
+    with pytest.raises(JAContractError, match="alignment_invalid"):
+        merge_module.bind_native_phone_graph(alignment, [_semantic_graph("ju_000001", "tok", ["a"])])
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda alignment: alignment["audio_receipt"]["alignment"].update(frames=50),
+    lambda alignment: alignment["audio_receipt"]["source"].update(frames=50),
+    lambda alignment: alignment["audio_receipt"]["train"].update(frames=50),
+    lambda alignment: (
+        alignment["audio_receipt"]["alignment_transform"].update(output_frames=50),
+        alignment["native_phones"][0]["source_axis"].update(transform=dict(alignment["audio_receipt"]["alignment_transform"])),
+    ),
+    lambda alignment: (
+        alignment["audio_receipt"]["alignment_transform"].update(source_end=50),
+        alignment["native_phones"][0]["source_axis"].update(transform=dict(alignment["audio_receipt"]["alignment_transform"])),
+    ),
+    lambda alignment: (
+        alignment["audio_receipt"]["train_transform"].update(output_frames=50),
+        alignment["native_phones"][0]["training_axis"].update(transform=dict(alignment["audio_receipt"]["train_transform"])),
+    ),
+    lambda alignment: alignment["audio_receipt"]["alignment_transform"].update(output_start=-1),
+    lambda alignment: alignment["audio_receipt"]["train_transform"].update(source_end=0),
+    lambda alignment: alignment["audio_receipt"]["alignment_transform"].update(output_start=50, output_frames=4000),
+])
+def test_binder_rejects_receipt_axis_frame_and_transform_range_tampering(mutate):
+    phone = _native_phone("p0", "a", "ju_000001", 1, token_id="tok")
+    alignment = _alignment([phone], [{"alias": "ju_000001", "token_id": "tok", "language": "ja", "pronunciation": ["a"]}])
+    mutate(alignment)
+    with pytest.raises(JAContractError, match="alignment_invalid"):
+        merge_module.bind_native_phone_graph(alignment, [_semantic_graph("ju_000001", "tok", ["a"])])
+
+
 def test_merge_receipt_preserves_contract_error_code_and_path(tmp_path):
     stage = tmp_path / "stages" / "merge"
     result = handle_merge({"merge": {
@@ -179,12 +227,12 @@ def test_strict_ledger_projects_axes_and_merges_with_bound_evidence(tmp_path):
         'intervals [1]:\nxmin = 0\nxmax = 1\ntext = "a"\n', encoding="utf-8")
     receipt = {
         "schema": "audio-transform-receipt-v2", "uid": "u1",
-        "source": {"path": "/source.wav", "sha256": "source", "sample_rate": 8000},
-        "alignment": {"path": "/align.wav", "sha256": "align", "sample_rate": 16000},
-        "train": {"path": "/train.wav", "sha256": "train", "sample_rate": 24000},
-        "sample_transform": {"source_start": 10, "output_start": 0, "source_rate": 8000, "target_rate": 16000},
-        "alignment_transform": {"source_start": 10, "output_start": 0, "source_rate": 8000, "target_rate": 16000},
-        "train_transform": {"source_start": 0, "output_start": 0, "source_rate": 8000, "target_rate": 24000},
+        "source": {"path": "/source.wav", "sha256": "source", "sample_rate": 8000, "frames": 10000},
+        "alignment": {"path": "/align.wav", "sha256": "align", "sample_rate": 16000, "frames": 16000},
+        "train": {"path": "/train.wav", "sha256": "train", "sample_rate": 24000, "frames": 30000},
+        "sample_transform": {"source_start": 10, "source_end": 8010, "output_start": 0, "output_frames": 16000, "source_rate": 8000, "target_rate": 16000},
+        "alignment_transform": {"source_start": 10, "source_end": 8010, "output_start": 0, "output_frames": 16000, "source_rate": 8000, "target_rate": 16000},
+        "train_transform": {"source_start": 0, "source_end": 10000, "output_start": 0, "output_frames": 30000, "source_rate": 8000, "target_rate": 24000},
     }
     run = {"run_id": "ja-run", "language": "ja", "unit_ids": ["unit-ja"],
            "aliases": [{"alias": "ju_000001", "token_id": "tok-ja", "unit_id": "unit-ja", "pronunciation": ["a"]}],

@@ -222,6 +222,7 @@ def map_raw_intervals_to_samples(
     interval_index: int | None = None,
     unit_id: str | None = None,
     token_id: str | None = None,
+    uid: str | None = None,
     audio_receipt: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Map raw MFA seconds to the immutable global sample axis."""
@@ -232,7 +233,10 @@ def map_raw_intervals_to_samples(
         raise ValueError("language must be ja or en")
     if not isinstance(token_id, str) or not token_id:
         raise JAContractError("alignment_invalid", "raw MFA token identity is required", "$.token_id")
-    if not isinstance(audio_receipt, Mapping) or audio_receipt.get("schema") != "audio-transform-receipt-v2":
+    if not isinstance(uid, str) or not uid:
+        raise JAContractError("alignment_invalid", "raw MFA UID identity is required", "$.uid")
+    if (not isinstance(audio_receipt, Mapping) or audio_receipt.get("schema") != "audio-transform-receipt-v2"
+            or audio_receipt.get("uid") != uid):
         raise JAContractError("receipt_invalid", "audio-transform receipt is required for MFA axis projection", "$.audio_receipt")
     required_audio = ("source", "alignment", "train")
     if any(not isinstance(audio_receipt.get(key), Mapping) for key in required_audio):
@@ -284,6 +288,7 @@ def map_raw_intervals_to_samples(
             raise ValueError("raw MFA interval crosses ownership")
         label = str(interval.get("text", ""))
         result.append({
+            "uid": uid,
             "alias": alias,
             "language": language,
             "phone": label,
@@ -405,6 +410,9 @@ def handle_align(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
         return StageResult(stage="align", status="BLOCKED", receipt_path=str(receipt_path))
     try:
         mfa_runner = raw.get("mfa_runner") or config.get("mfa_runner")
+        uid = raw.get("uid", config.get("uid"))
+        if not isinstance(uid, str) or not uid:
+            raise JAContractError("alignment_invalid", "alignment UID is required", "$.uid")
         ledger_runs: dict[str, list[dict[str, Any]]] = {"ja": [], "en": []}
         ledger_expected: dict[str, list[str]] = {"ja": [], "en": []}
         output_paths: list[Path] = []
@@ -505,7 +513,7 @@ def handle_align(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
                 containing = [word["text"] for word in words if word["xmin"] <= interval["xmin"] and interval["xmax"] <= word["xmax"] and word["text"] and word["text"] not in {"<eps>", "sil", "sp", "spn"}]
                 if len(containing) != 1:
                     raise ValueError(f"{run_id}: phone cannot be assigned to one alias")
-                mapped = map_raw_intervals_to_samples([interval], offset_sample=offset, sample_rate=int(run.get("sample_rate", 16000)), ownership=ownership, alias=containing[0], language=language, run_id=run_id, raw_artifact_path=str(Path(str(grid_raw)).resolve()), raw_artifact_sha256=grid_sha256, interval_index=interval_index, unit_id=alias_to_unit.get(containing[0]), token_id=alias_to_token.get(containing[0]), audio_receipt=run.get("audio_receipt"))
+                mapped = map_raw_intervals_to_samples([interval], offset_sample=offset, sample_rate=int(run.get("sample_rate", 16000)), ownership=ownership, alias=containing[0], language=language, run_id=run_id, raw_artifact_path=str(Path(str(grid_raw)).resolve()), raw_artifact_sha256=grid_sha256, interval_index=interval_index, unit_id=alias_to_unit.get(containing[0]), token_id=alias_to_token.get(containing[0]), uid=uid, audio_receipt=run.get("audio_receipt"))
                 for phone in mapped:
                     phone["phone_id"] = f"{raw.get('uid', config.get('uid', ''))}:{run_id}:{phone['alias']}:p{len(phones):06d}"
                 phones.extend(mapped)

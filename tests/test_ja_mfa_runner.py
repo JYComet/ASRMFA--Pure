@@ -29,9 +29,11 @@ def test_raw_interval_carries_token_and_receipt_projected_three_axes():
         [{"raw_interval_id": 7, "xmin": 0.1, "xmax": 0.2, "text": "t"}],
         offset_sample=0, sample_rate=16000, ownership=(0, 8000), alias="ju_000000",
         language="ja", run_id="ja-run", unit_id="unit-1", token_id="tok-1",
+        uid="u1",
         audio_receipt=_audio_receipt(),
     )
     phone = rows[0]
+    assert phone["uid"] == "u1"
     assert phone["token_id"] == "tok-1"
     assert phone["alignment_axis"] == {"start_sample": 1600, "end_sample": 3200, "sample_rate": 16000,
                                        "artifact": {"path": "/fixture/alignment.wav", "sha256": "alignment"}}
@@ -47,6 +49,7 @@ def test_raw_seconds_and_receipt_projection_use_half_up_at_boundaries():
         [{"raw_interval_id": 8, "xmin": "0.00003125", "xmax": "0.00009375", "text": "t"}],
         offset_sample=0, sample_rate=16000, ownership=(0, 8000), alias="ju_000000",
         language="ja", run_id="ja-run", unit_id="unit-1", token_id="tok-1",
+        uid="u1",
         audio_receipt=_audio_receipt(),
     )
     phone = rows[0]

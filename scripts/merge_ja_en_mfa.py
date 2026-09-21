@@ -61,7 +61,7 @@ def _axis_boundaries(phone: Mapping[str, Any], path: str, receipt: Mapping[str, 
         raise JAContractError("alignment_invalid", "native interval bounds are invalid", path)
     if phone.get("raw_interval_id") is None or not isinstance(phone.get("run_id"), str) or not phone["run_id"]:
         raise JAContractError("alignment_invalid", "raw interval provenance is required", path)
-    if not isinstance(receipt, Mapping) or receipt.get("schema") != "audio-transform-receipt-v2" or receipt.get("uid") not in {None, uid}:
+    if phone.get("uid") != uid or not isinstance(receipt, Mapping) or receipt.get("schema") != "audio-transform-receipt-v2" or receipt.get("uid") != uid:
         raise JAContractError("alignment_invalid", "receipt-bound axis identity is required", path)
     source, alignment, train = receipt.get("source"), receipt.get("alignment"), receipt.get("train")
     alignment_transform = receipt.get("alignment_transform") or receipt.get("sample_transform")
@@ -69,19 +69,39 @@ def _axis_boundaries(phone: Mapping[str, Any], path: str, receipt: Mapping[str, 
     if not all(isinstance(value, Mapping) for value in (source, alignment, train, alignment_transform, train_transform)):
         raise JAContractError("alignment_invalid", "receipt axis artifacts and transforms are required", path)
     def rate(axis: Mapping[str, Any], name: str) -> int:
-        value = axis.get("sample_rate")
-        if type(value) is not int or value <= 0 or not isinstance(axis.get("path"), str) or not axis.get("sha256"):
+        value, frames = axis.get("sample_rate"), axis.get("frames")
+        if (type(value) is not int or value <= 0 or type(frames) is not int or frames < 0
+                or not isinstance(axis.get("path"), str) or not axis["path"]
+                or not isinstance(axis.get("sha256"), str) or not axis["sha256"]):
             raise JAContractError("alignment_invalid", f"receipt {name} axis is invalid", path)
         return value
     source_rate, alignment_rate, train_rate = rate(source, "source"), rate(alignment, "alignment"), rate(train, "training")
-    def transform_fields(value: Mapping[str, Any], name: str, source_rate_value: int, target_rate: int) -> tuple[int, int]:
-        source_start, output_start = value.get("source_start"), value.get("output_start")
-        if (type(source_start) is not int or source_start < 0 or type(output_start) is not int or output_start < 0
+    def transform_fields(value: Mapping[str, Any], name: str, source_rate_value: int, target_rate: int,
+                         source_frames: int, target_frames: int) -> tuple[int, int, int, int]:
+        source_start, source_end = value.get("source_start"), value.get("source_end")
+        output_start, output_frames = value.get("output_start"), value.get("output_frames")
+        if (type(source_start) is not int or source_start < 0 or type(source_end) is not int or source_end <= source_start
+                or type(output_start) is not int or output_start < 0 or type(output_frames) is not int or output_frames <= 0
+                or source_end > source_frames or output_start + output_frames > target_frames
                 or value.get("source_rate") != source_rate_value or value.get("target_rate") != target_rate):
             raise JAContractError("alignment_invalid", f"receipt {name} transform is invalid", path)
-        return source_start, output_start
-    source_start, alignment_output_start = transform_fields(alignment_transform, "alignment", source_rate, alignment_rate)
-    train_source_start, train_output_start = transform_fields(train_transform, "train", source_rate, train_rate)
+        return source_start, source_end, output_start, output_frames
+    source_start, source_end, alignment_output_start, alignment_output_frames = transform_fields(
+        alignment_transform, "alignment", source_rate, alignment_rate, source["frames"], alignment["frames"])
+    train_source_start, train_source_end, train_output_start, train_output_frames = transform_fields(
+        train_transform, "train", source_rate, train_rate, source["frames"], train["frames"])
+
+    def checked_bounds(value: Mapping[str, Any], name: str, artifact_frames: int,
+                       window_start: int, window_end: int) -> tuple[int, int]:
+        start, end = value.get("start_sample"), value.get("end_sample")
+        if type(start) is not int or type(end) is not int or start < 0 or end <= start:
+            raise JAContractError("alignment_invalid", f"{name} bounds are invalid", path)
+        if end > artifact_frames or start < window_start or end > window_end:
+            raise JAContractError("alignment_invalid", f"{name} bounds are outside receipt artifact or transform", path)
+        return start, end
+
+    checked_bounds(phone, "native interval", alignment["frames"], alignment_output_start,
+                   alignment_output_start + alignment_output_frames)
     def project(value: int, numerator: int, denominator: int) -> int:
         if value < 0:
             raise JAContractError("alignment_invalid", "axis coordinate precedes receipt transform origin", path)
@@ -96,10 +116,23 @@ def _axis_boundaries(phone: Mapping[str, Any], path: str, receipt: Mapping[str, 
     }
     for axis_name, (bounds, sample_rate, artifact, transform) in expected.items():
         axis = phone.get(axis_name)
-        if not isinstance(axis, Mapping) or (axis.get("start_sample"), axis.get("end_sample")) != bounds or axis.get("sample_rate") != sample_rate:
+        if not isinstance(axis, Mapping):
+            raise JAContractError("alignment_invalid", f"{axis_name} bounds or sample rate differs from receipt", path)
+        if axis_name == "alignment_axis":
+            checked_bounds(axis, axis_name, alignment["frames"], alignment_output_start,
+                           alignment_output_start + alignment_output_frames)
+        elif axis_name == "source_axis":
+            checked_bounds(axis, axis_name, source["frames"], max(source_start, train_source_start),
+                           min(source_end, train_source_end))
+        else:
+            checked_bounds(axis, axis_name, train["frames"], train_output_start,
+                           train_output_start + train_output_frames)
+        if (axis.get("start_sample"), axis.get("end_sample")) != bounds or axis.get("sample_rate") != sample_rate:
             raise JAContractError("alignment_invalid", f"{axis_name} bounds or sample rate differs from receipt", path)
         if axis.get("artifact") != {"path": artifact["path"], "sha256": artifact["sha256"]}:
             raise JAContractError("alignment_invalid", f"{axis_name} artifact differs from receipt", path)
+        if transform is None and "transform" in axis:
+            raise JAContractError("alignment_invalid", f"{axis_name} must remain raw-MFA provenance", path)
         if transform is not None and axis.get("transform") != dict(transform):
             raise JAContractError("alignment_invalid", f"{axis_name} transform differs from receipt", path)
 
