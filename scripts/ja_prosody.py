@@ -125,17 +125,19 @@ def _frontend_provenance(frontend: Mapping[str, Any], digest: str, nodes: Sequen
     for row in evidence_moras:
         row = _mapping(row, "accent_phrase_unresolved", "frontend mora position is invalid", "$.frontend.accent_evidence.moras")
         phrase_id, position = row.get("accent_phrase_id"), row.get("mora_index_in_phrase")
-        if not isinstance(phrase_id, str) or not isinstance(position, int) or (phrase_id, position) in evidence_positions:
+        if not isinstance(phrase_id, str) or not isinstance(position, int) or phrase_id not in by_phrase or (phrase_id, position) in evidence_positions:
             raise JAContractError("accent_phrase_unresolved", "frontend mora position is invalid", "$.frontend.accent_evidence.moras")
+        if position < 1 or position > len(by_phrase[phrase_id]):
+            raise JAContractError("tone_cardinality_mismatch", "frontend mora position is outside phrase cardinality", "$.frontend.accent_evidence.moras")
         evidence_positions[(phrase_id, position)] = row
-    for phrase_id, phrase_tones in by_phrase.items():
-        if {position for (item_id, position) in evidence_positions if item_id == phrase_id} != set(range(1, len(phrase_tones) + 1)):
-            raise JAContractError("tone_cardinality_mismatch", "frontend phrase positions are incomplete", "$.frontend.accent_evidence.moras")
     tones: list[str] = []
     for node in nodes:
         phrase_id, position = node.get("accent_phrase_id"), node.get("mora_index_in_phrase")
-        if not isinstance(phrase_id, str) or not isinstance(position, int) or phrase_id not in by_phrase or (phrase_id, position) not in evidence_positions:
+        evidence_row = evidence_positions.get((phrase_id, position))
+        if not isinstance(phrase_id, str) or not isinstance(position, int) or phrase_id not in by_phrase or evidence_row is None:
             raise JAContractError("tone_cardinality_mismatch", "semantic mora has no explicit frontend phrase position", "$.mora_nodes")
+        if evidence_row.get("accent_phrase_id") != phrase_id or evidence_row.get("mora_index_in_phrase") != position:
+            raise JAContractError("tone_cardinality_mismatch", "frontend mora does not match semantic phrase position", "$.mora_nodes")
         tones.append(by_phrase[phrase_id][position - 1])
     identity = _mapping(evidence.get("provider_identity"), "tone_provenance_missing", "frontend provider identity is missing", "$.frontend.accent_evidence.provider_identity")
     provider_revision = identity.get("provider_revision")

@@ -229,11 +229,29 @@ def test_multiword_phrase_selects_explicit_positions_across_unit_boundary():
                 "provider_identity": {"provider": "test", "provider_revision": "r1"},
                 "provider_evidence_sha256": "provider", "unit_evidence_sha256": "unit",
                 "accent_phrases": [{"accent_phrase_id": "ap-shared", "mora_count": 2, "nucleus": 1}],
-                "moras": [{"accent_phrase_id": "ap-shared", "mora_index_in_phrase": 1, "mora_count": 2, "nucleus": 1},
-                          {"accent_phrase_id": "ap-shared", "mora_index_in_phrase": 2, "mora_count": 2, "nucleus": 1}]}
-    frontend = {"accent_evidence_valid": True, "locked_reading_digest": digest, "accent_evidence": evidence}
-    assert [row["tone"] for row in resolve_mora_tones(first, frontend)] == ["H"]
-    assert [row["tone"] for row in resolve_mora_tones(second, frontend)] == ["L"]
+                "moras": [{"accent_phrase_id": "ap-shared", "mora_index_in_phrase": 1, "mora_count": 2, "nucleus": 1}]}
+    first_frontend = {"accent_evidence_valid": True, "locked_reading_digest": digest, "accent_evidence": evidence}
+    second_evidence = copy.deepcopy(evidence)
+    second_evidence["unit_evidence_sha256"] = "unit-2"
+    second_evidence["moras"] = [{"accent_phrase_id": "ap-shared", "mora_index_in_phrase": 2, "mora_count": 2, "nucleus": 1}]
+    second_frontend = {"accent_evidence_valid": True, "locked_reading_digest": digest, "accent_evidence": second_evidence}
+    assert [row["tone"] for row in resolve_mora_tones(first, first_frontend)] == ["H"]
+    assert [row["tone"] for row in resolve_mora_tones(second, second_frontend)] == ["L"]
+
+
+@pytest.mark.parametrize(("nucleus", "positions", "tones"), [
+    (0, [1, 3], ["L", "H"]), (2, [1, 3], ["L", "L"]),
+])
+def test_scoped_phrase_evidence_selects_flat_and_middle_subsets(nucleus, positions, tones):
+    graph = graph_for("アイ")
+    graph["mora_nodes"] = [dict(graph["mora_nodes"][0], mora_index_in_phrase=positions[0]),
+                           dict(graph["mora_nodes"][1], mora_index_in_phrase=positions[1])]
+    evidence = valid_frontend("アイ", nucleus=nucleus)["accent_evidence"]
+    evidence["accent_phrases"][0]["mora_count"] = 4
+    evidence["moras"] = [{"accent_phrase_id": "ap0", "mora_index_in_phrase": position, "mora_count": 4, "nucleus": nucleus}
+                         for position in positions]
+    assert [row["tone"] for row in resolve_mora_tones(graph, {"accent_evidence_valid": True,
+        "locked_reading_digest": graph["locked_reading_digest"], "accent_evidence": evidence})] == tones
 
 
 def test_non_japanese_phone_with_mora_or_basic_ownership_is_rejected():
