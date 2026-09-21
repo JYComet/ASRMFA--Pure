@@ -489,11 +489,15 @@ def validate_config(config: Any, *, config_path: os.PathLike[str] | str | None =
             if isinstance(resource, str) and resource.strip():
                 # Normalize only for validation.  Resolution relative to a
                 # config file remains the responsibility of preflight.
-                candidate = _absolute(resource)
-                if candidate.is_symlink():
-                    raise JAContractError("config_path_invalid", "prosody resource may not be a symlink", f"$.prosody.{resource_key}")
-                if candidate.exists() and not candidate.is_file():
-                    raise JAContractError("config_path_invalid", "prosody resource must be a file", f"$.prosody.{resource_key}")
+                # Relative resource paths are resolved against the config
+                # file by pipeline preflight; filesystem checks happen there
+                # after resolution rather than against the process CWD.
+                if Path(resource).expanduser().is_absolute():
+                    candidate = _absolute(resource)
+                    if candidate.is_symlink():
+                        raise JAContractError("config_path_invalid", "prosody resource may not be a symlink", f"$.prosody.{resource_key}")
+                    if candidate.exists() and not candidate.is_file():
+                        raise JAContractError("config_path_invalid", "prosody resource must be a file", f"$.prosody.{resource_key}")
         if type(prosody.get("allow_unknown_tones")) is not bool:
             raise JAContractError("config_malformed", "allow_unknown_tones must be boolean", "$.prosody.allow_unknown_tones")
     # config_path is deliberately only used to reject a symlink config; source

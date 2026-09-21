@@ -269,7 +269,7 @@ def config_identity(config: Mapping[str, Any], manifest_path: Path, manifest: li
                 collect_paths(child, key)
         elif isinstance(value, str) and (
             key.endswith(("_path", "_file", "_model", "_acoustic", "_dictionary", "_metadata", "_wheel", "_binary", "_aligner", "_manifest", "_lock", "_receipt", ".model", ".runtime_python", ".runtime"))
-            or key in {"input_manifest", "supply_chain_lock", "mapping_file", "gold_manifest", "manual_overrides", "runtime_python"}
+            or key in {"input_manifest", "supply_chain_lock", "mapping_file", "gold_manifest", "manual_overrides", "runtime_python", "prosody.manual_overrides", "prosody.accent_lexicon"}
         ):
             if key.endswith("runtime_python") or key in {"runtime_python", "runtime"}:
                 config_paths[key] = runtime_identity(value)
@@ -309,6 +309,10 @@ def preflight(config: Mapping[str, Any], *, config_path: Path | None = None) -> 
             return str(candidate if candidate.is_absolute() else (base / candidate).absolute())
         return value
     validated = resolve(validated)
+    # Resource paths inside prosody are now config-relative absolute paths;
+    # re-run validation after resolution so symlink/non-file checks use the
+    # config directory rather than the process working directory.
+    validated = validate_config(validated, config_path=config_path)
     manifest_path = Path(str(validated["input_manifest"])).expanduser().absolute()
     if manifest_path.is_symlink():
         raise JAContractError("manifest_symlink", "manifest is a symlink", str(manifest_path))

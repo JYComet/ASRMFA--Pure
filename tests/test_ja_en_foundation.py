@@ -203,3 +203,44 @@ def test_config_identity_refuses_symlinked_asset_directories(tmp_path):
     with pytest.raises(JAContractError) as error:
         config_identity(config, manifest_path, rows)
     assert error.value.code == "config_malformed"
+
+
+def test_prosody_resources_are_hash_bound_to_config_identity(tmp_path):
+    config_path, config = _config(tmp_path)
+    manual = tmp_path / "manual-overrides.json"
+    lexicon = tmp_path / "accent-lexicon.json"
+    manual.write_text('{"tone": "H"}\n', encoding="utf-8")
+    lexicon.write_text('{"accent": 1}\n', encoding="utf-8")
+    config["prosody"] = {
+        "algorithm_version": "ja-mora-tone-v1",
+        "manual_overrides": str(manual),
+        "accent_lexicon": str(lexicon),
+        "allow_unknown_tones": True,
+    }
+    validated, manifest_path, rows, _ = preflight(config, config_path=config_path)
+    first = config_identity(validated, manifest_path, rows)
+    assert {"prosody.manual_overrides", "prosody.accent_lexicon"} <= set(first["config_artifacts"])
+    manual.write_text('{"tone": "L"}\n', encoding="utf-8")
+    lexicon.write_text('{"accent": 2}\n', encoding="utf-8")
+    validated, manifest_path, rows, _ = preflight(config, config_path=config_path)
+    second = config_identity(validated, manifest_path, rows)
+    assert first["config_artifacts"]["prosody.manual_overrides"]["sha256"] != second["config_artifacts"]["prosody.manual_overrides"]["sha256"]
+    assert first["config_artifacts"]["prosody.accent_lexicon"]["sha256"] != second["config_artifacts"]["prosody.accent_lexicon"]["sha256"]
+
+
+def test_config_relative_prosody_symlink_is_rejected_after_resolution(tmp_path):
+    config_path, config = _config(tmp_path)
+    target = tmp_path / "target.json"
+    target.write_text("{}\n", encoding="utf-8")
+    resource_dir = tmp_path / "resources"
+    resource_dir.mkdir()
+    (resource_dir / "manual.json").symlink_to(target)
+    config["prosody"] = {
+        "algorithm_version": "ja-mora-tone-v1",
+        "manual_overrides": "resources/manual.json",
+        "accent_lexicon": None,
+        "allow_unknown_tones": True,
+    }
+    with pytest.raises(JAContractError) as error:
+        preflight(config, config_path=config_path)
+    assert error.value.code == "config_path_invalid"
