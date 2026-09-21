@@ -350,7 +350,20 @@ def handle_prosody(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
     try:
         if not source.is_file() or source.is_symlink():
             raise JAContractError("publish_blocked", "prosody alignment source is unavailable", str(source))
-        source_rows = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
+        source_text = source.read_text(encoding="utf-8")
+        try:
+            source_payload = json.loads(source_text)
+        except json.JSONDecodeError:
+            source_payload = None
+        if isinstance(source_payload, Mapping) and isinstance(source_payload.get("alignments"), list):
+            source_rows = list(source_payload["alignments"])
+        elif isinstance(source_payload, Mapping):
+            source_rows = [dict(source_payload.get("alignment", source_payload))]
+        elif isinstance(source_payload, list):
+            source_rows = source_payload
+        else:
+            # JSONL remains the normal bridge artifact.
+            source_rows = [json.loads(line) for line in source_text.splitlines() if line.strip()]
         try:
             from .ja_en_stage_inputs import assemble_prosody_rows
         except ImportError:  # pragma: no cover
@@ -363,6 +376,12 @@ def handle_prosody(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
                 failures.append({"uid": uid, **error.as_dict()})
             except Exception as error:  # a bad UID must not erase other work
                 failures.append({"uid": uid, "code": "verifier_failed", "message": f"{type(error).__name__}: {error}"})
+        upstream_errors = workspace / "stages" / "merge" / "uid_errors.json"
+        if upstream_errors.is_file() and not upstream_errors.is_symlink():
+            ledger = json.loads(upstream_errors.read_text(encoding="utf-8"))
+            for error in ledger.get("errors", []) if isinstance(ledger, Mapping) else []:
+                if isinstance(error, Mapping) and error.get("uid"):
+                    failures.append({"uid": str(error["uid"]), **{key: value for key, value in error.items() if key != "uid"}})
         output = stage_dir / "prosody_alignments.jsonl"
         atomic_write_bytes(output, b"".join(canonical_json(row) for row in rows), workspace=workspace)
         if failures:

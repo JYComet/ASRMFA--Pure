@@ -311,10 +311,7 @@ def handle_tts(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
     receipt_path = stage_dir / "receipt.json"
     workspace = stage_dir.parent.parent
     settings = config.get("tts", {}) if isinstance(config.get("tts", {}), Mapping) else {}
-    candidates = [settings.get("alignment_jsonl"), settings.get("alignment_artifact"),
-                  config.get("alignment_jsonl"), config.get("alignment_artifact"),
-                  workspace / "stages" / "merge" / "alignment.jsonl",
-                  workspace / "stages" / "merge" / "ja_en_alignment.jsonl"]
+    candidates = [settings.get("alignment_jsonl"), settings.get("alignment_artifact")]
     source = next((Path(value).expanduser().absolute() for value in candidates if value and Path(value).is_file()), None)
     if source is None:
         receipt = make_receipt(stage="tts", status="BLOCKED", params={"implementation": "tts-training-record-v1"},
@@ -328,6 +325,10 @@ def handle_tts(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
         outputs = []
         for row in rows:
             alignment = row.get("alignment", row)
+            # The pipeline bridge always declares this stage input.  Keep the
+            # standalone legacy helper usable for Task 7's fixture migration.
+            if isinstance(config.get("stage_inputs"), Mapping) and alignment.get("schema") != "ja-prosody-alignment-v1":
+                raise ValueError("TTS requires ja-prosody-alignment-v1 input")
             train_wav = row.get("train_wav") or alignment.get("train_wav")
             alignment_wav = row.get("alignment_wav") or alignment.get("alignment_wav")
             if not train_wav or not alignment_wav:

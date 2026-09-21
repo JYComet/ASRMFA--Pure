@@ -286,3 +286,18 @@ def test_prosody_handler_preserves_each_failed_uid_in_ledger(tmp_path: Path):
     assert [error["uid"] for error in receipt["errors"]] == ["bad"]
     rows = [json.loads(line) for line in (stage_dir / "prosody_alignments.jsonl").read_text(encoding="utf-8").splitlines()]
     assert [row["uid"] for row in rows] == ["good"]
+
+
+def test_prosody_handler_consumes_multi_uid_merge_aggregate_and_keeps_merge_ledger(tmp_path: Path):
+    alignment = _prosody_alignment("good")
+    config = _write_prosody_sources(tmp_path, alignment)
+    source = tmp_path / "stages" / "merge" / "ja_en_alignments.json"
+    source.write_text(json.dumps({"schema": "ja-en-alignment-v3", "alignments": [alignment]}), encoding="utf-8")
+    config["prosody"]["alignment_jsonl"] = str(source)
+    (tmp_path / "stages" / "merge" / "uid_errors.json").write_text(json.dumps({
+        "schema": "ja-en-uid-error-ledger-v1", "errors": [{"uid": "rejected", "code": "seam_rejected", "message": "fixture"}],
+    }), encoding="utf-8")
+    result = handle_prosody(config, tmp_path / "stages" / "prosody")
+    assert result.status == "PARTIAL"
+    receipt = json.loads((tmp_path / "stages" / "prosody" / "receipt.json").read_text(encoding="utf-8"))
+    assert [row["uid"] for row in receipt["errors"]] == ["rejected"]

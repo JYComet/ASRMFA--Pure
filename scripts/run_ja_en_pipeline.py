@@ -340,6 +340,11 @@ def _identity_path(workspace: Path) -> Path:
     return workspace / ".ja_en_run_identity.json"
 
 
+def _compatibility_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
+    """Immutable resume shape; mutable resources belong to stage cache keys."""
+    return {key: copy.deepcopy(identity.get(key)) for key in ("schema", "pipeline", "schemas", "stage_registry")}
+
+
 def _production_lock_payload(lock_path: Path) -> dict[str, Any]:
     if not lock_path.is_file():
         return {"schema": "ja-supply-chain-lock-v1", "status": "missing", "policy": {}, "resources": [], "source_path": str(lock_path)}
@@ -386,7 +391,9 @@ def validate_resume(workspace: Path, identity: Mapping[str, Any], *, allow_new: 
                 return
         raise JAContractError("resume_stale", "run identity is missing", str(identity_path))
     existing = load_json(identity_path)
-    if not isinstance(existing, Mapping) or existing.get("identity_digest") != stable_digest(identity):
+    compatible = _compatibility_identity(identity)
+    if (not isinstance(existing, Mapping)
+            or existing.get("compatibility_digest") != stable_digest(compatible)):
         raise JAContractError("resume_identity_drift", "run identity changed", str(identity_path))
     for root_receipt in (workspace / ".ja_en_pipeline_receipt.json", workspace / "receipt.json"):
         if root_receipt.is_file():
@@ -786,7 +793,9 @@ def _prepare_stage_config(config: Mapping[str, Any], stage: str, workspace: Path
             settings = dict(settings) if isinstance(settings, Mapping) else {}
             prepared["prosody"] = settings
         if not settings.get("alignment_jsonl"):
-            source = workspace / "stages" / "merge" / "ja_en_alignment.jsonl"
+            source = workspace / "stages" / "merge" / "ja_en_alignments.json"
+            if not source.is_file():
+                source = workspace / "stages" / "merge" / "ja_en_alignment.jsonl"
             if not source.is_file():
                 source = workspace / "stages" / "merge" / "ja_en_alignment.json"
             settings["alignment_jsonl"] = str(source)
@@ -1064,6 +1073,7 @@ def dispatch(config: Mapping[str, Any], config_path: Path, stages: list[str], *,
         identity_payload = {
             "schema": "ja-pipeline-receipt-v1",
             "identity_digest": stable_digest(identity),
+            "compatibility_digest": stable_digest(_compatibility_identity(identity)),
             "identity": identity,
         }
         atomic_write_json(_identity_path(workspace), identity_payload, workspace=workspace)

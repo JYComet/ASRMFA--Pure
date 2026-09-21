@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import wave
+import copy
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -24,6 +25,7 @@ try:
         canonical_json,
         reject_symlink,
         sha256_file,
+        stable_digest,
         validate_exact_partition,
         validate_manifest,
         validate_receipt,
@@ -37,6 +39,7 @@ except ImportError:  # pragma: no cover
         canonical_json,
         reject_symlink,
         sha256_file,
+        stable_digest,
         validate_exact_partition,
         validate_manifest,
         validate_receipt,
@@ -909,6 +912,29 @@ def _resource_for_uid(config: Mapping[str, Any], key: str, uid: str) -> Mapping[
     return entries[uid]
 
 
+def _namespace_graph(uid: str, source: Mapping[str, Any], phones: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Make producer-local semantic IDs unique before composing a UID row."""
+    token = str(source.get("token_id") or "")
+    prefix = f"{uid}:{token}:"
+    mora_map = {str(row.get("mora_id")): prefix + str(row.get("mora_id")) for row in source.get("mora_nodes", []) if isinstance(row, Mapping)}
+    basic_map = {str(row.get("basic_phone_id")): prefix + str(row.get("basic_phone_id")) for row in source.get("basic_phone_nodes", []) if isinstance(row, Mapping)}
+    template_map = {str(row.get("native_phone_id")): prefix + str(row.get("native_phone_id")) for row in source.get("native_phone_templates", []) if isinstance(row, Mapping)}
+    graph = copy.deepcopy(dict(source))
+    graph["mora_nodes"] = [{**dict(row), "mora_id": mora_map[str(row.get("mora_id"))]} for row in source.get("mora_nodes", []) if isinstance(row, Mapping)]
+    graph["basic_phone_nodes"] = [{**dict(row), "basic_phone_id": basic_map[str(row.get("basic_phone_id"))],
+                                    "mora_id": mora_map.get(str(row.get("mora_id")), row.get("mora_id"))}
+                                  for row in source.get("basic_phone_nodes", []) if isinstance(row, Mapping)]
+    graph["native_phone_templates"] = [{**dict(row), "native_phone_id": template_map[str(row.get("native_phone_id"))],
+                                         "mora_ids": [mora_map.get(str(value), value) for value in row.get("mora_ids", [])],
+                                         "basic_phone_ids": [basic_map.get(str(value), value) for value in row.get("basic_phone_ids", [])]}
+                                        for row in source.get("native_phone_templates", []) if isinstance(row, Mapping)]
+    bound = [{**dict(phone), "mora_ids": [mora_map.get(str(value), value) for value in phone.get("mora_ids", [])],
+              "basic_phone_ids": [basic_map.get(str(value), value) for value in phone.get("basic_phone_ids", [])],
+              "native_phone_template_id": template_map.get(str(phone.get("native_phone_template_id")), phone.get("native_phone_template_id"))}
+             for phone in phones]
+    return graph, bound
+
+
 def assemble_prosody_rows(
     config: Mapping[str, Any], workspace: str | os.PathLike[str], merged_alignments: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -938,13 +964,13 @@ def assemble_prosody_rows(
         if not uid or uid in frontend_by_uid:
             _fail("accent_phrase_unresolved", "frontend UID binding is missing or duplicated", "$.frontend")
         frontend_by_uid[uid] = value
-    reading_by_uid: dict[str, Mapping[str, Any]] = {}
+    reading_by_uid: dict[str, list[Mapping[str, Any]]] = {}
     for row in reading_rows:
         value = _unwrap_stage_row(row, "reading_lock")
         uid = str(row.get("uid", value.get("uid", "")))
-        if not uid or uid in reading_by_uid:
-            _fail("reading_unresolved", "locked reading UID binding is missing or duplicated", "$.reading")
-        reading_by_uid[uid] = value
+        if not uid:
+            _fail("reading_unresolved", "locked reading UID binding is missing", "$.reading")
+        reading_by_uid.setdefault(uid, []).append(value)
     try:
         from .ja_prosody import build_prosody_alignment
     except ImportError:  # pragma: no cover
@@ -977,7 +1003,8 @@ def assemble_prosody_rows(
         for phone in phones:
             if not isinstance(phone, Mapping) or phone.get("language") != "ja":
                 continue
-            template = next((item for item in templates if item.get("native_phone_id") == phone.get("native_phone_template_id")), None)
+            template = next((item for item in templates if item.get("native_phone_id") == phone.get("native_phone_template_id")
+                             and item.get("token_id") == phone.get("token_id") and item.get("alias") == phone.get("alias")), None)
             if template is None or template.get("token_id") != phone.get("token_id") or template.get("alias") != phone.get("alias"):
                 _fail("native_basic_mapping_ambiguous", "native phone does not bind its semantic UID/token/alias template", f"$.{uid}.native_phones")
             if str(phone.get("alias")) not in aliases:
@@ -988,12 +1015,18 @@ def assemble_prosody_rows(
             graph_phones = [phone for phone in phones if isinstance(phone, Mapping) and phone.get("language") == "ja" and phone.get("token_id") == token_id]
             if not graph_phones:
                 continue
-            graph = {"uid": uid, "locked_reading_digest": source.get("locked_reading_digest"),
-                     "mora_nodes": list(source.get("mora_nodes", [])),
-                     "basic_phone_nodes": list(source.get("basic_phone_nodes", [])),
-                     "native_phone_templates": list(source.get("native_phone_templates", []))}
+            graph, graph_phones = _namespace_graph(uid, source, graph_phones)
+            graph["uid"] = uid
+            locks = reading_by_uid[uid]
+            lock = next((item for item in locks if token_id is None or item.get("token_id") in {None, token_id}), None)
+            selected_reading = lock.get("selected_reading", lock.get("chosen_reading")) if isinstance(lock, Mapping) else None
+            if not isinstance(selected_reading, str) or stable_digest(selected_reading) != graph.get("locked_reading_digest"):
+                _fail("reading_unresolved", "semantic locked reading does not match its UID/token lock", f"$.{uid}.{token_id}")
+            scoped_frontend = _frontend_for_graph(frontend, str(token_id) if token_id is not None else None)
+            if scoped_frontend.get("locked_reading_digest") != graph.get("locked_reading_digest"):
+                _fail("tone_provenance_missing", "frontend tone evidence digest differs from semantic lock", f"$.{uid}.{token_id}")
             partials.append(build_prosody_alignment({**alignment, "native_phones": graph_phones}, graph,
-                                                    _frontend_for_graph(frontend, str(token_id) if token_id is not None else None),
+                                                    scoped_frontend,
                                                     _resource_for_uid(config, "manual_overrides", uid),
                                                     _resource_for_uid(config, "accent_lexicon", uid)))
         non_japanese = [phone for phone in phones if isinstance(phone, Mapping) and phone.get("language") != "ja"]

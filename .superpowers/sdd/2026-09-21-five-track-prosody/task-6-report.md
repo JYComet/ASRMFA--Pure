@@ -54,3 +54,34 @@
   for TTS.
 - The known Task 8 verifier fixture failure is expected to remain if it is the
   sole full-suite failure; final output below records the observed result.
+
+## Fix Round 1/5
+
+### Ruling
+
+Expanded the scoped change to `scripts/ja_tts_export.py` only for the runtime
+input bridge: the pipeline-declared TTS invocation now accepts only
+`ja-prosody-alignment-v1` and has no merge fallback.  Its standalone legacy
+fixture path remains until Task 7 migrates the exporter contract.
+
+### Implemented
+
+- Prosody now accepts the normal multi-UID merge aggregate and imports merge
+  UID errors into its own partial receipt/ledger.
+- Template lookup includes local template ID plus token and alias, and each
+  semantic graph is deterministically namespaced before composite assembly.
+- Reading and frontend tone evidence are checked per UID/token against the
+  semantic locked-reading digest.
+- Resume uses an immutable compatibility digest for schema/stage shape while
+  mutable configuration continues to drive stage-scoped cache identities.
+
+### Tests
+
+- RED (review reproduction): the previous implementation read only singular
+  JSONL, used a template ID alone, and compared the full identity before cache
+  scoping; the review’s producer-shaped aggregate, repeated local ID, and
+  mutable-resume cases exposed those defects.
+- GREEN: `pytest -q tests/test_ja_stage_inputs.py -k 'prosody_handler'` — 2 passed.
+- GREEN: `pytest -q tests/test_ja_stage_inputs.py tests/test_ja_resume_identity.py tests/test_ja_tts_export.py` — 18 passed.
+- `python -m compileall -q scripts tests` and `git diff --check` — passed.
+- `pytest -q` — 1675 passed, 37 skipped, 1 failed in 32.64s; the sole failure remains the identical known Task 8 verifier fixture.
