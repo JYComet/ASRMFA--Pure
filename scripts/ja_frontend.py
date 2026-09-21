@@ -426,6 +426,22 @@ def _unit_evidence_digest(evidence: Mapping[str, Any]) -> str:
     return stable_digest({key: value for key, value in evidence.items() if key != "unit_evidence_sha256"})
 
 
+def _scoped_unit_evidence(root_evidence: Mapping[str, Any], moras: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    summaries = {row["accent_phrase_id"]: row for row in root_evidence["accent_phrases"]}
+    phrase_ids = {row["accent_phrase_id"] for row in moras}
+    evidence = {
+        "adapter_version": root_evidence["adapter_version"],
+        "provider_evidence_sha256": root_evidence["provider_evidence_sha256"],
+        "provider_identity": root_evidence["provider_identity"],
+        "njd_rows": root_evidence["njd_rows"],
+        "full_context_labels": root_evidence["full_context_labels"],
+        "accent_phrases": [summaries[phrase_id] for phrase_id in sorted(phrase_ids)],
+        "moras": list(moras),
+    }
+    evidence["unit_evidence_sha256"] = _unit_evidence_digest(evidence)
+    return evidence
+
+
 def extract_contextual_accent_evidence(
     njd_rows: Sequence[Mapping[str, Any]], labels: Sequence[str], provider_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -448,7 +464,6 @@ def extract_contextual_accent_evidence(
 def _attach_contextual_accent_evidence(units: list[dict[str, Any]], evidence: Mapping[str, Any] | None) -> None:
     cursor = 0
     all_moras = list(evidence.get("moras", [])) if evidence else []
-    summaries = {row["accent_phrase_id"]: row for row in evidence.get("accent_phrases", [])} if evidence else {}
     for unit in units:
         contextual_reading = str(unit.get("read", ""))
         unit["contextual_reading"] = contextual_reading
@@ -457,18 +472,7 @@ def _attach_contextual_accent_evidence(units: list[dict[str, Any]], evidence: Ma
         count = int(unit.get("mora_count", 0) or 0)
         unit_moras = all_moras[cursor:cursor + count]
         cursor += count
-        phrase_ids = {row["accent_phrase_id"] for row in unit_moras}
-        unit_evidence = None if evidence is None else {
-            "adapter_version": evidence["adapter_version"],
-            "provider_evidence_sha256": evidence["provider_evidence_sha256"],
-            "provider_identity": evidence["provider_identity"],
-            "njd_rows": evidence["njd_rows"],
-            "full_context_labels": evidence["full_context_labels"],
-            "accent_phrases": [summaries[phrase_id] for phrase_id in sorted(phrase_ids)],
-            "moras": unit_moras,
-        }
-        if unit_evidence is not None:
-            unit_evidence["unit_evidence_sha256"] = _unit_evidence_digest(unit_evidence)
+        unit_evidence = None if evidence is None else _scoped_unit_evidence(evidence, unit_moras)
         unit["accent_evidence"] = unit_evidence
         unit["accent_evidence_valid"] = evidence is not None
         if evidence is None:
@@ -489,8 +493,32 @@ def validate_frontend_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         ))
         and contextual_evidence["provider_evidence_sha256"] == _provider_evidence_digest(contextual_evidence)
     )
+    expected_unit_evidence: list[dict[str, Any] | None] = []
+    if evidence_digest_matches:
+        cursor = 0
+        for unit in contract.get("units", []):
+            try:
+                mora_count = int(unit.get("mora_count", 0) or 0)
+            except (AttributeError, TypeError, ValueError):
+                expected_unit_evidence = []
+                break
+            if mora_count < 0:
+                expected_unit_evidence = []
+                break
+            unit_moras = contextual_evidence["moras"][cursor:cursor + mora_count]
+            if len(unit_moras) != mora_count:
+                expected_unit_evidence = []
+                break
+            try:
+                expected_unit_evidence.append(_scoped_unit_evidence(contextual_evidence, unit_moras))
+            except (KeyError, TypeError):
+                expected_unit_evidence = []
+                break
+            cursor += mora_count
+        if cursor != len(contextual_evidence["moras"]):
+            expected_unit_evidence = []
     checked_units: list[dict[str, Any]] = []
-    for unit in contract.get("units", []):
+    for index, unit in enumerate(contract.get("units", [])):
         checked = dict(unit)
         contextual_reading = str(checked.get("contextual_reading", checked.get("read", "")))
         locked_reading = str(checked.get("locked_reading", contextual_reading))
@@ -505,6 +533,8 @@ def validate_frontend_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
             isinstance(unit_evidence, Mapping)
             and "unit_evidence_sha256" in unit_evidence
             and unit_evidence["unit_evidence_sha256"] == _unit_evidence_digest(unit_evidence)
+            and index < len(expected_unit_evidence)
+            and unit_evidence == expected_unit_evidence[index]
         )
         if not contextual_digest_matches:
             checked["accent_evidence_valid"] = False
@@ -647,20 +677,43 @@ def _candidate_unit(row: Mapping[str, Any], index: int, layer: Mapping[str, Any]
 
 def _accent_provider_identity(settings: FrontendConfig, provider_info: Mapping[str, Any]) -> dict[str, Any]:
     options = dict(settings.options)
-    uses_model = any(options[name] for name in ("run_marine", "use_tsqyomi", "predict_nani"))
+    enabled_features = [name for name in ("run_marine", "use_tsqyomi", "predict_nani") if options[name]]
+    provider_revision = provider_info.get("version")
+    build_provenance = provider_info.get("build_provenance")
+    if not isinstance(provider_revision, str) or not provider_revision or not isinstance(build_provenance, Mapping):
+        raise JAContractError("frontend_capability_missing", "frontend accent identity lacks provider revision/build provenance")
+    common_identity = {
+        "provider_revision": provider_revision,
+        "frontend_commit": settings.commit,
+        "build_provenance_digest": stable_digest(build_provenance),
+        "options_digest": stable_digest(options),
+    }
+    if enabled_features:
+        learned_identity = provider_info.get("learned_model_identity")
+        if not isinstance(learned_identity, Mapping) or any(
+            not isinstance(learned_identity.get(key), str) or not learned_identity[key]
+            for key in ("provider_revision", "build_provenance_digest", "options_digest")
+        ):
+            raise JAContractError("frontend_capability_missing", "enabled learned frontend behavior lacks reopenable model identity")
+        model_identity = {
+            "mode": "learned",
+            "enabled_features": enabled_features,
+            "provider_revision": learned_identity["provider_revision"],
+            "build_provenance_digest": learned_identity["build_provenance_digest"],
+            "options_digest": learned_identity["options_digest"],
+            "frontend_commit": learned_identity.get("frontend_commit", settings.commit),
+        }
+    else:
+        model_identity = {"mode": "rule_based", **common_identity}
     return {
         "provider": provider_info.get("provider", settings.provider),
-        "provider_revision": provider_info.get("version"),
+        "provider_revision": provider_revision,
         "frontend_commit": settings.commit,
         "options": options,
         "options_digest": stable_digest(options),
-        "build_provenance": provider_info.get("build_provenance"),
-        "model_identity": {
-            "accent_model": "provider_managed" if uses_model else "openjtalk_rule_based",
-            "run_marine": options["run_marine"],
-            "use_tsqyomi": options["use_tsqyomi"],
-            "predict_nani": options["predict_nani"],
-        },
+        "build_provenance": dict(build_provenance),
+        "build_provenance_digest": stable_digest(build_provenance),
+        "model_identity": model_identity,
     }
 
 

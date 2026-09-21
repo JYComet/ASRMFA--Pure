@@ -1,3 +1,4 @@
+import copy
 import json
 import importlib.util
 import os
@@ -11,6 +12,7 @@ from scripts.ja_asr_crossval import select_reading
 from scripts.ja_frontend import (
     DEFAULT_FRONTEND_OPTIONS,
     FrontendConfig,
+    _accent_provider_identity,
     extract_contextual_accent_evidence,
     frontend_stage,
     probe_provider,
@@ -149,6 +151,42 @@ def test_tampered_contextual_evidence_or_identity_is_invalidated(tamper):
     checked = validate_frontend_contract(contract)
     assert checked["units"][0]["accent_evidence_valid"] is False
     assert checked["units"][0]["accent_evidence_invalid_reason"] == "accent_evidence_digest_mismatch"
+
+
+def test_self_consistent_unit_evidence_from_another_contract_is_invalidated():
+    source = run_frontend("さくら", _config())
+    target = run_frontend("東京で", _config())
+    swapped = copy.deepcopy(source["units"][0]["accent_evidence"])
+    swapped["unit_evidence_sha256"] = stable_digest({
+        key: value for key, value in swapped.items() if key != "unit_evidence_sha256"
+    })
+    target["units"][0]["accent_evidence"] = swapped
+    checked = validate_frontend_contract(target)
+    assert checked["units"][0]["accent_evidence_valid"] is False
+    assert checked["units"][0]["accent_evidence_invalid_reason"] == "accent_evidence_digest_mismatch"
+
+
+def test_accent_model_identity_is_exact_and_binds_build_and_options():
+    settings = FrontendConfig.from_mapping(_config())
+    provider_info = {"provider": "pyopenjtalk-plus", "version": "pinned-revision", "build_provenance": {"status": "verified", "receipt_sha256": "build-a"}}
+    identity = _accent_provider_identity(settings, provider_info)
+    model = identity["model_identity"]
+    assert model["mode"] == "rule_based"
+    assert model["provider_revision"] == "pinned-revision"
+    assert model["frontend_commit"] == settings.commit
+    assert model["build_provenance_digest"] == stable_digest(provider_info["build_provenance"])
+    assert model["options_digest"] == stable_digest(dict(settings.options))
+    changed_build = _accent_provider_identity(settings, {**provider_info, "build_provenance": {"status": "verified", "receipt_sha256": "build-b"}})
+    changed_options = _accent_provider_identity(FrontendConfig.from_mapping({**_config(), "normalize_mode": "NFC"}), provider_info)
+    assert changed_build["model_identity"]["build_provenance_digest"] != model["build_provenance_digest"]
+    assert changed_options["model_identity"]["options_digest"] != model["options_digest"]
+
+
+def test_learned_accent_requires_reopenable_model_identity():
+    settings = FrontendConfig.from_mapping({**_config(), "run_marine": True})
+    with pytest.raises(JAContractError) as exc:
+        _accent_provider_identity(settings, {"provider": "pyopenjtalk-plus", "version": "pinned", "build_provenance": {"status": "verified"}})
+    assert exc.value.code == "frontend_capability_missing"
 
 
 def test_label_cardinality_mismatch_is_rejected_without_guessing():
