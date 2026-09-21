@@ -268,6 +268,30 @@ def test_scoped_evidence_rejects_extra_or_metadata_tampered_positions():
         resolve_mora_tones(graph, {**frontend, "accent_evidence": evidence})
 
 
+@pytest.mark.parametrize(("mutation", "expected_code"), [
+    ("duplicate", "accent_phrase_unresolved"),
+    ("out_of_range", "tone_cardinality_mismatch"),
+    ("missing_semantic", "tone_cardinality_mismatch"),
+    ("mismatched_binding", "tone_cardinality_mismatch"),
+])
+def test_scoped_producer_evidence_rejects_each_position_binding_failure(mutation, expected_code):
+    graph = graph_for("アイ")
+    evidence = scoped_evidence(phrase_id="ap0", count=2, nucleus=1, positions=[1, 2])
+    # The helper above produces the real unit-scoped shape before each targeted mutation.
+    if mutation == "duplicate":
+        evidence["moras"].append(copy.deepcopy(evidence["moras"][0]))
+    elif mutation == "out_of_range":
+        evidence["moras"][1]["mora_index_in_phrase"] = 3
+    elif mutation == "missing_semantic":
+        evidence = scoped_evidence(phrase_id="ap0", count=2, nucleus=1, positions=[1])
+    else:
+        graph["mora_nodes"][1]["mora_index_in_phrase"] = 1
+    frontend = {"accent_evidence_valid": True, "locked_reading_digest": graph["locked_reading_digest"], "accent_evidence": evidence}
+    with pytest.raises(JAContractError) as error:
+        resolve_mora_tones(graph, frontend)
+    assert error.value.code == expected_code
+
+
 def test_non_japanese_phone_with_mora_or_basic_ownership_is_rejected():
     alignment = {"native_phones": [native_phone(0, mora_ids=["m-0"], basic_ids=["bp-0"], language="en", label="AH")]}
     with pytest.raises(JAContractError, match="phone_tone_projection_lossy"):
