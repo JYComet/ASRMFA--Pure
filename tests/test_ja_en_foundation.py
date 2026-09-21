@@ -244,3 +244,40 @@ def test_config_relative_prosody_symlink_is_rejected_after_resolution(tmp_path):
     with pytest.raises(JAContractError) as error:
         preflight(config, config_path=config_path)
     assert error.value.code == "config_path_invalid"
+
+
+def test_config_relative_accent_lexicon_content_is_hash_bound(tmp_path):
+    config_path, config = _config(tmp_path)
+    accent = tmp_path / "accent-lexicon.json"
+    accent.write_text('{"accent": 1}\n', encoding="utf-8")
+    config["prosody"] = {
+        "algorithm_version": "ja-mora-tone-v1",
+        "manual_overrides": None,
+        "accent_lexicon": "accent-lexicon.json",
+        "allow_unknown_tones": True,
+    }
+    validated, manifest_path, rows, _ = preflight(config, config_path=config_path)
+    first = config_identity(validated, manifest_path, rows)
+    assert first["config_artifacts"]["prosody.accent_lexicon"]["sha256"]
+    accent.write_text('{"accent": 2}\n', encoding="utf-8")
+    validated, manifest_path, rows, _ = preflight(config, config_path=config_path)
+    second = config_identity(validated, manifest_path, rows)
+    assert first["config_artifacts"]["prosody.accent_lexicon"]["sha256"] != second["config_artifacts"]["prosody.accent_lexicon"]["sha256"]
+
+
+def test_config_relative_accent_lexicon_symlink_is_rejected_after_resolution(tmp_path):
+    config_path, config = _config(tmp_path)
+    target = tmp_path / "target.json"
+    target.write_text("{}\n", encoding="utf-8")
+    resource_dir = tmp_path / "resources"
+    resource_dir.mkdir()
+    (resource_dir / "accent.json").symlink_to(target)
+    config["prosody"] = {
+        "algorithm_version": "ja-mora-tone-v1",
+        "manual_overrides": None,
+        "accent_lexicon": "resources/accent.json",
+        "allow_unknown_tones": True,
+    }
+    with pytest.raises(JAContractError) as error:
+        preflight(config, config_path=config_path)
+    assert error.value.code == "config_path_invalid"

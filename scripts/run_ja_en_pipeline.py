@@ -301,7 +301,7 @@ def preflight(config: Mapping[str, Any], *, config_path: Path | None = None) -> 
         if isinstance(value, list):
             return [resolve(child, key) for child in value]
         if isinstance(value, str) and (
-            key in {"workspace", "input_manifest", "supply_chain_lock", "mapping_file", "gold_manifest", "manual_overrides", "runtime_python"}
+            key in {"workspace", "input_manifest", "supply_chain_lock", "mapping_file", "gold_manifest", "manual_overrides", "accent_lexicon", "runtime_python"}
             or key in {"model", "aligner", "runtime"}
             or key.endswith(("_path", "_file", "_model", "_acoustic", "_dictionary", "_metadata", "_wheel", "_binary", "_manifest", "_lock", "_receipt"))
         ):
