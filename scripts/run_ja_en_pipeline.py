@@ -644,7 +644,8 @@ def _run_uid_batch(stage: str, requests: Sequence[Mapping[str, Any]], config: Ma
                              "output_dir": str(isolated_stage / "mfa_output" / str(run["run_id"])),
                              "temporary_directory": tempfile.mkdtemp(prefix=f"ja-en-mfa-{run['run_id']}-"),
                              "runtime_python": mfa.get("runtime_python"), "sample_rate": run["crop"]["sample_rate"],
-                             "offset_sample": run["global_offset_sample"], "total_samples": run["crop"]["frames"]})
+                             "offset_sample": run["global_offset_sample"], "total_samples": run["crop"]["frames"],
+                             "audio_receipt": request.get("audio_receipt")})
             request_payload = {"uid": uid, "runs": runs}
         elif stage == "merge":
             align_dir = workspace / "stages" / "align" / "uids" / uid
@@ -654,14 +655,17 @@ def _run_uid_batch(stage: str, requests: Sequence[Mapping[str, Any]], config: Ma
                 "expected_languages": request.get("expected_languages", {}), "ownership": [0, max((int(v["end_sample"]) for v in request.get("ownership", {}).values()), default=1)],
                 "sample_rate": int((request.get("source_alignment") or {}).get("sample_rate", 16000)),
                 "words": request.get("expected_units", []), "seams": request.get("seams", []),
-                "rerun_plan": request.get("rerun_plan")}
+                "rerun_plan": request.get("rerun_plan"), "locked_aliases": request.get("locked_aliases"),
+                "semantic_graphs": request.get("semantic_graphs") or ([request["semantic_graph"]] if isinstance(request.get("semantic_graph"), Mapping) else []),
+                "runs": request.get("runs", []), "audio_receipt": request.get("audio_receipt"),
+                "source_receipt": request.get("source_receipt")}
         stage_config.setdefault("stage_inputs", {})[stage] = request_payload
         result = _run_stage(handler, stage_config, isolated_stage)
         statuses.append(result.status)
         source_receipt = isolated_stage / "receipt.json"
         if source_receipt.is_file():
             payload = load_json(source_receipt)
-            errors.extend(payload.get("errors", []))
+            errors.extend({"uid": uid, **dict(error)} for error in payload.get("errors", []) if isinstance(error, Mapping))
         destination = root_stage / "uids" / uid
         destination.mkdir(parents=True, exist_ok=True)
         for source in sorted(isolated_stage.rglob("*")):
@@ -686,7 +690,7 @@ def _run_uid_batch(stage: str, requests: Sequence[Mapping[str, Any]], config: Ma
         output_paths.append(aggregate)
     if stage == "merge" and merged_payloads:
         aggregate = root_stage / "ja_en_alignments.json"
-        atomic_write_json(aggregate, {"schema": "ja-en-alignment-v2", "alignments": merged_payloads}, workspace=workspace)
+        atomic_write_json(aggregate, {"schema": "ja-en-alignment-v3", "alignments": merged_payloads}, workspace=workspace)
         output_paths.append(aggregate)
     if blocked_uids:
         blocked_path = root_stage / "uid_errors.json"
@@ -806,7 +810,8 @@ def _prepare_stage_config(config: Mapping[str, Any], stage: str, workspace: Path
                                  "output_dir": str(workspace / "stages" / "align" / "mfa_output" / run["run_id"]),
                                  "temporary_directory": tempfile.mkdtemp(prefix=f"ja-en-mfa-{run['run_id']}-"),
                                  "runtime_python": mfa.get("runtime_python"), "sample_rate": run["crop"]["sample_rate"],
-                                 "offset_sample": run["global_offset_sample"], "total_samples": run["crop"]["frames"]})
+                                 "offset_sample": run["global_offset_sample"], "total_samples": run["crop"]["frames"],
+                                 "audio_receipt": request.get("audio_receipt")})
             ready_requests = [request for request in requests if request.get("status") not in {"REJECTED", "BLOCKED", "UNRESOLVED"}]
             if runs and len(ready_requests) == 1:
                 stage_inputs["align"] = {"uid": ready_requests[0]["uid"], "runs": runs}
@@ -833,7 +838,11 @@ def _prepare_stage_config(config: Mapping[str, Any], stage: str, workspace: Path
                     "english_ledger": str(align_dir / "strict_en_mfa.json") if (align_dir / "strict_en_mfa.json").is_file() else [],
                     "expected_languages": request["expected_languages"], "ownership": [0, int(request["runs"][0]["source_audio"]["frames"])],
                     "sample_rate": int(request["runs"][0]["source_audio"]["sample_rate"]), "words": plans[0].get("units", []),
-                    "seams": request.get("seams", []), "rerun_plan": request.get("rerun_plan")}
+                    "seams": request.get("seams", []), "rerun_plan": request.get("rerun_plan"),
+                    "locked_aliases": request.get("locked_aliases"),
+                    "semantic_graphs": request.get("semantic_graphs") or ([request["semantic_graph"]] if isinstance(request.get("semantic_graph"), Mapping) else []),
+                    "runs": request.get("runs", []), "audio_receipt": request.get("audio_receipt"),
+                    "source_receipt": request.get("source_receipt")}
         else:
             blocked = (_uid_error_rows(workspace, "anchors", "ja-en-merge-request-v1") +
                        _uid_error_rows(workspace, "align", "ja-en-merge-request-v1"))

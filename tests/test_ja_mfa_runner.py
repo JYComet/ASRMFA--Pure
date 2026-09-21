@@ -8,7 +8,38 @@ from scripts.align_japanese_mfa import (
     parse_raw_textgrid,
     validate_native_inventory,
     handle_align,
+    map_raw_intervals_to_samples,
 )
+
+
+def _audio_receipt(uid: str = "u1") -> dict:
+    return {
+        "schema": "audio-transform-receipt-v2", "uid": uid,
+        "source": {"path": "/fixture/source.wav", "sha256": "source", "sample_rate": 8000, "frames": 4000},
+        "alignment": {"path": "/fixture/alignment.wav", "sha256": "alignment", "sample_rate": 16000, "frames": 8000},
+        "train": {"path": "/fixture/train.wav", "sha256": "train", "sample_rate": 24000, "frames": 12000},
+        "sample_transform": {"source_start": 10, "source_rate": 8000, "target_rate": 16000, "frame_policy": "round_half_up_v1"},
+        "alignment_transform": {"source_start": 10, "source_rate": 8000, "target_rate": 16000, "frame_policy": "round_half_up_v1"},
+        "train_transform": {"source_start": 0, "source_rate": 8000, "target_rate": 24000, "frame_policy": "round_half_up_v1"},
+    }
+
+
+def test_raw_interval_carries_token_and_receipt_projected_three_axes():
+    rows = map_raw_intervals_to_samples(
+        [{"raw_interval_id": 7, "xmin": 0.1, "xmax": 0.2, "text": "t"}],
+        offset_sample=0, sample_rate=16000, ownership=(0, 8000), alias="ju_000000",
+        language="ja", run_id="ja-run", unit_id="unit-1", token_id="tok-1",
+        audio_receipt=_audio_receipt(),
+    )
+    phone = rows[0]
+    assert phone["token_id"] == "tok-1"
+    assert phone["alignment_axis"] == {"start_sample": 1600, "end_sample": 3200, "sample_rate": 16000,
+                                       "artifact": {"path": "/fixture/alignment.wav", "sha256": "alignment"}}
+    assert phone["source_axis"]["start_sample"] == 810
+    assert phone["source_axis"]["end_sample"] == 1610
+    assert phone["training_axis"]["start_sample"] == 2400
+    assert phone["training_axis"]["end_sample"] == 4800
+    assert phone["source_axis"]["transform"]["source_start"] == 10
 
 
 def test_locked_dictionary_has_one_ascii_alias_row_per_occurrence(tmp_path: Path):
@@ -78,15 +109,17 @@ def test_align_stage_runs_prepared_fixture_and_writes_strict_ledger(tmp_path: Pa
     def fake_runner(run, run_root, locked):
         return {"status": "COMPLETE", "textgrid": str(grid)}
     run = {"run_id": "ja_run_0000", "language": "ja", "unit_ids": ["u0"],
-           "aliases": [{"alias": "ju_000000", "surface": "東京", "reading": "とうきょう", "pronunciation": ["t"]}],
+           "aliases": [{"alias": "ju_000000", "token_id": "tok-0", "surface": "東京", "reading": "とうきょう", "pronunciation": ["t"]}],
            "ownership_start_sample": 0, "ownership_end_sample": 16000,
-           "context_start_sample": 0, "context_end_sample": 16000, "sample_rate": 16000}
+           "context_start_sample": 0, "context_end_sample": 16000, "sample_rate": 16000,
+           "audio_receipt": _audio_receipt()}
     stage = tmp_path / "stages" / "align"
     result = handle_align({"align": {"uid": "u1", "runs": [run], "mfa_runner": fake_runner}}, stage)
     assert result.status == "COMPLETE"
     payload = __import__("json").loads((stage / "strict_ja_mfa.json").read_text(encoding="utf-8"))
     assert payload["schema"] == "strict-ja-mfa-v2"
     assert payload["runs"][0]["phones"][0]["raw_interval_id"] == 1
+    assert payload["runs"][0]["phones"][0]["token_id"] == "tok-0"
 
 
 def test_align_stage_rejects_word_alias_cardinality_mismatch(tmp_path: Path):

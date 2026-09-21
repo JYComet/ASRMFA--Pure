@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+import scripts.run_ja_en_pipeline as pipeline
 
 from scripts.ja_en_schema import (
     ERROR_CODES,
@@ -73,6 +74,19 @@ def test_five_track_contract_versions_and_stage_order():
         "native_basic_mapping_ambiguous", "phone_tone_projection_lossy",
         "five_track_boundary_mismatch", "tone_provenance_missing",
     } <= ERROR_CODES
+
+
+def test_merge_uid_aggregate_uses_alignment_v3_schema(tmp_path, monkeypatch):
+    def merge_handler(_config, stage_dir):
+        output = stage_dir / "ja_en_alignment.json"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps({"schema": "ja-en-alignment-v3", "uid": "u1", "words": [],
+                                      "native_phones": [], "languages": [], "raw_mfa": {}}), encoding="utf-8")
+        return pipeline.StageResult("merge", "COMPLETE", str(stage_dir / "receipt.json"))
+    monkeypatch.setitem(pipeline._STAGE_REGISTRY, "merge", (merge_handler, "merge"))
+    pipeline._run_uid_batch("merge", [{"uid": "u1"}], {}, tmp_path)
+    aggregate = json.loads((tmp_path / "stages" / "merge" / "ja_en_alignments.json").read_text(encoding="utf-8"))
+    assert aggregate["schema"] == "ja-en-alignment-v3"
 
 
 def test_prosody_config_has_closed_keys(tmp_path):

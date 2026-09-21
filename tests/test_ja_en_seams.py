@@ -1,6 +1,7 @@
 import pytest
 import scripts.merge_ja_en_mfa as merge_module
 from scripts.ja_en_schema import JAContractError
+from scripts.align_japanese_mfa import handle_align
 
 from scripts.merge_ja_en_mfa import (
     MergeRejected,
@@ -39,9 +40,11 @@ def _semantic_graph(alias, token_id, labels):
 
 
 def _alignment(phones, locked_aliases):
+    languages = {row["alias"]: row["language"] for row in phones}
     return {
         "schema": "ja-en-alignment-v2", "uid": "u1", "words": [],
-        "native_phones": phones, "locked_aliases": locked_aliases,
+        "native_phones": phones,
+        "locked_aliases": [{**row, "language": row.get("language", languages.get(row["alias"]))} for row in locked_aliases],
     }
 
 
@@ -74,6 +77,95 @@ def test_alias_mismatch_never_falls_back_to_all_actual_phones():
         )
 
 
+def test_english_and_mixed_aliases_bind_without_japanese_templates():
+    en_phone = _native_phone("en0", "AH", "eu_000001", 1, token_id="tok-en", language="en")
+    english = merge_module.bind_native_phone_graph(
+        _alignment([en_phone], [{"alias": "eu_000001", "token_id": "tok-en", "language": "en", "pronunciation": ["AH"]}]),
+        [],
+    )
+    assert english["native_phones"][0]["basic_phone_ids"] == []
+    assert english["native_phones"][0]["mora_ids"] == []
+    assert english["native_phones"][0]["transform"] == "identity"
+
+    ja_phone = _native_phone("ja0", "t", "ju_000002", 2, token_id="tok-ja", start=100, end=200)
+    mixed = merge_module.bind_native_phone_graph(
+        _alignment([en_phone, ja_phone], [
+            {"alias": "eu_000001", "token_id": "tok-en", "language": "en", "pronunciation": ["AH"]},
+            {"alias": "ju_000002", "token_id": "tok-ja", "language": "ja", "pronunciation": ["t"]},
+        ]),
+        [_semantic_graph("ju_000002", "tok-ja", ["t"])],
+    )
+    assert [row["phone_id"] for row in mixed["native_phones"]] == ["en0", "ja0"]
+
+
+def test_japanese_template_without_ordered_basic_and_mora_ids_is_rejected():
+    graph = _semantic_graph("ju_000001", "tok", ["a"])
+    graph["native_phone_templates"][0]["basic_phone_ids"] = []
+    with pytest.raises(JAContractError, match="native_basic_mapping_ambiguous"):
+        merge_module.bind_native_phone_graph(
+            _alignment([_native_phone("p0", "a", "ju_000001", 1, token_id="tok")], [
+                {"alias": "ju_000001", "token_id": "tok", "language": "ja", "pronunciation": ["a"]},
+            ]), [graph],
+        )
+
+
+def test_merge_receipt_preserves_contract_error_code_and_path(tmp_path):
+    stage = tmp_path / "stages" / "merge"
+    result = handle_merge({"merge": {
+        "uid": "u1", "ownership": [0, 100], "sample_rate": 16000,
+        "expected_languages": {"ju_000001": "ja"},
+        "japanese_intervals": [_native_phone("p0", "a", "ju_000001", 1, token_id="tok", end=100)],
+        "english_intervals": [],
+        "locked_aliases": [{"alias": "ju_000001", "token_id": "tok", "language": "ja", "pronunciation": ["a"]}],
+        "semantic_graphs": [],
+    }}, stage)
+    assert result.status == "REJECTED"
+    error = __import__("json").loads((stage / "receipt.json").read_text(encoding="utf-8"))["errors"][0]
+    assert error["code"] == "native_basic_mapping_ambiguous"
+    assert error["path"] == "$.semantic_graphs"
+
+
+def test_strict_ledger_projects_axes_and_merges_with_bound_evidence(tmp_path):
+    raw_grid = tmp_path / "raw.TextGrid"
+    raw_grid.write_text(
+        'File type = "ooTextFile"\nObject class = "TextGrid"\n\n'
+        'xmin = 0\nxmax = 1\ntiers? <exists>\nsize = 2\nitem []:\n'
+        'item [1]:\nclass = "IntervalTier"\nname = "words"\nxmin = 0\nxmax = 1\nintervals: size = 1\n'
+        'intervals [1]:\nxmin = 0\nxmax = 1\ntext = "ju_000001"\n'
+        'item [2]:\nclass = "IntervalTier"\nname = "phones"\nxmin = 0\nxmax = 1\nintervals: size = 1\n'
+        'intervals [1]:\nxmin = 0\nxmax = 1\ntext = "a"\n', encoding="utf-8")
+    receipt = {
+        "schema": "audio-transform-receipt-v2", "uid": "u1",
+        "source": {"path": "/source.wav", "sha256": "source", "sample_rate": 8000},
+        "alignment": {"path": "/align.wav", "sha256": "align", "sample_rate": 16000},
+        "train": {"path": "/train.wav", "sha256": "train", "sample_rate": 24000},
+        "sample_transform": {"source_start": 10}, "alignment_transform": {"source_start": 10},
+        "train_transform": {"source_start": 0},
+    }
+    run = {"run_id": "ja-run", "language": "ja", "unit_ids": ["unit-ja"],
+           "aliases": [{"alias": "ju_000001", "token_id": "tok-ja", "unit_id": "unit-ja", "pronunciation": ["a"]}],
+           "ownership_start_sample": 0, "ownership_end_sample": 16000,
+           "context_start_sample": 0, "context_end_sample": 16000, "sample_rate": 16000,
+           "audio_receipt": receipt}
+    align_stage = tmp_path / "stages" / "align"
+    aligned = handle_align({"align": {"uid": "u1", "runs": [run],
+                                        "mfa_runner": lambda *_: {"status": "COMPLETE", "textgrid": str(raw_grid)}}}, align_stage)
+    assert aligned.status == "COMPLETE"
+    merged = handle_merge({"merge": {
+        "uid": "u1", "ownership": [0, 16000], "sample_rate": 16000,
+        "expected_languages": {"ju_000001": "ja"},
+        "japanese_ledger": str(align_stage / "strict_ja_mfa.json"), "english_ledger": [],
+        "locked_aliases": [{"alias": "ju_000001", "token_id": "tok-ja", "language": "ja", "pronunciation": ["a"]}],
+        "semantic_graphs": [_semantic_graph("ju_000001", "tok-ja", ["a"])],
+        "runs": [run], "audio_receipt": receipt,
+    }}, tmp_path / "stages" / "merge")
+    assert merged.status == "COMPLETE"
+    payload = __import__("json").loads((tmp_path / "stages" / "merge" / "ja_en_alignment.json").read_text(encoding="utf-8"))
+    assert payload["native_phones"][0]["token_id"] == "tok-ja"
+    assert payload["raw_mfa"]["runs"][0]["run_id"] == "ja-run"
+    assert payload["audio_receipt"] == receipt
+
+
 def test_alignment_v3_retains_raw_mfa_boundaries_and_axes(tmp_path):
     stage = tmp_path / "stages" / "merge"
     raw = _native_phone("p0", "a", "ju_000001", 4, token_id="tok-a", start=100, end=300)
@@ -81,7 +173,7 @@ def test_alignment_v3_retains_raw_mfa_boundaries_and_axes(tmp_path):
         "uid": "u1", "ownership": [0, 400], "sample_rate": 16000,
         "expected_languages": {"ju_000001": "ja"},
         "japanese_intervals": [raw], "english_intervals": [],
-        "locked_aliases": [{"alias": "ju_000001", "token_id": "tok-a", "pronunciation": ["a"]}],
+        "locked_aliases": [{"alias": "ju_000001", "token_id": "tok-a", "language": "ja", "pronunciation": ["a"]}],
         "semantic_graphs": [_semantic_graph("ju_000001", "tok-a", ["a"])],
     }}, stage)
     assert result.status == "COMPLETE"
@@ -178,8 +270,8 @@ def test_merge_stage_consumes_prepared_ledgers_and_writes_alignment(tmp_path):
         "uid": "u1", "ownership": [0, 2000], "sample_rate": 16000,
         "expected_languages": {"ju_000000": "ja", "eu_000001": "en"},
         "japanese_intervals": [ja], "english_intervals": [en],
-        "locked_aliases": [{"alias": "ju_000000", "token_id": "tok-ja", "pronunciation": ["t"]},
-                           {"alias": "eu_000001", "token_id": "tok-en", "pronunciation": ["G"]}],
+        "locked_aliases": [{"alias": "ju_000000", "token_id": "tok-ja", "language": "ja", "pronunciation": ["t"]},
+                           {"alias": "eu_000001", "token_id": "tok-en", "language": "en", "pronunciation": ["G"]}],
         "semantic_graphs": [_semantic_graph("ju_000000", "tok-ja", ["t"]), _semantic_graph("eu_000001", "tok-en", ["G"])],
     }}, stage)
     assert result.status == "COMPLETE"
@@ -199,8 +291,8 @@ def test_merge_stage_serialized_retry_plan_reruns_both_sides(tmp_path):
         "expected_languages": {"ju_000000": "ja", "eu_000001": "en"}, "reject_edge_touch": True,
         "initial_padding_samples": 100, "max_retries": 1,
         "japanese_intervals": bad_ja, "english_intervals": bad_en,
-        "locked_aliases": [{"alias": "ju_000000", "token_id": "tok-ja", "pronunciation": ["t"]},
-                           {"alias": "eu_000001", "token_id": "tok-en", "pronunciation": ["G"]}],
+        "locked_aliases": [{"alias": "ju_000000", "token_id": "tok-ja", "language": "ja", "pronunciation": ["t"]},
+                           {"alias": "eu_000001", "token_id": "tok-en", "language": "en", "pronunciation": ["G"]}],
         "semantic_graphs": [_semantic_graph("ju_000000", "tok-ja", ["t"]), _semantic_graph("eu_000001", "tok-en", ["G"])],
         "rerun_plan": {"left": {"japanese_intervals": good_ja, "english_intervals": good_en}, "right": {"japanese_intervals": good_ja, "english_intervals": good_en}},
     }}

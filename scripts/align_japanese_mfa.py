@@ -220,6 +220,8 @@ def map_raw_intervals_to_samples(
     tier: str = "phones",
     interval_index: int | None = None,
     unit_id: str | None = None,
+    token_id: str | None = None,
+    audio_receipt: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Map raw MFA seconds to the immutable global sample axis."""
     if type(offset_sample) is not int or offset_sample < 0 or type(sample_rate) is not int or sample_rate <= 0:
@@ -227,6 +229,37 @@ def map_raw_intervals_to_samples(
     owner_start, owner_end = ownership
     if language not in {"ja", "en"}:
         raise ValueError("language must be ja or en")
+    if not isinstance(token_id, str) or not token_id:
+        raise JAContractError("alignment_invalid", "raw MFA token identity is required", "$.token_id")
+    if not isinstance(audio_receipt, Mapping) or audio_receipt.get("schema") != "audio-transform-receipt-v2":
+        raise JAContractError("receipt_invalid", "audio-transform receipt is required for MFA axis projection", "$.audio_receipt")
+    required_audio = ("source", "alignment", "train")
+    if any(not isinstance(audio_receipt.get(key), Mapping) for key in required_audio):
+        raise JAContractError("receipt_invalid", "audio-transform receipt lacks axis artifact", "$.audio_receipt")
+    alignment = audio_receipt["alignment"]
+    source = audio_receipt["source"]
+    train = audio_receipt["train"]
+    transform = audio_receipt.get("alignment_transform") or audio_receipt.get("sample_transform")
+    train_transform = audio_receipt.get("train_transform")
+    if not isinstance(transform, Mapping) or not isinstance(train_transform, Mapping):
+        raise JAContractError("receipt_invalid", "audio-transform recipe is required for MFA axis projection", "$.audio_receipt")
+    def rate(axis: Mapping[str, Any], name: str) -> int:
+        value = axis.get("sample_rate")
+        if type(value) is not int or value <= 0:
+            raise JAContractError("receipt_invalid", f"{name} axis sample rate is required", "$.audio_receipt")
+        if not isinstance(axis.get("path"), str) or not axis.get("sha256"):
+            raise JAContractError("receipt_invalid", f"{name} axis artifact path/hash is required", "$.audio_receipt")
+        return value
+    alignment_rate, source_rate, train_rate = rate(alignment, "alignment"), rate(source, "source"), rate(train, "training")
+    if alignment_rate != sample_rate:
+        raise JAContractError("alignment_invalid", "raw MFA rate differs from alignment receipt axis", "$.sample_rate")
+    source_offset = transform.get("source_start")
+    if type(source_offset) is not int or source_offset < 0:
+        raise JAContractError("receipt_invalid", "alignment transform source_start is required", "$.audio_receipt.alignment_transform")
+    def project(value: int, target_rate: int) -> int:
+        return int((value * target_rate + alignment_rate // 2) // alignment_rate)
+    def artifact(axis: Mapping[str, Any]) -> dict[str, Any]:
+        return {"path": axis["path"], "sha256": axis["sha256"]}
     result: list[dict[str, Any]] = []
     for local_index, interval in enumerate(intervals):
         try:
@@ -250,8 +283,19 @@ def map_raw_intervals_to_samples(
             "run_id": run_id,
             "crop_offset_sample": offset_sample,
             "unit_id": unit_id,
+            "token_id": token_id,
             "start_sample": start,
             "end_sample": end,
+            "alignment_axis": {"start_sample": start, "end_sample": end,
+                               "sample_rate": alignment_rate, "artifact": artifact(alignment)},
+            "source_axis": {"start_sample": source_offset + project(start, source_rate),
+                            "end_sample": source_offset + project(end, source_rate),
+                            "sample_rate": source_rate, "artifact": artifact(source),
+                            "transform": dict(transform)},
+            "training_axis": {"start_sample": project(start, train_rate),
+                              "end_sample": project(end, train_rate),
+                              "sample_rate": train_rate, "artifact": artifact(train),
+                              "transform": dict(train_transform)},
         })
     return result
 
@@ -427,6 +471,7 @@ def handle_align(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
                 grid_raw = candidates[0]
             expected_aliases = [str(row["alias"]) for row in rows]
             alias_to_unit = {str(row["alias"]): str(row.get("unit_id", row.get("token_id", row["alias"]))) for row in rows}
+            alias_to_token = {str(row["alias"]): row.get("token_id") for row in rows}
             alias_to_pron = {str(row["alias"]): [str(phone) for phone in row["pronunciation"]] for row in rows}
             inventory = run.get("native_inventory")
             if run.get("native_inventory_path"):
@@ -447,7 +492,7 @@ def handle_align(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
                 containing = [word["text"] for word in words if word["xmin"] <= interval["xmin"] and interval["xmax"] <= word["xmax"] and word["text"] and word["text"] not in {"<eps>", "sil", "sp", "spn"}]
                 if len(containing) != 1:
                     raise ValueError(f"{run_id}: phone cannot be assigned to one alias")
-                mapped = map_raw_intervals_to_samples([interval], offset_sample=offset, sample_rate=int(run.get("sample_rate", 16000)), ownership=ownership, alias=containing[0], language=language, run_id=run_id, raw_artifact_path=str(Path(str(grid_raw)).resolve()), raw_artifact_sha256=grid_sha256, interval_index=interval_index, unit_id=alias_to_unit.get(containing[0]))
+                mapped = map_raw_intervals_to_samples([interval], offset_sample=offset, sample_rate=int(run.get("sample_rate", 16000)), ownership=ownership, alias=containing[0], language=language, run_id=run_id, raw_artifact_path=str(Path(str(grid_raw)).resolve()), raw_artifact_sha256=grid_sha256, interval_index=interval_index, unit_id=alias_to_unit.get(containing[0]), token_id=alias_to_token.get(containing[0]), audio_receipt=run.get("audio_receipt"))
                 for phone in mapped:
                     phone["phone_id"] = f"{raw.get('uid', config.get('uid', ''))}:{run_id}:{phone['alias']}:p{len(phones):06d}"
                 phones.extend(mapped)
@@ -461,10 +506,13 @@ def handle_align(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
             missing_run_keys = sorted(RUN_REQUIRED_KEYS - set(run))
             if missing_run_keys:
                 raise ValueError(f"{run_id}: missing run contract keys {missing_run_keys}")
-            ledger = build_strict_ledger(uid=str(raw.get("uid", config.get("uid", ""))), language=language, runs=[{key: run[key] for key in RUN_REQUIRED_KEYS if key in run}], expected_unit_ids=unit_ids, verified=unit_ids, rejected=[], unresolved=[])
+            ledger_run = {key: run[key] for key in RUN_REQUIRED_KEYS if key in run}
+            ledger_run["audio_receipt"] = dict(run["audio_receipt"]) if isinstance(run.get("audio_receipt"), Mapping) else run.get("audio_receipt")
+            ledger = build_strict_ledger(uid=str(raw.get("uid", config.get("uid", ""))), language=language, runs=[ledger_run], expected_unit_ids=unit_ids, verified=unit_ids, rejected=[], unresolved=[])
             ledger["runs"][0]["phones"] = phones
             ledger["runs"][0]["silence_intervals"] = silence_intervals
             ledger["runs"][0]["textgrid"] = str(grid_raw)
+            ledger["runs"][0]["raw_textgrid"] = {"path": str(Path(str(grid_raw)).resolve()), "sha256": grid_sha256}
             ledger_runs[language].extend(ledger["runs"])
             ledger_expected[language].extend(unit_ids)
             output_paths.extend([locked, alias_map])
@@ -500,13 +548,14 @@ def handle_align(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
                 units = [str(value) for value in source_run.get("unit_ids", [row.get("alias") for row in source_run.get("aliases", [])])]
                 grouped_expected[lang].extend(units)
                 rejected_run = {key: source_run.get(key, 0 if key.endswith("_sample") else []) for key in RUN_REQUIRED_KEYS}
-                rejected_run.update({"run_id": str(source_run.get("run_id", "unknown")), "language": lang, "unit_ids": units, "error": str(exc)})
+                error = exc.as_dict() if isinstance(exc, JAContractError) else {"code": "alignment_invalid", "message": str(exc)}
+                rejected_run.update({"run_id": str(source_run.get("run_id", "unknown")), "language": lang, "unit_ids": units, "error": error})
                 grouped[lang].append(rejected_run)
             for lang in ("ja", "en"):
                 if not grouped[lang]:
                     continue
                 rejected_ledger = build_strict_ledger(uid=str(raw.get("uid", config.get("uid", ""))), language=lang, runs=grouped[lang], expected_unit_ids=grouped_expected[lang], verified=[], rejected=grouped_expected[lang], unresolved=[])
-                rejected_ledger["error"] = str(exc)
+                rejected_ledger["error"] = error
                 ledger_path = stage_dir / (JA_LEDGER_FILENAME if lang == "ja" else EN_LEDGER_FILENAME)
                 atomic_write_json(ledger_path, rejected_ledger, workspace=stage_dir.parent.parent)
                 rejected_outputs.append(ledger_path)
@@ -514,7 +563,8 @@ def handle_align(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
             if artifact.is_file() and not artifact.is_symlink():
                 rejected_outputs.append(artifact)
         rejected_outputs = list(dict.fromkeys(rejected_outputs))
-        receipt = make_receipt(stage="align", status="REJECTED", outputs=rejected_outputs, params={"implementation": "isolated-ja-en-mfa-v3"}, errors=[{"code": "alignment_invalid", "message": str(exc)}])
+        error = exc.as_dict() if isinstance(exc, JAContractError) else {"code": "alignment_invalid", "message": str(exc)}
+        receipt = make_receipt(stage="align", status="REJECTED", outputs=rejected_outputs, params={"implementation": "isolated-ja-en-mfa-v3"}, errors=[error])
     atomic_write_json(receipt_path, receipt, workspace=stage_dir.parent.parent)
     return StageResult(stage="align", status=receipt["status"], receipt_path=str(receipt_path))
 
