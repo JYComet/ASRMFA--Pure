@@ -132,3 +132,31 @@ fixture path remains until Task 7 migrates the exporter contract.
 - [x] B: UID-only evidence is rejected when repeated occurrences make it ambiguous; selected reading/digest and frontend evidence are occurrence-bound.
 - [x] C: The registered handler processes only complete prosody-v1 through the authoritative assembler; malformed/tampered input rejects.
 - [x] D: Dependency scoping uses explicit semantic sections, while immutable stage/schema compatibility rejects resume drift.
+
+## Fix Round 5/5
+
+### Ruling alignment
+
+The plan's old assertion that every MFA dictionary change begins at `align` is superseded by the real `semantic_stage` consumer: it reads the Japanese dictionary and validates Japanese/English metadata-to-acoustic archive bindings before producing semantic graphs and aliases. Those assets therefore begin at `semantic`; MFA runtime/execution-only settings begin at `align`.
+
+### RED
+
+- Full registered-handler regressions for an existing mora/basic rebind, `phone_tone` tamper, and missing immutable `mora_graph` relation were accepted by the previous code, because enrichment replaced the supplied relation graph from native rows. A malformed duration group was already rejected for a shallow reason and is now covered by exact validation.
+- The prior cache regression incorrectly expected a real `mfa.japanese_dictionary` change to leave semantic unchanged despite `semantic_stage` consuming it.
+
+### GREEN
+
+- `validate_prosody_alignment` now checks the original v1 graph before `assemble_tts_rows` enrichment: unique identities; exact basic-to-mora and native-to-basic/mora coverage; immutable relation equality; projected kana/tone vectors; and complete, unique duration-group identity, references, and sample sums. Enrichment no longer reconstructs `mora_graph.relations`.
+- Registered `handle_tts` tests reject rebind, kana/tone, missing relation/coverage, and duration-group tampering while the complete source artifact succeeds.
+- Cache dependencies are granular and consumer-based: semantic MFA dictionary/inventory/model-bundle fields start at semantic; runtime/configuration fields begin at align; frontend at frontend; and tone resources at prosody. A persisted stage-cache regression confirms dictionary drift first invalidates semantic. Immutable stage-order/schema resume rejection remains covered.
+
+### Verification
+
+- `pytest -q tests/test_ja_stage_inputs.py tests/test_ja_resume_identity.py tests/test_ja_prosody_projection.py tests/test_ja_prosody_schema.py tests/test_ja_tts_export.py tests/test_ja_frontend_contract_w2.py tests/test_ja_phone_adapter_w2.py tests/test_ja_mora_graph.py` — 95 passed, 37 skipped.
+- `pytest -q` — 1692 passed, 37 skipped, 1 failed in 32.68s. The sole failure remains Task 8-owned `tests/test_ja_independent_verifier.py::test_three_uid_bound_fixture_integrity_and_evidence_tamper`.
+- `python -m compileall -q scripts tests` and `git diff --check` — passed.
+
+### Self-audit
+
+- [x] C: Immutable graph contradiction cannot be normalized away before comparison or serialization.
+- [x] D: Dependency start stages are based on actual configuration consumers, and persisted cache invalidation matches the first consumer.

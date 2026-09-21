@@ -67,23 +67,82 @@ def validate_prosody_alignment(alignment: Mapping[str, Any]) -> None:
     required = ("words", "moras", "basic_phones", "native_phones", "tone_sources", "duration_groups")
     if alignment.get("schema") != "ja-prosody-alignment-v1" or any(not isinstance(alignment.get(key), list) for key in required):
         raise ValueError("TTS requires a complete ja-prosody-alignment-v1 artifact")
-    moras = {row.get("mora_id") for row in alignment["moras"] if isinstance(row, Mapping)}
-    basics = {row.get("basic_phone_id") for row in alignment["basic_phones"] if isinstance(row, Mapping)}
-    phones = {row.get("phone_id") for row in alignment["native_phones"] if isinstance(row, Mapping)}
+    moras = {row.get("mora_id"): row for row in alignment["moras"] if isinstance(row, Mapping) and isinstance(row.get("mora_id"), str)}
+    basics = {row.get("basic_phone_id"): row for row in alignment["basic_phones"] if isinstance(row, Mapping) and isinstance(row.get("basic_phone_id"), str)}
+    phones = {row.get("phone_id"): row for row in alignment["native_phones"] if isinstance(row, Mapping) and isinstance(row.get("phone_id"), str)}
+    if len(moras) != len(alignment["moras"]) or len(basics) != len(alignment["basic_phones"]) or len(phones) != len(alignment["native_phones"]):
+        raise ValueError("prosody artifact has duplicate or invalid node identities")
     if not phones or (any(row.get("language") == "ja" for row in alignment["native_phones"] if isinstance(row, Mapping)) and (not moras or not basics)):
         raise ValueError("prosody artifact has incomplete mora/basic/native graph")
     for basic in alignment["basic_phones"]:
         if not isinstance(basic, Mapping) or basic.get("mora_id") not in moras:
             raise ValueError("prosody basic phone references an unknown mora")
+    graph = alignment.get("mora_graph")
+    if not isinstance(graph, Mapping) or not isinstance(graph.get("moras"), list) or not isinstance(graph.get("relations"), list):
+        raise ValueError("prosody artifact lacks immutable mora_graph")
+    graph_moras = [row.get("mora_id") for row in graph["moras"] if isinstance(row, Mapping)]
+    if len(graph_moras) != len(graph["moras"]) or len(graph_moras) != len(set(graph_moras)) or set(graph_moras) != set(moras):
+        raise ValueError("prosody mora_graph ownership differs from mora nodes")
+    expected_relations: set[tuple[str, str]] = set()
+    basic_owners: dict[str, int] = {key: 0 for key in basics}
     for phone in alignment["native_phones"]:
         if (not isinstance(phone, Mapping) or not isinstance(phone.get("mora_ids"), list)
                 or not isinstance(phone.get("basic_phone_ids"), list)
-                or not set(phone["mora_ids"]) <= moras or not set(phone["basic_phone_ids"]) <= basics):
+                or not phone.get("phone_id") in phones
+                or not set(phone["mora_ids"]) <= set(moras) or not set(phone["basic_phone_ids"]) <= set(basics)):
             raise ValueError("prosody native phone references an unknown mora/basic phone")
+        language = phone.get("language")
+        if language == "ja":
+            if not isinstance(phone.get("token_id"), str) or not phone.get("token_id") or not phone["mora_ids"] or not phone["basic_phone_ids"]:
+                raise ValueError("Japanese native phone lacks semantic ownership")
+            ordered_moras = []
+            for basic_id in phone["basic_phone_ids"]:
+                basic_owners[basic_id] += 1
+                mora_id = basics[basic_id].get("mora_id")
+                if mora_id not in ordered_moras:
+                    ordered_moras.append(mora_id)
+            if ordered_moras != phone["mora_ids"]:
+                raise ValueError("native basic/mora ownership is contradictory")
+            expected_kana = "|".join(str(moras[mora_id].get("kana", "")) for mora_id in phone["mora_ids"])
+            expected_tone = "|".join(str(moras[mora_id].get("tone", "UNK")) for mora_id in phone["mora_ids"])
+            if phone.get("phone_kana") != expected_kana or phone.get("phone_tone") != expected_tone:
+                raise ValueError("native phone kana/tone projection differs from immutable moras")
+            expected_relations.update((mora_id, phone["phone_id"]) for mora_id in phone["mora_ids"])
+        elif phone["mora_ids"] or phone["basic_phone_ids"] or phone.get("phone_kana") != "" or phone.get("phone_tone") != "NA":
+            raise ValueError("non-Japanese native phone has semantic ownership or projection")
+    for basic_id, basic in basics.items():
+        expected = 0 if basic.get("realization") == "elided" else 1
+        if basic_owners[basic_id] != expected:
+            raise ValueError("basic phone native coverage is incomplete or duplicated")
+    if {basic.get("mora_id") for basic in basics.values()} != set(moras):
+        raise ValueError("prosody mora has no basic-phone ownership")
+    actual_relations = []
+    for relation in graph["relations"]:
+        if not isinstance(relation, Mapping) or relation.get("mora_id") not in moras or relation.get("phone_id") not in phones:
+            raise ValueError("prosody mora_graph relation references an unknown node")
+        actual_relations.append((relation["mora_id"], relation["phone_id"]))
+    if len(actual_relations) != len(set(actual_relations)) or set(actual_relations) != expected_relations:
+        raise ValueError("prosody mora_graph relations differ from native ownership")
+    expected_groups = {
+        phone_id: phone for phone_id, phone in phones.items()
+        if len(phone.get("basic_phone_ids", [])) > 1
+    }
+    groups_by_phone: dict[str, Mapping[str, Any]] = {}
     for group in alignment["duration_groups"]:
-        if (not isinstance(group, Mapping) or group.get("native_phone_id") not in phones
-                or not set(group.get("basic_phone_ids", [])) <= basics):
+        if (not isinstance(group, Mapping) or group.get("native_phone_id") not in expected_groups
+                or group.get("native_phone_id") in groups_by_phone):
             raise ValueError("prosody duration group references an unknown node")
+        phone = expected_groups[group["native_phone_id"]]
+        if (group.get("duration_group_id") != f"duration-group-{group['native_phone_id']}"
+                or group.get("basic_phone_ids") != phone.get("basic_phone_ids")
+                or group.get("total_duration_samples") != int(phone["end_sample"]) - int(phone["start_sample"])
+                or group.get("internal_boundaries_known") is not False
+                or group.get("boundary_source") != "unknown_inside_mfa_interval"
+                or group.get("duration_loss_mode") != "group_sum"):
+            raise ValueError("prosody duration group differs from native interval")
+        groups_by_phone[group["native_phone_id"]] = group
+    if set(groups_by_phone) != set(expected_groups):
+        raise ValueError("prosody duration-group coverage is incomplete")
 
 
 def build_quality_masks(prosody: Mapping[str, Any] | None = None) -> dict[str, Any]:

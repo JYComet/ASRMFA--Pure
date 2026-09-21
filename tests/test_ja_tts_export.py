@@ -59,13 +59,14 @@ def test_tts_stage_consumes_authoritative_alignment_and_declares_real_outputs(tm
     alignment["alignment_wav"] = alignment["audio_receipt"]["alignment"]
     alignment["schema"] = "ja-prosody-alignment-v1"
     alignment["native_phones"] = alignment.pop("phones")
-    for phone in alignment["native_phones"]:
-        phone.update({"token_id": "w0", "mora_ids": ["m0"], "basic_phone_ids": ["bp0"], "phone_kana": "さ", "phone_tone": "H"})
+    for index, phone in enumerate(alignment["native_phones"]):
+        mora_id, basic_id, kana = ("m0", "bp0", "さ") if index == 0 else ("m1", "bp1", "く")
+        phone.update({"token_id": "w0", "mora_ids": [mora_id], "basic_phone_ids": [basic_id], "phone_kana": kana, "phone_tone": "H"})
     alignment.update({
-        "moras": [{"mora_id": "m0", "kana": "さ", "tone": "H"}],
-        "basic_phones": [{"basic_phone_id": "bp0", "mora_id": "m0", "symbol": "s"}],
+        "moras": [{"mora_id": "m0", "kana": "さ", "tone": "H"}, {"mora_id": "m1", "kana": "く", "tone": "H"}],
+        "basic_phones": [{"basic_phone_id": "bp0", "mora_id": "m0", "symbol": "s"}, {"basic_phone_id": "bp1", "mora_id": "m1", "symbol": "a"}],
         "duration_groups": [], "tone_sources": [{"entry_id": "fixture"}],
-        "mora_graph": {"moras": [{"mora_id": "m0"}], "relations": [{"mora_id": "m0", "phone_id": "p0"}, {"mora_id": "m0", "phone_id": "p1"}]},
+        "mora_graph": {"moras": [{"mora_id": "m0"}, {"mora_id": "m1"}], "relations": [{"mora_id": "m0", "phone_id": "p0"}, {"mora_id": "m1", "phone_id": "p1"}]},
         "frontend": {"fixture": True}, "model_ids": {"mfa": "fixture"}, "dict_ids": {"ja": "fixture"}, "seams": [],
         "source_receipt": make_receipt(stage="merge", status="COMPLETE"),
     })
@@ -81,6 +82,31 @@ def test_tts_stage_consumes_authoritative_alignment_and_declares_real_outputs(tm
     source.write_text(json.dumps(tampered) + "\n", encoding="utf-8")
     rejected = handle_tts({"input_manifest": str(manifest), "workspace": str(tmp_path), "tts": {"alignment_jsonl": str(source)}, "stage_inputs": {"tts": {"alignment_jsonl": str(source)}}}, tmp_path / "tampered")
     assert rejected.status == "REJECTED"
+    source.write_text(json.dumps(alignment) + "\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("tamper", ("rebind", "projection", "coverage", "duration"))
+def test_tts_handler_rejects_semantically_inconsistent_complete_prosody_graph(tmp_path: Path, tamper: str):
+    """All referenced IDs can exist while immutable prosody relations disagree."""
+    # Reuse the complete registered-handler fixture and transform only one
+    # immutable semantic claim at a time.
+    test_tts_stage_consumes_authoritative_alignment_and_declares_real_outputs(tmp_path)
+    source = tmp_path / "alignment.jsonl"
+    artifact = json.loads(source.read_text(encoding="utf-8"))
+    if tamper == "rebind":
+        artifact["native_phones"][0].update({"mora_ids": ["m1"], "basic_phone_ids": ["bp1"], "phone_kana": "く"})
+    elif tamper == "projection":
+        artifact["native_phones"][0].update({"phone_kana": "tampered", "phone_tone": "L"})
+    elif tamper == "coverage":
+        artifact["mora_graph"]["relations"].pop()
+    else:
+        artifact["native_phones"] = [artifact["native_phones"][0]]
+        artifact["native_phones"][0].update({"mora_ids": ["m0", "m1"], "basic_phone_ids": ["bp0", "bp1"], "phone_kana": "さ|く", "phone_tone": "H|H"})
+        artifact["mora_graph"]["relations"] = [{"mora_id": "m0", "phone_id": "p0"}, {"mora_id": "m1", "phone_id": "p0"}]
+        artifact["duration_groups"] = [{"duration_group_id": "duration-group-p0", "native_phone_id": "p0", "basic_phone_ids": ["bp0"], "total_duration_samples": 1}]
+    source.write_text(json.dumps(artifact) + "\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    assert handle_tts({"input_manifest": str(manifest), "workspace": str(tmp_path), "tts": {"alignment_jsonl": str(source)}, "stage_inputs": {"tts": {"alignment_jsonl": str(source)}}}, tmp_path / f"bad-{tamper}").status == "REJECTED"
 
 
 def test_tts_stage_rejects_merge_v3_on_production_path(tmp_path: Path):

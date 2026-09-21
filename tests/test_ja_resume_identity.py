@@ -99,21 +99,21 @@ def test_prosody_resources_invalidate_only_prosody_downstream(tmp_path: Path):
     assert all(before[stage] != after[stage] for stage in ("prosody", "tts", "verify"))
 
 
-def test_mfa_dictionary_invalidates_align_and_all_downstream(tmp_path: Path):
+def test_mfa_dictionary_invalidates_semantic_and_all_downstream(tmp_path: Path):
     identity = {"config": {"mfa": {"japanese_dictionary": "dictionary-a"}, "prosody": {}}}
     changed = {"config": {"mfa": {"japanese_dictionary": "dictionary-b"}, "prosody": {}}}
     stages = ("semantic", "align", "merge", "prosody", "tts", "verify")
     before = {stage: _stage_cache_identity(stage, identity, {}, tmp_path) for stage in stages}
     after = {stage: _stage_cache_identity(stage, changed, {}, tmp_path) for stage in stages}
-    assert before["semantic"] == after["semantic"]
-    assert all(before[stage] != after[stage] for stage in ("align", "merge", "prosody", "tts", "verify"))
+    assert all(before[stage] != after[stage] for stage in ("semantic", "align", "merge", "prosody", "tts", "verify"))
 
 
 def test_real_identity_scopes_assets_to_their_first_consuming_stage(tmp_path: Path):
     config_path, config = _config(tmp_path)
-    dictionary, frontend_model, tones = (tmp_path / "dictionary", tmp_path / "frontend.model", tmp_path / "tones.json")
-    dictionary.write_text("dictionary-a", encoding="utf-8"); frontend_model.write_text("frontend-a", encoding="utf-8"); tones.write_text("tones-a", encoding="utf-8")
-    config["mfa"] = {"japanese_dictionary": str(dictionary)}
+    dictionary, metadata, archive, runtime, frontend_model, tones = (tmp_path / "dictionary", tmp_path / "metadata", tmp_path / "archive", tmp_path / "runtime", tmp_path / "frontend.model", tmp_path / "tones.json")
+    for path, value in ((dictionary, "dictionary-a"), (metadata, "metadata-a"), (archive, "archive-a"), (runtime, "runtime-a"), (frontend_model, "frontend-a"), (tones, "tones-a")):
+        path.write_text(value, encoding="utf-8")
+    config["mfa"] = {"japanese_dictionary": str(dictionary), "japanese_metadata": str(metadata), "japanese_acoustic": str(archive), "runtime_python": str(runtime)}
     config["frontend"]["accent_model"] = str(frontend_model)
     config["prosody"] = {"manual_overrides": str(tones)}
     manifest_path = Path(config["input_manifest"])
@@ -122,9 +122,17 @@ def test_real_identity_scopes_assets_to_their_first_consuming_stage(tmp_path: Pa
     before = config_identity(config, manifest_path, rows)
     dictionary.write_text("dictionary-b", encoding="utf-8")
     after_dictionary = config_identity(config, manifest_path, rows)
-    assert _stage_cache_identity("semantic", before, config, workspace) == _stage_cache_identity("semantic", after_dictionary, config, workspace)
-    assert _stage_cache_identity("align", before, config, workspace) != _stage_cache_identity("align", after_dictionary, config, workspace)
-    dictionary.write_text("dictionary-a", encoding="utf-8"); frontend_model.write_text("frontend-b", encoding="utf-8")
+    assert _stage_cache_identity("semantic", before, config, workspace) != _stage_cache_identity("semantic", after_dictionary, config, workspace)
+    for asset in (metadata, archive):
+        dictionary.write_text("dictionary-a", encoding="utf-8"); metadata.write_text("metadata-a", encoding="utf-8"); archive.write_text("archive-a", encoding="utf-8")
+        asset.write_text("changed", encoding="utf-8")
+        changed = config_identity(config, manifest_path, rows)
+        assert _stage_cache_identity("semantic", before, config, workspace) != _stage_cache_identity("semantic", changed, config, workspace)
+    metadata.write_text("metadata-a", encoding="utf-8"); archive.write_text("archive-a", encoding="utf-8"); runtime.write_text("runtime-b", encoding="utf-8")
+    after_runtime = config_identity(config, manifest_path, rows)
+    assert _stage_cache_identity("semantic", before, config, workspace) == _stage_cache_identity("semantic", after_runtime, config, workspace)
+    assert _stage_cache_identity("align", before, config, workspace) != _stage_cache_identity("align", after_runtime, config, workspace)
+    runtime.write_text("runtime-a", encoding="utf-8"); frontend_model.write_text("frontend-b", encoding="utf-8")
     after_frontend = config_identity(config, manifest_path, rows)
     assert _stage_cache_identity("reading", before, config, workspace) == _stage_cache_identity("reading", after_frontend, config, workspace)
     assert _stage_cache_identity("frontend", before, config, workspace) != _stage_cache_identity("frontend", after_frontend, config, workspace)
@@ -132,6 +140,23 @@ def test_real_identity_scopes_assets_to_their_first_consuming_stage(tmp_path: Pa
     after_tones = config_identity(config, manifest_path, rows)
     assert _stage_cache_identity("merge", before, config, workspace) == _stage_cache_identity("merge", after_tones, config, workspace)
     assert _stage_cache_identity("prosody", before, config, workspace) != _stage_cache_identity("prosody", after_tones, config, workspace)
+
+
+def test_persisted_stage_cache_decision_starts_at_semantic_for_dictionary_drift(tmp_path: Path):
+    config_path, config = _config(tmp_path)
+    dictionary = tmp_path / "dictionary"; dictionary.write_text("a", encoding="utf-8")
+    config["mfa"] = {"japanese_dictionary": str(dictionary)}
+    manifest_path = Path(config["input_manifest"])
+    rows = [{"uid": "u1", "wav": "/mnt/source/read-only.wav", "text": "さくら"}]
+    workspace = Path(config["workspace"]); workspace.mkdir()
+    before = config_identity(config, manifest_path, rows)
+    persisted = {stage: _stage_cache_identity(stage, before, config, workspace) for stage in ("reading", "frontend", "semantic", "align", "merge", "prosody", "tts", "verify")}
+    atomic_write_json(workspace / ".ja_en_stage_cache.json", {"schema": "ja-stage-cache-v1", "stages": persisted}, workspace=workspace)
+    dictionary.write_text("b", encoding="utf-8")
+    after = config_identity(config, manifest_path, rows)
+    cached = json.loads((workspace / ".ja_en_stage_cache.json").read_text())["stages"]
+    first_invalidated = next(stage for stage in persisted if cached[stage] != _stage_cache_identity(stage, after, config, workspace))
+    assert first_invalidated == "semantic"
 
 
 def test_workspace_override_rejects_nonempty_target_without_resume(tmp_path: Path):

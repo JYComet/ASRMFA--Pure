@@ -774,21 +774,9 @@ def _enrich_merged_alignment(config: Mapping[str, Any], root: Path, alignment: M
         enriched["selected_reading"] = enriched["reading_evidence"]["selected_reading"]
         enriched["selected_readings"] = selected
     enriched.setdefault("mora_graph", _mora_graph(manifest_row, uid))
-    # MFA-native rows are already bound to semantic templates by the merge
-    # stage.  Reconstruct relations from those bound IDs only; a semantic node
-    # may never acquire a timing interval through list position or label.
-    actual_phones = list(enriched.get("native_phones") or [])
-    if actual_phones:
-        relations: list[dict[str, Any]] = []
-        for phone in actual_phones:
-            token_id = phone.get("token_id")
-            if not isinstance(token_id, str) or not token_id:
-                _fail("native_basic_mapping_ambiguous", "bound native phone token identity is required", f"$.{uid}.native_phones")
-            for mora_id in phone.get("mora_ids", []):
-                relations.append({"mora_id": mora_id, "phone_id": phone.get("phone_id")})
-        graph = dict(enriched["mora_graph"])
-        graph["relations"] = relations
-        enriched["mora_graph"] = graph
+    # Prosody-v1 relations are immutable evidence.  They were validated before
+    # this enrichment call; never reconstruct or overwrite them from observed
+    # native rows, because that would erase a contradictory source artifact.
     enriched.setdefault("frontend", manifest_row.get("frontend") or {})
     enriched.setdefault("model_ids", {"qwen": (config.get("asr") or {}).get("qwen_forced_aligner"),
                                        "mfa": (config.get("mfa") or {}).get("japanese_acoustic")})
@@ -1157,6 +1145,16 @@ def assemble_tts_rows(config: Mapping[str, Any], workspace: str | os.PathLike[st
             _fail("publish_blocked", "prosody alignment must be an object")
         if alignment.get("schema") != PROSODY_ROW_SCHEMA:
             _fail("publish_blocked", "TTS accepts only ja-prosody-alignment-v1 artifacts", "$.schema")
+        try:
+            from .ja_tts_export import validate_prosody_alignment
+        except ImportError:  # pragma: no cover
+            from ja_tts_export import validate_prosody_alignment
+        try:
+            # Must happen before _enrich_merged_alignment can normalize any
+            # compatibility fields; this validates the immutable v1 graph.
+            validate_prosody_alignment(alignment)
+        except ValueError as exc:
+            _fail("publish_blocked", str(exc), f"$.{alignment.get('uid', '')}.prosody")
         uid = str(alignment.get("uid") or "")
         if not uid or uid in seen:
             _fail("publish_blocked", "missing or duplicate merged UID", f"$.{uid}")

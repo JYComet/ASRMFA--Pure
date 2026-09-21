@@ -525,9 +525,10 @@ def _stage_cache_identity(stage: str, identity: Mapping[str, Any], config: Mappi
     # it here defeats the per-stage resource scoping below.
     scoped_identity.pop("config_digest", None)
     stage_index = PRODUCTION_STAGES.index(stage) if stage in PRODUCTION_STAGES else len(PRODUCTION_STAGES)
-    # Cache scope is an explicit dependency graph, not a substring heuristic:
-    # e.g. `mfa.japanese_dictionary` has no "mfa" in its leaf key.
-    dependency_starts = {"asr": "asr", "frontend": "frontend", "mfa": "align", "prosody": "prosody"}
+    # Cache scope follows real consumers.  semantic_stage reads/validates the
+    # locked dictionary and MFA inventory/archive binding, while MFA runtime
+    # and execution parameters are first consumed by align.
+    dependency_starts = {"asr": "asr", "frontend": "frontend", "prosody": "prosody"}
     for section, first_stage in dependency_starts.items():
         if stage_index >= PRODUCTION_STAGES.index(first_stage):
             continue
@@ -539,6 +540,26 @@ def _stage_cache_identity(stage: str, identity: Mapping[str, Any], config: Mappi
                     key: value for key, value in scoped_identity[identity_field].items()
                     if not str(key).startswith(f"{section}.")
                 }
+    semantic_mfa_assets = frozenset({
+        "japanese_dictionary", "japanese_metadata", "english_metadata",
+        "japanese_acoustic", "english_acoustic", "japanese_acoustic_sha256", "english_acoustic_sha256",
+    })
+    if isinstance(scoped_identity.get("config"), Mapping):
+        mfa_config = scoped_identity["config"].get("mfa")
+        if isinstance(mfa_config, Mapping):
+            allowed = semantic_mfa_assets if stage_index < PRODUCTION_STAGES.index("align") else set(mfa_config)
+            if stage_index < PRODUCTION_STAGES.index("semantic"):
+                allowed = set()
+            scoped_identity["config"]["mfa"] = {key: value for key, value in mfa_config.items() if key in allowed}
+    for identity_field in ("model_artifacts", "config_artifacts"):
+        if not isinstance(scoped_identity.get(identity_field), Mapping):
+            continue
+        scoped_identity[identity_field] = {
+            key: value for key, value in scoped_identity[identity_field].items()
+            if not str(key).startswith("mfa.")
+            or (stage_index >= PRODUCTION_STAGES.index("semantic") and str(key).removeprefix("mfa.") in semantic_mfa_assets)
+            or stage_index >= PRODUCTION_STAGES.index("align")
+        }
     if stage_index < PRODUCTION_STAGES.index("prosody") and isinstance(scoped_identity.get("implementation_files"), list):
         scoped_identity["implementation_files"] = [row for row in scoped_identity["implementation_files"] if not str(row.get("path", "")).endswith("ja_prosody.py")]
     payload: dict[str, Any] = {"stage": stage, "global_identity": scoped_identity, "upstream_receipts": upstream}
