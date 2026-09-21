@@ -7,10 +7,14 @@ import pytest
 
 from scripts.ja_en_schema import JAContractError, atomic_write_json, make_receipt, stable_digest
 from scripts.run_ja_en_pipeline import (
+    _autoload_stages,
+    _prepare_stage_config,
     config_identity,
     _stage_cache_identity,
     dispatch,
+    main,
     preflight,
+    stage_registry,
     validate_resume,
 )
 
@@ -81,3 +85,49 @@ def test_legacy_workspace_is_stale_after_prosody_stage_is_added(tmp_path: Path):
     with pytest.raises(JAContractError) as error:
         validate_resume(workspace, config_identity(config, manifest_path, rows), allow_new=False)
     assert error.value.code in {"resume_identity_drift", "resume_stale"}
+
+
+def test_prosody_resources_invalidate_only_prosody_downstream(tmp_path: Path):
+    identity = {"config": {"mfa": {"japanese_dictionary": "dictionary-a"},
+                           "prosody": {"manual_overrides": "tones-a"}}}
+    changed = {"config": {"mfa": {"japanese_dictionary": "dictionary-a"},
+                          "prosody": {"manual_overrides": "tones-b"}}}
+    stages = ("merge", "prosody", "tts", "verify")
+    before = {stage: _stage_cache_identity(stage, identity, {}, tmp_path) for stage in stages}
+    after = {stage: _stage_cache_identity(stage, changed, {}, tmp_path) for stage in stages}
+    assert before["merge"] == after["merge"]
+    assert all(before[stage] != after[stage] for stage in ("prosody", "tts", "verify"))
+
+
+def test_mfa_dictionary_invalidates_align_and_all_downstream(tmp_path: Path):
+    identity = {"config": {"mfa": {"japanese_dictionary": "dictionary-a"}, "prosody": {}}}
+    changed = {"config": {"mfa": {"japanese_dictionary": "dictionary-b"}, "prosody": {}}}
+    stages = ("semantic", "align", "merge", "prosody", "tts", "verify")
+    before = {stage: _stage_cache_identity(stage, identity, {}, tmp_path) for stage in stages}
+    after = {stage: _stage_cache_identity(stage, changed, {}, tmp_path) for stage in stages}
+    assert before["semantic"] == after["semantic"]
+    assert all(before[stage] != after[stage] for stage in ("align", "merge", "prosody", "tts", "verify"))
+
+
+def test_workspace_override_rejects_nonempty_target_without_resume(tmp_path: Path):
+    config_path, config = _config(tmp_path)
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    occupied = tmp_path / "occupied"
+    occupied.mkdir()
+    (occupied / "evidence.txt").write_text("keep", encoding="utf-8")
+    assert main(["--config", str(config_path), "--workspace", str(occupied)]) == 2
+    assert (occupied / "evidence.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_autoload_registers_prosody_stage():
+    _autoload_stages()
+    assert stage_registry()["prosody"]["owner"] == "scripts.ja_prosody"
+
+
+def test_tts_stage_input_is_only_the_prosody_artifact(tmp_path: Path):
+    artifact = tmp_path / "stages" / "prosody" / "prosody_alignments.jsonl"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text('{"schema":"ja-prosody-alignment-v1"}\n', encoding="utf-8")
+    prepared = _prepare_stage_config({}, "tts", tmp_path)
+    assert prepared["tts"]["alignment_jsonl"] == str(artifact)
+    assert prepared["stage_inputs"]["tts"] == {"alignment_jsonl": str(artifact)}

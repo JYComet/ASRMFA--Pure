@@ -83,6 +83,8 @@ def register_stage(name: str, handler: StageHandler, *, output_namespace: str | 
     if not namespace or "/" in namespace or "\\" in namespace or namespace in {".", ".."}:
         raise ValueError("stage namespace must be a single directory name")
     if name in _STAGE_REGISTRY and getattr(_STAGE_REGISTRY[name][0], "__name__", "") != "_skeleton_handler":
+        if _STAGE_REGISTRY[name] == (handler, namespace):
+            return
         raise ValueError(f"stage already registered: {name}")
     _STAGE_REGISTRY[name] = (handler, namespace)
 
@@ -239,7 +241,7 @@ def config_identity(config: Mapping[str, Any], manifest_path: Path, manifest: li
         "ja_frontend.py", "ja_text_layers.py", "ja_phone_adapter.py", "ja_en_anchors.py",
         "ja_asr_provider_worker.py", "ja_canary_gate.py", "align_japanese_mfa.py",
         "merge_ja_en_mfa.py", "ja_tts_export.py", "verify_ja_en_tts.py", "verify_ja_supply_chain.py",
-        "ja_en_stage_inputs.py",
+        "ja_en_stage_inputs.py", "ja_prosody.py",
     ):
         candidate = Path(__file__).resolve().parent / filename
         if candidate.is_file():
@@ -421,7 +423,7 @@ def _autoload_stages() -> None:
     modules = (
         "ja_audio", "ja_asr_crossval", "ja_frontend", "ja_phone_adapter",
         "ja_en_anchors", "align_japanese_mfa", "merge_ja_en_mfa",
-        "run_julius_diagnostic", "ja_tts_export",
+        "ja_prosody", "run_julius_diagnostic", "ja_tts_export",
     )
     for name in modules:
         try:
@@ -510,7 +512,23 @@ def _stage_cache_identity(stage: str, identity: Mapping[str, Any], config: Mappi
         reading_receipt = _stage_receipt(workspace, "reading")
         if reading_receipt is not None:
             upstream["reading_locked_reconstruction"] = stable_digest(reading_receipt)
-    payload: dict[str, Any] = {"stage": stage, "global_identity": identity, "upstream_receipts": upstream}
+    scoped_identity = copy.deepcopy(dict(identity))
+    stage_index = PRODUCTION_STAGES.index(stage) if stage in PRODUCTION_STAGES else len(PRODUCTION_STAGES)
+    if stage_index < PRODUCTION_STAGES.index("align"):
+        if isinstance(scoped_identity.get("config"), Mapping):
+            scoped_identity["config"].pop("mfa", None)
+        if isinstance(scoped_identity.get("model_artifacts"), Mapping):
+            scoped_identity["model_artifacts"] = {key: value for key, value in scoped_identity["model_artifacts"].items() if "mfa" not in str(key)}
+        if isinstance(scoped_identity.get("config_artifacts"), Mapping):
+            scoped_identity["config_artifacts"] = {key: value for key, value in scoped_identity["config_artifacts"].items() if "mfa" not in str(key)}
+    if stage_index < PRODUCTION_STAGES.index("prosody"):
+        if isinstance(scoped_identity.get("config"), Mapping):
+            scoped_identity["config"].pop("prosody", None)
+        if isinstance(scoped_identity.get("config_artifacts"), Mapping):
+            scoped_identity["config_artifacts"] = {key: value for key, value in scoped_identity["config_artifacts"].items() if not str(key).startswith("prosody.")}
+        if isinstance(scoped_identity.get("implementation_files"), list):
+            scoped_identity["implementation_files"] = [row for row in scoped_identity["implementation_files"] if not str(row.get("path", "")).endswith("ja_prosody.py")]
+    payload: dict[str, Any] = {"stage": stage, "global_identity": scoped_identity, "upstream_receipts": upstream}
     if stage == "julius":
         payload["diagnostic_config"] = config.get("julius_diagnostic", {})
     return stable_digest(payload)
@@ -762,6 +780,31 @@ def _prepare_stage_config(config: Mapping[str, Any], stage: str, workspace: Path
     """Build declared mechanical inputs from immutable upstream artifacts."""
     prepared = copy.deepcopy(dict(config))
     stage_inputs = prepared.setdefault("stage_inputs", {})
+    if stage == "prosody" and "prosody" not in stage_inputs:
+        settings = prepared.setdefault("prosody", {})
+        if not isinstance(settings, dict):
+            settings = dict(settings) if isinstance(settings, Mapping) else {}
+            prepared["prosody"] = settings
+        if not settings.get("alignment_jsonl"):
+            source = workspace / "stages" / "merge" / "ja_en_alignment.jsonl"
+            if not source.is_file():
+                source = workspace / "stages" / "merge" / "ja_en_alignment.json"
+            settings["alignment_jsonl"] = str(source)
+        stage_inputs["prosody"] = {"alignment_jsonl": settings["alignment_jsonl"]}
+    if stage == "tts" and "tts" not in stage_inputs:
+        # TTS receives only the prosody artifact.  It must never reconstruct
+        # tone from a merge row or pick a merge fallback by filename.
+        source = workspace / "stages" / "prosody" / "prosody_alignments.jsonl"
+        settings = prepared.setdefault("tts", {})
+        if not isinstance(settings, dict):
+            settings = dict(settings) if isinstance(settings, Mapping) else {}
+            prepared["tts"] = settings
+        settings["alignment_jsonl"] = str(source)
+        stage_inputs["tts"] = {"alignment_jsonl": str(source)}
+        if not source.is_file():
+            stage_inputs["_tts_bridge_error"] = {
+                "code": "publish_blocked", "message": "prosody alignment artifact is required before TTS",
+            }
     try:
         from .ja_en_stage_inputs import assemble_tts_rows, prepare_alignment_requests, prepare_anchor_requests, prepare_merge_requests
     except ImportError:
@@ -1158,6 +1201,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--inspect", metavar="WORKSPACE", help="inspect stage receipts without loading models")
     parser.add_argument("--stage", default=",".join(PRODUCTION_STAGES), help="comma-separated stages")
     parser.add_argument("--resume", action="store_true", help="resume an existing, identity-matching workspace")
+    parser.add_argument("--workspace", help="override config workspace; target must be new/empty unless --resume")
     return parser
 
 
@@ -1172,6 +1216,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--config is required unless --inspect is used")
         config_path = Path(args.config).expanduser().absolute()
         config = _load_yaml(config_path)
+        if args.workspace:
+            config["workspace"] = str(Path(args.workspace).expanduser().absolute())
         _autoload_stages()
         validated, manifest_path, manifest, workspace = preflight(config, config_path=config_path)
         if args.check:

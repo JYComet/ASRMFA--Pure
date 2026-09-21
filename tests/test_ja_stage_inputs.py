@@ -9,11 +9,14 @@ import pytest
 
 from scripts.ja_en_schema import JAContractError, artifact_record
 from scripts.ja_en_stage_inputs import (
+    assemble_prosody_rows,
     assemble_tts_rows,
     prepare_alignment_requests,
     prepare_anchor_requests,
     prepare_merge_requests,
 )
+from scripts.ja_prosody import handle_prosody
+from scripts.ja_en_schema import stable_digest
 
 
 def _wav(path: Path, frames: int = 3200) -> Path:
@@ -171,33 +174,11 @@ def _merged_row(tmp_path: Path, uid: str = "u-ja") -> dict:
                                "inputs": {"artifacts": []}, "outputs": [audio], "params": {}, "tools": [], "commands": [], "errors": []}}
 
 
-def test_authoritative_tts_assembly_rejects_missing_tampered_and_cross_uid(tmp_path: Path):
+def test_tts_assembly_rejects_pre_prosody_rows(tmp_path: Path):
     config, _ = _fixture(tmp_path)
     row = _merged_row(tmp_path)
-    rows = assemble_tts_rows(config, tmp_path, [row])
-    assert rows[0]["schema"] == "tts-training-record-v1"
-    assert rows[0]["uid"] == "u-ja"
-    assert rows[0]["locked_aliases"][0]["alias"] == "ju_000001"
-    assert rows[0]["raw_mfa"]["runs"]
-    assert rows[0]["reading_evidence"]["selected_reading"] == "東京"
-
-    bad = dict(row)
-    bad["native_phones"] = []
     with pytest.raises((JAContractError, ValueError)):
-        assemble_tts_rows(config, tmp_path, [bad])
-
-    bad_uid = dict(row)
-    bad_uid["native_phones"] = [dict(row["native_phones"][0], uid="other")]
-    with pytest.raises((JAContractError, ValueError)):
-        assemble_tts_rows(config, tmp_path, [bad_uid])
-
-    link = tmp_path / "link.wav"
-    link.symlink_to(Path(row["alignment_wav"]["path"]))
-    bad_link = dict(row)
-    bad_link["alignment_wav"] = {**row["alignment_wav"], "path": str(link)}
-    bad_link["audio_receipt"] = dict(row["audio_receipt"], alignment=bad_link["alignment_wav"])
-    with pytest.raises((JAContractError, ValueError)):
-        assemble_tts_rows(config, tmp_path, [bad_link])
+        assemble_tts_rows(config, tmp_path, [row])
 
 
 def test_alignment_rejects_tampered_upstream_audio_hash(tmp_path: Path):
@@ -209,3 +190,99 @@ def test_alignment_rejects_tampered_upstream_audio_hash(tmp_path: Path):
     bad = next(row for row in rejected if row["uid"] == "u-ja")
     assert bad["status"] == "REJECTED"
     assert bad["errors"][0]["code"] == "receipt_hash_mismatch"
+
+
+def _prosody_graph(uid: str = "mixed-1") -> dict:
+    reading = "コー"
+    digest = stable_digest(reading)
+    return {
+        "schema": "ja-semantic-phone-graph-v2", "uid": uid, "token_id": "tok-1",
+        "locked_reading": reading, "locked_reading_digest": digest,
+        "mora_nodes": [
+            {"mora_id": "m-1", "kana": "コ", "kind": "regular", "mora_index": 0,
+             "accent_phrase_id": "ap-1", "mora_index_in_phrase": 1},
+            {"mora_id": "m-2", "kana": "ー", "kind": "long_extension", "mora_index": 1,
+             "accent_phrase_id": "ap-1", "mora_index_in_phrase": 2},
+        ],
+        "basic_phone_nodes": [
+            {"basic_phone_id": "bp-1", "mora_id": "m-1", "realization": "observed"},
+            {"basic_phone_id": "bp-2", "mora_id": "m-2", "realization": "merged"},
+        ],
+        "native_phone_templates": [
+            {"native_phone_id": "np-1", "native_phone": "k", "token_id": "tok-1", "alias": "ju-1",
+             "mora_ids": ["m-1"], "basic_phone_ids": ["bp-1"], "transform": "identity"},
+            {"native_phone_id": "np-2", "native_phone": "o\u02d0", "token_id": "tok-1", "alias": "ju-1",
+             "mora_ids": ["m-1", "m-2"], "basic_phone_ids": ["bp-1", "bp-2"], "transform": "long_vowel_merge"},
+        ],
+    }
+
+
+def _prosody_frontend(reading: str = "コー") -> dict:
+    digest = stable_digest(reading)
+    return {"accent_evidence_valid": True, "locked_reading_digest": digest,
+            "accent_evidence": {
+                "adapter_version": "fixture-v1", "provider_evidence_sha256": "provider-sha",
+                "unit_evidence_sha256": "unit-sha",
+                "provider_identity": {"provider": "fixture", "provider_revision": "r1"},
+                "accent_phrases": [{"accent_phrase_id": "ap-1", "mora_count": 2, "nucleus": 1}],
+                "moras": [
+                    {"accent_phrase_id": "ap-1", "mora_index_in_phrase": 1, "mora_count": 2, "nucleus": 1},
+                    {"accent_phrase_id": "ap-1", "mora_index_in_phrase": 2, "mora_count": 2, "nucleus": 1},
+                ],
+            }}
+
+
+def _prosody_alignment(uid: str = "mixed-1") -> dict:
+    phones = []
+    for index, (template, label, mora_ids, basic_ids) in enumerate((
+        ("np-1", "k", ["m-1"], ["bp-1"]),
+        ("np-1", "k", ["m-1"], ["bp-1"]),
+        ("np-2", "o\u02d0", ["m-1", "m-2"], ["bp-1", "bp-2"]),
+        ("np-2", "o\u02d0", ["m-1", "m-2"], ["bp-1", "bp-2"]),
+    )):
+        phones.append({"phone_id": f"p-{index}", "uid": uid, "token_id": "tok-1", "alias": "ju-1",
+                       "language": "ja", "native_phone": label, "native_phone_template_id": template,
+                       "mora_ids": mora_ids, "basic_phone_ids": basic_ids,
+                       "transform": "identity" if template == "np-1" else "long_vowel_merge",
+                       "start_sample": index * 100, "end_sample": (index + 1) * 100,
+                       "raw_interval_id": index + 1})
+    return {"schema": "ja-en-alignment-v3", "uid": uid, "words": [], "native_phones": phones}
+
+
+def _write_prosody_sources(workspace: Path, alignment: dict) -> dict:
+    for stage in ("semantic", "frontend", "reading", "merge"):
+        (workspace / "stages" / stage).mkdir(parents=True, exist_ok=True)
+    (workspace / "stages" / "semantic" / "semantic_graphs.jsonl").write_text(
+        json.dumps({"uid": alignment["uid"], "semantic_graph": _prosody_graph(alignment["uid"])}, ensure_ascii=False) + "\n", encoding="utf-8")
+    (workspace / "stages" / "frontend" / "frontend_contracts.jsonl").write_text(
+        json.dumps({"uid": alignment["uid"], "frontend": _prosody_frontend()}, ensure_ascii=False) + "\n", encoding="utf-8")
+    (workspace / "stages" / "reading" / "locked_readings.jsonl").write_text(
+        json.dumps({"uid": alignment["uid"], "reading_lock": {"uid": alignment["uid"], "selected_reading": "コー"}}, ensure_ascii=False) + "\n", encoding="utf-8")
+    source = workspace / "stages" / "merge" / "merged_alignments.jsonl"
+    source.write_text(json.dumps(alignment, ensure_ascii=False) + "\n", encoding="utf-8")
+    return {"prosody": {"algorithm_version": "ja-mora-tone-v1", "alignment_jsonl": str(source)}}
+
+
+def test_assemble_prosody_rows_joins_by_uid_token_and_alias(tmp_path: Path):
+    alignment = _prosody_alignment()
+    config = _write_prosody_sources(tmp_path, alignment)
+    rows = assemble_prosody_rows(config, tmp_path, [alignment])
+    assert [row["uid"] for row in rows] == ["mixed-1"]
+    assert rows[0]["schema"] == "ja-prosody-alignment-v1"
+    assert [row["raw_interval_id"] for row in rows[0]["native_phones"]] == [1, 2, 3, 4]
+    assert rows[0]["native_phones"][2]["phone_tone"] == "H|L"
+
+
+def test_prosody_handler_preserves_each_failed_uid_in_ledger(tmp_path: Path):
+    valid = _prosody_alignment("good")
+    invalid = _prosody_alignment("bad")
+    config = _write_prosody_sources(tmp_path, valid)
+    source = Path(config["prosody"]["alignment_jsonl"])
+    source.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in (valid, invalid)) + "\n", encoding="utf-8")
+    stage_dir = tmp_path / "stages" / "prosody"
+    result = handle_prosody(config, stage_dir)
+    assert result.status == "PARTIAL"
+    receipt = json.loads((stage_dir / "receipt.json").read_text(encoding="utf-8"))
+    assert [error["uid"] for error in receipt["errors"]] == ["bad"]
+    rows = [json.loads(line) for line in (stage_dir / "prosody_alignments.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [row["uid"] for row in rows] == ["good"]

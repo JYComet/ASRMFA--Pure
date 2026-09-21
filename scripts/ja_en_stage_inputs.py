@@ -47,6 +47,7 @@ ANCHOR_REQUEST_SCHEMA = "ja-en-anchor-request-v1"
 ALIGNMENT_REQUEST_SCHEMA = "ja-en-alignment-request-v1"
 MERGE_REQUEST_SCHEMA = "ja-en-merge-request-v1"
 TTS_ROW_SCHEMA = "tts-training-record-v1"
+PROSODY_ROW_SCHEMA = "ja-prosody-alignment-v1"
 
 
 def _fail(code: str, message: str, path: str = "$") -> None:
@@ -832,6 +833,198 @@ def _enrich_merged_alignment(config: Mapping[str, Any], root: Path, alignment: M
     return enriched
 
 
+def _stage_jsonl(root: Path, stage: str, names: Sequence[str]) -> list[dict[str, Any]]:
+    """Read a declared upstream JSONL artifact without guessing alternatives."""
+    for name in names:
+        path = root / "stages" / stage / name
+        if path.is_file() and not path.is_symlink():
+            try:
+                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            except (OSError, json.JSONDecodeError) as exc:
+                _fail("publish_blocked", f"{stage} JSONL is invalid: {exc}", str(path))
+            if not all(isinstance(row, Mapping) for row in rows):
+                _fail("publish_blocked", f"{stage} JSONL rows must be objects", str(path))
+            return [dict(row) for row in rows]
+    _fail("publish_blocked", f"{stage} JSONL artifact is required", f"$.stages.{stage}")
+
+
+def _unwrap_stage_row(row: Mapping[str, Any], *keys: str) -> Mapping[str, Any]:
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, Mapping):
+            return value
+    return row
+
+
+def _stage_json(root: Path, stage: str, name: str) -> Mapping[str, Any] | None:
+    path = root / "stages" / stage / name
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _fail("publish_blocked", f"{stage} JSON is invalid: {exc}", str(path))
+    if not isinstance(payload, Mapping):
+        _fail("publish_blocked", f"{stage} JSON must be an object", str(path))
+    return payload
+
+
+def _frontend_for_graph(frontend: Mapping[str, Any], token_id: str | None) -> Mapping[str, Any]:
+    """Select unit-scoped contextual evidence without reconstructing it."""
+    if "accent_evidence" in frontend or token_id is None:
+        return frontend
+    units = frontend.get("units")
+    if not isinstance(units, list):
+        _fail("accent_phrase_unresolved", "frontend record has no unit evidence", "$.frontend")
+    unit = next((item for item in units if isinstance(item, Mapping) and item.get("token_id") == token_id), None)
+    if not isinstance(unit, Mapping):
+        _fail("accent_phrase_unresolved", "frontend token is absent", f"$.frontend.{token_id}")
+    return {
+        "accent_evidence_valid": unit.get("accent_evidence_valid", False),
+        "locked_reading_digest": unit.get("locked_reading_digest"),
+        "accent_evidence": unit.get("accent_evidence"),
+    }
+
+
+def _resource_for_uid(config: Mapping[str, Any], key: str, uid: str) -> Mapping[str, Any] | None:
+    settings = config.get("prosody") if isinstance(config.get("prosody"), Mapping) else {}
+    value = settings.get(key)
+    if value is None:
+        return None
+    if isinstance(value, (str, os.PathLike)):
+        path = Path(value).expanduser()
+        if not path.is_file() or path.is_symlink():
+            _fail("tone_provenance_missing", f"prosody {key} resource is unavailable", f"$.prosody.{key}")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _fail("tone_provenance_missing", f"prosody {key} resource is invalid: {exc}", f"$.prosody.{key}")
+    if not isinstance(value, Mapping):
+        _fail("tone_provenance_missing", f"prosody {key} resource must be an object", f"$.prosody.{key}")
+    entries = value.get("entries")
+    if entries is None:
+        return value
+    if not isinstance(entries, Mapping) or not isinstance(entries.get(uid), Mapping):
+        return None
+    return entries[uid]
+
+
+def assemble_prosody_rows(
+    config: Mapping[str, Any], workspace: str | os.PathLike[str], merged_alignments: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Join immutable merge rows to semantic and frontend evidence by stable IDs.
+
+    Labels are intentionally never used as a key: repeated MFA labels are
+    commonplace.  Japanese template ownership is checked by UID, token, and
+    alias before the pure prosody layer receives the composite graph.
+    """
+    root = _workspace(workspace)
+    semantic_path = root / "stages" / "semantic" / "semantic_graphs.jsonl"
+    semantic_rows = _stage_jsonl(root, "semantic", ("semantic_graphs.jsonl",)) if semantic_path.is_file() else list((_stage_json(root, "semantic", "semantic_graph.json") or {}).get("graphs", []))
+    frontend_path = root / "stages" / "frontend" / "frontend_contracts.jsonl"
+    frontend_rows = _stage_jsonl(root, "frontend", ("frontend_contracts.jsonl",)) if frontend_path.is_file() else list((_stage_json(root, "frontend", "frontend_reconstruction.json") or {}).get("records", []))
+    reading_rows = _stage_jsonl(root, "reading", ("locked_readings.jsonl",))
+    graphs_by_uid: dict[str, list[Mapping[str, Any]]] = {}
+    for row in semantic_rows:
+        graph = _unwrap_stage_row(row, "semantic_graph")
+        uid = str(graph.get("uid", row.get("uid", "")))
+        if not uid:
+            _fail("native_basic_mapping_ambiguous", "semantic graph has no UID", "$.semantic")
+        graphs_by_uid.setdefault(uid, []).append(graph)
+    frontend_by_uid: dict[str, Mapping[str, Any]] = {}
+    for row in frontend_rows:
+        value = _unwrap_stage_row(row, "frontend")
+        uid = str(row.get("uid", value.get("uid", "")))
+        if not uid or uid in frontend_by_uid:
+            _fail("accent_phrase_unresolved", "frontend UID binding is missing or duplicated", "$.frontend")
+        frontend_by_uid[uid] = value
+    reading_by_uid: dict[str, Mapping[str, Any]] = {}
+    for row in reading_rows:
+        value = _unwrap_stage_row(row, "reading_lock")
+        uid = str(row.get("uid", value.get("uid", "")))
+        if not uid or uid in reading_by_uid:
+            _fail("reading_unresolved", "locked reading UID binding is missing or duplicated", "$.reading")
+        reading_by_uid[uid] = value
+    try:
+        from .ja_prosody import build_prosody_alignment
+    except ImportError:  # pragma: no cover
+        from ja_prosody import build_prosody_alignment
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_alignment in merged_alignments:
+        if not isinstance(raw_alignment, Mapping):
+            _fail("native_basic_mapping_ambiguous", "merged alignment must be an object", "$.merge")
+        alignment = dict(raw_alignment)
+        uid = str(alignment.get("uid", ""))
+        if not uid or uid in seen:
+            _fail("native_basic_mapping_ambiguous", "merged alignment UID is missing or duplicated", "$.merge")
+        seen.add(uid)
+        graphs = graphs_by_uid.get(uid, [])
+        frontend = frontend_by_uid.get(uid)
+        if not graphs or frontend is None or uid not in reading_by_uid:
+            _fail("accent_phrase_unresolved", "prosody requires bound semantic, frontend, and reading artifacts", f"$.{uid}")
+        phones = alignment.get("native_phones")
+        if not isinstance(phones, list):
+            _fail("native_basic_mapping_ambiguous", "merged native phones are missing", f"$.{uid}.native_phones")
+        tokens = {str(phone.get("token_id")) for phone in phones if isinstance(phone, Mapping) and phone.get("language") == "ja"}
+        aliases = {str(phone.get("alias")) for phone in phones if isinstance(phone, Mapping) and phone.get("language") == "ja"}
+        selected = [graph for graph in graphs if not tokens or str(graph.get("token_id")) in tokens]
+        if tokens and {str(graph.get("token_id")) for graph in selected} != tokens:
+            _fail("native_basic_mapping_ambiguous", "semantic token ownership differs from merge phones", f"$.{uid}.token_id")
+        templates: list[Mapping[str, Any]] = []
+        for graph in selected:
+            templates.extend(item for item in graph.get("native_phone_templates", []) if isinstance(item, Mapping))
+        for phone in phones:
+            if not isinstance(phone, Mapping) or phone.get("language") != "ja":
+                continue
+            template = next((item for item in templates if item.get("native_phone_id") == phone.get("native_phone_template_id")), None)
+            if template is None or template.get("token_id") != phone.get("token_id") or template.get("alias") != phone.get("alias"):
+                _fail("native_basic_mapping_ambiguous", "native phone does not bind its semantic UID/token/alias template", f"$.{uid}.native_phones")
+            if str(phone.get("alias")) not in aliases:
+                _fail("native_basic_mapping_ambiguous", "native alias binding is invalid", f"$.{uid}.native_phones")
+        partials: list[dict[str, Any]] = []
+        for source in selected:
+            token_id = source.get("token_id")
+            graph_phones = [phone for phone in phones if isinstance(phone, Mapping) and phone.get("language") == "ja" and phone.get("token_id") == token_id]
+            if not graph_phones:
+                continue
+            graph = {"uid": uid, "locked_reading_digest": source.get("locked_reading_digest"),
+                     "mora_nodes": list(source.get("mora_nodes", [])),
+                     "basic_phone_nodes": list(source.get("basic_phone_nodes", [])),
+                     "native_phone_templates": list(source.get("native_phone_templates", []))}
+            partials.append(build_prosody_alignment({**alignment, "native_phones": graph_phones}, graph,
+                                                    _frontend_for_graph(frontend, str(token_id) if token_id is not None else None),
+                                                    _resource_for_uid(config, "manual_overrides", uid),
+                                                    _resource_for_uid(config, "accent_lexicon", uid)))
+        non_japanese = [phone for phone in phones if isinstance(phone, Mapping) and phone.get("language") != "ja"]
+        if non_japanese:
+            partials.append(build_prosody_alignment({**alignment, "native_phones": non_japanese},
+                                                    {"uid": uid, "mora_nodes": [], "basic_phone_nodes": []}, {}))
+        if not partials and phones:
+            _fail("native_basic_mapping_ambiguous", "no merged native phone received a semantic graph", f"$.{uid}.native_phones")
+        built = {
+            "schema": PROSODY_ROW_SCHEMA, "uid": uid, "words": list(alignment.get("words", [])),
+            "moras": [row for part in partials for row in part["moras"]],
+            "basic_phones": [row for part in partials for row in part["basic_phones"]],
+            "duration_groups": [row for part in partials for row in part["duration_groups"]],
+            "tone_sources": [row for part in partials for row in part["tone_sources"]],
+        }
+        projected = {str(row.get("phone_id")): row for part in partials for row in part["native_phones"]}
+        built["native_phones"] = [projected[str(phone.get("phone_id"))] for phone in phones if str(phone.get("phone_id")) in projected]
+        if len(built["native_phones"]) != len(phones):
+            _fail("native_basic_mapping_ambiguous", "prosody projection lost a native phone", f"$.{uid}.native_phones")
+        # Carry receipt-bound timing/provenance forward; the prosody layer only
+        # adds tone/mora graph fields and never replaces source authority.
+        for key in ("train_wav", "alignment_wav", "audio_receipt", "locked_aliases", "raw_mfa",
+                    "reading_evidence", "partition", "native_inventory", "frontend", "model_ids",
+                    "dict_ids", "seams", "source_receipt", "display_attachments"):
+            if key in alignment:
+                built[key] = alignment[key]
+        built["schema"] = PROSODY_ROW_SCHEMA
+        result.append(built)
+    return result
+
+
 def assemble_tts_rows(config: Mapping[str, Any], workspace: str | os.PathLike[str], merged_alignments: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Assemble authoritative post-merge TTS records, preserving provenance."""
     root = _workspace(workspace)
@@ -840,7 +1033,9 @@ def assemble_tts_rows(config: Mapping[str, Any], workspace: str | os.PathLike[st
     seen: set[str] = set()
     for alignment in merged_alignments:
         if not isinstance(alignment, Mapping):
-            _fail("publish_blocked", "merged alignment must be an object")
+            _fail("publish_blocked", "prosody alignment must be an object")
+        if alignment.get("schema") != PROSODY_ROW_SCHEMA:
+            _fail("publish_blocked", "TTS accepts only ja-prosody-alignment-v1 artifacts", "$.schema")
         uid = str(alignment.get("uid") or "")
         if not uid or uid in seen:
             _fail("publish_blocked", "missing or duplicate merged UID", f"$.{uid}")

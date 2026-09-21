@@ -9,12 +9,14 @@ creates sub-phone boundaries.
 from __future__ import annotations
 
 import copy
-from typing import Any, Mapping, Sequence
+import json
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
 
 try:  # Support both ``python -m scripts.ja_prosody`` and direct imports.
-    from .ja_en_schema import JAContractError
+    from .ja_en_schema import JAContractError, StageResult, atomic_write_bytes, atomic_write_json, canonical_json, make_receipt, sha256_file
 except ImportError:  # pragma: no cover - script invocation compatibility
-    from ja_en_schema import JAContractError
+    from ja_en_schema import JAContractError, StageResult, atomic_write_bytes, atomic_write_json, canonical_json, make_receipt, sha256_file
 
 
 TONE_VALUES = frozenset({"H", "L", "UNK"})
@@ -331,7 +333,61 @@ def build_prosody_alignment(
     }
 
 
+def handle_prosody(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
+    """Build all independent prosody rows and preserve a fail-closed UID ledger."""
+    workspace = stage_dir.parent.parent
+    receipt_path = stage_dir / "receipt.json"
+    settings = config.get("prosody") if isinstance(config.get("prosody"), Mapping) else {}
+    source_value = settings.get("alignment_jsonl")
+    if not isinstance(source_value, str):
+        receipt = make_receipt(stage="prosody", status="BLOCKED", params={"implementation": "ja-mora-tone-v1"},
+                               errors=[{"code": "publish_blocked", "message": "prosody.alignment_jsonl is required"}])
+        atomic_write_json(receipt_path, receipt, workspace=workspace)
+        return StageResult("prosody", "BLOCKED", str(receipt_path))
+    source = Path(source_value).expanduser().absolute()
+    rows: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    try:
+        if not source.is_file() or source.is_symlink():
+            raise JAContractError("publish_blocked", "prosody alignment source is unavailable", str(source))
+        source_rows = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
+        try:
+            from .ja_en_stage_inputs import assemble_prosody_rows
+        except ImportError:  # pragma: no cover
+            from ja_en_stage_inputs import assemble_prosody_rows
+        for alignment in source_rows:
+            uid = str(alignment.get("uid", "")) if isinstance(alignment, Mapping) else ""
+            try:
+                rows.extend(assemble_prosody_rows(config, workspace, [alignment]))
+            except JAContractError as error:
+                failures.append({"uid": uid, **error.as_dict()})
+            except Exception as error:  # a bad UID must not erase other work
+                failures.append({"uid": uid, "code": "verifier_failed", "message": f"{type(error).__name__}: {error}"})
+        output = stage_dir / "prosody_alignments.jsonl"
+        atomic_write_bytes(output, b"".join(canonical_json(row) for row in rows), workspace=workspace)
+        if failures:
+            atomic_write_json(stage_dir / "uid_errors.json", {
+                "schema": "ja-en-uid-error-ledger-v1", "stage": "prosody",
+                "expected_uids": [str(row.get("uid", "")) for row in source_rows if isinstance(row, Mapping)],
+                "blocked_uids": sorted({item["uid"] for item in failures}), "errors": failures,
+            }, workspace=workspace)
+        status = "COMPLETE" if not failures else "PARTIAL"
+        receipt = make_receipt(stage="prosody", status=status,
+                               inputs={"artifacts": [{"path": str(source), "sha256": sha256_file(source)}]},
+                               outputs=[output], params={"implementation": "ja-mora-tone-v1"}, errors=failures)
+    except JAContractError as error:
+        receipt = make_receipt(stage="prosody", status="REJECTED", params={"implementation": "ja-mora-tone-v1"},
+                               errors=[error.as_dict()])
+        status = "REJECTED"
+    atomic_write_json(receipt_path, receipt, workspace=workspace)
+    return StageResult("prosody", status, str(receipt_path))
+
+
+def register_stages(registrar: Callable[..., Any]) -> None:
+    registrar("prosody", handle_prosody, output_namespace="prosody")
+
+
 __all__ = [
     "TONE_VALUES", "build_prosody_alignment", "mora_tones_from_phrase", "project_native_phone_tones",
-    "resolve_mora_tones", "validate_projected_phone",
+    "resolve_mora_tones", "validate_projected_phone", "handle_prosody", "register_stages",
 ]
