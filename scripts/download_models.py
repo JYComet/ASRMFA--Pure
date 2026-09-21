@@ -42,10 +42,13 @@ Multilingual-NVASR 是 anchored_nvv 模式的可选组件, 主流程 (mode: full
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import shutil
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -66,6 +69,16 @@ MFA_MODELS: list[tuple[str, str, str]] = [
 HF_MODELS: list[tuple[str, str]] = [
     ("Qwen/Qwen3-ASR-1.7B-hf", "Qwen3-ASR-1.7B-hf"),
     ("Qwen/Qwen3-ForcedAligner-0.6B-hf", "Qwen3-ForcedAligner-0.6B-hf"),
+]
+
+# Japanese/English v3 assets are deliberately opt-in.  The normal downloader
+# path below remains byte-for-byte compatible with the existing MFA/Qwen
+# workflow; these URLs are only contacted when ``--only ja-en`` is explicit.
+JA_EN_ASSETS: list[dict[str, str]] = [
+    {"id": "japanese_mfa_v3_acoustic", "url": "https://github.com/MontrealCorpusTools/mfa-models/releases/download/acoustic-japanese_mfa-v3.0.0/japanese_mfa.zip", "filename": "japanese_mfa-v3.0.0.zip", "sha256": "85928ffb1024486872a677a92e1fa94d2f997462d0b84c73a58aa9bb0e35179a"},
+    {"id": "japanese_mfa_v3_dictionary", "url": "https://github.com/MontrealCorpusTools/mfa-models/releases/download/dictionary-japanese_mfa-v3.0.0/japanese_mfa.dict", "filename": "japanese_mfa-v3.0.0.dict", "sha256": "4a0c66760576e4b7f3748f3169e7d5217c0135f857f0b5d34637c93a85fd1c91"},
+    {"id": "english_us_arpa_v3_acoustic", "url": "https://github.com/MontrealCorpusTools/mfa-models/releases/download/acoustic-english_us_arpa-v3.0.0/english_us_arpa.zip", "filename": "english_us_arpa-v3.0.0.zip", "sha256": "d35ce271ded357d833d2f4b8d1041dc3748b9538567ba13f2c697f4e4126711b"},
+    {"id": "english_us_arpa_v3_dictionary", "url": "https://github.com/MontrealCorpusTools/mfa-models/releases/download/dictionary-english_us_arpa-v3.0.0/english_us_arpa.dict", "filename": "english_us_arpa-v3.0.0.dict", "sha256": "e8c6c7b036ae2b7c78d2768b8dc6b1f9359175b842956d00b48c53c9c332e6b0"},
 ]
 
 # 配置文件里 ctc_prealign.*_model_path 需要指向的目录名, 用于打印提示。
@@ -243,11 +256,52 @@ def download_qwen(qwen_dir: Path, *, force: bool) -> list[str]:
     return failures
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download_ja_en(target_dir: Path, *, force: bool) -> list[str]:
+    """Download fixed JA/EN v3 assets and write a hash receipt.
+
+    This function is never called by default.  A failed URL or missing asset
+    remains a failure; no unverified model is silently substituted.
+    """
+    target_dir.mkdir(parents=True, exist_ok=True)
+    failures: list[str] = []
+    receipt: list[dict[str, str]] = []
+    for asset in JA_EN_ASSETS:
+        target = target_dir / asset["filename"]
+        if target.exists() and not force:
+            digest = _file_sha256(target)
+            status = "present" if digest == asset["sha256"] else "hash_mismatch"
+            if status != "present":
+                failures.append(asset["id"])
+            receipt.append({"id": asset["id"], "url": asset["url"], "path": str(target), "sha256": digest, "expected_sha256": asset["sha256"], "status": status})
+            continue
+        try:
+            urllib.request.urlretrieve(asset["url"], target)
+            digest = _file_sha256(target)
+            if digest != asset["sha256"]:
+                failures.append(asset["id"])
+                receipt.append({"id": asset["id"], "url": asset["url"], "path": str(target), "sha256": digest, "expected_sha256": asset["sha256"], "status": "hash_mismatch"})
+            else:
+                receipt.append({"id": asset["id"], "url": asset["url"], "path": str(target), "sha256": digest, "expected_sha256": asset["sha256"], "status": "downloaded"})
+        except Exception as exc:
+            failures.append(asset["id"])
+            receipt.append({"id": asset["id"], "url": asset["url"], "path": str(target), "sha256": "", "status": "failed", "error": f"{type(exc).__name__}: {exc}"})
+    (target_dir / "ja_en_assets.receipt.json").write_text(json.dumps({"schema": "ja-en-assets-receipt-v1", "assets": receipt}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return failures
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 入口
 # ═══════════════════════════════════════════════════════════════════════
 
-def _report_status(models_root: Path, qwen_dir: Path, only: str | None) -> int:
+def _report_status(models_root: Path, qwen_dir: Path, only: str | None, ja_en_dir: Path | None = None) -> int:
     """打印当前就位情况, 返回缺失数量。"""
     missing = 0
     if only in (None, "mfa"):
@@ -262,6 +316,14 @@ def _report_status(models_root: Path, qwen_dir: Path, only: str | None) -> int:
             ok = hf_model_present(qwen_dir / subdir)
             missing += 0 if ok else 1
             print(f"  [{'ok  ' if ok else 'MISS'}] {qwen_dir / subdir}")
+    if only == "ja-en":
+        ja_en_dir = ja_en_dir or qwen_dir.parent / "ja-en"
+        print("Japanese/English MFA v3 assets:")
+        for asset in JA_EN_ASSETS:
+            target = ja_en_dir / asset["filename"]
+            ok = target.is_file() and _file_sha256(target) == asset["sha256"]
+            missing += 0 if ok else 1
+            print(f"  [{'ok  ' if ok else 'MISS'}] {target}")
     return missing
 
 
@@ -272,7 +334,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--check", action="store_true",
                         help="只检查本地是否齐全, 不下载")
-    parser.add_argument("--only", choices=("mfa", "qwen"), default=None,
+    parser.add_argument("--only", choices=("mfa", "qwen", "ja-en"), default=None,
                         help="只处理指定的一类模型")
     parser.add_argument("--force", action="store_true",
                         help="已存在也重新下载")
@@ -282,6 +344,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--qwen-dir", type=Path,
                         default=PROJECT_ROOT / "models" / "qwen3",
                         help="Qwen3 权重落盘目录 (默认 models/qwen3)")
+    parser.add_argument("--ja-en-dir", type=Path,
+                        default=PROJECT_ROOT / "models" / "ja-en",
+                        help="Japanese/English v3 assets (仅 --only ja-en 时使用)")
     parser.add_argument("--mfa-python", default="",
                         help="MFA 所在 conda 环境的 python 路径")
     args = parser.parse_args(argv)
@@ -293,7 +358,7 @@ def main(argv: list[str] | None = None) -> int:
         print("=" * 60)
         print("  模型就位检查")
         print("=" * 60)
-        missing = _report_status(models_root, qwen_dir, args.only)
+        missing = _report_status(models_root, qwen_dir, args.only, args.ja_en_dir.resolve())
         print()
         if missing:
             print(f"{missing} 项缺失 — 运行 `python scripts/download_models.py` 补齐。")
@@ -303,6 +368,7 @@ def main(argv: list[str] | None = None) -> int:
 
     want_mfa = args.only in (None, "mfa")
     want_qwen = args.only in (None, "qwen")
+    want_ja_en = args.only == "ja-en"
     failures: list[str] = []
 
     if want_mfa:
@@ -327,6 +393,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  HF_ENDPOINT = {os.environ['HF_ENDPOINT']}")
         print("=" * 60)
         failures.extend(download_qwen(qwen_dir, force=args.force))
+        print()
+
+    if want_ja_en:
+        print("=" * 60)
+        print(f"  Japanese/English v3 assets → {args.ja_en_dir.resolve()}")
+        print("  opt-in download; hashes are recorded in ja_en_assets.receipt.json")
+        print("=" * 60)
+        failures.extend(download_ja_en(args.ja_en_dir.resolve(), force=args.force))
         print()
 
     if failures:

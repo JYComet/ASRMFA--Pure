@@ -10,6 +10,18 @@
 - GPU with CUDA (可选，CPU 也可运行但较慢)
 - 本地原生 Qwen3-ASR 与 Qwen3-ForcedAligner 模型；纯参考文本模式只需 ForcedAligner 权重
 
+## 日英 TTS 管线
+
+日英管线是独立入口，不改变上面的中文步骤。它使用 Japanese MFA 和 English
+US ARPA 两套隔离 phone inventory，输出带 `ja:`/`en:` namespace 的 phones、
+JSONL 训练记录和 `words`/`phones`/`language` TextGrid。`さくら` 是三 mora，
+`東京` 是四 mora；mora 与 phone 是多对多关系，长元音不会被按索引硬拆。
+文本重音预测和音频 F0 测量分别保存并分别 mask。
+
+操作、配置、恢复、Julius 诊断和当前阻塞项见 [日英管线说明](docs/JA_EN_PIPELINE.md)。
+没有人工 gold 或独立 verifier 通过时不能发布 `COMPLETE`；当前仓库只验证了合成
+输入的 smoke，不能据此声称完整生产运行。
+
 ## 移植到新机器
 
 整个 `chinese_mfa_pipeline/` 目录是**完全可移植的**——所有配置使用相对路径。新机器上只需：

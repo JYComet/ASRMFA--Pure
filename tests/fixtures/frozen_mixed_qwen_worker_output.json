@@ -1,0 +1,25 @@
+{
+  "provenance": {
+    "source": "/home/user/ja-en-task-artifacts/final-cli-proof/isolated-mixed-anchor/stages/anchors/qwen_worker_output.json",
+    "purpose": "portable regression fixture for mixed JA/EN lexical seam mapping",
+    "audio_or_model_embedded": false
+  },
+  "status": "COMPLETE",
+  "passes": {
+    "English": [
+      {"end_s": 0.64, "start_s": 0.24, "unit": "桜"},
+      {"end_s": 0.8, "start_s": 0.64, "unit": "が"},
+      {"end_s": 1.12, "start_s": 0.8, "unit": "咲"},
+      {"end_s": 1.52, "start_s": 1.12, "unit": "きました"},
+      {"end_s": 2.56, "start_s": 2.08, "unit": "people"}
+    ],
+    "Japanese": [
+      {"end_s": 0.64, "start_s": 0.24, "unit": "桜"},
+      {"end_s": 0.8, "start_s": 0.64, "unit": "が"},
+      {"end_s": 1.12, "start_s": 0.8, "unit": "咲き"},
+      {"end_s": 1.28, "start_s": 1.12, "unit": "まし"},
+      {"end_s": 1.52, "start_s": 1.28, "unit": "た"},
+      {"end_s": 2.56, "start_s": 2.08, "unit": "people"}
+    ]
+  }
+}

@@ -1,5 +1,10 @@
 # Qwen3-ASR 模式：transcript_only 与 anchored_nvv
 
+日英 TTS 使用独立的 `scripts/run_ja_en_pipeline.py` 入口和
+`docs/JA_EN_PIPELINE.md`，不会把 Qwen 中文 profile、中文 TextGrid 或其缓存
+当成日英生产证据。日英管线的 ASR family vote、Japanese/English MFA inventory、
+Julius diagnostic namespace 和独立 verifier 均单独记录。
+
 ## 主管线默认：原生 Qwen 后端与固定时间戳正则化
 
 当前设计见 [Qwen3 主管线设计](superpowers/specs/2026-09-14-qwen3-main-pipeline-design.md)。

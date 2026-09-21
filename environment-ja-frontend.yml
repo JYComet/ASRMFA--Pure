@@ -1,0 +1,8 @@
+name: ja-en-frontend
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - pip
+  - pip:
+      - -r requirements-ja-frontend.txt

@@ -1,0 +1,67 @@
+pipeline: ja_en_tts
+workspace: /data/runs/ja_en_v1
+input_manifest: /data/manifests/game_ja.jsonl
+supply_chain_lock: third_party/japanese_nlp_sources.lock.json
+mapping_file: /data/manifests/ja_frontend_mapping.json
+manual_overrides: /data/manifests/ja_manual_overrides.json
+gold_manifest: /data/manifests/ja_en_gold.json
+stage_inputs: {}
+
+asr:
+  profile: baseline_3family
+  family_vote_policy: one_per_family
+  qwen_model: /models/qwen3-asr
+  qwen_forced_aligner: /models/qwen3-forced-aligner
+  whisper_model: /models/whisper-large-v3
+  reazon_nemo_model: /models/reazonspeech-nemo-v2
+
+frontend:
+  provider: pyopenjtalk-plus
+  commit: 9e4bf25324ac135dfc81ca64aed2fa6a48b83304
+  runtime_python: /envs/frontend/bin/python
+  use_vanilla: false
+  use_tsqyomi: false
+  use_sudachi_kanji_yomi: false
+  predict_nani: false
+  normalize_mode: None
+  use_read_as_pron: false
+  revert_long_vowels: false
+  revert_yotsugana: false
+  run_marine: false
+  reject_unbound_spans: true
+  mapping_file: /data/manifests/ja_frontend_mapping.json
+  build_receipt: /data/evidence/frontend-build-evidence.json
+  require_build_receipt: true
+
+mfa:
+  runtime_python: /envs/mfa/bin/python
+  dither: 0.0
+  japanese_acoustic: /models/mfa/japanese_mfa-v3.0.0.zip
+  japanese_dictionary: /models/mfa/japanese_mfa-v3.0.0.dict
+  english_acoustic: /models/mfa/english_us_arpa-v3.0.0.zip
+  english_dictionary: /models/mfa/english_us_arpa-v3.0.0.dict
+  japanese_metadata: /models/mfa/japanese-mfa-metadata.json
+  english_metadata: /models/mfa/english-mfa-metadata.json
+
+mixed:
+  enabled: false
+  anchor_strategy: dual_full_utterance_v1
+  anchor_max_disagreement_ms: 80
+  padding_ms: 100
+  max_retries: 2
+  allow_phone_clipping: false
+
+julius_diagnostic:
+  enabled: false
+  converter_commit: e14beae2940fd5a6ac5a9d2afc249eac6fac4a50
+  jatts_reference_commit: a5a8cd0b9a92caa065b1b6cc4cf8e805e56e4c61
+  write_back: false
+
+publish:
+  require_supply_chain_licenses: true
+  require_all_resolved: true
+  require_independent_verifier: true
+
+verify:
+  supply_chain_lock: third_party/japanese_nlp_sources.lock.json
+  gold_manifest: /data/manifests/ja_en_gold.json

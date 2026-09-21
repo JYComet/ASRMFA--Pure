@@ -1,0 +1,26 @@
+{
+  "schema": "ja-supply-chain-lock-v1",
+  "status": "catalogue-unresolved",
+  "policy": {
+    "runtime_import_of_awesome_index": false,
+    "strict_unknown_license": true,
+    "family_vote_policy": "one_per_family",
+    "strict_requires_bound_local_artifacts": true
+  },
+  "resources": [
+    {"id":"awesome-japanese-nlp-resources","kind":"source","source_url":"https://github.com/taishi-i/awesome-japanese-nlp-resources","commit":"4a1c437535f2115fdb8bdcdbc6aa2c3a60d758fd","tree_sha256":null,"license":{"spdx":"CC0-1.0","status":"unreviewed","file_sha256":"a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499","evidence_path":"external-artifact:evidence/source-license-evidence/awesome-LICENSE"},"artifact_hashes":[{"id":"README.md","sha256":"b96b646858c78022793b331d0b4e6b12676ce5ebc323f52b7fe3ab7439df7375"}],"artifacts":[]},
+    {"id":"pyopenjtalk-plus","kind":"frontend","source_url":"https://github.com/tsukumijima/pyopenjtalk-plus","commit":"9e4bf25324ac135dfc81ca64aed2fa6a48b83304","tree_sha256":null,"license":{"spdx":"MIT","status":"unreviewed","file_sha256":"c38083a4d51c1ea86e08b3303a984d0c23718c5ac214058af705814d30f4bb5b","evidence_path":"external-artifact:evidence/source-license-evidence/LICENSE.md"},"artifact_hashes":[{"id":"wheel","sha256":"88f14c2250997a3d63f559a7d2c6e72fa2409b13c50c7f76c989f4ab7a6f79fa"}],"artifacts":[]},
+    {"id":"julius4seg","kind":"diagnostic","source_url":"https://github.com/Hiroshiba/julius4seg","commit":"e14beae2940fd5a6ac5a9d2afc249eac6fac4a50","tree_sha256":null,"license":{"spdx":"MIT","status":"unreviewed","file_sha256":null},"artifact_hashes":[],"artifacts":[]},
+    {"id":"jatts","kind":"diagnostic","source_url":"https://github.com/unilight/jatts","commit":"a5a8cd0b9a92caa065b1b6cc4cf8e805e56e4c61","tree_sha256":null,"license":{"spdx":"MIT","status":"unreviewed","file_sha256":null},"artifact_hashes":[],"artifacts":[]},
+    {"id":"qwen3-asr-1.7b","kind":"model","source_url":"https://huggingface.co/Qwen/Qwen3-ASR-1.7B","revision":"7278e1e70fe206f11671096ffdd38061171dd6e5","license":{"status":"unreviewed","file_sha256":null},"artifact_hashes":[{"id":"local-tree-evidence","sha256":"f994739fe38e5210b9e3e8ce6c6307315e2ceac3cb630e7b7414d69dce520f60"}],"artifacts":[]},
+    {"id":"qwen3-forced-aligner-0.6b","kind":"model","source_url":"https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B","revision":"c7cbfc2048c462b0d63a45797104fc9db3ad62b7","license":{"status":"unreviewed","file_sha256":null},"artifact_hashes":[{"id":"model","sha256":"47831d0e82f96b20e9034dba01a075ee06436654719f6a68289e49f1b65ce0e7"}],"artifacts":[]},
+    {"id":"qwen-asr-runtime","kind":"runtime","source_url":"https://pypi.org/project/qwen-asr/","revision":"0.0.6","license":{"status":"unreviewed","file_sha256":null},"artifact_hashes":[],"artifacts":[]},
+    {"id":"mfa-runtime","kind":"runtime","source_url":"https://montreal-forced-aligner.readthedocs.io/","revision":"3.3.9","license":{"status":"unreviewed","file_sha256":null},"artifact_hashes":[],"artifacts":[]},
+    {"id":"whisper-large-v3","kind":"model","source_url":"https://huggingface.co/openai/whisper-large-v3","revision":"required-before-production","license":{"status":"unreviewed","file_sha256":null},"artifact_hashes":[],"artifacts":[]},
+    {"id":"reazonspeech-nemo-v2","kind":"model","source_url":"https://github.com/reazon-research/ReazonSpeech","revision":"required-before-production","license":{"status":"unreviewed","file_sha256":null},"artifact_hashes":[],"artifacts":[]},
+    {"id":"japanese-mfa-v3-acoustic","kind":"model","source_url":"https://github.com/MontrealCorpusTools/mfa-models/releases/download/acoustic-japanese_mfa-v3.0.0/japanese_mfa.zip","revision":"v3.0.0","license":{"status":"unreviewed","file_sha256":null},"artifact_hashes":[{"id":"japanese_mfa.zip","sha256":"85928ffb1024486872a677a92e1fa94d2f997462d0b84c73a58aa9bb0e35179a"}],"artifacts":[]},
+    {"id":"japanese-mfa-v3-dictionary","kind":"dictionary","source_url":"https://github.com/MontrealCorpusTools/mfa-models/releases/download/dictionary-japanese_mfa-v3.0.0/japanese_mfa.dict","revision":"v3.0.0","license":{"status":"unreviewed","file_sha256":null},"artifact_hashes":[{"id":"japanese_mfa.dict","sha256":"4a0c66760576e4b7f3748f3169e7d5217c0135f857f0b5d34637c93a85fd1c91"}],"artifacts":[]},
+    {"id":"english-us-arpa-v3-acoustic","kind":"model","source_url":"https://github.com/MontrealCorpusTools/mfa-models/releases/download/acoustic-english_us_arpa-v3.0.0/english_us_arpa.zip","revision":"v3.0.0","license":{"status":"unreviewed","file_sha256":null},"artifact_hashes":[{"id":"english_us_arpa.zip","sha256":"d35ce271ded357d833d2f4b8d1041dc3748b9538567ba13f2c697f4e4126711b"}],"artifacts":[]},
+    {"id":"english-us-arpa-v3-dictionary","kind":"dictionary","source_url":"https://github.com/MontrealCorpusTools/mfa-models/releases/download/dictionary-english_us_arpa-v3.0.0/english_us_arpa.dict","revision":"v3.0.0","license":{"status":"unreviewed","file_sha256":null},"artifact_hashes":[{"id":"english_us_arpa.dict","sha256":"e8c6c7b036ae2b7c78d2768b8dc6b1f9359175b842956d00b48c53c9c332e6b0"}],"artifacts":[]}
+  ]
+}

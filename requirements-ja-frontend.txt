@@ -1,0 +1,8 @@
+# W2 frontend runtime.  This environment must contain exactly one provider of
+# the pyopenjtalk namespace; do not install the vanilla pyopenjtalk package.
+# Source pin: https://github.com/tsukumijima/pyopenjtalk-plus/tree/9e4bf25324ac135dfc81ca64aed2fa6a48b83304
+# Production setup must install the wheel built from that commit (the verified
+# build receipt binds wheel SHA-256 88f14c2250997a3d63f559a7d2c6e72fa2409b13c50c7f76c989f4ab7a6f79fa).
+# Example: pip install --no-index --find-links /path/to/frontend-wheels pyopenjtalk-plus==0.4.1.post9
+pyopenjtalk-plus==0.4.1.post9
+numpy>=2.0,<3

@@ -1,0 +1,5 @@
+{
+  "version": "3.0-fixture",
+  "coverage_status": "fixture_partial",
+  "phones": ["a", "c", "e", "i", "k", "kː", "o", "oː", "s", "t", "tɕ", "w", "ɡ", "ɯ", "ɲː", "ɾ"]
+}
