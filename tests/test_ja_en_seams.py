@@ -12,6 +12,18 @@ from scripts.merge_ja_en_mfa import (
 )
 
 
+def _receipt():
+    return {
+        "schema": "audio-transform-receipt-v2", "uid": "u1",
+        "source": {"path": "/source.wav", "sha256": "source", "sample_rate": 16000},
+        "alignment": {"path": "/align.wav", "sha256": "align", "sample_rate": 16000},
+        "train": {"path": "/train.wav", "sha256": "train", "sample_rate": 16000},
+        "sample_transform": {"source_start": 0, "output_start": 0, "source_rate": 16000, "target_rate": 16000},
+        "alignment_transform": {"source_start": 0, "output_start": 0, "source_rate": 16000, "target_rate": 16000},
+        "train_transform": {"source_start": 0, "output_start": 0, "source_rate": 16000, "target_rate": 16000},
+    }
+
+
 def _native_phone(phone_id, label, alias, raw_interval_id, *, token_id=None, start=0, end=100, language="ja"):
     token = token_id or alias
     return {
@@ -19,10 +31,20 @@ def _native_phone(phone_id, label, alias, raw_interval_id, *, token_id=None, sta
         "alias": alias, "language": language, "native_phone": label, "phone": f"{language}:{label}",
         "raw_interval_id": raw_interval_id, "raw_interval_index": raw_interval_id,
         "run_id": "ja-run", "start_sample": start, "end_sample": end,
-        "source_axis": {"name": "source", "sample_rate": 16000},
-        "alignment_axis": {"name": "alignment", "sample_rate": 16000},
-        "training_axis": {"name": "training", "sample_rate": 16000},
+        "source_axis": {"start_sample": start, "end_sample": end, "sample_rate": 16000,
+                        "artifact": {"path": "/source.wav", "sha256": "source"}, "transform": _receipt()["alignment_transform"]},
+        "alignment_axis": {"start_sample": start, "end_sample": end, "sample_rate": 16000,
+                           "artifact": {"path": "/align.wav", "sha256": "align"}},
+        "training_axis": {"start_sample": start, "end_sample": end, "sample_rate": 16000,
+                          "artifact": {"path": "/train.wav", "sha256": "train"}, "transform": _receipt()["train_transform"]},
     }
+
+
+def _with_bounds(phone, start, end):
+    result = dict(phone, start_sample=start, end_sample=end)
+    for axis in ("source_axis", "alignment_axis", "training_axis"):
+        result[axis] = {**phone[axis], "start_sample": start, "end_sample": end}
+    return result
 
 
 def _semantic_graph(alias, token_id, labels):
@@ -45,6 +67,7 @@ def _alignment(phones, locked_aliases):
         "schema": "ja-en-alignment-v2", "uid": "u1", "words": [],
         "native_phones": phones,
         "locked_aliases": [{**row, "language": row.get("language", languages.get(row["alias"]))} for row in locked_aliases],
+        "audio_receipt": _receipt(),
     }
 
 
@@ -109,6 +132,26 @@ def test_japanese_template_without_ordered_basic_and_mora_ids_is_rejected():
         )
 
 
+@pytest.mark.parametrize(("field", "replacement"), [
+    ("alignment_axis", {"start_sample": 1, "end_sample": 100, "sample_rate": 16000,
+                          "artifact": {"path": "/align.wav", "sha256": "align"}}),
+    ("source_axis", {"start_sample": 0, "end_sample": 100, "sample_rate": 16000,
+                       "artifact": {"path": "/source.wav", "sha256": "source"},
+                       "transform": {"source_start": 1, "output_start": 0, "source_rate": 16000, "target_rate": 16000}}),
+    ("training_axis", {"start_sample": 0, "end_sample": 100, "sample_rate": 16000,
+                         "artifact": {"path": "/train.wav", "sha256": "tampered"},
+                         "transform": _receipt()["train_transform"]}),
+])
+def test_binder_rejects_axis_bound_transform_and_artifact_tampering(field, replacement):
+    phone = _native_phone("p0", "a", "ju_000001", 1, token_id="tok")
+    phone[field] = replacement
+    with pytest.raises(JAContractError, match="alignment_invalid"):
+        merge_module.bind_native_phone_graph(
+            _alignment([phone], [{"alias": "ju_000001", "token_id": "tok", "language": "ja", "pronunciation": ["a"]}]),
+            [_semantic_graph("ju_000001", "tok", ["a"])],
+        )
+
+
 def test_merge_receipt_preserves_contract_error_code_and_path(tmp_path):
     stage = tmp_path / "stages" / "merge"
     result = handle_merge({"merge": {
@@ -139,8 +182,9 @@ def test_strict_ledger_projects_axes_and_merges_with_bound_evidence(tmp_path):
         "source": {"path": "/source.wav", "sha256": "source", "sample_rate": 8000},
         "alignment": {"path": "/align.wav", "sha256": "align", "sample_rate": 16000},
         "train": {"path": "/train.wav", "sha256": "train", "sample_rate": 24000},
-        "sample_transform": {"source_start": 10}, "alignment_transform": {"source_start": 10},
-        "train_transform": {"source_start": 0},
+        "sample_transform": {"source_start": 10, "output_start": 0, "source_rate": 8000, "target_rate": 16000},
+        "alignment_transform": {"source_start": 10, "output_start": 0, "source_rate": 8000, "target_rate": 16000},
+        "train_transform": {"source_start": 0, "output_start": 0, "source_rate": 8000, "target_rate": 24000},
     }
     run = {"run_id": "ja-run", "language": "ja", "unit_ids": ["unit-ja"],
            "aliases": [{"alias": "ju_000001", "token_id": "tok-ja", "unit_id": "unit-ja", "pronunciation": ["a"]}],
@@ -173,8 +217,9 @@ def test_alignment_v3_retains_raw_mfa_boundaries_and_axes(tmp_path):
         "uid": "u1", "ownership": [0, 400], "sample_rate": 16000,
         "expected_languages": {"ju_000001": "ja"},
         "japanese_intervals": [raw], "english_intervals": [],
-        "locked_aliases": [{"alias": "ju_000001", "token_id": "tok-a", "language": "ja", "pronunciation": ["a"]}],
-        "semantic_graphs": [_semantic_graph("ju_000001", "tok-a", ["a"])],
+            "locked_aliases": [{"alias": "ju_000001", "token_id": "tok-a", "language": "ja", "pronunciation": ["a"]}],
+            "semantic_graphs": [_semantic_graph("ju_000001", "tok-a", ["a"])],
+            "audio_receipt": _receipt(),
     }}, stage)
     assert result.status == "COMPLETE"
     row = __import__("json").loads((stage / "ja_en_alignment.json").read_text(encoding="utf-8"))
@@ -270,9 +315,10 @@ def test_merge_stage_consumes_prepared_ledgers_and_writes_alignment(tmp_path):
         "uid": "u1", "ownership": [0, 2000], "sample_rate": 16000,
         "expected_languages": {"ju_000000": "ja", "eu_000001": "en"},
         "japanese_intervals": [ja], "english_intervals": [en],
-        "locked_aliases": [{"alias": "ju_000000", "token_id": "tok-ja", "language": "ja", "pronunciation": ["t"]},
-                           {"alias": "eu_000001", "token_id": "tok-en", "language": "en", "pronunciation": ["G"]}],
-        "semantic_graphs": [_semantic_graph("ju_000000", "tok-ja", ["t"]), _semantic_graph("eu_000001", "tok-en", ["G"])],
+            "locked_aliases": [{"alias": "ju_000000", "token_id": "tok-ja", "language": "ja", "pronunciation": ["t"]},
+                               {"alias": "eu_000001", "token_id": "tok-en", "language": "en", "pronunciation": ["G"]}],
+            "semantic_graphs": [_semantic_graph("ju_000000", "tok-ja", ["t"]), _semantic_graph("eu_000001", "tok-en", ["G"])],
+            "audio_receipt": _receipt(),
     }}, stage)
     assert result.status == "COMPLETE"
     payload = __import__("json").loads((stage / "ja_en_alignment.json").read_text(encoding="utf-8"))
@@ -284,8 +330,8 @@ def test_merge_stage_serialized_retry_plan_reruns_both_sides(tmp_path):
     stage = tmp_path / "stages" / "merge"
     bad_ja = [_native_phone("p0", "t", "ju_000000", 1, token_id="tok-ja", start=0, end=500)]
     bad_en = [_native_phone("p1", "G", "eu_000001", 2, token_id="tok-en", start=600, end=1000, language="en")]
-    good_ja = [{**bad_ja[0], "start_sample": 100, "end_sample": 500}]
-    good_en = [{**bad_en[0], "start_sample": 600, "end_sample": 900}]
+    good_ja = [_with_bounds(bad_ja[0], 100, 500)]
+    good_en = [_with_bounds(bad_en[0], 600, 900)]
     config = {"merge": {
         "uid": "u1", "ownership": [0, 1000], "sample_rate": 16000,
         "expected_languages": {"ju_000000": "ja", "eu_000001": "en"}, "reject_edge_touch": True,
@@ -293,7 +339,8 @@ def test_merge_stage_serialized_retry_plan_reruns_both_sides(tmp_path):
         "japanese_intervals": bad_ja, "english_intervals": bad_en,
         "locked_aliases": [{"alias": "ju_000000", "token_id": "tok-ja", "language": "ja", "pronunciation": ["t"]},
                            {"alias": "eu_000001", "token_id": "tok-en", "language": "en", "pronunciation": ["G"]}],
-        "semantic_graphs": [_semantic_graph("ju_000000", "tok-ja", ["t"]), _semantic_graph("eu_000001", "tok-en", ["G"])],
+            "semantic_graphs": [_semantic_graph("ju_000000", "tok-ja", ["t"]), _semantic_graph("eu_000001", "tok-en", ["G"])],
+            "audio_receipt": _receipt(),
         "rerun_plan": {"left": {"japanese_intervals": good_ja, "english_intervals": good_en}, "right": {"japanese_intervals": good_ja, "english_intervals": good_en}},
     }}
     result = handle_merge(config, stage)

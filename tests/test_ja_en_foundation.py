@@ -89,6 +89,19 @@ def test_merge_uid_aggregate_uses_alignment_v3_schema(tmp_path, monkeypatch):
     assert aggregate["schema"] == "ja-en-alignment-v3"
 
 
+def test_rejected_executed_uid_is_recorded_with_structured_contract_error(tmp_path, monkeypatch):
+    error = {"code": "native_basic_mapping_ambiguous", "message": "bad template", "path": "$.semantic_graphs[0]"}
+    def merge_handler(_config, stage_dir):
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        (stage_dir / "receipt.json").write_text(json.dumps(make_receipt(stage="merge", status="REJECTED", errors=[error])), encoding="utf-8")
+        return pipeline.StageResult("merge", "REJECTED", str(stage_dir / "receipt.json"))
+    monkeypatch.setitem(pipeline._STAGE_REGISTRY, "merge", (merge_handler, "merge"))
+    pipeline._run_uid_batch("merge", [{"uid": "u1"}], {}, tmp_path)
+    ledger = json.loads((tmp_path / "stages" / "merge" / "uid_errors.json").read_text(encoding="utf-8"))
+    assert ledger["blocked_uids"] == ["u1"]
+    assert ledger["errors"] == [{"uid": "u1", **error}]
+
+
 def test_prosody_config_has_closed_keys(tmp_path):
     _, config = _config(tmp_path)
     config["prosody"] = {

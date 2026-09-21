@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -253,19 +254,31 @@ def map_raw_intervals_to_samples(
     alignment_rate, source_rate, train_rate = rate(alignment, "alignment"), rate(source, "source"), rate(train, "training")
     if alignment_rate != sample_rate:
         raise JAContractError("alignment_invalid", "raw MFA rate differs from alignment receipt axis", "$.sample_rate")
-    source_offset = transform.get("source_start")
-    if type(source_offset) is not int or source_offset < 0:
-        raise JAContractError("receipt_invalid", "alignment transform source_start is required", "$.audio_receipt.alignment_transform")
-    def project(value: int, target_rate: int) -> int:
-        return int((value * target_rate + alignment_rate // 2) // alignment_rate)
+    def transform_fields(value: Mapping[str, Any], *, name: str, expected_source_rate: int, expected_target_rate: int) -> tuple[int, int]:
+        source_start, output_start = value.get("source_start"), value.get("output_start")
+        if type(source_start) is not int or source_start < 0 or type(output_start) is not int or output_start < 0:
+            raise JAContractError("receipt_invalid", f"{name} transform source_start/output_start is required", f"$.audio_receipt.{name}_transform")
+        if value.get("source_rate") != expected_source_rate or value.get("target_rate") != expected_target_rate:
+            raise JAContractError("receipt_invalid", f"{name} transform rate declaration differs from receipt", f"$.audio_receipt.{name}_transform")
+        return source_start, output_start
+    source_offset, alignment_output_start = transform_fields(transform, name="alignment", expected_source_rate=source_rate, expected_target_rate=alignment_rate)
+    train_source_start, train_output_start = transform_fields(train_transform, name="train", expected_source_rate=source_rate, expected_target_rate=train_rate)
+    def project(value: int, numerator: int, denominator: int) -> int:
+        if value < 0:
+            raise JAContractError("alignment_invalid", "axis coordinate precedes transform output origin", "$.native_phones")
+        return int((value * numerator + denominator // 2) // denominator)
+    def source_coordinate(alignment_coordinate: int) -> int:
+        return source_offset + project(alignment_coordinate - alignment_output_start, source_rate, alignment_rate)
+    def training_coordinate(source_coordinate_value: int) -> int:
+        return train_output_start + project(source_coordinate_value - train_source_start, train_rate, source_rate)
     def artifact(axis: Mapping[str, Any]) -> dict[str, Any]:
         return {"path": axis["path"], "sha256": axis["sha256"]}
     result: list[dict[str, Any]] = []
     for local_index, interval in enumerate(intervals):
         try:
-            start = offset_sample + int(round(float(interval["xmin"]) * sample_rate))
-            end = offset_sample + int(round(float(interval["xmax"]) * sample_rate))
-        except (KeyError, TypeError, ValueError) as exc:
+            start = offset_sample + int((Decimal(str(interval["xmin"])) * sample_rate).to_integral_value(rounding=ROUND_HALF_UP))
+            end = offset_sample + int((Decimal(str(interval["xmax"])) * sample_rate).to_integral_value(rounding=ROUND_HALF_UP))
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
             raise ValueError("invalid raw MFA interval") from exc
         if end <= start or start < owner_start or end > owner_end:
             raise ValueError("raw MFA interval crosses ownership")
@@ -288,12 +301,12 @@ def map_raw_intervals_to_samples(
             "end_sample": end,
             "alignment_axis": {"start_sample": start, "end_sample": end,
                                "sample_rate": alignment_rate, "artifact": artifact(alignment)},
-            "source_axis": {"start_sample": source_offset + project(start, source_rate),
-                            "end_sample": source_offset + project(end, source_rate),
+            "source_axis": {"start_sample": source_coordinate(start),
+                            "end_sample": source_coordinate(end),
                             "sample_rate": source_rate, "artifact": artifact(source),
                             "transform": dict(transform)},
-            "training_axis": {"start_sample": project(start, train_rate),
-                              "end_sample": project(end, train_rate),
+            "training_axis": {"start_sample": training_coordinate(source_coordinate(start)),
+                              "end_sample": training_coordinate(source_coordinate(end)),
                               "sample_rate": train_rate, "artifact": artifact(train),
                               "transform": dict(train_transform)},
         })

@@ -662,6 +662,8 @@ def _run_uid_batch(stage: str, requests: Sequence[Mapping[str, Any]], config: Ma
         stage_config.setdefault("stage_inputs", {})[stage] = request_payload
         result = _run_stage(handler, stage_config, isolated_stage)
         statuses.append(result.status)
+        if result.status in {"REJECTED", "BLOCKED", "PARTIAL"}:
+            blocked_uids.append(uid)
         source_receipt = isolated_stage / "receipt.json"
         if source_receipt.is_file():
             payload = load_json(source_receipt)

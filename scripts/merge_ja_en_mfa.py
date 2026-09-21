@@ -52,11 +52,8 @@ def _locked_aliases(alignment: Mapping[str, Any], uid: str) -> dict[tuple[str, s
     return indexed
 
 
-def _axis_boundaries(phone: Mapping[str, Any], path: str) -> None:
+def _axis_boundaries(phone: Mapping[str, Any], path: str, receipt: Mapping[str, Any], uid: str) -> None:
     """Require declared axes; coordinates are copied, never inferred or equated."""
-    for axis in ("source_axis", "alignment_axis", "training_axis"):
-        if phone.get(axis) is None:
-            raise JAContractError("alignment_invalid", f"{axis} evidence is required", path)
     for boundary in ("start_sample", "end_sample"):
         if type(phone.get(boundary)) is not int:
             raise JAContractError("alignment_invalid", f"{boundary} must be an integer", path)
@@ -64,6 +61,47 @@ def _axis_boundaries(phone: Mapping[str, Any], path: str) -> None:
         raise JAContractError("alignment_invalid", "native interval bounds are invalid", path)
     if phone.get("raw_interval_id") is None or not isinstance(phone.get("run_id"), str) or not phone["run_id"]:
         raise JAContractError("alignment_invalid", "raw interval provenance is required", path)
+    if not isinstance(receipt, Mapping) or receipt.get("schema") != "audio-transform-receipt-v2" or receipt.get("uid") not in {None, uid}:
+        raise JAContractError("alignment_invalid", "receipt-bound axis identity is required", path)
+    source, alignment, train = receipt.get("source"), receipt.get("alignment"), receipt.get("train")
+    alignment_transform = receipt.get("alignment_transform") or receipt.get("sample_transform")
+    train_transform = receipt.get("train_transform")
+    if not all(isinstance(value, Mapping) for value in (source, alignment, train, alignment_transform, train_transform)):
+        raise JAContractError("alignment_invalid", "receipt axis artifacts and transforms are required", path)
+    def rate(axis: Mapping[str, Any], name: str) -> int:
+        value = axis.get("sample_rate")
+        if type(value) is not int or value <= 0 or not isinstance(axis.get("path"), str) or not axis.get("sha256"):
+            raise JAContractError("alignment_invalid", f"receipt {name} axis is invalid", path)
+        return value
+    source_rate, alignment_rate, train_rate = rate(source, "source"), rate(alignment, "alignment"), rate(train, "training")
+    def transform_fields(value: Mapping[str, Any], name: str, source_rate_value: int, target_rate: int) -> tuple[int, int]:
+        source_start, output_start = value.get("source_start"), value.get("output_start")
+        if (type(source_start) is not int or source_start < 0 or type(output_start) is not int or output_start < 0
+                or value.get("source_rate") != source_rate_value or value.get("target_rate") != target_rate):
+            raise JAContractError("alignment_invalid", f"receipt {name} transform is invalid", path)
+        return source_start, output_start
+    source_start, alignment_output_start = transform_fields(alignment_transform, "alignment", source_rate, alignment_rate)
+    train_source_start, train_output_start = transform_fields(train_transform, "train", source_rate, train_rate)
+    def project(value: int, numerator: int, denominator: int) -> int:
+        if value < 0:
+            raise JAContractError("alignment_invalid", "axis coordinate precedes receipt transform origin", path)
+        return (value * numerator + denominator // 2) // denominator
+    expected_alignment = (phone["start_sample"], phone["end_sample"])
+    expected_source = tuple(source_start + project(value - alignment_output_start, source_rate, alignment_rate) for value in expected_alignment)
+    expected_training = tuple(train_output_start + project(value - train_source_start, train_rate, source_rate) for value in expected_source)
+    expected = {
+        "alignment_axis": (expected_alignment, alignment_rate, alignment, None),
+        "source_axis": (expected_source, source_rate, source, alignment_transform),
+        "training_axis": (expected_training, train_rate, train, train_transform),
+    }
+    for axis_name, (bounds, sample_rate, artifact, transform) in expected.items():
+        axis = phone.get(axis_name)
+        if not isinstance(axis, Mapping) or (axis.get("start_sample"), axis.get("end_sample")) != bounds or axis.get("sample_rate") != sample_rate:
+            raise JAContractError("alignment_invalid", f"{axis_name} bounds or sample rate differs from receipt", path)
+        if axis.get("artifact") != {"path": artifact["path"], "sha256": artifact["sha256"]}:
+            raise JAContractError("alignment_invalid", f"{axis_name} artifact differs from receipt", path)
+        if transform is not None and axis.get("transform") != dict(transform):
+            raise JAContractError("alignment_invalid", f"{axis_name} transform differs from receipt", path)
 
 
 def bind_native_phone_graph(alignment: Mapping[str, Any], semantic_graphs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -80,6 +118,7 @@ def bind_native_phone_graph(alignment: Mapping[str, Any], semantic_graphs: Seque
     if not isinstance(raw_phones, Sequence) or isinstance(raw_phones, (str, bytes)) or not raw_phones:
         raise JAContractError("native_basic_mapping_ambiguous", "raw native MFA phones are required", "$.native_phones")
     locks = _locked_aliases(alignment, uid)
+    receipt = alignment.get("audio_receipt")
     templates: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for graph_index, graph in enumerate(semantic_graphs):
         if not isinstance(graph, Mapping) or graph.get("uid") != uid:
@@ -126,7 +165,7 @@ def bind_native_phone_graph(alignment: Mapping[str, Any], semantic_graphs: Seque
     native: list[dict[str, Any]] = []
     for index, phone in enumerate(ordered):
         path = f"$.native_phones[{index}]"
-        _axis_boundaries(phone, path)
+        _axis_boundaries(phone, path, receipt, uid)
         token_id, alias = phone.get("token_id"), phone.get("alias")
         if phone.get("uid", uid) != uid or not isinstance(token_id, str) or not token_id or not isinstance(alias, str) or not alias:
             raise JAContractError("native_basic_mapping_ambiguous", "raw phone composite identity is invalid", path)
