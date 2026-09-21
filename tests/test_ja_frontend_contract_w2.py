@@ -6,11 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from scripts.ja_en_schema import JAContractError
+from scripts.ja_en_schema import JAContractError, stable_digest
 from scripts.ja_asr_crossval import select_reading
 from scripts.ja_frontend import (
     DEFAULT_FRONTEND_OPTIONS,
     FrontendConfig,
+    extract_contextual_accent_evidence,
     frontend_stage,
     probe_provider,
     reconstruct_locked_reading,
@@ -53,6 +54,80 @@ def _portable_config():
         "revert_long_vowels": False, "revert_yotsugana": False, "run_marine": False,
         "reject_unbound_spans": True,
     }
+
+
+# These are literal full-context label rows captured from the pinned
+# pyopenjtalk-plus runtime.  One representative label per mora is enough to
+# exercise the public binding boundary without regenerating fixtures in-test.
+_ACCENT_CASES = {
+    "flat": (
+        [{"string": "さくら", "read": "サクラ", "acc": 0, "mora_size": 3, "chain_flag": -1}],
+        [
+            "xx^sil-s+a=k/A:-2+1+3/B:xx-xx_xx/C:02_xx+xx/D:xx+xx_xx/E:xx_xx!xx_xx-xx/F:3_3#0_0@1_1|1_3/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-3@1+1&1-1|1+3/J:xx_xx/K:1+1-3",
+            "s^a-k+u=r/A:-1+2+2/B:xx-xx_xx/C:02_xx+xx/D:xx+xx_xx/E:xx_xx!xx_xx-xx/F:3_3#0_0@1_1|1_3/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-3@1+1&1-1|1+3/J:xx_xx/K:1+1-3",
+            "k^u-r+a=sil/A:0+3+1/B:xx-xx_xx/C:02_xx+xx/D:xx+xx_xx/E:xx_xx!xx_xx-xx/F:3_3#0_0@1_1|1_3/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-3@1+1&1-1|1+3/J:xx_xx/K:1+1-3",
+        ],
+    ),
+    "head": (
+        [{"string": "みかん", "read": "ミカン", "acc": 1, "mora_size": 3, "chain_flag": -1}],
+        [
+            "xx^sil-m+i=k/A:0+1+3/B:xx-xx_xx/C:02_xx+xx/D:xx+xx_xx/E:xx_xx!xx_xx-xx/F:3_1#0_0@1_1|1_3/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-3@1+1&1-1|1+3/J:xx_xx/K:1+1-3",
+            "m^i-k+a=N/A:1+2+2/B:xx-xx_xx/C:02_xx+xx/D:xx+xx_xx/E:xx_xx!xx_xx-xx/F:3_1#0_0@1_1|1_3/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-3@1+1&1-1|1+3/J:xx_xx/K:1+1-3",
+            "k^a-N+sil=xx/A:2+3+1/B:xx-xx_xx/C:02_xx+xx/D:xx+xx_xx/E:xx_xx!xx_xx-xx/F:3_1#0_0@1_1|1_3/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-3@1+1&1-1|1+3/J:xx_xx/K:1+1-3",
+        ],
+    ),
+    "middle": (
+        [{"string": "たべもの", "read": "タベモノ", "acc": 2, "mora_size": 4, "chain_flag": -1}],
+        [
+            "xx^sil-t+a=b/A:-1+1+4/B:xx-xx_xx/C:02_xx+xx/D:xx+xx_xx/E:xx_xx!xx_xx-xx/F:4_2#0_0@1_1|1_4/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-4@1+1&1-1|1+4/J:xx_xx/K:1+1-4",
+            "t^a-b+e=m/A:0+2+3/B:xx-xx_xx/C:02_xx+xx/D:xx+xx_xx/E:xx_xx!xx_xx-xx/F:4_2#0_0@1_1|1_4/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-4@1+1&1-1|1+4/J:xx_xx/K:1+1-4",
+            "b^e-m+o=n/A:1+3+2/B:xx-xx_xx/C:02_xx+xx/D:xx+xx_xx/E:xx_xx!xx_xx-xx/F:4_2#0_0@1_1|1_4/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-4@1+1&1-1|1+4/J:xx_xx/K:1+1-4",
+            "m^o-n+o=sil/A:2+4+1/B:xx-xx_xx/C:02_xx+xx/D:xx+xx_xx/E:xx_xx!xx_xx-xx/F:4_2#0_0@1_1|1_4/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-4@1+1&1-1|1+4/J:xx_xx/K:1+1-4",
+        ],
+    ),
+    "tail": (
+        [{"string": "かみなり", "read": "カミナリ", "acc": 3, "mora_size": 4, "chain_flag": -1}],
+        [
+            "xx^sil-k+a=m/A:-2+1+4/B:xx-xx_xx/C:02_xx+xx/D:xx+xx_xx/E:xx_xx!xx_xx-xx/F:4_3#0_0@1_1|1_4/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-4@1+1&1-1|1+4/J:xx_xx/K:1+1-4",
+            "k^a-m+i=n/A:-1+2+3/B:xx-xx_xx/C:02_xx+xx/D:xx+xx_xx/E:xx_xx!xx_xx-xx/F:4_3#0_0@1_1|1_4/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-4@1+1&1-1|1+4/J:xx_xx/K:1+1-4",
+            "m^i-n+a=r/A:0+3+2/B:xx-xx_xx/C:02_xx+xx/D:xx+xx_xx/E:xx_xx!xx_xx-xx/F:4_3#0_0@1_1|1_4/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-4@1+1&1-1|1+4/J:xx_xx/K:1+1-4",
+            "n^a-r+i=sil/A:1+4+1/B:xx-xx_xx/C:02_xx+xx/D:xx+xx_xx/E:xx_xx!xx_xx-xx/F:4_3#0_0@1_1|1_4/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-4@1+1&1-1|1+4/J:xx_xx/K:1+1-4",
+        ],
+    ),
+}
+
+
+@pytest.mark.parametrize(("case", "expected"), [
+    ("flat", ["L", "H", "H"]), ("head", ["H", "L", "L"]),
+    ("middle", ["L", "H", "L", "L"]), ("tail", ["L", "H", "H", "L"]),
+])
+def test_literal_phrase_tone_fixture_shape(case, expected):
+    rows, labels = _ACCENT_CASES[case]
+    evidence = extract_contextual_accent_evidence(rows, labels)
+    assert evidence["accent_phrases"][0]["expected_tones"] == expected
+
+
+def test_literal_multiword_phrase_keeps_one_phrase_id_and_evidence_digest():
+    rows = [
+        {"string": "さくら", "read": "サクラ", "acc": 0, "mora_size": 3, "chain_flag": -1},
+        {"string": "が", "read": "ガ", "acc": 0, "mora_size": 1, "chain_flag": 1},
+    ]
+    labels = [
+        "xx^sil-s+a=k/A:-3+1+4/B:xx-xx_xx/C:02_xx+xx/D:13+xx_xx/E:xx_xx!xx_xx-xx/F:4_4#0_0@1_1|1_4/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-4@1+1&1-1|1+4/J:xx_xx/K:1+1-4",
+        "s^a-k+u=r/A:-2+2+3/B:xx-xx_xx/C:02_xx+xx/D:13+xx_xx/E:xx_xx!xx_xx-xx/F:4_4#0_0@1_1|1_4/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-4@1+1&1-1|1+4/J:xx_xx/K:1+1-4",
+        "k^u-r+a=g/A:-1+3+2/B:xx-xx_xx/C:02_xx+xx/D:13+xx_xx/E:xx_xx!xx_xx-xx/F:4_4#0_0@1_1|1_4/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-4@1+1&1-1|1+4/J:xx_xx/K:1+1-4",
+        "r^a-g+a=sil/A:0+4+1/B:02-xx_xx/C:13_xx+xx/D:xx+xx_xx/E:xx_xx!xx_xx-xx/F:4_4#0_0@1_1|1_4/G:xx_xx%xx_xx_xx/H:xx_xx/I:1-4@1+1&1-1|1+4/J:xx_xx/K:1+1-4",
+    ]
+    result = extract_contextual_accent_evidence(rows, labels)
+    assert [row["accent_phrase_id"] for row in result["moras"]] == ["ap0", "ap0", "ap0", "ap0"]
+    assert result["provider_evidence_sha256"] == stable_digest({"njd_rows": rows, "full_context_labels": labels})
+
+
+def test_label_cardinality_mismatch_is_rejected_without_guessing():
+    rows, labels = _ACCENT_CASES["flat"]
+    with pytest.raises(JAContractError) as exc:
+        extract_contextual_accent_evidence(rows, labels[:-1])
+    assert exc.value.code == "accent_phrase_unresolved"
 
 
 def test_canonical_layer_preserves_original_and_maps_nfkc_offsets():
@@ -122,6 +197,14 @@ def test_real_frontend_bridge_returns_caller_bound_candidates():
     assert tokyo["candidate_ids"] == [tokyo["candidate_id"]]
 
 
+def test_pinned_frontend_accent_evidence_digest_is_deterministic():
+    first = run_frontend("さくらが", _config())
+    second = run_frontend("さくらが", _config())
+    assert first["contextual_accent_evidence"]["provider_evidence_sha256"] == second["contextual_accent_evidence"]["provider_evidence_sha256"]
+    assert first["units"][0]["accent_evidence_valid"] is True
+    assert first["units"][0]["accent_evidence"]["provider_evidence_sha256"] == first["contextual_accent_evidence"]["provider_evidence_sha256"]
+
+
 def test_locked_reading_requires_exact_digest_and_candidate_id():
     analysis = run_frontend("東京", _config())
     tokyo = analysis["units"][0]
@@ -159,7 +242,7 @@ def test_locked_reading_rejects_missing_and_duplicate_lexical_units():
 def test_probe_provider_reports_capabilities():
     probe = probe_provider(_config())
     assert probe["provider"] == "pyopenjtalk-plus"
-    assert {"g2p_mapping", "run_frontend_detailed", "make_phoneme_mapping"} <= set(probe["capabilities"])
+    assert {"g2p_mapping", "run_frontend_detailed", "make_phoneme_mapping", "extract_fullcontext"} <= set(probe["capabilities"])
 
 
 def test_asr_transcript_binds_surface_and_kana_evidence_with_raw_offsets():

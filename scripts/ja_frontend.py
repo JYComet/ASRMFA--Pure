@@ -51,7 +51,7 @@ DEFAULT_FRONTEND_OPTIONS = {
     "revert_yotsugana": False,
 }
 ANALYSIS_VERSION = "ja-frontend-analysis-v2"
-_CAPABILITIES = ("g2p_mapping", "run_frontend_detailed", "make_phoneme_mapping")
+_CAPABILITIES = ("g2p_mapping", "run_frontend_detailed", "make_phoneme_mapping", "extract_fullcontext")
 
 
 @dataclass(frozen=True)
@@ -140,7 +140,7 @@ request = json.load(sys.stdin)
 dists = md.packages_distributions().get("pyopenjtalk", [])
 if not dists:
     dists = ["unknown"]
-capabilities = {name: str(inspect.signature(getattr(pyopenjtalk, name))) for name in ("g2p_mapping", "run_frontend_detailed", "make_phoneme_mapping") if hasattr(pyopenjtalk, name)}
+capabilities = {name: str(inspect.signature(getattr(pyopenjtalk, name))) for name in ("g2p_mapping", "run_frontend_detailed", "make_phoneme_mapping", "extract_fullcontext") if hasattr(pyopenjtalk, name)}
 distribution_files = []
 try:
     distribution = md.distribution("pyopenjtalk-plus")
@@ -157,11 +157,12 @@ options = dict(request["options"])
 if request["op"] == "mapping":
     njd, morphs = pyopenjtalk.run_frontend_detailed(text=request["text"], **options)
     rows = pyopenjtalk.g2p_mapping(text=request["text"], **options)
+    labels = pyopenjtalk.extract_fullcontext(text=request["text"], **options)
 elif request["op"] == "reading":
     rows = pyopenjtalk.g2p_mapping(text=request["text"], **options)
 else:
     raise ValueError("unknown bridge operation")
-print(json.dumps({"provider": "pyopenjtalk-plus", "distributions": dists, "version": md.version("pyopenjtalk-plus"), "module": pyopenjtalk.__file__, "capabilities": capabilities, "distribution_files": distribution_files, "rows": rows, "morphs": morphs if request["op"] == "mapping" else []}, ensure_ascii=False))
+print(json.dumps({"provider": "pyopenjtalk-plus", "distributions": dists, "version": md.version("pyopenjtalk-plus"), "module": pyopenjtalk.__file__, "capabilities": capabilities, "distribution_files": distribution_files, "rows": rows, "morphs": morphs if request["op"] == "mapping" else [], "njd_rows": njd if request["op"] == "mapping" else [], "full_context_labels": labels if request["op"] == "mapping" else []}, ensure_ascii=False))
 '''
 
 
@@ -258,6 +259,220 @@ def _span_row(row: Mapping[str, Any], canonical_length: int, index: int) -> tupl
     if start < 0 or end <= start or end > canonical_length:
         raise JAContractError("frontend_span_unbound", "span is outside canonical caller text", f"$.units[{index}].char_span")
     return start, end
+
+
+_LABEL_A_RE = re.compile(r"/A:([-+]?\d+)\+(\d+)\+(\d+)")
+_LABEL_F_RE = re.compile(r"/F:(\d+)_(\d+)#[^@]*@(\d+)_(\d+)\|(\d+)_(\d+)")
+
+
+def _accent_error(message: str, path: str | None = None) -> JAContractError:
+    return JAContractError("accent_phrase_unresolved", message, path)
+
+
+def _accent_row_int(row: Mapping[str, Any], *names: str) -> int:
+    for name in names:
+        if name in row:
+            try:
+                return int(row[name])
+            except (TypeError, ValueError) as exc:
+                raise _accent_error(f"invalid {name} in NJD row") from exc
+    raise _accent_error(f"NJD row lacks {'/'.join(names)}")
+
+
+def _accent_groups(rows: Sequence[Mapping[str, Any]]) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for source in rows:
+        row = dict(source)
+        if current and _accent_row_int(row, "chain_flag") != 1:
+            groups.append(current)
+            current = []
+        current.append(row)
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _mora_tones(mora_count: int, nucleus: int) -> list[str]:
+    if mora_count < 1 or nucleus < 0 or nucleus > mora_count:
+        raise _accent_error("invalid phrase nucleus")
+    if nucleus == 1:
+        return ["H"] + ["L"] * (mora_count - 1)
+    tones = ["L"] + ["H"] * (mora_count - 1)
+    if 1 < nucleus < mora_count:
+        tones[nucleus:] = ["L"] * (mora_count - nucleus)
+    return tones
+
+
+def _parsed_label_moras(labels: Sequence[str]) -> list[dict[str, Any]]:
+    """Collapse phone labels to their explicit, one-based mora positions."""
+    phrases: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for index, label in enumerate(labels):
+        if not isinstance(label, str):
+            raise _accent_error("full-context label is not text", f"$.full_context_labels[{index}]")
+        a_match = _LABEL_A_RE.search(label)
+        if a_match is None:
+            continue
+        f_match = _LABEL_F_RE.search(label)
+        if f_match is None:
+            raise _accent_error("mora label has no parseable F feature", f"$.full_context_labels[{index}]")
+        offset, position, remaining = (int(value) for value in a_match.groups())
+        mora_count, encoded_nucleus, phrase_index, phrase_remaining, breath_position, breath_remaining = (
+            int(value) for value in f_match.groups()
+        )
+        if position < 1 or remaining < 1 or position + remaining - 1 != mora_count:
+            raise _accent_error("A/F mora cardinality disagrees", f"$.full_context_labels[{index}]")
+        if offset != position - encoded_nucleus:
+            raise _accent_error("A/F nucleus position disagrees", f"$.full_context_labels[{index}]")
+        descriptor = (mora_count, encoded_nucleus, phrase_index, phrase_remaining, breath_position, breath_remaining)
+        if current and descriptor != current[-1]["label_descriptor"]:
+            # A descriptor changes only at a phrase boundary.  The next mora
+            # must restart at one; otherwise the label stream is ambiguous.
+            if position != 1:
+                raise _accent_error("full-context phrase descriptor changes mid-phrase", f"$.full_context_labels[{index}]")
+            phrases.append(current)
+            current = []
+        if current and position == current[-1]["mora_index_in_phrase"]:
+            current[-1]["label_indices"].append(index)
+            continue
+        if current and position != current[-1]["mora_index_in_phrase"] + 1:
+            raise _accent_error("full-context mora positions are not monotonic", f"$.full_context_labels[{index}]")
+        if not current and position != 1:
+            raise _accent_error("full-context phrase does not start at mora one", f"$.full_context_labels[{index}]")
+        current.append({
+            "mora_index_in_phrase": position,
+            "mora_count": mora_count,
+            "encoded_nucleus": encoded_nucleus,
+            "label_descriptor": descriptor,
+            "label_indices": [index],
+        })
+    if current:
+        phrases.append(current)
+    return [{"moras": phrase, "descriptor": phrase[0]["label_descriptor"]} for phrase in phrases]
+
+
+def _bind_full_context_moras(groups: Sequence[Sequence[Mapping[str, Any]]], labels: Sequence[str]) -> list[dict[str, Any]]:
+    expected: list[tuple[int, int]] = []
+    for group in groups:
+        mora_count = sum(_accent_row_int(row, "mora_size", "mora_count") for row in group)
+        if mora_count == 0:
+            continue
+        nucleus = _accent_row_int(group[0], "acc", "accent_nucleus")
+        if nucleus < 0 or nucleus > mora_count:
+            raise _accent_error("NJD phrase nucleus is outside its mora count")
+        expected.append((mora_count, nucleus))
+    parsed = _parsed_label_moras(labels)
+    if len(parsed) != len(expected):
+        raise _accent_error("NJD and full-context accent phrase counts differ")
+    result: list[dict[str, Any]] = []
+    for phrase_number, ((mora_count, nucleus), label_phrase) in enumerate(zip(expected, parsed)):
+        label_moras = label_phrase["moras"]
+        descriptor = label_phrase["descriptor"]
+        if len(label_moras) != mora_count or descriptor[0] != mora_count:
+            raise _accent_error("NJD and full-context mora cardinalities differ")
+        encoded_nucleus = mora_count if nucleus == 0 else nucleus
+        if descriptor[1] != encoded_nucleus:
+            raise _accent_error("NJD and full-context nuclei differ")
+        for expected_position, label_mora in enumerate(label_moras, start=1):
+            if label_mora["mora_index_in_phrase"] != expected_position:
+                raise _accent_error("full-context mora sequence is not contiguous")
+            result.append({
+                "accent_phrase_id": f"ap{phrase_number}",
+                "mora_index_in_phrase": expected_position,
+                "mora_count": mora_count,
+                "nucleus": nucleus,
+                "downstep_after_mora": nucleus if nucleus else None,
+                "phrase_start": expected_position == 1,
+                "phrase_end": expected_position == mora_count,
+                "label_indices": label_mora["label_indices"],
+            })
+    return result
+
+
+def _phrase_summaries(moras: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    by_phrase: dict[str, list[Mapping[str, Any]]] = {}
+    for mora in moras:
+        by_phrase.setdefault(str(mora["accent_phrase_id"]), []).append(mora)
+    for phrase_id, phrase_moras in by_phrase.items():
+        first = phrase_moras[0]
+        mora_count = int(first["mora_count"])
+        nucleus = int(first["nucleus"])
+        if len(phrase_moras) != mora_count:
+            raise _accent_error("bound phrase has incomplete mora sequence")
+        summaries.append({
+            "accent_phrase_id": phrase_id,
+            "mora_count": mora_count,
+            "nucleus": nucleus,
+            "downstep_after_mora": nucleus if nucleus else None,
+            "expected_tones": _mora_tones(mora_count, nucleus),
+        })
+    return summaries
+
+
+def extract_contextual_accent_evidence(njd_rows: Sequence[Mapping[str, Any]], labels: Sequence[str]) -> dict[str, Any]:
+    """Normalize pinned OpenJTalk phrase evidence without re-predicting text."""
+    rows = [dict(row) for row in njd_rows]
+    copied_labels = list(labels)
+    moras = _bind_full_context_moras(_accent_groups(rows), copied_labels)
+    return {
+        "adapter_version": "openjtalk-fullcontext-accent-v1",
+        "accent_phrases": _phrase_summaries(moras),
+        "moras": moras,
+        "full_context_labels": copied_labels,
+        "provider_evidence_sha256": stable_digest({"njd_rows": rows, "full_context_labels": copied_labels}),
+    }
+
+
+def _attach_contextual_accent_evidence(units: list[dict[str, Any]], evidence: Mapping[str, Any] | None) -> None:
+    cursor = 0
+    all_moras = list(evidence.get("moras", [])) if evidence else []
+    summaries = {row["accent_phrase_id"]: row for row in evidence.get("accent_phrases", [])} if evidence else {}
+    for unit in units:
+        contextual_reading = str(unit.get("read", ""))
+        unit["contextual_reading"] = contextual_reading
+        unit["contextual_reading_digest"] = stable_digest(contextual_reading)
+        unit["locked_reading_digest"] = unit["contextual_reading_digest"]
+        count = int(unit.get("mora_count", 0) or 0)
+        unit_moras = all_moras[cursor:cursor + count]
+        cursor += count
+        phrase_ids = {row["accent_phrase_id"] for row in unit_moras}
+        unit["accent_evidence"] = None if evidence is None else {
+            "adapter_version": evidence["adapter_version"],
+            "provider_evidence_sha256": evidence["provider_evidence_sha256"],
+            "accent_phrases": [summaries[phrase_id] for phrase_id in sorted(phrase_ids)],
+            "moras": unit_moras,
+        }
+        unit["accent_evidence_valid"] = evidence is not None
+        if evidence is None:
+            unit["accent_evidence_invalid_reason"] = "contextual_accent_unavailable"
+    if evidence is not None and cursor != len(all_moras):
+        raise _accent_error("frontend units and full-context mora cardinalities differ")
+
+
+def validate_frontend_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
+    """Recompute the validity gate for contextual evidence after a reading lock."""
+    payload = dict(contract)
+    checked_units: list[dict[str, Any]] = []
+    for unit in contract.get("units", []):
+        checked = dict(unit)
+        contextual_digest = checked.get("contextual_reading_digest", stable_digest(str(checked.get("contextual_reading", checked.get("read", "")))))
+        locked_digest = checked.get("locked_reading_digest", contextual_digest)
+        checked["contextual_reading_digest"] = contextual_digest
+        checked["locked_reading_digest"] = locked_digest
+        if locked_digest != contextual_digest:
+            checked["accent_evidence_valid"] = False
+            checked["accent_evidence_invalid_reason"] = "locked_reading_changed"
+        elif checked.get("accent_evidence") is None:
+            checked["accent_evidence_valid"] = False
+            checked["accent_evidence_invalid_reason"] = "contextual_accent_unavailable"
+        else:
+            checked["accent_evidence_valid"] = True
+            checked.pop("accent_evidence_invalid_reason", None)
+        checked_units.append(checked)
+    payload["units"] = checked_units
+    return payload
 
 
 def _load_arpa_pronunciations(path: str | None) -> dict[str, list[list[str]]]:
@@ -383,10 +598,12 @@ def run_frontend(caller_text: str, config: Mapping[str, Any] | FrontendConfig | 
         probe = probe_provider(settings)
         bridge = _run_bridge(settings.runtime_python, {"op": "mapping", "text": layer["canonical_text"], "options": {**settings.options, "normalize_mode": "None"}})
         rows = bridge.get("rows", [])
+        accent_evidence = extract_contextual_accent_evidence(bridge.get("njd_rows", []), bridge.get("full_context_labels", []))
         provider_info = {key: bridge.get(key) for key in ("provider", "version", "module", "distributions", "capabilities")}
         provider_info["build_provenance"] = probe.get("build_provenance")
     else:
         rows = provider(layer["canonical_text"], **{**settings.options, "normalize_mode": "None"})
+        accent_evidence = None
         provider_info = {"provider": settings.provider, "version": "injected", "module": "injected", "distributions": [settings.provider], "capabilities": list(_CAPABILITIES)}
     if not isinstance(rows, list) or not rows:
         raise JAContractError("frontend_capability_missing", "frontend returned no mapping")
@@ -404,6 +621,7 @@ def run_frontend(caller_text: str, config: Mapping[str, Any] | FrontendConfig | 
     morphs = bridge.get("morphs", []) if provider is None else []
     units = [_candidate_unit(row, index, layer, settings, arpa, morphs[source_index] if source_index < len(morphs) else None)
              for index, (source_index, row) in enumerate(mapped_rows)]
+    _attach_contextual_accent_evidence(units, accent_evidence)
     if _contains_unsupported_markup(caller_text):
         for unit in units:
             unit["language"] = "unresolved"
@@ -434,6 +652,7 @@ def run_frontend(caller_text: str, config: Mapping[str, Any] | FrontendConfig | 
         "contextual_candidate_ids": [unit["contextual_candidate_ids"] for unit in units],
         "contextual_readings": [unit["read"] for unit in units],
         "contextual_phones": [unit["phones"] for unit in units],
+        "contextual_accent_evidence": accent_evidence,
         "provenance": {"frontend": provider_info, "text_layer": layer["text_layer_digest"]},
         "analysis_provenance": "frontend_candidates_only_no_locked_reading",
     }
@@ -447,7 +666,7 @@ def run_frontend(caller_text: str, config: Mapping[str, Any] | FrontendConfig | 
         "ignored": [unit["token_id"] for unit in units if unit["lexical_status"] in {"ignored", "empty"}],
     }
     payload["analysis_digest"] = stable_digest(payload)
-    return payload
+    return validate_frontend_contract(payload)
 
 
 def _reading_request_rows(request: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -528,6 +747,7 @@ def reconstruct_locked_reading(analysis: Mapping[str, Any], request: Mapping[str
                 "locked_candidate_id": selected_candidate_id,
                 "reading_provenance": row.get("evidence", row.get("provenance", "locked_reading_request")),
                 "accent_prediction_valid": False,
+                "locked_reading_digest": stable_digest(reading),
             })
             result_units.append(updated)
             continue
@@ -548,6 +768,7 @@ def reconstruct_locked_reading(analysis: Mapping[str, Any], request: Mapping[str
             "reading_provenance": row.get("evidence", row.get("provenance", "locked_reading_request")),
             "accent_provenance": "regenerated_from_locked_reading" if reading != unit.get("read") else "frontend_text_prediction",
             "accent_prediction_valid": reading == unit.get("read"),
+            "locked_reading_digest": stable_digest(reading),
         })
         if reading != unit.get("read"):
             updated["accent_provenance"] = "invalidated_by_locked_reading"
@@ -557,7 +778,7 @@ def reconstruct_locked_reading(analysis: Mapping[str, Any], request: Mapping[str
     payload["analysis_provenance"] = "reconstructed_from_locked_reading_request"
     payload["locked_reading_request_digest"] = stable_digest(request)
     payload["reconstruction_digest"] = stable_digest({"canonical_sha256": payload["canonical_sha256"], "units": result_units})
-    return payload
+    return validate_frontend_contract(payload)
 
 
 def reconstruct_locked_readings(analysis: Mapping[str, Any], request: Mapping[str, Any], config: Mapping[str, Any] | FrontendConfig | None = None) -> dict[str, Any]:
@@ -1054,7 +1275,7 @@ if __name__ == "__main__":  # pragma: no cover
 
 __all__ = [
     "DEFAULT_FRONTEND_OPTIONS", "FrontendConfig", "FrontendCandidateAnalysis", "frontend_stage", "probe_provider",
-    "bind_asr_candidates", "reconstruct_locked_reading", "reconstruct_locked_readings", "register_stages", "run_frontend", "unit_candidate_analysis",
+    "bind_asr_candidates", "extract_contextual_accent_evidence", "reconstruct_locked_reading", "reconstruct_locked_readings", "register_stages", "run_frontend", "unit_candidate_analysis", "validate_frontend_contract",
     "project_blind_asr_candidates", "project_asr_candidates", "analyze_blind_asr",
 ]
 

@@ -1,4 +1,19 @@
 from scripts.ja_asr_crossval import select_reading
+from scripts.ja_en_schema import stable_digest
+from scripts.ja_frontend import validate_frontend_contract
+
+
+def test_reading_override_invalidates_contextual_accent():
+    contract = {"schema": "ja-frontend-contract-v2", "units": [{
+        "read": "トーキョー", "contextual_reading_digest": stable_digest("トーキョー"),
+        "locked_reading": "トーキョー", "locked_reading_digest": stable_digest("トーキョー"),
+        "accent_evidence": {"adapter_version": "openjtalk-fullcontext-accent-v1"},
+    }]}
+    contract["units"][0]["locked_reading"] = "トウキョウ"
+    contract["units"][0]["locked_reading_digest"] = stable_digest("トウキョウ")
+    checked = validate_frontend_contract(contract)
+    assert checked["units"][0]["accent_evidence_valid"] is False
+    assert checked["units"][0]["accent_evidence_invalid_reason"] == "locked_reading_changed"
 
 
 def test_selector_precedence_manual_origin_consensus_medoid_none():
