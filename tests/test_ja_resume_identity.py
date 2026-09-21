@@ -131,3 +131,16 @@ def test_tts_stage_input_is_only_the_prosody_artifact(tmp_path: Path):
     prepared = _prepare_stage_config({}, "tts", tmp_path)
     assert prepared["tts"]["alignment_jsonl"] == str(artifact)
     assert prepared["stage_inputs"]["tts"] == {"alignment_jsonl": str(artifact)}
+
+
+def test_resume_compatibility_rejects_stage_order_drift(tmp_path: Path):
+    config_path, config = _config(tmp_path)
+    _, manifest_path, rows, workspace = preflight(config, config_path=config_path)
+    identity = config_identity(config, manifest_path, rows)
+    workspace.mkdir()
+    from scripts.run_ja_en_pipeline import _compatibility_identity
+    payload = {"compatibility_digest": stable_digest(_compatibility_identity(identity))}
+    atomic_write_json(workspace / ".ja_en_run_identity.json", payload, workspace=workspace)
+    identity["production_stages"] = list(reversed(identity["production_stages"]))
+    with pytest.raises(JAContractError, match="resume_identity_drift"):
+        validate_resume(workspace, identity, allow_new=False)

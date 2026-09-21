@@ -301,3 +301,20 @@ def test_prosody_handler_consumes_multi_uid_merge_aggregate_and_keeps_merge_ledg
     assert result.status == "PARTIAL"
     receipt = json.loads((tmp_path / "stages" / "prosody" / "receipt.json").read_text(encoding="utf-8"))
     assert [row["uid"] for row in receipt["errors"]] == ["rejected"]
+
+
+def test_prosody_aggregate_unions_expected_and_blocked_merge_uid_ledger(tmp_path: Path):
+    alignment = _prosody_alignment("good")
+    config = _write_prosody_sources(tmp_path, alignment)
+    source = tmp_path / "stages" / "merge" / "ja_en_alignments.json"
+    source.write_text(json.dumps({"alignments": [alignment]}), encoding="utf-8")
+    config["prosody"]["alignment_jsonl"] = str(source)
+    (tmp_path / "stages" / "merge" / "uid_errors.json").write_text(json.dumps({
+        "expected_uids": ["good", "blocked"], "blocked_uids": ["blocked"], "errors": [],
+    }), encoding="utf-8")
+    result = handle_prosody(config, tmp_path / "stages" / "prosody")
+    assert result.status == "PARTIAL"
+    ledger = json.loads((tmp_path / "stages" / "prosody" / "uid_errors.json").read_text(encoding="utf-8"))
+    assert ledger["expected_uids"] == ["blocked", "good"]
+    assert ledger["blocked_uids"] == ["blocked"]
+    assert ledger["errors"][0]["uid"] == "blocked"

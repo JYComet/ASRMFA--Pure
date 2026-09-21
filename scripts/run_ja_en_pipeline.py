@@ -290,6 +290,7 @@ def config_identity(config: Mapping[str, Any], manifest_path: Path, manifest: li
         "config_artifacts": config_paths,
         "implementation_files": implementation_files,
         "schemas": sorted(SCHEMAS),
+        "production_stages": list(PRODUCTION_STAGES),
         "stage_registry": stage_registry(),
     }
 
@@ -342,7 +343,7 @@ def _identity_path(workspace: Path) -> Path:
 
 def _compatibility_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
     """Immutable resume shape; mutable resources belong to stage cache keys."""
-    return {key: copy.deepcopy(identity.get(key)) for key in ("schema", "pipeline", "schemas", "stage_registry")}
+    return {key: copy.deepcopy(identity.get(key)) for key in ("schema", "pipeline", "schemas", "production_stages", "stage_registry")}
 
 
 def _production_lock_payload(lock_path: Path) -> dict[str, Any]:

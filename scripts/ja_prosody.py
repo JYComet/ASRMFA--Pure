@@ -376,19 +376,28 @@ def handle_prosody(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
                 failures.append({"uid": uid, **error.as_dict()})
             except Exception as error:  # a bad UID must not erase other work
                 failures.append({"uid": uid, "code": "verifier_failed", "message": f"{type(error).__name__}: {error}"})
+        expected_uids = {str(row.get("uid", "")) for row in source_rows if isinstance(row, Mapping) and row.get("uid")}
+        blocked_uids: set[str] = set()
         upstream_errors = workspace / "stages" / "merge" / "uid_errors.json"
         if upstream_errors.is_file() and not upstream_errors.is_symlink():
             ledger = json.loads(upstream_errors.read_text(encoding="utf-8"))
+            if isinstance(ledger, Mapping):
+                expected_uids.update(str(value) for value in ledger.get("expected_uids", []) if value)
+                blocked_uids.update(str(value) for value in ledger.get("blocked_uids", []) if value)
             for error in ledger.get("errors", []) if isinstance(ledger, Mapping) else []:
                 if isinstance(error, Mapping) and error.get("uid"):
                     failures.append({"uid": str(error["uid"]), **{key: value for key, value in error.items() if key != "uid"}})
+                    blocked_uids.add(str(error["uid"]))
+        failed_uids = {str(item.get("uid", "")) for item in failures if item.get("uid")}
+        for uid in sorted(blocked_uids - failed_uids):
+            failures.append({"uid": uid, "code": "publish_blocked", "message": "upstream merge UID is blocked"})
         output = stage_dir / "prosody_alignments.jsonl"
         atomic_write_bytes(output, b"".join(canonical_json(row) for row in rows), workspace=workspace)
         if failures:
             atomic_write_json(stage_dir / "uid_errors.json", {
                 "schema": "ja-en-uid-error-ledger-v1", "stage": "prosody",
-                "expected_uids": [str(row.get("uid", "")) for row in source_rows if isinstance(row, Mapping)],
-                "blocked_uids": sorted({item["uid"] for item in failures}), "errors": failures,
+                "expected_uids": sorted(expected_uids),
+                "blocked_uids": sorted({str(item["uid"]) for item in failures if item.get("uid")}), "errors": failures,
             }, workspace=workspace)
         status = "COMPLETE" if not failures else "PARTIAL"
         receipt = make_receipt(stage="prosody", status=status,

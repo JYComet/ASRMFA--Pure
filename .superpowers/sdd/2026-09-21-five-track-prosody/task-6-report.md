@@ -85,3 +85,12 @@ fixture path remains until Task 7 migrates the exporter contract.
 - GREEN: `pytest -q tests/test_ja_stage_inputs.py tests/test_ja_resume_identity.py tests/test_ja_tts_export.py` — 18 passed.
 - `python -m compileall -q scripts tests` and `git diff --check` — passed.
 - `pytest -q` — 1675 passed, 37 skipped, 1 failed in 32.64s; the sole failure remains the identical known Task 8 verifier fixture.
+
+## Fix Round 2/5
+
+- Finding 1: `test_prosody_aggregate_unions_expected_and_blocked_merge_uid_ledger` went RED (incorrect `COMPLETE`), then GREEN; prosody now unions merge expected/blocked/errors and creates a stable propagated blocked error.
+- Finding 2/3: composite template lookup is token+alias scoped and graph IDs are namespaced before projection; locked-reading and frontend digest checks remain fail-closed at the token boundary.
+- Finding 4: pipeline TTS bridge has no merge fallback and validates prosody schema when `stage_inputs` declares the production handler path; standalone legacy fixture remains explicitly transitional per the Fix Round 1 ruling.
+- Finding 5: `test_resume_compatibility_rejects_stage_order_drift` went RED then GREEN; immutable compatibility now contains exact ordered `production_stages` while mutable resources remain cache-scoped.
+- Focused: `pytest -q tests/test_ja_stage_inputs.py tests/test_ja_resume_identity.py tests/test_ja_tts_export.py` — 21 passed. `compileall` and `git diff --check` passed.
+- Full: `pytest -q` — 1677 passed, 37 skipped, 1 known Task 8 verifier-fixture failure in 32.70s.
