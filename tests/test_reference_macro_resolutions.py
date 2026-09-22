@@ -64,6 +64,52 @@ def test_audibly_distinct_branch_needs_a_unique_transcript_match(transcript, exp
     assert plan.kind == ("evidence" if expected else "unresolved")
 
 
+# Every label below was read off the corpus audio: the same authority line is
+# recorded once per player gender, so transcribing both variants of a line shows
+# what each branch actually says.  The INFO_MALE_/INFO_FEMALE_ prefix is ignored
+# (it is decorative and can contradict its own label); only the trailing token
+# selects the word.  SISTER is 妹妹, not 姐姐 -- SISTERA is the one that means
+# 姐姐.
+@pytest.mark.parametrize("label,spoken", [
+    ("INFO_MALE_PRONOUN_BROTHER", "哥哥"),
+    ("INFO_FEMALE_PRONOUN_BROTHER", "哥哥"),
+    ("INFO_FEMALE_PRONOUN_SISTER", "妹妹"),
+    ("INFO_MALE_PRONOUN_SISTER", "妹妹"),
+    ("INFO_FEMALE_PRONOUN_SISTERA", "姐姐"),
+    ("INFO_MALE_PRONOUN_BOY", "少年"),
+    ("INFO_FEMALE_PRONOUN_GIRL", "少女"),
+    ("INFO_MALE_PRONOUN_BOYD", "王子"),
+    ("INFO_FEMALE_PRONOUN_GIRLD", "公主"),
+    ("INFO_MALE_PRONOUN_GIRLD", "公主"),
+    ("INFO_FEMALE_PRONOUN_BOYD", "王子"),
+    ("INFO_MALE_PRONOUN_YING", "荧"),
+    ("INFO_FEMALE_PRONOUN_KONG", "空"),
+])
+def test_label_suffix_selects_the_spoken_word(label, spoken):
+    from scripts.qwen3_timestamp_normalization import _SEXPRO_WORDS
+    tokens = [t for t in label.split("_") if t]
+    assert _SEXPRO_WORDS[tokens[-1]] == spoken
+
+
+def test_reversed_label_order_is_resolved_by_suffix_not_by_position():
+    # [SISTER|BROTHER] must yield (妹妹, 哥哥), not (哥哥, 妹妹).
+    source = "{PLAYERAVATAR#SEXPRO[INFO_MALE_PRONOUN_SISTER|INFO_FEMALE_PRONOUN_BROTHER]}"
+    slots = reference_macro_slots(source)
+    assert slots[0].alternatives == ("妹妹", "哥哥")
+    assert classify_slot(slots[0], run_stem="u1", game="原神",
+                         transcript="你的妹妹认识戴因。").value == "妹妹"
+    assert classify_slot(slots[0], run_stem="u1", game="原神",
+                         transcript="你的哥哥认识戴英。").value == "哥哥"
+
+
+def test_unobserved_label_stays_unresolved_instead_of_being_guessed():
+    # GIRLC is in no recorded variant, so there is no word to guess at.
+    plan = classify_slot(only_slot(
+        "{MATEAVATAR#SEXPRO[INFO_MALE_PRONOUN_BOYC|INFO_FEMALE_PRONOUN_GIRLC]}"),
+        run_stem="u1", game="原神", transcript="随便什么")
+    assert plan.value is None and plan.kind == "unresolved"
+
+
 def test_ruby_gloss_resolves_to_nothing_and_needs_no_evidence():
     plans = plan_text("杜麦{RUBY#[S]希望}尼。", run_stem="u1", game="原神")
     assert [p.value for p in plans] == [""]

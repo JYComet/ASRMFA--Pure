@@ -34,6 +34,39 @@ MERGE_KIND_COMPOUND = "compound"
 
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 CANONICAL_UNITS_SCHEMA = "canonical-english-units-v1"
+# This policy is part of every producer/cache certificate.  Changing the
+# treatment of all-uppercase ASCII words must invalidate prior artifacts.
+ENGLISH_UNITS_POLICY_ID = "uppercase-ascii-letter-names-v1"
+ENGLISH_UNITS_POLICY = {
+    "policy_id": ENGLISH_UNITS_POLICY_ID,
+    "uppercase_ascii": "split_each_character",
+    "lowercase_article_a": "preserve",
+}
+ENGLISH_UNITS_POLICY_SHA256 = hashlib.sha256(
+    json.dumps(ENGLISH_UNITS_POLICY, ensure_ascii=False, sort_keys=True,
+               separators=(",", ":")).encode("utf-8")).hexdigest()
+
+# CMU/MFA letter-name pronunciations.  These are intentionally fixed so a
+# one-letter unit is never sent through an arbitrary word G2P fallback.
+LETTER_NAME_PRONUNCIATIONS: dict[str, tuple[str, ...]] = {
+    "a": ("EY1",), "b": ("B", "IY1"), "c": ("S", "IY1"),
+    "d": ("D", "IY1"), "e": ("IY1",), "f": ("EH1", "F"),
+    "g": ("JH", "IY1"), "h": ("EY1", "CH"), "i": ("AY1",),
+    "j": ("JH", "EY1"), "k": ("K", "EY1"), "l": ("EH1", "L"),
+    "m": ("EH1", "M"), "n": ("EH1", "N"), "o": ("OW1",),
+    "p": ("P", "IY1"), "q": ("K", "Y", "UW1"),
+    "r": ("AA1", "R"), "s": ("EH1", "S"), "t": ("T", "IY1"),
+    "u": ("Y", "UW1"), "v": ("V", "IY1"),
+    "w": ("D", "AH1", "B", "L", "Y", "UW1"),
+    "x": ("EH1", "K", "S"), "y": ("W", "AY1"), "z": ("Z", "IY1"),
+}
+
+
+def letter_name_pronunciation(token: str) -> tuple[str, ...] | None:
+    """Return the fixed pronunciation for one synthetic letter-name key."""
+    if not isinstance(token, str) or not token.casefold().startswith("letter"):
+        return None
+    return LETTER_NAME_PRONUNCIATIONS.get(token[6:].casefold())
 _ORDINAL_KEYS = ("ordinal", "ctc_ordinal", "source_ctc_ordinal")
 _TEXT_KEYS = ("text", "surface_text", "word", "token")
 _START_KEYS = ("start", "xmin", "start_s")
@@ -75,6 +108,8 @@ def _canonical_token(text: str) -> str:
     # QUESTION-YI, which otherwise satisfies the compound grammar.
     if _is_nvv(text):
         raise EnglishUnitError("nvv_is_not_english", text)
+    if len(text) == 1 and text.isascii() and text.isalpha() and text.isupper():
+        return f"letter{text.casefold()}"
     token = text.replace("-", "").lower()
     # Dictionary lookup uses the alphabetic base while surface/unit identity
     # retains the numeric suffix (target1 and target2 remain distinct units).
@@ -88,6 +123,17 @@ def canonicalize_english_token(text: str) -> str:
     a malformed token.
     """
     return _canonical_token(text)
+
+
+def english_alignment_matches_surface(alignment_token: object,
+                                      surface_text: object) -> bool:
+    """Return whether one canonical alignment key owns one surface spelling."""
+    if not isinstance(alignment_token, str) or not isinstance(surface_text, str):
+        return False
+    try:
+        return canonicalize_english_token(surface_text) == alignment_token.casefold()
+    except (EnglishUnitError, TypeError, ValueError):
+        return False
 
 
 def is_english_fragment_token(text: str) -> bool:
@@ -245,9 +291,16 @@ def parse_english_units(text: str) -> tuple[EnglishUnit, ...]:
         # explicit check documents and protects the crossing boundary.
         if _is_cjk(surface):
             continue
-        units.append(_make_unit(surface, len(units),
-                                canonical_start=match.start(),
-                                canonical_end=match.end()))
+        if surface.isascii() and surface.isalpha() and surface.isupper():
+            for offset, character in enumerate(surface):
+                units.append(_make_unit(
+                    character, len(units),
+                    canonical_start=match.start() + offset,
+                    canonical_end=match.start() + offset + 1))
+        else:
+            units.append(_make_unit(surface, len(units),
+                                    canonical_start=match.start(),
+                                    canonical_end=match.end()))
     return tuple(units)
 
 
@@ -300,6 +353,20 @@ def project_authority_semantics(text: str) -> tuple[dict[str, Any], ...]:
             elif _is_nvv(surface):
                 kind, alignment, unit_id, ordinal = "nvv", None, None, None
             else:
+                # Keep authority semantics in lockstep with parse_english_units:
+                # uppercase identifiers are spoken as independent letter names.
+                if surface.isascii() and surface.isalpha() and surface.isupper():
+                    for character in surface:
+                        alignment = _canonical_token(character)
+                        result.append({
+                            "kind": "english", "surface": character,
+                            "alignment_token": alignment,
+                            "unit_id": _unit_id(english_ordinal),
+                            "reference_ordinal": english_ordinal,
+                        })
+                        english_ordinal += 1
+                    index += match.end()
+                    continue
                 try:
                     alignment = _canonical_token(surface)
                 except EnglishUnitError:

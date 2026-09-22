@@ -39,6 +39,7 @@ from pipeline_utils import (  # noqa: E402
 from english_units import (  # noqa: E402
     EnglishUnitError, canonicalize_english_token, is_english_fragment_token,
     parse_english_units,
+    english_alignment_matches_surface, letter_name_pronunciation,
     project_authority_semantics,
     resolve_processed_english_token,
     validate_processed_english_token_binding,
@@ -2312,6 +2313,12 @@ def _pronunciation_consumer_reasons(record: dict, source_word: dict,
     ledger_labels = tuple(str(phone.get("label", "")).strip()
                           for phone in record.get("phones", [])
                           if isinstance(phone, dict))
+    expected_letter = letter_name_pronunciation(token)
+    if expected_letter is not None:
+        errors = []
+        if source_labels != expected_letter or ledger_labels != expected_letter:
+            errors.append("letter_name_pronunciation_mismatch")
+        return errors
     if token == "app":
         return ([] if ledger_labels == APP_EXPECTED_PRONUNCIATION
                 and source_labels == APP_EXPECTED_PRONUNCIATION
@@ -2534,8 +2541,9 @@ def _english_provenance_reasons(stem: str, final_tg, ctc_dir: Path,
                 if ordinal in used_ctc_ordinals or ordinal not in ctc_english:
                     continue
                 actual = _compact_english(interval.text)
-                if not actual or not text or not (actual == text
-                        or actual.startswith(text) or text.startswith(actual)):
+                if (not actual or not text
+                        or not english_alignment_matches_surface(
+                            record.get("alignment_token"), interval.text)):
                     continue
                 if start is not None and abs(float(interval.xmin) - start) > 0.012:
                     continue
@@ -2603,8 +2611,13 @@ def _english_provenance_reasons(stem: str, final_tg, ctc_dir: Path,
                 if (record.get("status") != "verified" or record.get("word_id") != expected_id
                         or not isinstance(mfa_word, dict)
                         or actual_ctc_ordinal is None
-                        or _compact_english(ctc_english[actual_ctc_ordinal]) != _compact_english(record.get("ctc_text", ""))
-                        or _compact_english(record.get("ctc_text", "")) != _compact_english(source_word["text"])
+                        or not english_alignment_matches_surface(
+                            record.get("alignment_token"),
+                            ctc_english[actual_ctc_ordinal])
+                        or not english_alignment_matches_surface(
+                            record.get("alignment_token"), record.get("ctc_text", ""))
+                        or not english_alignment_matches_surface(
+                            record.get("alignment_token"), source_word["text"])
                         or mfa_word.get("ordinal") != source_word["ordinal"]
                         or not _same_number(mfa_word.get("start"), source_word["start"])
                         or not _same_number(mfa_word.get("end"), source_word["end"])
@@ -2652,6 +2665,15 @@ def _english_provenance_reasons(stem: str, final_tg, ctc_dir: Path,
             record_cursor = 0
             for unit in authority_units:
                 start_cursor = record_cursor
+                if (record_cursor < len(verified_words)
+                        and verified_words[record_cursor]["ledger"].get("unit_id") == unit.unit_id
+                        and verified_words[record_cursor]["ledger"].get("alignment_token") == unit.alignment_token
+                        and english_alignment_matches_surface(
+                            unit.alignment_token,
+                            verified_words[record_cursor]["source"].get("text", ""))):
+                    record_cursor += 1
+                    grouped.append(verified_words[start_cursor])
+                    continue
                 compact = ""
                 while record_cursor < len(verified_words):
                     evidence = verified_words[record_cursor]
@@ -2731,8 +2753,8 @@ def _english_provenance_reasons(stem: str, final_tg, ctc_dir: Path,
                                 and abs(iv.xmax - final_word.xmax) <= EPS]
                 if len(hanzi_owners) != 1 or hanzi_owners[0].text.strip() != unit.surface_text:
                     return ["english_hanzi_owner_mismatch"], None
-            if (re.sub(r"[^a-z0-9]", "", final_word.text.strip().casefold())
-                    != re.sub(r"[^a-z0-9]", "", record.get("alignment_token", "").casefold())):
+            if not english_alignment_matches_surface(
+                    record.get("alignment_token"), final_word.text.strip()):
                 return ["english_word_unmatched"], None
             # Every positive-overlap phone inside an English word is part of
             # its evidence sequence.  Silence cannot be smuggled into the

@@ -1,0 +1,23 @@
+# Independent qwen3asr probe used by the reference-macro repair.
+#
+# 148 原神 items carry an audibly-distinct SEXPRO branch (哥哥/姐姐 类) that the
+# published run never heard, because a reference-mode item is aligned against its
+# authority text and never gets an ASR transcript.  This run supplies the missing
+# evidence: the transcript decides which branch was actually spoken.
+#
+# `context` is deliberately empty -- a hotword hint naming either branch would
+# bias the very decision this run exists to make.
+mode: qwen3asr
+data_dir: /mnt/nvme3/qwen3_macro_asr_20260918/wav
+qwen3asr:
+  backend: transformers
+  profile: transcript_only
+  model_path: /mnt/nvme3/models/Qwen3-ASR-1.7B
+  output_dir: /mnt/nvme3/qwen3_macro_asr_20260918/output
+  python: /home/user/miniconda3/envs/asr/bin/python
+  device: cuda:0
+  dtype: bfloat16
+  language: Chinese
+  context: ""
+  batch_size: 1
+  max_new_tokens: 2048

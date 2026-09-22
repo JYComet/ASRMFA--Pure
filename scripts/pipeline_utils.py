@@ -1281,34 +1281,48 @@ CTC_NORMALIZATION_MARKER = "reference-authority-v3-safe-transcript\n"
 # v4 marker embeds content identity (stem count + manifest digest) so a
 # marker leftover from a different run or tampered data cannot be mistaken
 # for a valid normalization certificate.
-_CTC_MARKER_V4_HEADER = "reference-authority-v4-safe-transcript"
+_CTC_MARKER_V5_HEADER = "reference-authority-v5-safe-transcript"
+
+
+def _english_units_policy_binding() -> tuple[str, str]:
+    """Load the shared lexical policy without importing it at module import."""
+    try:
+        from english_units import ENGLISH_UNITS_POLICY_ID, ENGLISH_UNITS_POLICY_SHA256
+    except ImportError:
+        from scripts.english_units import ENGLISH_UNITS_POLICY_ID, ENGLISH_UNITS_POLICY_SHA256
+    return ENGLISH_UNITS_POLICY_ID, ENGLISH_UNITS_POLICY_SHA256
 
 
 def make_ctc_normalization_marker(stem_count: int, manifest_sha256: str) -> str:
-    """Build a v4 marker that binds content identity to the certificate."""
+    """Build a v5 marker binding content and English-unit policy identity."""
+    policy_id, policy_hash = _english_units_policy_binding()
     return (
-        f"{_CTC_MARKER_V4_HEADER}\n"
+        f"{_CTC_MARKER_V5_HEADER}\n"
         f"stems={stem_count}\n"
         f"manifest_sha256={manifest_sha256}\n"
+        f"english_units_policy_id={policy_id}\n"
+        f"english_units_policy_sha256={policy_hash}\n"
     )
 
 
 def parse_ctc_normalization_marker(text: str) -> dict | None:
-    """Extract content identity from a v4 marker.
+    """Extract content and lexical policy identity from a v5 marker.
 
     Returns a dict with keys ``stems`` (int) and ``manifest_sha256`` (str),
     or ``None`` when the marker is missing, unparseable, or from an older
     schema version.
     """
     lines = text.strip().split("\n")
-    if not lines or lines[0] != _CTC_MARKER_V4_HEADER:
+    if not lines or lines[0] != _CTC_MARKER_V5_HEADER:
         return None
     info: dict = {}
     for line in lines[1:]:
         if "=" in line:
             k, v = line.split("=", 1)
             info[k.strip()] = v.strip()
-    if "stems" not in info or "manifest_sha256" not in info:
+    if ("stems" not in info or "manifest_sha256" not in info
+            or info.get("english_units_policy_id") != _english_units_policy_binding()[0]
+            or info.get("english_units_policy_sha256") != _english_units_policy_binding()[1]):
         return None
     try:
         info["stems"] = int(info["stems"])

@@ -56,6 +56,9 @@ from english_units import (
     is_english_fragment_token,
     merge_authority_fragment_group,
     parse_english_units,
+    ENGLISH_UNITS_POLICY_ID,
+    ENGLISH_UNITS_POLICY_SHA256,
+    letter_name_pronunciation,
 )
 
 # English MFA phone inventory — vowels, consonants, and stress markers
@@ -683,6 +686,10 @@ def _strict_verified_words(sid: str, segment: dict, words: list[dict], phones: l
                 raise ValueError("phone_gap")
         dictionary = dictionary_provenance or {}
         actual_source_sequence = tuple(phone["text"] for phone in word_phones)
+        expected_letter_pronunciation = letter_name_pronunciation(unit.alignment_token)
+        if (expected_letter_pronunciation is not None
+                and actual_source_sequence != expected_letter_pronunciation):
+            raise ValueError("letter_name_pronunciation_mismatch")
         if unit.alignment_token == APP_ALIGNMENT_TOKEN and actual_source_sequence != APP_EXPECTED_PRONUNCIATION:
             raise ValueError("app_expected_pronunciation_mismatch")
         pronunciation_policy = None
@@ -1363,11 +1370,20 @@ def build_en_dict(en_segments: dict[str, list[dict]],
                         # they are not eligible for canonical English lookup.
                         continue
 
-    oov_words = sorted(all_words - base_words)
     # Always start with a clean (comment-free) copy of the base dictionary.
     # SOS is deliberately in-vocabulary, so it must be replaced before the
     # OOV decision rather than sent through G2P or copied from CMUdict.
     dictionary_text = base_dict_text
+    letter_words = sorted(word for word in all_words
+                          if word.startswith("letter") and len(word) == 7)
+    for word in letter_words:
+        pronunciation = letter_name_pronunciation(word)
+        if pronunciation is None:
+            raise StrictG2PError(f"unknown letter-name key: {word}")
+        dictionary_text = _replace_exact_dictionary_entry(
+            dictionary_text, word, pronunciation)
+    base_words.update(letter_words)
+    oov_words = sorted(all_words - base_words)
     if SOS_ALIGNMENT_TOKEN in all_words:
         dictionary_text = _replace_exact_dictionary_entry(
             dictionary_text, SOS_ALIGNMENT_TOKEN, SOS_EXPECTED_PRONUNCIATION)
@@ -1407,7 +1423,11 @@ def build_en_dict(en_segments: dict[str, list[dict]],
 
     # Check dictionary cache (keyed by hash of sorted OOV word list)
     import hashlib
-    cache_key = hashlib.sha1(",".join(oov_words).encode()).hexdigest()[:12]
+    cache_key = hashlib.sha1(json.dumps({
+        "oov_words": oov_words,
+        "english_units_policy_id": ENGLISH_UNITS_POLICY_ID,
+        "english_units_policy_sha256": ENGLISH_UNITS_POLICY_SHA256,
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:12]
     cache_dir = temp_dir / "en_dict_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cached_dict = cache_dir / f"{cache_key}.dict"

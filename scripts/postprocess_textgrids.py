@@ -68,6 +68,8 @@ from english_units import (
     is_english_fragment_token,
     merge_authority_fragment_group,
     parse_english_units,
+    english_alignment_matches_surface,
+    letter_name_pronunciation,
     project_authority_semantics,
     resolve_processed_english_token,
     validate_processed_english_token_binding,
@@ -10042,15 +10044,16 @@ def _restore_reference_surfaces(words_tier: Tier | None,
         return []
     restored: list[str] = []
     for unit, owner in zip(units, owners):
-        compact = re.sub(r"[^a-z0-9]", "", owner.text.strip().casefold())
-        if compact != unit.alignment_token:
+        if not english_alignment_matches_surface(unit.alignment_token,
+                                                  owner.text.strip()):
             continue
         owner.text = unit.surface_text
         matching = [iv for iv in hanzi_tier.intervals
                     if is_english_token(iv.text.strip())
                     and abs(iv.xmin - owner.xmin) <= AXIS_EPS
                     and abs(iv.xmax - owner.xmax) <= AXIS_EPS
-                    and re.sub(r"[^a-z0-9]", "", iv.text.strip().casefold()) == compact]
+                    and english_alignment_matches_surface(
+                        unit.alignment_token, iv.text.strip())]
         if len(matching) == 1:
             matching[0].text = unit.surface_text
         restored.append(unit.unit_id)
@@ -16420,6 +16423,10 @@ def _strict_en_pronunciation_reason(record: dict, ledger: dict) -> str | None:
     labels = tuple(str(phone.get("label", "")).strip()
                    for phone in record.get("phones", [])
                    if isinstance(phone, dict))
+    expected_letter = letter_name_pronunciation(token)
+    if expected_letter is not None:
+        return (None if labels == expected_letter
+                else "letter_name_pronunciation_mismatch")
     if token == "app":
         return (None if labels == APP_EXPECTED_PRONUNCIATION
                 else "app_expected_pronunciation_mismatch")
@@ -16922,8 +16929,8 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
         if (record.get("status") != "verified" or record.get("provenance") != "english_mfa_textgrid"
                 or not isinstance(word_id, str) or not word_id or word_id in seen_word_ids
                 or ordinal <= previous_ctc_ordinal
-            or re.sub(r"[^a-z0-9]", "", str(record.get("alignment_token", "")).casefold())
-               != re.sub(r"[^a-z0-9]", "", final_word.text.strip().casefold())
+            or not english_alignment_matches_surface(
+                record.get("alignment_token"), final_word.text.strip())
                 or not isinstance(mfa_word, dict) or not isinstance(phones, list) or not phones):
             return _strict_en_fail(required, "strict_en_word_identity_or_evidence_invalid",
                                    ledger_sha256=actual_hash, failed_word_ids=[str(word_id or "")])
@@ -16932,8 +16939,8 @@ def load_strict_en_provenance(stem: str, words_tier: Tier | None,
         try:
             if (not isinstance(mfa_word.get("ordinal"), int)
                     or mfa_word["ordinal"] < 0
-                    or re.sub(r"[^a-z0-9]", "", str(mfa_word.get("text", "")).casefold())
-                       != re.sub(r"[^a-z0-9]", "", str(record.get("alignment_token", "")).casefold())):
+                    or not english_alignment_matches_surface(
+                        record.get("alignment_token"), str(mfa_word.get("text", "")))):
                 raise ValueError("mfa_word_identity")
         except Exception:
             return _strict_en_fail(required, "strict_en_mfa_word_invalid", ledger_sha256=actual_hash,

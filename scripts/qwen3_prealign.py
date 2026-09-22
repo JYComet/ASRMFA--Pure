@@ -38,10 +38,14 @@ except ModuleNotFoundError:
     )
 
 try:
-    from english_units import parse_english_units, project_authority_semantics
+    from english_units import (parse_english_units, project_authority_semantics,
+                               ENGLISH_UNITS_POLICY_ID,
+                               ENGLISH_UNITS_POLICY_SHA256)
     from pipeline_utils import validate_ctc_transcript_bundle, CTC_SUFFIXES
 except ModuleNotFoundError:
-    from .english_units import parse_english_units, project_authority_semantics
+    from .english_units import (parse_english_units, project_authority_semantics,
+                                ENGLISH_UNITS_POLICY_ID,
+                                ENGLISH_UNITS_POLICY_SHA256)
     from .pipeline_utils import validate_ctc_transcript_bundle, CTC_SUFFIXES
 
 try:
@@ -246,7 +250,10 @@ def _lexical_plan(text: str) -> list[dict[str, Any]]:
             plan.append({"unit": surface, "authority": None})
         elif kind == "english":
             authority = authorities[item["reference_ordinal"]]
-            plan.append({"unit": surface.replace("-", ""), "authority": authority})
+            # Qwen aligns the literal authority spelling.  The synthetic
+            # letter-name key is introduced only when emitting MFA/CTC words.
+            aligner_unit = surface.replace("-", "")
+            plan.append({"unit": aligner_unit, "authority": authority})
         elif kind == "other" and any(ch.isalnum() for ch in surface):
             raise Qwen3PrealignError(
                 f"unsupported MFA lexical unit {surface!r}; use Chinese characters or English words")
@@ -348,6 +355,8 @@ def _identity_payload(*, settings: Qwen3HFSettings, runtime: dict[str, Any],
         "inputs": {"stems": sorted(stems), "digest": input_digest},
         "references_digest": reference_digest,
         "output_digest": output_digest,
+        "english_units_policy_id": ENGLISH_UNITS_POLICY_ID,
+        "english_units_policy_sha256": ENGLISH_UNITS_POLICY_SHA256,
     }
 
 
@@ -553,6 +562,10 @@ def run_qwen3_hf(cfg: dict[str, Any], project_root: Path,
     runtime["timestamp_normalization"] = TIMESTAMP_SCHEMA
     runtime["timestamp_normalization_sha256"] = _sha256(
         Path(__file__).with_name("qwen3_timestamp_normalization.py"))
+    runtime["english_units_policy_id"] = ENGLISH_UNITS_POLICY_ID
+    runtime["english_units_policy_sha256"] = ENGLISH_UNITS_POLICY_SHA256
+    runtime["english_units_sha256"] = _sha256(
+        Path(__file__).with_name("english_units.py"))
     for package_name in ("torch", "pypinyin"):
         try:
             runtime[package_name] = importlib.metadata.version(package_name)

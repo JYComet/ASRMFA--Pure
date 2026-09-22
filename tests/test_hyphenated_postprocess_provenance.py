@@ -82,6 +82,57 @@ def test_012871_canary_restores_one_surface_owner_without_mfa(tmp_path):
     assert len(pairs) == 1
 
 
+def test_cpu_letter_aliases_restore_surface_without_changing_timing(tmp_path):
+    ledger_path, record = _ledger_fixture(tmp_path)
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    source = ledger["segments"][0]["mfa_textgrid"]
+    records = []
+    pronunciations = [("letterc", ("S", "IY1")),
+                      ("letterp", ("P", "IY1")),
+                      ("letteru", ("Y", "UW1"))]
+    for ordinal, (token, labels) in enumerate(pronunciations):
+        start, end = ordinal * 0.4, (ordinal + 1) * 0.4
+        records.append({
+            "word_id": f"012871:s0:w{ordinal}", "unit_id": f"en-u{ordinal:04d}",
+            "ctc_ordinal": ordinal, "source_ctc_ordinals": [ordinal],
+            "ctc_text": "CPU"[ordinal], "alignment_token": token,
+            "canonical_span": [ordinal, ordinal + 1],
+            "canonical_binding": post.CANONICAL_UNITS_SCHEMA,
+            "status": "verified", "provenance": "english_mfa_textgrid",
+            "mfa_word": {"ordinal": ordinal, "text": token, "start": start, "end": end},
+            "phones": [{"ordinal": index, "mfa_phone_ordinal": ordinal * 2 + index,
+                        "label": label, "start": start + index * .2,
+                        "end": start + (index + 1) * .2}
+                       for index, label in enumerate(labels)],
+        })
+    ledger["segments"][0]["words"] = records
+    ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+    manifest_path = tmp_path / "en_alignment_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["stem_ledgers"][0]["sha256"] = hashlib.sha256(
+        ledger_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    words = post.Tier("words", 0.0, 1.2, [
+        post.Interval(0.0, 0.4, "letterc"),
+        post.Interval(0.4, 0.8, "letterp"),
+        post.Interval(0.8, 1.2, "letteru"),
+    ])
+    hanzi = post.Tier("hanzi", 0.0, 1.2, [
+        post.Interval(0.0, 0.4, "letterc"),
+        post.Interval(0.4, 0.8, "letterp"),
+        post.Interval(0.8, 1.2, "letteru"),
+    ])
+    restored = post._restore_reference_surfaces(words, hanzi, "CPU")
+    assert restored == ["en-u0000", "en-u0001", "en-u0002"]
+    assert [iv.text for iv in words.intervals] == ["C", "P", "U"]
+    assert [(iv.xmin, iv.xmax) for iv in words.intervals] == [
+        (0.0, 0.4), (0.4, 0.8), (0.8, 1.2)]
+    report, pairs = post.load_strict_en_provenance(
+        "012871", words, tmp_path, hanzi_tier=hanzi, reference_text="CPU")
+    assert report["status"] == "verified"
+    assert len(pairs) == 3
+
+
 def test_strict_report_and_evidence_preserve_hyphenated_unicode_spelling(tmp_path):
     """Surface publication keeps exact reference spelling in evidence paths."""
     ledger_path, _ = _ledger_fixture(tmp_path)

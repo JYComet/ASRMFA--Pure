@@ -61,11 +61,18 @@ _REFERENCE_NAME_MACROS = frozenset({"NICKNAME", "REALNAME"})
 # on the INFO_MALE_/INFO_FEMALE_ prefix: the corpus contains
 # `[INFO_MALE_PRONOUN_SHE|INFO_FEMALE_PRONOUN_HE]`, so the prefix contradicts
 # the pronoun it labels.
+#
+# The values are read off the audio, not guessed.  The corpus carries one voice
+# variant per player gender for the same authority line, so every label's
+# rendering is directly observable by transcribing both variants of a line.
+# That is how SISTER/SISTERA turn out to be different words (妹妹 / 姐姐), as do
+# BOY/GIRL (少年 / 少女) and BOYD/GIRLD (王子 / 公主).  A label with no observed
+# audio has no entry, and its macro stays unresolved rather than being guessed.
 _SEXPRO_WORDS = {
     "HE": "他", "SHE": "她",
-    "BROTHER": "哥哥", "SISTER": "姐姐", "SISTERA": "姐姐",
-    "BOY": "男孩", "BOYD": "男孩",
-    "GIRL": "女孩", "GIRLD": "女孩", "GIRLC": "女孩",
+    "BROTHER": "哥哥", "SISTER": "妹妹", "SISTERA": "姐姐",
+    "BOY": "少年", "BOYD": "王子",
+    "GIRL": "少女", "GIRLD": "公主",
     "YING": "荧", "KONG": "空",
 }
 # 他/她/它 are indistinguishable to an acoustic model, so the branch is chosen

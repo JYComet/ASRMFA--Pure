@@ -465,7 +465,11 @@ def normalize_stem(txt_dir: Path, stem: str, dry_run: bool = False) -> bool:
     # Regression Case 31 Fix-3a (NVV guard).
     en_ref_positions: dict[int, str] = {}  # ref_unit_idx → word
     for ri, (ci, u) in enumerate(ref_units):
-        if u.isascii() and u.isalpha() and len(u) >= 2 and not is_nvv_token(u):
+        # Uppercase ASCII references are already authoritative letter-name
+        # units.  Legacy normalization must not collapse C/P/U back to CPU;
+        # splitting a single pre-existing CPU timing row would invent spans.
+        if (u.isascii() and u.isalpha() and len(u) >= 2
+                and not u.isupper() and not is_nvv_token(u)):
             en_ref_positions[ri] = u
 
     if not en_ref_positions:

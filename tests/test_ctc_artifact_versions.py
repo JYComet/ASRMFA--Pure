@@ -36,7 +36,18 @@ from scripts.pipeline_utils import (  # noqa: E402
     validate_pipeline_resume_receipt,
     write_ctc_raw_manifest,
     write_ctc_work_receipt,
+    make_ctc_normalization_marker,
+    parse_ctc_normalization_marker,
 )
+
+
+def test_ctc_normalization_marker_v5_binds_english_units_policy():
+    marker = make_ctc_normalization_marker(1, "a" * 64)
+    parsed = parse_ctc_normalization_marker(marker)
+
+    assert marker.startswith("reference-authority-v5-safe-transcript\n")
+    assert parsed["english_units_policy_id"] == "uppercase-ascii-letter-names-v1"
+    assert len(parsed["english_units_policy_sha256"]) == 64
 
 
 def test_adjust_cli_propagates_main_failure_exit_code(tmp_path):

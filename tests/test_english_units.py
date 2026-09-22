@@ -15,6 +15,7 @@ from scripts.english_units import (
     merge_authority_fragment_group,
     merge_authority_units,
     parse_english_units,
+    project_authority_semantics,
     resolve_processed_english_token,
     validate_processed_english_token_binding,
 )
@@ -139,17 +140,37 @@ def test_alpha_digit_units_keep_surface_identity_but_use_alpha_dictionary_key():
     units = parse_english_units("target1 target2 jin1 rui4 OK K-Pop")
 
     assert [unit.surface_text for unit in units] == [
-        "target1", "target2", "OK", "K-Pop"
+        "target1", "target2", "O", "K", "K-Pop"
     ]
     assert [unit.alignment_token for unit in units] == [
-        "target", "target", "ok", "kpop"
+        "target", "target", "lettero", "letterk", "kpop"
     ]
     assert [unit.unit_id for unit in units] == [
-        "en-u0000", "en-u0001", "en-u0002", "en-u0003"
+        "en-u0000", "en-u0001", "en-u0002", "en-u0003", "en-u0004"
     ]
     assert canonicalize_english_token("target1") == "target"
     assert not is_english_fragment_token("jin1")
     assert not is_english_fragment_token("rui4")
+
+
+def test_all_uppercase_ascii_words_split_into_letter_name_units_with_spans():
+    units = parse_english_units("CPU a OpenAI")
+
+    assert [unit.surface_text for unit in units] == ["C", "P", "U", "a", "OpenAI"]
+    assert [unit.alignment_token for unit in units] == ["letterc", "letterp", "letteru", "a", "openai"]
+    assert [unit.canonical_span for unit in units] == [(0, 1), (1, 2), (2, 3), (4, 5), (6, 12)]
+
+
+def test_authority_projection_splits_uppercase_word_but_preserves_lowercase_article():
+    projected = project_authority_semantics("CPU a")
+
+    assert [(row["kind"], row["surface"], row["alignment_token"], row["reference_ordinal"])
+            for row in projected if row["kind"] == "english"] == [
+                ("english", "C", "letterc", 0),
+                ("english", "P", "letterp", 1),
+                ("english", "U", "letteru", 2),
+                ("english", "a", "a", 3),
+            ]
 
 
 def test_alpha_digit_ctc_suffix_is_final_and_exact():

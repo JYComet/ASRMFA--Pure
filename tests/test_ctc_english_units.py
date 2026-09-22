@@ -20,6 +20,7 @@ from scripts.ctc_processed_geometry import (
 from scripts.adjust_ctc_boundaries import _read_pause_intervals
 from scripts.pipeline_utils import validate_ctc_authority_bundle
 from scripts.normalize_english_tokens import rewrite_ctc_textgrid_words
+from scripts import normalize_english_tokens as normalize_en
 
 
 def _row(text: str, ordinal: int, start: float, end: float) -> dict:
@@ -239,6 +240,31 @@ def test_authority_alpha_digit_single_token_is_still_exact():
     assert merged[0]["word"] == "mp"
     assert merged[0]["surface_text"] == "MP3"
     assert merged[0]["canonical_span"] == [0.10, 0.20]
+
+
+def test_authority_uppercase_acronym_emits_one_canonical_ctc_row_per_letter():
+    merged = ctc._merge_reference_english_fragments(
+        [_row("C", 0, 0.10, 0.20), _row("P", 1, 0.20, 0.30),
+         _row("U", 2, 0.30, 0.40)],
+        "CPU",
+    )
+
+    assert [(row["word"], row["surface_text"], row["source_ctc_ordinals"])
+            for row in merged] == [("letterc", "C", [0]), ("letterp", "P", [1]), ("letteru", "U", [2])]
+
+
+def test_legacy_english_normalization_does_not_recombine_uppercase_letters(tmp_path):
+    (tmp_path / "demo_ref.txt").write_text("CPU\n", encoding="utf-8")
+    (tmp_path / "demo_text_cn.txt").write_text("CPU\n", encoding="utf-8")
+    (tmp_path / "demo.lab").write_text("C P U\n", encoding="utf-8")
+    (tmp_path / "demo_tokens.jsonl").write_text(
+        "\n".join(json.dumps({"word": token, "start_s": i * .1,
+                                  "end_s": (i + 1) * .1})
+                  for i, token in enumerate(("C", "P", "U"))) + "\n",
+        encoding="utf-8")
+
+    assert normalize_en.normalize_stem(tmp_path, "demo") is False
+    assert (tmp_path / "demo.lab").read_text(encoding="utf-8").strip() == "C P U"
 
 
 @pytest.mark.parametrize("field", ["reference_identity", "canonical_unit_sha256"])

@@ -67,6 +67,24 @@ def test_canonical_compound_is_one_mfa_word_with_alignment_token(tmp_path: Path)
     assert word["canonical_unit"]["canonical_binding"] == "canonical-english-units-v1"
 
 
+def test_uppercase_authority_is_three_canonical_mfa_words(tmp_path: Path):
+    ctc = tmp_path / "ctc"
+    ctc.mkdir()
+    words = [(0.0, 0.2, "C"), (0.2, 0.4, "P"), (0.4, 0.6, "U")]
+    _textgrid(ctc / "demo.TextGrid", {"words": words})
+    (ctc / "demo.lab").write_text("C P U\n", encoding="utf-8")
+    (ctc / "demo_ref.txt").write_text("CPU\n", encoding="utf-8")
+
+    segments = producer.find_english_segments(ctc, ["demo"])
+    result = segments["demo"][0]["words"]
+    assert [(word["text"], word["alignment_token"], word["canonical_span"])
+            for word in result] == [
+                ("C", "letterc", [0.0, 0.2]),
+                ("P", "letterp", [0.2, 0.4]),
+                ("U", "letteru", [0.4, 0.6])]
+    assert [word["source_ctc_ordinals"] for word in result] == [[0], [1], [2]]
+
+
 def test_repeated_adjacent_compounds_keep_distinct_unit_identity(tmp_path: Path):
     _, segments = _kpop_source(tmp_path, repeated=True)
 

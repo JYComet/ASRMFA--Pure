@@ -5,11 +5,14 @@ import struct
 import sys
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from qwen3_prealign import (  # noqa: E402
     Qwen3PrealignError,
+    _lexical_plan,
+    _identity_payload,
     _write_textgrid,
     run_qwen3_hf,
 )
@@ -47,6 +50,27 @@ class FakeBackend:
 
     def close(self):
         pass
+
+
+def test_qwen_lexical_plan_splits_uppercase_ascii_into_letter_units():
+    plan = _lexical_plan("CPU a")
+
+    assert [(item["unit"], item["authority"].surface_text)
+            for item in plan] == [("C", "C"), ("P", "P"), ("U", "U"), ("a", "a")]
+
+
+def test_qwen_identity_binds_english_units_policy_and_hash():
+    identity = _identity_payload(
+        settings=SimpleNamespace(model_path=Path("asr"),
+                                 forced_aligner_model_path=Path("aligner"),
+                                 device="cpu", dtype="float32", language="auto",
+                                 max_new_tokens=1, batch_size=1, context="",
+                                 forced_aligner_device=None),
+        runtime={}, asr_digest="a", aligner_digest="b", input_digest="c",
+        reference_digest="d", output_digest="e", stems=["demo"])
+
+    assert identity["english_units_policy_id"] == "uppercase-ascii-letter-names-v1"
+    assert len(identity["english_units_policy_sha256"]) == 64
 
 
 def test_producer_keeps_punctuation_as_pinyin_phrase_boundary(tmp_path):
