@@ -527,7 +527,7 @@ def test_run_local_dictionary_has_exact_letter_rows_without_rewriting_letters(tm
     (ctc / "demo_ref.txt").write_text("CPU\n", encoding="utf-8")
     segments = producer.find_english_segments(ctc, ["demo"])
     base = tmp_path / "base.dict"
-    base.write_text("LETTERS EH1 T ER0 Z\n", encoding="utf-8")
+    base.write_text("LETTER L EH1 T ER0\nLETTERS EH1 T ER0 Z\n", encoding="utf-8")
 
     dictionary = producer.build_en_dict(
         segments, base, tmp_path / "unused-g2p.zip", Path("python"),
@@ -541,6 +541,7 @@ def test_run_local_dictionary_has_exact_letter_rows_without_rewriting_letters(tm
     assert rows["mfaletterc"] == ("S", "IY1")
     assert rows["mfaletterp"] == ("P", "IY1")
     assert rows["mfaletteru"] == ("Y", "UW1")
+    assert rows["letter"] == ("L", "EH1", "T", "ER0")
     assert rows["letters"] == ("EH1", "T", "ER0", "Z")
 
 

@@ -133,6 +133,127 @@ def test_cpu_letter_aliases_restore_surface_without_changing_timing(tmp_path):
     assert len(pairs) == 3
 
 
+def _cpu_disk_audit_fixture(tmp_path: Path, *, wrong_c_phone: bool = False):
+    ctc_dir = tmp_path / "ctc"
+    aligned_dir = tmp_path / "aligned"
+    ctc_dir.mkdir()
+    aligned_dir.mkdir()
+    labels = [("S", "AY1") if wrong_c_phone else ("S", "IY1"),
+              ("P", "IY1"), ("Y", "UW1")]
+    bounds = [(0.0, 0.4), (0.4, 0.8), (0.8, 1.2)]
+    surfaces = ["C", "P", "U"]
+    synthetic = ["mfaletterc", "mfaletterp", "mfaletteru"]
+    ctc_grid = post.TextGrid(0.0, 1.2, [post.Tier(
+        "words", 0.0, 1.2,
+        [post.Interval(start, end, surface) for (start, end), surface in zip(bounds, surfaces)])])
+    post.write_textgrid(ctc_grid, ctc_dir / "cpu.TextGrid")
+    source_intervals = [post.Interval(start, end, token)
+                        for (start, end), token in zip(bounds, synthetic)]
+    source_phones = []
+    phone_ordinal = 0
+    for (start, end), phones in zip(bounds, labels):
+        step = (end - start) / len(phones)
+        for index, label in enumerate(phones):
+            source_phones.append(post.Interval(
+                start + index * step, start + (index + 1) * step, label))
+            phone_ordinal += 1
+    source_grid = post.TextGrid(0.0, 1.2, [
+        post.Tier("words", 0.0, 1.2, source_intervals),
+        post.Tier("phones", 0.0, 1.2, source_phones),
+    ])
+    source_path = aligned_dir / "cpu_seg0.TextGrid"
+    post.write_textgrid(source_grid, source_path)
+    records = []
+    phone_cursor = 0
+    for ordinal, ((start, end), token, phones) in enumerate(zip(bounds, synthetic, labels)):
+        step = (end - start) / len(phones)
+        record_phones = []
+        for index, label in enumerate(phones):
+            record_phones.append({
+                "ordinal": index, "mfa_phone_ordinal": phone_cursor,
+                "label": label, "start": start + index * step,
+                "end": start + (index + 1) * step,
+            })
+            phone_cursor += 1
+        records.append({
+            "word_id": f"cpu:s0:w{ordinal}", "unit_id": f"en-u{ordinal:04d}",
+            "ctc_ordinal": ordinal, "source_ctc_ordinals": [ordinal],
+            "ctc_text": surfaces[ordinal], "alignment_token": token,
+            "canonical_span": [start, end],
+            "canonical_binding": post.CANONICAL_UNITS_SCHEMA,
+            "status": "verified", "provenance": "english_mfa_textgrid",
+            "mfa_word": {"ordinal": ordinal, "text": token,
+                         "start": start, "end": end},
+            "phones": record_phones,
+        })
+    ledger_path = tmp_path / "cpu_en_phones.json"
+    ctc_hash = hashlib.sha256((ctc_dir / "cpu.TextGrid").read_bytes()).hexdigest()
+    source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    ledger = {
+        "schema": post.STRICT_EN_MFA_SCHEMA, "stem": "cpu",
+        "ctc_textgrid_sha256": ctc_hash,
+        "canonical_units": post.CANONICAL_UNITS_SCHEMA,
+        "segments": [{
+            "segment_id": "cpu:s0", "segment_ordinal": 0, "status": "verified",
+            "mfa_textgrid": {"path": str(source_path), "sha256": source_hash},
+            "words": records,
+        }],
+    }
+    ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+    manifest = {
+        "schema": post.STRICT_EN_MFA_SCHEMA, "strict_provenance": True,
+        "canonical_units": post.CANONICAL_UNITS_SCHEMA, "status": "success",
+        "expected_segments": ["cpu:s0"], "produced_segments": ["cpu:s0"],
+        "rejected_segments": [],
+        "stem_ledgers": [{"stem": "cpu", "path": str(ledger_path),
+                          "sha256": hashlib.sha256(ledger_path.read_bytes()).hexdigest()}],
+        "mfa": {"return_code": 0, "timed_out": False, "exception": "",
+                "command": [], "timeout_seconds": 1,
+                "acoustic_model_sha256": "0" * 64,
+                "dictionary_sha256": "1" * 64},
+        "counts": {"english_stems": 1, "english_segments": 1,
+                   "english_words": 3, "verified_words": 3, "rejected_words": 0},
+    }
+    (tmp_path / "en_alignment_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8")
+    final_tg = post.TextGrid(0.0, 1.2, [
+        post.Tier("raw", 0.0, 1.2, []), post.Tier("raw2", 0.0, 1.2, []),
+        post.Tier("hanzi", 0.0, 1.2,
+                  [post.Interval(start, end, surface) for (start, end), surface in zip(bounds, surfaces)]),
+        post.Tier("words", 0.0, 1.2,
+                  [post.Interval(start, end, surface) for (start, end), surface in zip(bounds, surfaces)]),
+        post.Tier("phones", 0.0, 1.2,
+                  [post.Interval(start + index * ((end - start) / len(phones)),
+                                 start + (index + 1) * ((end - start) / len(phones)),
+                                 f"en:{label}")
+                   for (start, end), phones in zip(bounds, labels)
+                   for index, label in enumerate(phones)]),
+    ])
+    args = SimpleNamespace(en_phones_dir=tmp_path,
+                           en_manifest="en_alignment_manifest.json",
+                           en_aligned_dir=aligned_dir)
+    return args, final_tg
+
+
+def test_cpu_disk_audit_accepts_alias_units_and_rejects_wrong_letter_phone(tmp_path):
+    args, final_tg = _cpu_disk_audit_fixture(tmp_path)
+    manifest, reasons = audit._load_english_manifest(args)
+    assert reasons == []
+    accepted, _ = audit._english_provenance_reasons(
+        "cpu", final_tg, tmp_path / "ctc", args, manifest, reference_text="CPU")
+    assert accepted == []
+
+    wrong_root = tmp_path / "wrong"
+    wrong_root.mkdir()
+    wrong_args, wrong_final = _cpu_disk_audit_fixture(wrong_root, wrong_c_phone=True)
+    wrong_manifest, reasons = audit._load_english_manifest(wrong_args)
+    assert reasons == []
+    rejected, _ = audit._english_provenance_reasons(
+        "cpu", wrong_final, wrong_root / "ctc", wrong_args, wrong_manifest,
+        reference_text="CPU")
+    assert rejected == ["letter_name_pronunciation_mismatch"]
+
+
 def test_strict_report_and_evidence_preserve_hyphenated_unicode_spelling(tmp_path):
     """Surface publication keeps exact reference spelling in evidence paths."""
     ledger_path, _ = _ledger_fixture(tmp_path)

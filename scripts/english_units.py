@@ -41,6 +41,7 @@ ENGLISH_UNITS_POLICY_ID = "uppercase-ascii-letter-names-v1"
 ENGLISH_UNITS_POLICY = {
     "policy_id": ENGLISH_UNITS_POLICY_ID,
     "uppercase_ascii": "split_each_character",
+    "letter_key_namespace": "mfaletter{lowercase_letter}",
     "lowercase_article_a": "preserve",
 }
 ENGLISH_UNITS_POLICY_SHA256 = hashlib.sha256(

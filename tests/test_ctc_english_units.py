@@ -253,7 +253,7 @@ def test_authority_uppercase_acronym_emits_one_canonical_ctc_row_per_letter():
             for row in merged] == [("mfaletterc", "C", [0]), ("mfaletterp", "P", [1]), ("mfaletteru", "U", [2])]
 
 
-def test_legacy_english_normalization_does_not_recombine_uppercase_mfaletters(tmp_path):
+def test_legacy_english_normalization_does_not_recombine_uppercase_letters(tmp_path):
     (tmp_path / "demo_ref.txt").write_text("CPU\n", encoding="utf-8")
     (tmp_path / "demo_text_cn.txt").write_text("CPU\n", encoding="utf-8")
     (tmp_path / "demo.lab").write_text("C P U\n", encoding="utf-8")
