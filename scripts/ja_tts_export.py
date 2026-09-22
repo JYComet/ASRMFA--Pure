@@ -83,6 +83,12 @@ def validate_prosody_alignment(alignment: Mapping[str, Any]) -> None:
     graph_moras = [row.get("mora_id") for row in graph["moras"] if isinstance(row, Mapping)]
     if len(graph_moras) != len(graph["moras"]) or len(graph_moras) != len(set(graph_moras)) or set(graph_moras) != set(moras):
         raise ValueError("prosody mora_graph ownership differs from mora nodes")
+    # The producer snapshots complete mora rows in mora_graph. Compare the
+    # original content by identity before enrichment can mask contradictions,
+    # including coordinated edits to top-level moras and native projections.
+    for graph_mora in graph["moras"]:
+        if graph_mora != moras[graph_mora["mora_id"]]:
+            raise ValueError("prosody mora_graph content differs from mora nodes")
     expected_relations: set[tuple[str, str]] = set()
     basic_owners: dict[str, int] = {key: 0 for key in basics}
     for phone in alignment["native_phones"]:

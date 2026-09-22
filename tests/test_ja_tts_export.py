@@ -1,5 +1,6 @@
 import json
 import hashlib
+import copy
 import wave
 from pathlib import Path
 
@@ -8,7 +9,7 @@ import pytest
 
 from scripts.ja_tts_export import export_tts_artifacts, build_training_record, handle_tts
 from scripts.ja_audio import make_audio_receipt
-from scripts.ja_en_schema import make_receipt
+from scripts.ja_en_schema import make_receipt, validate_record
 
 
 def _wav(path: Path, frames: int = 16000) -> None:
@@ -48,7 +49,7 @@ def test_export_writes_native_jsonl_and_three_textgrid_tiers(tmp_path: Path):
     assert paths["textgrid"].is_file()
 
 
-def test_tts_stage_consumes_authoritative_alignment_and_declares_real_outputs(tmp_path: Path):
+def _complete_prosody_fixture(tmp_path: Path):
     train, alignment_wav = tmp_path / "train.wav", tmp_path / "alignment.wav"
     _wav(train); _wav(alignment_wav)
     raw_grid = tmp_path / "raw.TextGrid"; raw_grid.write_text('File type = "ooTextFile"\n', encoding="utf-8")
@@ -63,24 +64,36 @@ def test_tts_stage_consumes_authoritative_alignment_and_declares_real_outputs(tm
         mora_id, basic_id, kana = ("m0", "bp0", "さ") if index == 0 else ("m1", "bp1", "く")
         phone.update({"token_id": "w0", "mora_ids": [mora_id], "basic_phone_ids": [basic_id], "phone_kana": kana, "phone_tone": "H"})
     alignment.update({
-        "moras": [{"mora_id": "m0", "kana": "さ", "tone": "H"}, {"mora_id": "m1", "kana": "く", "tone": "H"}],
+        "moras": [{"mora_id": f"m{index}", "token_id": "w0", "kana": kana,
+                   "kind": "regular", "mora_index": index, "tone": "H", "tone_known": True,
+                   "tone_source": "manual_override", "f0_observed": False,
+                   "tone_provenance": {"entry_id": "fixture"}, "overridden_sources": []}
+                  for index, kana in enumerate(("さ", "く"))],
         "basic_phones": [{"basic_phone_id": "bp0", "mora_id": "m0", "symbol": "s"}, {"basic_phone_id": "bp1", "mora_id": "m1", "symbol": "a"}],
         "duration_groups": [], "tone_sources": [{"entry_id": "fixture"}],
         "mora_graph": {"moras": [{"mora_id": "m0"}, {"mora_id": "m1"}], "relations": [{"mora_id": "m0", "phone_id": "p0"}, {"mora_id": "m1", "phone_id": "p1"}]},
         "frontend": {"fixture": True}, "model_ids": {"mfa": "fixture"}, "dict_ids": {"ja": "fixture"}, "seams": [],
         "source_receipt": make_receipt(stage="merge", status="COMPLETE"),
     })
+    alignment["mora_graph"]["moras"] = copy.deepcopy(alignment["moras"])
+    validate_record(alignment, "ja-prosody-alignment-v1")
     source = tmp_path / "alignment.jsonl"; source.write_text(json.dumps(alignment) + "\n", encoding="utf-8")
-    stage = tmp_path / "stage"; stage.mkdir()
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"items": [{"uid": "stage-1", "wav": str(train), "text": "さくら", "reading_lock": {"uid": "stage-1", "status": "COMPLETE", "selected_reading": "さくら"}}]}), encoding="utf-8")
-    result = handle_tts({"input_manifest": str(manifest), "workspace": str(tmp_path), "tts": {"alignment_jsonl": str(source)}, "stage_inputs": {"tts": {"alignment_jsonl": str(source)}}}, stage)
+    config = {"input_manifest": str(manifest), "workspace": str(tmp_path), "tts": {"alignment_jsonl": str(source)}, "stage_inputs": {"tts": {"alignment_jsonl": str(source)}}}
+    return alignment, source, config
+
+
+def test_tts_stage_consumes_authoritative_alignment_and_declares_real_outputs(tmp_path: Path):
+    alignment, source, config = _complete_prosody_fixture(tmp_path)
+    stage = tmp_path / "stage"
+    result = handle_tts(config, stage)
     assert result.status == "COMPLETE"
     receipt = json.loads((stage / "receipt.json").read_text())
     assert {Path(row["path"]).name for row in receipt["outputs"]} == {"tts_training_records.jsonl", "stage-1.TextGrid"}
     tampered = {**alignment, "basic_phones": []}
     source.write_text(json.dumps(tampered) + "\n", encoding="utf-8")
-    rejected = handle_tts({"input_manifest": str(manifest), "workspace": str(tmp_path), "tts": {"alignment_jsonl": str(source)}, "stage_inputs": {"tts": {"alignment_jsonl": str(source)}}}, tmp_path / "tampered")
+    rejected = handle_tts(config, tmp_path / "tampered")
     assert rejected.status == "REJECTED"
     source.write_text(json.dumps(alignment) + "\n", encoding="utf-8")
 
@@ -90,9 +103,7 @@ def test_tts_handler_rejects_semantically_inconsistent_complete_prosody_graph(tm
     """All referenced IDs can exist while immutable prosody relations disagree."""
     # Reuse the complete registered-handler fixture and transform only one
     # immutable semantic claim at a time.
-    test_tts_stage_consumes_authoritative_alignment_and_declares_real_outputs(tmp_path)
-    source = tmp_path / "alignment.jsonl"
-    artifact = json.loads(source.read_text(encoding="utf-8"))
+    artifact, source, config = _complete_prosody_fixture(tmp_path)
     if tamper == "rebind":
         artifact["native_phones"][0].update({"mora_ids": ["m1"], "basic_phone_ids": ["bp1"], "phone_kana": "く"})
     elif tamper == "projection":
@@ -105,8 +116,35 @@ def test_tts_handler_rejects_semantically_inconsistent_complete_prosody_graph(tm
         artifact["mora_graph"]["relations"] = [{"mora_id": "m0", "phone_id": "p0"}, {"mora_id": "m1", "phone_id": "p0"}]
         artifact["duration_groups"] = [{"duration_group_id": "duration-group-p0", "native_phone_id": "p0", "basic_phone_ids": ["bp0"], "total_duration_samples": 1}]
     source.write_text(json.dumps(artifact) + "\n", encoding="utf-8")
-    manifest = tmp_path / "manifest.json"
-    assert handle_tts({"input_manifest": str(manifest), "workspace": str(tmp_path), "tts": {"alignment_jsonl": str(source)}, "stage_inputs": {"tts": {"alignment_jsonl": str(source)}}}, tmp_path / f"bad-{tamper}").status == "REJECTED"
+    assert handle_tts(config, tmp_path / f"bad-{tamper}").status == "REJECTED"
+
+
+@pytest.mark.parametrize("mutation", [
+    {"kana": "た", "tone": "L"}, {"token_id": "other-token"},
+    {"mora_index": 7}, {"kind": "long_vowel"}, {"tone_known": False},
+    {"tone_provenance": {"entry_id": "other-source"}},
+])
+def test_tts_handler_rejects_original_mora_content_contradiction(tmp_path: Path, mutation: dict):
+    artifact, source, config = _complete_prosody_fixture(tmp_path)
+    # Graph order is immaterial: mora identity, not list position, binds content.
+    artifact["mora_graph"]["moras"].reverse()
+    source.write_text(json.dumps(artifact) + "\n", encoding="utf-8")
+    assert handle_tts(config, tmp_path / "unchanged").status == "COMPLETE"
+    immutable_graph = copy.deepcopy(artifact["mora_graph"])
+    artifact["moras"][0].update(mutation)
+    # A coordinated mutation defeats validation against top-level moras alone.
+    artifact["native_phones"][0].update({
+        "phone_kana": artifact["moras"][0]["kana"],
+        "phone_tone": artifact["moras"][0]["tone"],
+    })
+    assert artifact["mora_graph"] == immutable_graph
+    validate_record(artifact, "ja-prosody-alignment-v1")
+    source.write_text(json.dumps(artifact) + "\n", encoding="utf-8")
+    stage = tmp_path / "contradiction"
+    assert handle_tts(config, stage).status == "REJECTED"
+    receipt = json.loads((stage / "receipt.json").read_text(encoding="utf-8"))
+    assert "mora_graph" in receipt["errors"][0]["message"]
+    assert not (stage / "tts_training_records.jsonl").exists()
 
 
 def test_tts_stage_rejects_merge_v3_on_production_path(tmp_path: Path):

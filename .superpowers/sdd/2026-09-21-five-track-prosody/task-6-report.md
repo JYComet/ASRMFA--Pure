@@ -160,3 +160,63 @@ The plan's old assertion that every MFA dictionary change begins at `align` is s
 
 - [x] C: Immutable graph contradiction cannot be normalized away before comparison or serialization.
 - [x] D: Dependency start stages are based on actual configuration consumers, and persisted cache invalidation matches the first consumer.
+
+## Task 6R: immutable mora content and English dictionary resume dependencies
+
+### Implemented
+
+- `validate_prosody_alignment` compares every original mora row with the
+  immutable `mora_graph.moras` row having the same ID before enrichment.
+  Complete row equality covers kana, tone, identity, ownership, display,
+  and provenance fields without deriving or rewriting any source data.
+- MFA dependency scoping explicitly starts `english_dictionary` at `frontend`
+  in config, model-artifact, and config-artifact identities. Japanese
+  dictionary/inventory/model-bundle inputs still begin at `semantic`; remaining
+  MFA runtime/execution settings still begin at `align`.
+- The registered TTS fixture now carries complete matching mora snapshots and
+  passes the repository's `ja-prosody-alignment-v1` schema validation. Regressions
+  accept unchanged artifacts with reordered graph rows, then reject coordinated
+  top-level/native kana/tone changes and token, index, kind, known-mask, and
+  provenance contradictions. Existing rebind, projection, coverage, relation,
+  duration-group, and pre-prosody rejection coverage remains.
+- Real `config_identity` tests mutate English dictionary contents and paths.
+  A dispatch integration test first lets production dispatch write current
+  identities, snapshots, receipts, and cache entries; proves unchanged resume
+  reuses all requested stages; changes the dictionary; and observes handlers
+  rerunning from `frontend` through `tts`. Inventory/audio/asr/reading receipt
+  bytes and execution counts remain unchanged. Only external stage handlers
+  are replaced by deterministic receipt writers; preflight, identity, resume
+  validation, stage planning, cache decisions, and dispatch remain production
+  code. Immutable schema and stage-order drift remain rejected.
+
+### TDD evidence
+
+- RED: `pytest -q tests/test_ja_tts_export.py tests/test_ja_resume_identity.py -k 'original_mora_content or english_dictionary or persisted_resume_dispatch'`
+  — 9 failed, 20 deselected. Six original-mora contradictions incorrectly
+  returned `COMPLETE`; both real dictionary mutations left frontend identity
+  unchanged; persisted resume executed `align` first instead of `frontend`.
+- GREEN: `pytest -q tests/test_ja_tts_export.py tests/test_ja_resume_identity.py`
+  — 29 passed in 3.92s.
+- Related Task 6/frontend/TTS verification:
+  `pytest -q tests/test_ja_stage_inputs.py tests/test_ja_resume_identity.py tests/test_ja_prosody_projection.py tests/test_ja_prosody_schema.py tests/test_ja_tts_export.py tests/test_ja_frontend_contract_w2.py tests/test_ja_phone_adapter_w2.py tests/test_ja_mora_graph.py`
+  — 105 passed, 37 skipped in 0.95s.
+- `python -m compileall -q scripts tests` and `git diff --check` — passed.
+
+### Files and self-review
+
+- Changed only `scripts/ja_tts_export.py`, `scripts/run_ja_en_pipeline.py`,
+  `tests/test_ja_tts_export.py`, `tests/test_ja_resume_identity.py`, and this report.
+- Mora comparison is by ID, independent of graph-row order, and preserves
+  all existing relation/coverage/duration validation. The dependency map is
+  shared by mutable config and both artifact identity views. No Task 7 behavior
+  was implemented.
+
+### Full-suite verification and concerns
+
+- Bare `pytest -q` — **1702 passed, 37 skipped, 1 failed in 32.60s**.
+- The sole failure remains
+  `tests/test_ja_independent_verifier.py::test_three_uid_bound_fixture_integrity_and_evidence_tamper`
+  at line 272: the same Task 8-owned fixture has raw sample/ownership,
+  reading/alias/receipt binding, missing prosody/gate, and unlisted-output
+  mismatches. Its fixture and verifier were not changed by Task 6R.
+- No additional implementation concerns found in scoped self-review.

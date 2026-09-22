@@ -4,8 +4,9 @@ import json
 from pathlib import Path
 
 import pytest
+import scripts.run_ja_en_pipeline as pipeline
 
-from scripts.ja_en_schema import JAContractError, atomic_write_json, make_receipt, stable_digest
+from scripts.ja_en_schema import JAContractError, PRODUCTION_STAGES, StageResult, atomic_write_json, make_receipt, stable_digest
 from scripts.run_ja_en_pipeline import (
     _autoload_stages,
     _prepare_stage_config,
@@ -159,6 +160,73 @@ def test_persisted_stage_cache_decision_starts_at_semantic_for_dictionary_drift(
     assert first_invalidated == "semantic"
 
 
+@pytest.mark.parametrize("change", ["content", "path"])
+def test_real_identity_english_dictionary_starts_at_frontend(tmp_path: Path, change: str):
+    config_path, config = _config(tmp_path)
+    dictionary = tmp_path / "english.dict"
+    dictionary.write_text("hello HH AH0 L OW1\n", encoding="utf-8")
+    config["mfa"] = {"english_dictionary": str(dictionary)}
+    validated, manifest_path, rows, workspace = preflight(config, config_path=config_path)
+    before = config_identity(validated, manifest_path, rows)
+    if change == "path":
+        dictionary = tmp_path / "replacement.dict"
+        validated["mfa"]["english_dictionary"] = str(dictionary)
+    dictionary.write_text("hello HH EH1 L OW0\n", encoding="utf-8")
+    after = config_identity(validated, manifest_path, rows)
+    for stage in ("inventory", "audio", "asr", "reading"):
+        assert _stage_cache_identity(stage, before, validated, workspace) == _stage_cache_identity(stage, after, validated, workspace)
+    for stage in ("frontend", "semantic", "anchors", "align", "merge", "prosody", "tts", "verify"):
+        assert _stage_cache_identity(stage, before, validated, workspace) != _stage_cache_identity(stage, after, validated, workspace), stage
+
+
+def test_persisted_resume_dispatch_reruns_frontend_after_english_dictionary_change(tmp_path: Path, monkeypatch):
+    config_path, config = _config(tmp_path)
+    dictionary = tmp_path / "english.dict"
+    dictionary.write_text("hello HH AH0 L OW1\n", encoding="utf-8")
+    config["mfa"] = {"english_dictionary": str(dictionary)}
+    # External model stages write deterministic receipts; production preflight,
+    # identity persistence, resume validation, planning, and dispatch stay real.
+    config["stage_inputs"] = {stage: {} for stage in ("anchors", "align", "merge", "tts")}
+    stages = list(PRODUCTION_STAGES[:-1])
+    executions = []
+    counts = {stage: 0 for stage in stages}
+
+    def execute_stage(_config, stage_dir):
+        stage = stage_dir.name
+        executions.append(stage)
+        counts[stage] += 1
+        output = stage_dir / "execution.json"
+        atomic_write_json(output, {"execution": counts[stage]}, workspace=stage_dir.parent.parent)
+        receipt_path = stage_dir / "receipt.json"
+        atomic_write_json(receipt_path, make_receipt(stage=stage, status="COMPLETE", outputs=[output]), workspace=stage_dir.parent.parent)
+        return StageResult(stage, "COMPLETE", str(receipt_path))
+
+    for stage in stages:
+        monkeypatch.setitem(pipeline._STAGE_REGISTRY, stage, (execute_stage, stage))
+    initial = dispatch(config, config_path, stages)
+    assert {result.stage: result.status for result in initial} == {stage: "COMPLETE" for stage in stages}
+    assert executions == stages
+    workspace = Path(config["workspace"])
+    assert json.loads((workspace / ".ja_en_stage_cache.json").read_text())["schema"] == "ja-stage-cache-v1"
+    assert json.loads((workspace / ".ja_en_run_identity.json").read_text())["compatibility_digest"]
+    upstream_receipts = {stage: (workspace / "stages" / stage / "receipt.json").read_bytes()
+                         for stage in ("inventory", "audio", "asr", "reading")}
+    executions.clear()
+    unchanged = dispatch(config, config_path, stages, resume=True)
+    assert all(result.status == "COMPLETE" for result in unchanged)
+    assert executions == []
+
+    dictionary.write_text("hello HH EH1 L OW0\n", encoding="utf-8")
+    resumed = dispatch(config, config_path, stages, resume=True)
+    assert all(result.status == "COMPLETE" for result in resumed)
+    assert executions == ["frontend", "semantic", "anchors", "align", "merge", "prosody", "tts"]
+    for stage, receipt_bytes in upstream_receipts.items():
+        assert counts[stage] == 1
+        assert (workspace / "stages" / stage / "receipt.json").read_bytes() == receipt_bytes
+    for stage in executions:
+        assert json.loads((workspace / "stages" / stage / "execution.json").read_text())["execution"] == 2
+
+
 def test_workspace_override_rejects_nonempty_target_without_resume(tmp_path: Path):
     config_path, config = _config(tmp_path)
     config_path.write_text(json.dumps(config), encoding="utf-8")
@@ -183,7 +251,8 @@ def test_tts_stage_input_is_only_the_prosody_artifact(tmp_path: Path):
     assert prepared["stage_inputs"]["tts"] == {"alignment_jsonl": str(artifact)}
 
 
-def test_resume_compatibility_rejects_stage_order_drift(tmp_path: Path):
+@pytest.mark.parametrize("drift", ["stage_order", "schema"])
+def test_resume_compatibility_rejects_stage_order_drift(tmp_path: Path, drift: str):
     config_path, config = _config(tmp_path)
     _, manifest_path, rows, workspace = preflight(config, config_path=config_path)
     identity = config_identity(config, manifest_path, rows)
@@ -191,6 +260,9 @@ def test_resume_compatibility_rejects_stage_order_drift(tmp_path: Path):
     from scripts.run_ja_en_pipeline import _compatibility_identity
     payload = {"compatibility_digest": stable_digest(_compatibility_identity(identity))}
     atomic_write_json(workspace / ".ja_en_run_identity.json", payload, workspace=workspace)
-    identity["production_stages"] = list(reversed(identity["production_stages"]))
+    if drift == "stage_order":
+        identity["production_stages"] = list(reversed(identity["production_stages"]))
+    else:
+        identity["schemas"] = [*identity["schemas"], "ja-prosody-alignment-v999"]
     with pytest.raises(JAContractError, match="resume_identity_drift"):
         validate_resume(workspace, identity, allow_new=False)
