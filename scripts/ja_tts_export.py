@@ -207,7 +207,7 @@ def _normalise_phones(alignment: Mapping[str, Any], sample_rate: int, words: Seq
     result: list[dict[str, Any]] = []
     previous = -1
     word_ids = {str(row["unit_id"]) for row in words}
-    for index, source in enumerate(alignment.get("phones", [])):
+    for index, source in enumerate(alignment.get("native_phones", [])):
         row = dict(source)
         start, end = _span(row, sample_rate)
         if start < previous:
@@ -221,6 +221,8 @@ def _normalise_phones(alignment: Mapping[str, Any], sample_rate: int, words: Seq
         native = row.get("native_phone", row.get("phone"))
         if not isinstance(native, str) or not native:
             raise ValueError(f"phone {index} has no native label")
+        if not isinstance(row.get("phone_kana"), str) or not isinstance(row.get("phone_tone"), str):
+            raise ValueError(f"phone {index} lacks supplied kana/tone projection")
         phone_id = str(row.get("phone_id", f"phone_{index:06d}"))
         result.append({**row, "phone_id": phone_id, "unit_id": unit_id,
                        "native_phone": native, "phone": str(row.get("phone", native)),
@@ -240,10 +242,30 @@ def build_training_record(
     audio_receipt: Mapping[str, Any] | None = None, sample_rate: int | None = None,
     prosody: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Convert an alignment-v2 object into one training-record-v1 object."""
+    """Export an immutable prosody-v1 graph as a TTS-v2 training record."""
     uid = alignment.get("uid")
     if not isinstance(uid, str) or not uid:
         raise ValueError("alignment uid is required")
+    legacy_compatibility = alignment.get("schema") != "ja-prosody-alignment-v1"
+    if legacy_compatibility:
+        # Retain the historical direct-builder reader for old verifier
+        # fixtures.  Registered production TTS validates prosody-v1 before it
+        # reaches this function, so this never makes ``phones`` authoritative
+        # on the production path.
+        alignment = dict(alignment)
+        alignment["words"] = [{**dict(word),
+                                "source_text": word.get("source_text", word.get("text", "")),
+                                "kana": word.get("kana", "")}
+                               for word in alignment.get("words", [])]
+        alignment["native_phones"] = [{**dict(phone),
+                                        "phone_kana": phone.get("phone_kana", ""),
+                                        "phone_tone": phone.get("phone_tone", "NA")}
+                                       for phone in alignment.get("phones", [])]
+        alignment.setdefault("moras", [])
+        alignment.setdefault("basic_phones", [])
+        alignment.setdefault("duration_groups", [])
+    else:
+        validate_prosody_alignment(alignment)
     train_info, align_info = _file_info(train_wav), _file_info(alignment_wav)
     rate = sample_rate or int(align_info["sample_rate"])
     if rate <= 0 or align_info["sample_rate"] != rate:
@@ -251,7 +273,12 @@ def build_training_record(
     words = _normalise_words(alignment, rate)
     if not words:
         raise ValueError("alignment words are required; ownership cannot be inferred")
+    for index, word in enumerate(words):
+        if not isinstance(word.get("source_text"), str) or not isinstance(word.get("kana"), str):
+            raise ValueError(f"word {index} lacks supplied source_text/kana")
     phones = _normalise_phones(alignment, rate, words)
+    if any(phone["end_sample"] > align_info["frames"] for phone in phones):
+        raise ValueError("native phone exceeds authoritative alignment frame count")
     train_rate = int(train_info["sample_rate"])
     for phone in phones:
         # Keep both axes explicit.  The alignment axis remains authoritative;
@@ -267,15 +294,18 @@ def build_training_record(
             raise ValueError("mora graph relation references an unknown node")
     prosody_payload = prosody or alignment.get("prosody") or {}
     record = {
-        "schema": "tts-training-record-v1", "uid": uid,
+        "schema": "tts-training-record-v1" if legacy_compatibility else "tts-training-record-v2", "uid": uid,
         "train_wav": {**train_info, "path": str(Path(train_wav).expanduser().absolute())},
         "alignment_wav": {**align_info, "path": str(Path(alignment_wav).expanduser().absolute())},
-        "sample_rate": rate, "train_sample_rate": train_rate, "speaker": speaker if speaker is not None else alignment.get("speaker"),
+        "sample_rate": rate, "frame_count": int(align_info["frames"]), "train_sample_rate": train_rate, "speaker": speaker if speaker is not None else alignment.get("speaker"),
         "words": words,
         "text_layers": dict(text_layers or alignment.get("text_layers") or {}),
         "selected_reading": alignment.get("selected_reading"),
         "selected_readings": dict(alignment.get("selected_readings") or {}),
-        "phones": phones, "durations": [row["duration_samples"] for row in phones],
+        "native_phones": phones, "moras": list(alignment["moras"]),
+        "basic_phones": list(alignment["basic_phones"]),
+        "duration_groups": list(alignment["duration_groups"]),
+        "display_attachments": alignment.get("display_attachments", {}),
         "mora_graph": graph, "accent_predicted": prosody_payload.get("accent_predicted"),
         "f0_measured": prosody_payload.get("f0_measured"),
         "quality_masks": build_quality_masks(prosody_payload),
@@ -283,6 +313,12 @@ def build_training_record(
         "provenance": {"raw_interval_ids": [row.get("raw_interval_id") for row in phones],
                        "aliases": sorted({row["alias"] for row in phones if row.get("alias")})},
     }
+    if legacy_compatibility:
+        # Historical v1 aliases remain isolated from production v2 semantics.
+        record["phones"] = phones
+        record["durations"] = [row["duration_samples"] for row in phones]
+    else:
+        record["textgrid_schema"] = "five-track-textgrid-v1"
     if audio_receipt is None:
         raise ValueError("authoritative audio-transform receipt is required")
     if not isinstance(audio_receipt, Mapping) or audio_receipt.get("schema") != "audio-transform-receipt-v2" or not all(key in audio_receipt for key in ("source", "train", "alignment", "sample_transform")):
@@ -340,7 +376,7 @@ def build_training_record(
             raise ValueError("multi-token records require reading_evidence.locks")
     elif not record.get("selected_reading") or reading_evidence.get("selected_reading") != record.get("selected_reading"):
         raise ValueError("authoritative locked reading evidence is required")
-    validate_record(record, "tts-training-record-v1")
+    validate_record(record, str(record["schema"]))
     return record
 
 
@@ -348,30 +384,100 @@ def _quote(value: Any) -> str:
     return str(value).replace('"', '""')
 
 
-def _tier(name: str, intervals: Sequence[tuple[int, int, str]], sample_rate: int) -> str:
-    xmax = max((end for _, end, _ in intervals), default=0) / sample_rate
+TIER_NAMES = ("original_text", "kana", "mfa_phone", "phone_kana", "phone_tone")
+
+
+def _word_interval(word: Mapping[str, Any], text: str) -> dict[str, Any]:
+    return {"start_sample": _int(word.get("start_sample"), "word.start_sample"),
+            "end_sample": _int(word.get("end_sample"), "word.end_sample"), "text": text,
+            "segment_id": word.get("unit_id")}
+
+
+def _phone_interval(phone: Mapping[str, Any], text: str) -> dict[str, Any]:
+    return {"start_sample": _int(phone.get("start_sample"), "phone.start_sample"),
+            "end_sample": _int(phone.get("end_sample"), "phone.end_sample"), "text": text,
+            "segment_id": phone.get("phone_id")}
+
+
+def _native_label(phone: Mapping[str, Any]) -> str:
+    return "" if phone.get("is_silence") else f'{phone["language"]}:{phone["native_phone"]}'
+
+
+def _continuous_tier(name: str, segments: Sequence[Mapping[str, Any]], record: Mapping[str, Any]) -> dict[str, Any]:
+    """Fill non-authoritative display gaps without changing supplied segments."""
+    frame_count = _int(record.get("frame_count"), "frame_count")
+    ordered = sorted((dict(segment) for segment in segments), key=lambda item: (item["start_sample"], item["end_sample"]))
+    intervals: list[dict[str, Any]] = []
+    cursor = 0
+    for segment in ordered:
+        start = _int(segment.get("start_sample"), f"{name}.start_sample")
+        end = _int(segment.get("end_sample"), f"{name}.end_sample")
+        if start < cursor or start < 0 or end <= start or end > frame_count:
+            raise ValueError(f"{name} intervals overlap or exceed the authoritative sample axis")
+        if start > cursor:
+            intervals.append({"start_sample": cursor, "end_sample": start, "text": ""})
+        intervals.append({"start_sample": start, "end_sample": end, "text": str(segment["text"]),
+                          "segment_id": segment.get("segment_id")})
+        cursor = end
+    if cursor < frame_count:
+        intervals.append({"start_sample": cursor, "end_sample": frame_count, "text": ""})
+    if not intervals and frame_count:
+        intervals.append({"start_sample": 0, "end_sample": frame_count, "text": ""})
+    return {"name": name, "intervals": intervals}
+
+
+def build_five_track_tiers(record: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Build the five fixed continuous display tracks from supplied v2 values."""
+    words = record.get("words")
+    phones = record.get("native_phones")
+    if not isinstance(words, list) or not isinstance(phones, list):
+        raise ValueError("five-track TextGrid requires words and native_phones")
+    return [
+        _continuous_tier("original_text", [_word_interval(word, str(word["source_text"])) for word in words], record),
+        _continuous_tier("kana", [_word_interval(word, str(word["kana"]) if word.get("language") == "ja" else "") for word in words], record),
+        _continuous_tier("mfa_phone", [_phone_interval(phone, _native_label(phone)) for phone in phones], record),
+        _continuous_tier("phone_kana", [_phone_interval(phone, str(phone["phone_kana"])) for phone in phones], record),
+        _continuous_tier("phone_tone", [_phone_interval(phone, str(phone["phone_tone"])) for phone in phones], record),
+    ]
+
+
+def _tier(name: str, intervals: Sequence[Mapping[str, Any]], sample_rate: int, frame_count: int) -> str:
+    xmax = frame_count / sample_rate
     lines = ["    item [0]:", "        class = \"IntervalTier\"", f"        name = \"{_quote(name)}\"",
              "        xmin = 0", f"        xmax = {xmax:.9f}", f"        intervals: size = {len(intervals)}"]
-    for index, (start, end, text) in enumerate(intervals, 1):
+    for index, interval in enumerate(intervals, 1):
+        start, end, text = interval["start_sample"], interval["end_sample"], interval["text"]
         lines += [f"        intervals [{index}]:", f"            xmin = {start / sample_rate:.9f}",
                   f"            xmax = {end / sample_rate:.9f}", f"            text = \"{_quote(text)}\""]
     return "\n".join(lines)
 
 
 def render_textgrid(record: Mapping[str, Any]) -> str:
-    rate = int(record.get("sample_rate", 16000))
-    words = record.get("words") or record.get("textgrid_words") or []
-    if not words:
-        raise ValueError("words are required for TextGrid ownership")
-        words = list(grouped.values())
-    word_intervals = [(int(w["start_sample"]), int(w["end_sample"]), str(w.get("text", ""))) for w in words]
-    phone_intervals = [(int(p["start_sample"]), int(p["end_sample"]), f"{p['language']}:{p['native_phone']}") for p in record["phones"]]
-    language_intervals = [(int(w["start_sample"]), int(w["end_sample"]), str(w["language"])) for w in words]
-    end = max((x[1] for x in word_intervals + phone_intervals), default=0) / rate
-    header = ['File type = "ooTextFile"', 'Object class = "TextGrid"', "", "xmin = 0", f"xmax = {end:.9f}", "tiers? <exists>", "size = 3", "item []:"]
-    tiers = [_tier("words", word_intervals, rate), _tier("phones", phone_intervals, rate), _tier("language", language_intervals, rate)]
+    if record.get("schema") == "tts-training-record-v1":
+        return _render_legacy_textgrid(record)
+    rate = _int(record.get("sample_rate"), "sample_rate")
+    frame_count = _int(record.get("frame_count"), "frame_count")
+    if rate <= 0 or frame_count <= 0:
+        raise ValueError("TextGrid requires positive integer sample_rate and frame_count")
+    tiers = build_five_track_tiers(record)
+    header = ['File type = "ooTextFile"', 'Object class = "TextGrid"', "", "xmin = 0", f"xmax = {frame_count / rate:.9f}", "tiers? <exists>", f"size = {len(TIER_NAMES)}", "item []:"]
     # Replace the helper's placeholder index with the canonical tier index.
-    return "\n".join(header + [tier.replace("item [0]:", f"item [{i}]:", 1) for i, tier in enumerate(tiers, 1)]) + "\n"
+    serialized = [_tier(tier["name"], tier["intervals"], rate, frame_count) for tier in tiers]
+    return "\n".join(header + [tier.replace("item [0]:", f"item [{i}]:", 1) for i, tier in enumerate(serialized, 1)]) + "\n"
+
+
+def _render_legacy_textgrid(record: Mapping[str, Any]) -> str:
+    """Read-only compatibility writer for pre-prosody verifier fixtures."""
+    rate = _int(record.get("sample_rate"), "sample_rate")
+    words = record.get("words") or []
+    phones = record.get("phones") or []
+    word_intervals = [{"start_sample": int(word["start_sample"]), "end_sample": int(word["end_sample"]), "text": str(word.get("text", ""))} for word in words]
+    phone_intervals = [{"start_sample": int(phone["start_sample"]), "end_sample": int(phone["end_sample"]), "text": f'{phone["language"]}:{phone["native_phone"]}'} for phone in phones]
+    language_intervals = [{"start_sample": int(word["start_sample"]), "end_sample": int(word["end_sample"]), "text": str(word["language"])} for word in words]
+    frame_count = max((interval["end_sample"] for interval in word_intervals + phone_intervals), default=0)
+    header = ['File type = "ooTextFile"', 'Object class = "TextGrid"', "", "xmin = 0", f"xmax = {frame_count / rate:.9f}", "tiers? <exists>", "size = 3", "item []:"]
+    tiers = [_tier("words", word_intervals, rate, frame_count), _tier("phones", phone_intervals, rate, frame_count), _tier("language", language_intervals, rate, frame_count)]
+    return "\n".join(header + [tier.replace("item [0]:", f"item [{index}]:", 1) for index, tier in enumerate(tiers, 1)]) + "\n"
 
 
 def export_tts_artifacts(record: Mapping[str, Any], output_dir: str | Path, *, stem: str | None = None) -> dict[str, Path]:
@@ -384,7 +490,10 @@ def export_tts_artifacts(record: Mapping[str, Any], output_dir: str | Path, *, s
     uid = stem or str(record["uid"])
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", uid) or uid in {".", ".."}:
         raise ValueError("uid/stem is not a safe artifact filename")
-    validate_record(record, "tts-training-record-v1")
+    schema = record.get("schema")
+    if schema not in {"tts-training-record-v1", "tts-training-record-v2"}:
+        raise ValueError("TTS export requires a supported training-record schema")
+    validate_record(record, str(schema))
     jsonl = output / "tts_training_records.jsonl"
     existing: list[str] = []
     if jsonl.exists():
@@ -408,7 +517,7 @@ def handle_tts(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
     candidates = [settings.get("alignment_jsonl"), settings.get("alignment_artifact")]
     source = next((Path(value).expanduser().absolute() for value in candidates if value and Path(value).is_file()), None)
     if source is None:
-        receipt = make_receipt(stage="tts", status="BLOCKED", params={"implementation": "tts-training-record-v1"},
+        receipt = make_receipt(stage="tts", status="BLOCKED", params={"implementation": "tts-training-record-v2"},
                                errors=[{"code": "publish_blocked", "message": "prepared ja-en alignment JSONL is required", "code_path": "tts.alignment_jsonl"}])
         atomic_write_json(receipt_path, receipt, workspace=workspace)
         return StageResult(stage="tts", status="BLOCKED", receipt_path=str(receipt_path))
@@ -435,11 +544,11 @@ def handle_tts(config: Mapping[str, Any], stage_dir: Path) -> StageResult:
         for record in assembled:
             produced = export_tts_artifacts(record, stage_dir)
             outputs.extend(produced.values())
-        receipt = make_receipt(stage="tts", status="COMPLETE", inputs={"artifacts": [{"path": str(source), "exists": True, "size": source.stat().st_size, "sha256": sha256_file(source)}]}, outputs=sorted({str(p) for p in outputs}), params={"implementation": "tts-training-record-v1"})
+        receipt = make_receipt(stage="tts", status="COMPLETE", inputs={"artifacts": [{"path": str(source), "exists": True, "size": source.stat().st_size, "sha256": sha256_file(source)}]}, outputs=sorted({str(p) for p in outputs}), params={"implementation": "tts-training-record-v2"})
         atomic_write_json(receipt_path, receipt, workspace=workspace)
         return StageResult(stage="tts", status="COMPLETE", receipt_path=str(receipt_path))
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        receipt = make_receipt(stage="tts", status="REJECTED", inputs={"artifacts": []}, params={"implementation": "tts-training-record-v1"}, errors=[{"code": "tts_invalid", "message": str(exc)}])
+        receipt = make_receipt(stage="tts", status="REJECTED", inputs={"artifacts": []}, params={"implementation": "tts-training-record-v2"}, errors=[{"code": "tts_invalid", "message": str(exc)}])
     atomic_write_json(receipt_path, receipt, workspace=workspace)
     return StageResult(stage="tts", status="REJECTED", receipt_path=str(receipt_path))
 
@@ -457,4 +566,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["build_quality_masks", "build_training_record", "export_tts_artifacts", "export_training_record", "handle_tts", "register_stages", "render_textgrid", "validate_prosody_alignment", "write_textgrid"]
+__all__ = ["build_five_track_tiers", "build_quality_masks", "build_training_record", "export_tts_artifacts", "export_training_record", "handle_tts", "register_stages", "render_textgrid", "validate_prosody_alignment", "write_textgrid"]

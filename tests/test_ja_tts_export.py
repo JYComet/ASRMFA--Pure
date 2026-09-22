@@ -20,32 +20,37 @@ def _wav(path: Path, frames: int = 16000) -> None:
 
 def _alignment():
     return {
-        "schema": "ja-en-alignment-v2", "uid": "u1",
-        "words": [{"unit_id": "w0", "text": "さくら", "language": "ja", "start_sample": 0, "end_sample": 8000}],
-        "phones": [
-            {"unit_id": "w0", "phone_id": "p0", "phone": "s", "native_phone": "s", "language": "ja", "start_sample": 0, "end_sample": 4000, "raw_interval_id": 1, "alias": "ju_000000", "mora_ids": ["m0"]},
-            {"unit_id": "w0", "phone_id": "p1", "phone": "a", "native_phone": "a", "language": "ja", "start_sample": 4000, "end_sample": 8000, "raw_interval_id": 2, "alias": "ju_000000", "mora_ids": ["m0"]},
+        "schema": "ja-prosody-alignment-v1", "uid": "u1",
+        "words": [{"unit_id": "w0", "source_text": "さくら", "kana": "サクラ", "language": "ja", "start_sample": 0, "end_sample": 8000}],
+        "native_phones": [
+            {"unit_id": "w0", "token_id": "w0", "phone_id": "p0", "native_phone": "s", "language": "ja", "start_sample": 0, "end_sample": 4000, "raw_interval_id": 1, "alias": "ju_000000", "mora_ids": ["m0"], "basic_phone_ids": ["bp0"], "phone_kana": "さ", "phone_tone": "H"},
+            {"unit_id": "w0", "token_id": "w0", "phone_id": "p1", "native_phone": "a", "language": "ja", "start_sample": 4000, "end_sample": 8000, "raw_interval_id": 2, "alias": "ju_000000", "mora_ids": ["m1"], "basic_phone_ids": ["bp1"], "phone_kana": "く", "phone_tone": "H"},
         ],
-        "languages": [{"language": "ja", "unit_ids": ["w0"]}],
-        "mora_graph": {"moras": [{"mora_id": "m0", "surface": "さ", "phone_ids": ["p0", "p1"]}], "relations": [{"mora_id": "m0", "phone_id": "p0"}, {"mora_id": "m0", "phone_id": "p1"}]},
+        "moras": [
+            {"mora_id": "m0", "token_id": "w0", "kana": "さ", "kind": "regular", "mora_index": 0, "tone": "H", "tone_known": True, "tone_source": "manual_override", "f0_observed": False, "tone_provenance": {"entry_id": "fixture"}, "overridden_sources": []},
+            {"mora_id": "m1", "token_id": "w0", "kana": "く", "kind": "regular", "mora_index": 1, "tone": "H", "tone_known": True, "tone_source": "manual_override", "f0_observed": False, "tone_provenance": {"entry_id": "fixture"}, "overridden_sources": []},
+        ],
+        "basic_phones": [{"basic_phone_id": "bp0", "mora_id": "m0", "symbol": "s"}, {"basic_phone_id": "bp1", "mora_id": "m1", "symbol": "a"}],
+        "duration_groups": [], "tone_sources": [{"entry_id": "fixture"}],
+        "mora_graph": {"moras": [{"mora_id": "m0", "token_id": "w0", "kana": "さ", "kind": "regular", "mora_index": 0, "tone": "H", "tone_known": True, "tone_source": "manual_override", "f0_observed": False, "tone_provenance": {"entry_id": "fixture"}, "overridden_sources": []}, {"mora_id": "m1", "token_id": "w0", "kana": "く", "kind": "regular", "mora_index": 1, "tone": "H", "tone_known": True, "tone_source": "manual_override", "f0_observed": False, "tone_provenance": {"entry_id": "fixture"}, "overridden_sources": []}], "relations": [{"mora_id": "m0", "phone_id": "p0"}, {"mora_id": "m1", "phone_id": "p1"}]},
     }
 
 
-def test_export_writes_native_jsonl_and_three_textgrid_tiers(tmp_path: Path):
+def test_export_writes_tts_v2_jsonl_and_five_textgrid_tiers(tmp_path: Path):
     train, alignment = tmp_path / "train.wav", tmp_path / "alignment.wav"
     _wav(train); _wav(alignment)
     alignment_data = _alignment()
     alignment_data.update({"selected_reading": "さくら", "locked_aliases": [{"alias": "ju_000000", "pronunciation": ["s", "a"]}], "native_inventory": {"ja": ["s", "a"], "en": []}, "raw_mfa": {"phones": [{"phone_id": "p0", "raw_interval_id": 1, "unit_id": "w0"}, {"phone_id": "p1", "raw_interval_id": 2, "unit_id": "w0"}]}, "reading_evidence": {"selected_reading": "さくら", "status": "manual_verified"}, "partition": {"verified": ["u1"], "rejected": [], "unresolved": []}})
     receipt = make_audio_receipt("u1", train, train, alignment, alignment_transform={"method": "identity_fixture_v1", "source_start": 0, "source_end": 16000, "output_start": 0, "output_frames": 16000})
     record = build_training_record(alignment_data, train_wav=train, alignment_wav=alignment, speaker="spk", audio_receipt=receipt)
-    assert record["schema"] == "tts-training-record-v1"
-    assert [p["duration_samples"] for p in record["phones"]] == [4000, 4000]
+    assert record["schema"] == "tts-training-record-v2"
+    assert [p["duration_samples"] for p in record["native_phones"]] == [4000, 4000]
     assert record["quality_masks"]["accent_predicted_known_mask"] is False
     paths = export_tts_artifacts(record, tmp_path / "out")
     row = json.loads((tmp_path / "out" / "tts_training_records.jsonl").read_text())
-    assert row["phones"][0]["native_phone"] == "s"
+    assert row["native_phones"][0]["native_phone"] == "s"
     grid = (tmp_path / "out" / "u1.TextGrid").read_text()
-    assert all(f'name = "{tier}"' in grid for tier in ("words", "phones", "language"))
+    assert all(f'name = "{tier}"' in grid for tier in ("original_text", "kana", "mfa_phone", "phone_kana", "phone_tone"))
     assert paths["textgrid"].is_file()
 
 
@@ -58,24 +63,12 @@ def _complete_prosody_fixture(tmp_path: Path):
     alignment["audio_receipt"] = make_audio_receipt("stage-1", train, train, alignment_wav, alignment_transform={"method": "identity_fixture_v1", "source_start": 0, "source_end": 16000, "output_start": 0, "output_frames": 16000})
     alignment["train_wav"] = alignment["audio_receipt"]["train"]
     alignment["alignment_wav"] = alignment["audio_receipt"]["alignment"]
-    alignment["schema"] = "ja-prosody-alignment-v1"
-    alignment["native_phones"] = alignment.pop("phones")
-    for index, phone in enumerate(alignment["native_phones"]):
-        mora_id, basic_id, kana = ("m0", "bp0", "さ") if index == 0 else ("m1", "bp1", "く")
-        phone.update({"token_id": "w0", "mora_ids": [mora_id], "basic_phone_ids": [basic_id], "phone_kana": kana, "phone_tone": "H"})
+    alignment["uid"] = "stage-1"
     alignment.update({
-        "moras": [{"mora_id": f"m{index}", "token_id": "w0", "kana": kana,
-                   "kind": "regular", "mora_index": index, "tone": "H", "tone_known": True,
-                   "tone_source": "manual_override", "f0_observed": False,
-                   "tone_provenance": {"entry_id": "fixture"}, "overridden_sources": []}
-                  for index, kana in enumerate(("さ", "く"))],
-        "basic_phones": [{"basic_phone_id": "bp0", "mora_id": "m0", "symbol": "s"}, {"basic_phone_id": "bp1", "mora_id": "m1", "symbol": "a"}],
-        "duration_groups": [], "tone_sources": [{"entry_id": "fixture"}],
-        "mora_graph": {"moras": [{"mora_id": "m0"}, {"mora_id": "m1"}], "relations": [{"mora_id": "m0", "phone_id": "p0"}, {"mora_id": "m1", "phone_id": "p1"}]},
+        "display_attachments": {"surface": "さくら"},
         "frontend": {"fixture": True}, "model_ids": {"mfa": "fixture"}, "dict_ids": {"ja": "fixture"}, "seams": [],
         "source_receipt": make_receipt(stage="merge", status="COMPLETE"),
     })
-    alignment["mora_graph"]["moras"] = copy.deepcopy(alignment["moras"])
     validate_record(alignment, "ja-prosody-alignment-v1")
     source = tmp_path / "alignment.jsonl"; source.write_text(json.dumps(alignment) + "\n", encoding="utf-8")
     manifest = tmp_path / "manifest.json"

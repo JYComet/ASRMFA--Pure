@@ -19,6 +19,7 @@ import numpy as np
 
 
 from scripts import postprocess_textgrids as post
+from scripts.ja_tts_export import render_textgrid
 
 
 AXIS_XMIN = 0.0
@@ -1580,3 +1581,18 @@ def test_publication_audit_uses_projected_boundary_but_source_surface_labels():
     projected = details["fallback_punctuation_projection"]["expected"]
     assert projected[0]["source_boundary"] == 3
     assert projected[0]["boundary"] == 2
+
+
+def test_five_track_writer_escapes_display_quotes_without_rounding_sample_edges():
+    record = {
+        "sample_rate": 16000, "frame_count": 2,
+        "words": [{"unit_id": "w0", "source_text": '「声"」!', "kana": "コ", "language": "ja", "start_sample": 0, "end_sample": 2}],
+        "native_phones": [
+            {"phone_id": "p0", "language": "ja", "native_phone": "k", "phone_kana": "コ", "phone_tone": "H", "start_sample": 0, "end_sample": 1},
+            {"phone_id": "p1", "language": "en", "native_phone": "G", "phone_kana": "", "phone_tone": "NA", "start_sample": 1, "end_sample": 2},
+        ],
+    }
+    textgrid = render_textgrid(record)
+    assert 'text = "「声""」!"' in textgrid
+    assert "xmax = 0.000062500" in textgrid
+    assert textgrid.count("name = ") == 5
