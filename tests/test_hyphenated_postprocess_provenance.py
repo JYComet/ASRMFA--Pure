@@ -87,9 +87,9 @@ def test_cpu_letter_aliases_restore_surface_without_changing_timing(tmp_path):
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     source = ledger["segments"][0]["mfa_textgrid"]
     records = []
-    pronunciations = [("letterc", ("S", "IY1")),
-                      ("letterp", ("P", "IY1")),
-                      ("letteru", ("Y", "UW1"))]
+    pronunciations = [("mfaletterc", ("S", "IY1")),
+                      ("mfaletterp", ("P", "IY1")),
+                      ("mfaletteru", ("Y", "UW1"))]
     for ordinal, (token, labels) in enumerate(pronunciations):
         start, end = ordinal * 0.4, (ordinal + 1) * 0.4
         records.append({
@@ -113,14 +113,14 @@ def test_cpu_letter_aliases_restore_surface_without_changing_timing(tmp_path):
         ledger_path.read_bytes()).hexdigest()
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     words = post.Tier("words", 0.0, 1.2, [
-        post.Interval(0.0, 0.4, "letterc"),
-        post.Interval(0.4, 0.8, "letterp"),
-        post.Interval(0.8, 1.2, "letteru"),
+        post.Interval(0.0, 0.4, "mfaletterc"),
+        post.Interval(0.4, 0.8, "mfaletterp"),
+        post.Interval(0.8, 1.2, "mfaletteru"),
     ])
     hanzi = post.Tier("hanzi", 0.0, 1.2, [
-        post.Interval(0.0, 0.4, "letterc"),
-        post.Interval(0.4, 0.8, "letterp"),
-        post.Interval(0.8, 1.2, "letteru"),
+        post.Interval(0.0, 0.4, "mfaletterc"),
+        post.Interval(0.4, 0.8, "mfaletterp"),
+        post.Interval(0.8, 1.2, "mfaletteru"),
     ])
     restored = post._restore_reference_surfaces(words, hanzi, "CPU")
     assert restored == ["en-u0000", "en-u0001", "en-u0002"]
@@ -213,23 +213,23 @@ def test_authority_alpha_digit_fragments_share_words_and_hanzi_owner():
     words = post.Tier("words", 0.0, 0.6, [
         post.Interval(0.0, 0.2, "target"),
         post.Interval(0.2, 0.3, "1"),
-        post.Interval(0.3, 0.6, "OK"),
+        post.Interval(0.3, 0.6, "ok"),
     ])
     ctc = [
         {"type": "word", "word": "target", "start_s": 0.0,
          "end_s": 0.2, "source_ctc_ordinal": 0},
         {"type": "word", "word": "1", "start_s": 0.2,
          "end_s": 0.3, "source_ctc_ordinal": 1},
-        {"type": "word", "word": "OK", "start_s": 0.3,
+        {"type": "word", "word": "ok", "start_s": 0.3,
          "end_s": 0.6, "source_ctc_ordinal": 2},
     ]
     assert post._merge_authority_alpha_digit_fragments(
-        words, "target1 OK", ctc) == ["en-u0000"]
+        words, "target1 ok", ctc) == ["en-u0000"]
     assert [(iv.xmin, iv.xmax, iv.text) for iv in words.intervals] == [
-        (0.0, 0.3, "target1"), (0.3, 0.6, "OK")
+        (0.0, 0.3, "target1"), (0.3, 0.6, "ok")
     ]
-    hanzi = post._build_hanzi_tier(words, "target1 OK", reference_authoritative=True)
-    assert [iv.text for iv in hanzi.intervals] == ["target1", "OK"]
+    hanzi = post._build_hanzi_tier(words, "target1 ok", reference_authoritative=True)
+    assert [iv.text for iv in hanzi.intervals] == ["target1", "ok"]
 
 
 def test_authority_target_numerals_project_to_cjk_pinyin_not_target_digit_english():
@@ -238,27 +238,27 @@ def test_authority_target_numerals_project_to_cjk_pinyin_not_target_digit_englis
         post.Interval(0.2, 0.3, "1"),
         post.Interval(0.3, 0.5, "target"),
         post.Interval(0.5, 0.6, "2"),
-        post.Interval(0.6, 0.7, "OK"),
+        post.Interval(0.6, 0.7, "ok"),
     ])
     ctc = [
         {"type": "word", "word": text, "start_s": start, "end_s": end}
         for text, start, end in (
             ("target", 0.0, 0.2), ("1", 0.2, 0.3),
             ("target", 0.3, 0.5), ("2", 0.5, 0.6),
-            ("OK", 0.6, 0.7))
+            ("ok", 0.6, 0.7))
     ]
     report = {}
     post._merge_authority_alpha_digit_fragments(
-        words, "target一 target二 OK", ctc, report=report)
+        words, "target一 target二 ok", ctc, report=report)
 
     assert [iv.text for iv in words.intervals] == [
-        "target", "yi1", "target", "er4", "OK"]
+        "target", "yi1", "target", "er4", "ok"]
     assert report["authority_compound_reconciliation"]["numeral_fragments"][0][
         "surface"] == "一"
     hanzi = post._build_hanzi_tier(
-        words, "target一 target二 OK", reference_authoritative=True)
+        words, "target一 target二 ok", reference_authoritative=True)
     assert [iv.text for iv in hanzi.intervals] == [
-        "target", "一", "target", "二", "OK"]
+        "target", "一", "target", "二", "ok"]
     assert post._reference_pinyin_text(
         "target一 target二", "target1 target2") == (
             "<sp1> target yi1 target er4")
@@ -313,7 +313,7 @@ def test_authority_alpha_digit_five_ctc_fragments_merge_without_count_limit():
         post.Interval(0.20, 0.30, "ge"),
         post.Interval(0.30, 0.40, "t"),
         post.Interval(0.40, 0.45, "1"),
-        post.Interval(0.45, 0.60, "OK"),
+        post.Interval(0.45, 0.60, "ok"),
     ])
 
     ctc = [
@@ -322,12 +322,12 @@ def test_authority_alpha_digit_five_ctc_fragments_merge_without_count_limit():
         for ordinal, (text, start, end) in enumerate((
             ("t", 0.00, 0.10), ("ar", 0.10, 0.20),
             ("ge", 0.20, 0.30), ("t", 0.30, 0.40),
-            ("1", 0.40, 0.45), ("OK", 0.45, 0.60)))
+            ("1", 0.40, 0.45), ("ok", 0.45, 0.60)))
     ]
     assert post._merge_authority_alpha_digit_fragments(
-        words, "target1 OK", ctc) == ["en-u0000"]
+        words, "target1 ok", ctc) == ["en-u0000"]
     assert [(iv.xmin, iv.xmax, iv.text) for iv in words.intervals] == [
-        (0.0, 0.45, "target1"), (0.45, 0.60, "OK")
+        (0.0, 0.45, "target1"), (0.45, 0.60, "ok")
     ]
 
 

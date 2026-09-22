@@ -58,6 +58,7 @@ from english_units import (
     parse_english_units,
     ENGLISH_UNITS_POLICY_ID,
     ENGLISH_UNITS_POLICY_SHA256,
+    is_letter_name_key,
     letter_name_pronunciation,
 )
 
@@ -1374,8 +1375,7 @@ def build_en_dict(en_segments: dict[str, list[dict]],
     # SOS is deliberately in-vocabulary, so it must be replaced before the
     # OOV decision rather than sent through G2P or copied from CMUdict.
     dictionary_text = base_dict_text
-    letter_words = sorted(word for word in all_words
-                          if word.startswith("letter") and len(word) == 7)
+    letter_words = sorted(word for word in all_words if is_letter_name_key(word))
     for word in letter_words:
         pronunciation = letter_name_pronunciation(word)
         if pronunciation is None:

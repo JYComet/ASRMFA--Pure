@@ -12,6 +12,7 @@ import json
 import hashlib
 import re
 from dataclasses import asdict, dataclass, replace
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
 try:  # Consumers commonly put ``scripts`` directly on sys.path.
@@ -46,27 +47,46 @@ ENGLISH_UNITS_POLICY_SHA256 = hashlib.sha256(
     json.dumps(ENGLISH_UNITS_POLICY, ensure_ascii=False, sort_keys=True,
                separators=(",", ":")).encode("utf-8")).hexdigest()
 
+# Synthetic keys use a reserved namespace so ordinary words such as
+# ``letters`` can never be mistaken for the spoken name of ``S``.  These
+# mappings are immutable and are the sole source of truth for all consumers.
+LETTER_NAME_KEYS = MappingProxyType({
+    character: f"mfaletter{character.lower()}"
+    for character in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+})
+LETTER_NAME_KEY_TO_SURFACE = MappingProxyType(
+    {key: surface for surface, key in LETTER_NAME_KEYS.items()})
+
 # CMU/MFA letter-name pronunciations.  These are intentionally fixed so a
 # one-letter unit is never sent through an arbitrary word G2P fallback.
-LETTER_NAME_PRONUNCIATIONS: dict[str, tuple[str, ...]] = {
-    "a": ("EY1",), "b": ("B", "IY1"), "c": ("S", "IY1"),
-    "d": ("D", "IY1"), "e": ("IY1",), "f": ("EH1", "F"),
-    "g": ("JH", "IY1"), "h": ("EY1", "CH"), "i": ("AY1",),
-    "j": ("JH", "EY1"), "k": ("K", "EY1"), "l": ("EH1", "L"),
-    "m": ("EH1", "M"), "n": ("EH1", "N"), "o": ("OW1",),
-    "p": ("P", "IY1"), "q": ("K", "Y", "UW1"),
-    "r": ("AA1", "R"), "s": ("EH1", "S"), "t": ("T", "IY1"),
-    "u": ("Y", "UW1"), "v": ("V", "IY1"),
-    "w": ("D", "AH1", "B", "L", "Y", "UW1"),
-    "x": ("EH1", "K", "S"), "y": ("W", "AY1"), "z": ("Z", "IY1"),
-}
+LETTER_NAME_PRONUNCIATIONS = MappingProxyType({
+    LETTER_NAME_KEYS["A"]: ("EY1",), LETTER_NAME_KEYS["B"]: ("B", "IY1"),
+    LETTER_NAME_KEYS["C"]: ("S", "IY1"), LETTER_NAME_KEYS["D"]: ("D", "IY1"),
+    LETTER_NAME_KEYS["E"]: ("IY1",), LETTER_NAME_KEYS["F"]: ("EH1", "F"),
+    LETTER_NAME_KEYS["G"]: ("JH", "IY1"), LETTER_NAME_KEYS["H"]: ("EY1", "CH"),
+    LETTER_NAME_KEYS["I"]: ("AY1",), LETTER_NAME_KEYS["J"]: ("JH", "EY1"),
+    LETTER_NAME_KEYS["K"]: ("K", "EY1"), LETTER_NAME_KEYS["L"]: ("EH1", "L"),
+    LETTER_NAME_KEYS["M"]: ("EH1", "M"), LETTER_NAME_KEYS["N"]: ("EH1", "N"),
+    LETTER_NAME_KEYS["O"]: ("OW1",), LETTER_NAME_KEYS["P"]: ("P", "IY1"),
+    LETTER_NAME_KEYS["Q"]: ("K", "Y", "UW1"), LETTER_NAME_KEYS["R"]: ("AA1", "R"),
+    LETTER_NAME_KEYS["S"]: ("EH1", "S"), LETTER_NAME_KEYS["T"]: ("T", "IY1"),
+    LETTER_NAME_KEYS["U"]: ("Y", "UW1"), LETTER_NAME_KEYS["V"]: ("V", "IY1"),
+    LETTER_NAME_KEYS["W"]: ("D", "AH1", "B", "L", "Y", "UW1"),
+    LETTER_NAME_KEYS["X"]: ("EH1", "K", "S"), LETTER_NAME_KEYS["Y"]: ("W", "AY1"),
+    LETTER_NAME_KEYS["Z"]: ("Z", "IY1"),
+})
 
 
 def letter_name_pronunciation(token: str) -> tuple[str, ...] | None:
     """Return the fixed pronunciation for one synthetic letter-name key."""
-    if not isinstance(token, str) or not token.casefold().startswith("letter"):
+    if not isinstance(token, str):
         return None
-    return LETTER_NAME_PRONUNCIATIONS.get(token[6:].casefold())
+    return LETTER_NAME_PRONUNCIATIONS.get(token.casefold())
+
+
+def is_letter_name_key(token: object) -> bool:
+    """Return whether *token* is one of the exact synthetic letter keys."""
+    return isinstance(token, str) and token.casefold() in LETTER_NAME_PRONUNCIATIONS
 _ORDINAL_KEYS = ("ordinal", "ctc_ordinal", "source_ctc_ordinal")
 _TEXT_KEYS = ("text", "surface_text", "word", "token")
 _START_KEYS = ("start", "xmin", "start_s")
@@ -109,7 +129,7 @@ def _canonical_token(text: str) -> str:
     if _is_nvv(text):
         raise EnglishUnitError("nvv_is_not_english", text)
     if len(text) == 1 and text.isascii() and text.isalpha() and text.isupper():
-        return f"letter{text.casefold()}"
+        return LETTER_NAME_KEYS[text]
     token = text.replace("-", "").lower()
     # Dictionary lookup uses the alphabetic base while surface/unit identity
     # retains the numeric suffix (target1 and target2 remain distinct units).
@@ -703,9 +723,12 @@ def serialize_english_units(units: Iterable[EnglishUnit]) -> list[dict[str, Any]
 
 __all__ = [
     "ENGLISH_COMPOUND_RE", "ENGLISH_TOKEN_RE", "LEXICAL_COMPOUND_RE",
+    "ENGLISH_UNITS_POLICY_ID", "ENGLISH_UNITS_POLICY", "ENGLISH_UNITS_POLICY_SHA256",
+    "LETTER_NAME_KEYS", "LETTER_NAME_KEY_TO_SURFACE", "LETTER_NAME_PRONUNCIATIONS",
     "MERGE_KIND_DIRECT", "MERGE_KIND_COMPOUND", "EnglishUnit",
     "EnglishUnitError", "canonicalize_english_token", "is_english_fragment_token",
-    "parse_english_units",
+    "english_alignment_matches_surface", "is_letter_name_key",
+    "letter_name_pronunciation", "parse_english_units",
     "project_authority_semantics",
     "validate_authority_fragment_group", "merge_authority_fragment_group",
     "merge_authority_fragments", "merge_authority_units",

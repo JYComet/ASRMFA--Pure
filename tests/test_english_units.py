@@ -11,7 +11,9 @@ from scripts.english_units import (
     EnglishUnit,
     EnglishUnitError,
     canonicalize_english_token,
+    english_alignment_matches_surface,
     is_english_fragment_token,
+    letter_name_pronunciation,
     merge_authority_fragment_group,
     merge_authority_units,
     parse_english_units,
@@ -143,7 +145,7 @@ def test_alpha_digit_units_keep_surface_identity_but_use_alpha_dictionary_key():
         "target1", "target2", "O", "K", "K-Pop"
     ]
     assert [unit.alignment_token for unit in units] == [
-        "target", "target", "lettero", "letterk", "kpop"
+        "target", "target", "mfalettero", "mfaletterk", "kpop"
     ]
     assert [unit.unit_id for unit in units] == [
         "en-u0000", "en-u0001", "en-u0002", "en-u0003", "en-u0004"
@@ -157,7 +159,7 @@ def test_all_uppercase_ascii_words_split_into_letter_name_units_with_spans():
     units = parse_english_units("CPU a OpenAI")
 
     assert [unit.surface_text for unit in units] == ["C", "P", "U", "a", "OpenAI"]
-    assert [unit.alignment_token for unit in units] == ["letterc", "letterp", "letteru", "a", "openai"]
+    assert [unit.alignment_token for unit in units] == ["mfaletterc", "mfaletterp", "mfaletteru", "a", "openai"]
     assert [unit.canonical_span for unit in units] == [(0, 1), (1, 2), (2, 3), (4, 5), (6, 12)]
 
 
@@ -166,11 +168,24 @@ def test_authority_projection_splits_uppercase_word_but_preserves_lowercase_arti
 
     assert [(row["kind"], row["surface"], row["alignment_token"], row["reference_ordinal"])
             for row in projected if row["kind"] == "english"] == [
-                ("english", "C", "letterc", 0),
-                ("english", "P", "letterp", 1),
-                ("english", "U", "letteru", 2),
+                ("english", "C", "mfaletterc", 0),
+                ("english", "P", "mfaletterp", 1),
+                ("english", "U", "mfaletteru", 2),
                 ("english", "a", "a", 3),
-            ]
+    ]
+
+
+def test_uppercase_and_lowercase_letter_words_use_distinct_keys():
+    units = parse_english_units("A a S letters")
+
+    assert [(unit.surface_text, unit.alignment_token) for unit in units] == [
+        ("A", "mfalettera"), ("a", "a"), ("S", "mfaletters"),
+        ("letters", "letters")]
+    assert letter_name_pronunciation("mfaletters") == ("EH1", "S")
+    assert letter_name_pronunciation("letters") is None
+    assert english_alignment_matches_surface("mfaletters", "S")
+    assert not english_alignment_matches_surface("letters", "S")
+    assert not english_alignment_matches_surface("mfaletters", "letters")
 
 
 def test_alpha_digit_ctc_suffix_is_final_and_exact():

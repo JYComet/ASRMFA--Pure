@@ -79,9 +79,9 @@ def test_uppercase_authority_is_three_canonical_mfa_words(tmp_path: Path):
     result = segments["demo"][0]["words"]
     assert [(word["text"], word["alignment_token"], word["canonical_span"])
             for word in result] == [
-                ("C", "letterc", [0.0, 0.2]),
-                ("P", "letterp", [0.2, 0.4]),
-                ("U", "letteru", [0.4, 0.6])]
+                ("C", "mfaletterc", [0.0, 0.2]),
+                ("P", "mfaletterp", [0.2, 0.4]),
+                ("U", "mfaletteru", [0.4, 0.6])]
     assert [word["source_ctc_ordinals"] for word in result] == [[0], [1], [2]]
 
 
@@ -194,6 +194,21 @@ def test_strict_ledger_rejects_short_processed_end_before_phone_validation():
             [{"ordinal": 0, "text": "ok", "start": 0.0, "end": 0.8}],
             [{"ordinal": 0, "text": "K", "start": 0.0, "end": 0.8}],
         )
+
+
+def test_strict_letter_record_requires_fixed_pronunciation():
+    word = _direct_word("C")
+    source = [{"ordinal": 0, "text": "mfaletterc", "start": 0.0, "end": 1.0}]
+    phones = [
+        {"ordinal": 0, "text": "S", "start": 0.0, "end": 0.5},
+        {"ordinal": 1, "text": "IY1", "start": 0.5, "end": 1.0},
+    ]
+    evidence = producer._strict_verified_words(
+        "demo:s0", {"words": [word]}, source, phones)
+    assert evidence[0]["alignment_token"] == "mfaletterc"
+    phones[1]["text"] = "AY1"
+    with pytest.raises(ValueError, match="letter_name_pronunciation_mismatch"):
+        producer._strict_verified_words("demo:s0", {"words": [word]}, source, phones)
 
 
 def test_alpha_digit_authority_units_merge_ordered_ctc_fragments(tmp_path: Path):
@@ -311,11 +326,11 @@ def test_pinyin_tone_token_is_not_an_english_authority_unit(tmp_path: Path):
 def _nonzero_ordinal_source(tmp_path: Path) -> tuple[Path, dict]:
     ctc = tmp_path / "ctc"
     ctc.mkdir()
-    words = [(0.0, 0.4, "target"), (0.4, 0.8, "OK"),
+    words = [(0.0, 0.4, "target"), (0.4, 0.8, "ok"),
              (0.8, 1.2, "target")]
     _textgrid(ctc / "demo.TextGrid", {"words": words})
-    (ctc / "demo.lab").write_text("target OK target\n", encoding="utf-8")
-    (ctc / "demo_ref.txt").write_text("target OK target\n", encoding="utf-8")
+    (ctc / "demo.lab").write_text("target ok target\n", encoding="utf-8")
+    (ctc / "demo_ref.txt").write_text("target ok target\n", encoding="utf-8")
     return ctc, producer.find_english_segments(ctc, ["demo"])
 
 
@@ -325,7 +340,7 @@ def test_validated_unit_uses_raw_nonzero_reference_ordinal(tmp_path: Path):
 
     ok_unit = producer._validated_unit(words[1])
 
-    assert words[1]["text"] == "OK"
+    assert words[1]["text"] == "ok"
     assert words[1]["unit_id"] == "en-u0001"
     assert ok_unit.unit_id == "en-u0001"
     assert ok_unit.reference_ordinal == 1
@@ -503,10 +518,41 @@ def test_dictionary_is_run_local_and_does_not_modify_repository_bytes(tmp_path: 
     assert "kpop K P" in result.read_text(encoding="utf-8")
 
 
+def test_run_local_dictionary_has_exact_letter_rows_without_rewriting_letters(tmp_path: Path):
+    ctc = tmp_path / "ctc"
+    ctc.mkdir()
+    _textgrid(ctc / "demo.TextGrid", {
+        "words": [(0.0, 0.2, "C"), (0.2, 0.4, "P"), (0.4, 0.6, "U")],
+    })
+    (ctc / "demo_ref.txt").write_text("CPU\n", encoding="utf-8")
+    segments = producer.find_english_segments(ctc, ["demo"])
+    base = tmp_path / "base.dict"
+    base.write_text("LETTERS EH1 T ER0 Z\n", encoding="utf-8")
+
+    dictionary = producer.build_en_dict(
+        segments, base, tmp_path / "unused-g2p.zip", Path("python"),
+        tmp_path / "models", tmp_path / "run", strict=True,
+    )
+    rows = {
+        line.split()[0].casefold(): tuple(line.split()[1:])
+        for line in dictionary.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+    assert rows["mfaletterc"] == ("S", "IY1")
+    assert rows["mfaletterp"] == ("P", "IY1")
+    assert rows["mfaletteru"] == ("Y", "UW1")
+    assert rows["letters"] == ("EH1", "T", "ER0", "Z")
+
+
 def _direct_word(surface: str, ordinal: int = 0) -> dict:
-    unit = producer.parse_english_units(surface)[0]
+    # Legacy policy fixtures exercise ordinary words and special SOS/APP
+    # overrides; use lowercase spelling so they remain whole lexical words
+    # under the uppercase acronym policy.
+    authority_surface = surface.lower() if surface.isupper() and len(surface) > 1 else surface
+    unit = producer.parse_english_units(authority_surface)[0]
     merged = producer.merge_authority_fragment_group(
-        unit, [{"text": surface, "ordinal": ordinal, "start": 0.0, "end": 1.0}],
+        unit, [{"text": authority_surface, "ordinal": ordinal,
+                "start": 0.0, "end": 1.0}],
     )
     return {
         "text": merged.surface_text,
@@ -569,8 +615,8 @@ def test_sos_five_phone_record_has_exact_policy_and_provenance(tmp_path: Path):
         tmp_path / "unused-g2p.zip", Path("python"), tmp_path / "models", tmp_path / "run",
         strict=True,
     )
-    _textgrid(tmp_path / "ctc.TextGrid", {"words": [(0.0, 1.0, "SOS")]})
-    (tmp_path / "ctc_ref.txt").write_text("SOS\n", encoding="utf-8")
+    _textgrid(tmp_path / "ctc.TextGrid", {"words": [(0.0, 1.0, "sos")]})
+    (tmp_path / "ctc_ref.txt").write_text("sos\n", encoding="utf-8")
     _textgrid(tmp_path / "aligned.TextGrid", {
         "words": [(0.0, 1.0, "sos")],
         "phones": [
@@ -609,7 +655,7 @@ def test_sos_old_missing_or_reordered_source_sequence_fails_closed(tmp_path: Pat
     step = 1.0 / len(labels)
     for index, label in enumerate(labels):
         phones.append((index * step, (index + 1) * step, label))
-    _textgrid(tmp_path / "ctc.TextGrid", {"words": [(0.0, 1.0, "SOS")]})
+    _textgrid(tmp_path / "ctc.TextGrid", {"words": [(0.0, 1.0, "sos")]})
     _textgrid(tmp_path / "aligned.TextGrid", {
         "words": [(0.0, 1.0, "sos")], "phones": phones,
     })
@@ -629,7 +675,7 @@ def test_sos_old_missing_or_reordered_source_sequence_fails_closed(tmp_path: Pat
 def test_sos_tampered_dictionary_hash_fails_closed(tmp_path: Path):
     dictionary = tmp_path / "dict.dict"
     dictionary.write_text("SOS EH2 S OW2 EH1 S\n", encoding="utf-8")
-    _textgrid(tmp_path / "ctc.TextGrid", {"words": [(0.0, 1.0, "SOS")]})
+    _textgrid(tmp_path / "ctc.TextGrid", {"words": [(0.0, 1.0, "sos")]})
     _textgrid(tmp_path / "aligned.TextGrid", {
         "words": [(0.0, 1.0, "sos")],
         "phones": [
@@ -664,7 +710,7 @@ def test_app_fake_second_p_is_rejected(tmp_path: Path):
 def test_app_fake_second_p_in_mfa_evidence_is_rejected(tmp_path: Path):
     dictionary = tmp_path / "dict.dict"
     dictionary.write_text("APP AE1 P\n", encoding="utf-8")
-    _textgrid(tmp_path / "ctc.TextGrid", {"words": [(0.0, 1.0, "APP")]})
+    _textgrid(tmp_path / "ctc.TextGrid", {"words": [(0.0, 1.0, "app")]})
     _textgrid(tmp_path / "aligned.TextGrid", {
         "words": [(0.0, 1.0, "app")],
         "phones": [(0.0, 0.25, "AE1"), (0.25, 0.6, "P"), (0.6, 1.0, "P")],

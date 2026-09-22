@@ -819,10 +819,10 @@ def test_processed_authority_geometry_is_required_without_mutating_raw_unit(tmp_
     row["processed_ctc_span"] = [0.06, 0.42]
     row["processed_ctc_boundary_source"] = "next_lexical_token_start"
     ctc.write_textgrid([row], 1.0, tmp_path / "demo.TextGrid")
-    (tmp_path / "demo.lab").write_text("k\n", encoding="utf-8")
+    (tmp_path / "demo.lab").write_text("mfaletterk\n", encoding="utf-8")
     (tmp_path / "demo_ref.txt").write_text("K\n", encoding="utf-8")
     (tmp_path / "demo_tokens.jsonl").write_text(json.dumps({
-        "word": "k", "start_s": 0.06, "end_s": 0.42,
+        "word": "mfaletterk", "start_s": 0.06, "end_s": 0.42,
         "canonical_span": raw_span, "canonical_unit": row["canonical_unit"],
         "canonical_unit_sha256": raw_hash,
         "surface_text": "K", "source_ctc_ordinals": [0],
@@ -853,10 +853,10 @@ def test_processed_span_shorter_than_canonical_end_is_rejected_with_context(tmp_
     row["processed_ctc_span"] = [0.06, 0.10]
     row["processed_ctc_boundary_source"] = "raw_end_fallback"
     ctc.write_textgrid([row], 1.0, tmp_path / "demo.TextGrid")
-    (tmp_path / "demo.lab").write_text("k\n", encoding="utf-8")
+    (tmp_path / "demo.lab").write_text("mfaletterk\n", encoding="utf-8")
     (tmp_path / "demo_ref.txt").write_text("K\n", encoding="utf-8")
     (tmp_path / "demo_tokens.jsonl").write_text(json.dumps({
-        "word": "k", "start_s": 0.06, "end_s": 0.10,
+        "word": "mfaletterk", "start_s": 0.06, "end_s": 0.10,
         "canonical_span": raw_span, "canonical_unit": row["canonical_unit"],
         "canonical_unit_sha256": raw_hash,
         "surface_text": "K", "source_ctc_ordinals": [0],
@@ -886,10 +886,10 @@ def test_processed_geometry_failure_reason_codes_are_stable(tmp_path, value, rea
     row["processed_ctc_span"] = value
     row["processed_ctc_boundary_source"] = "raw_end_fallback"
     ctc.write_textgrid([row], 1.0, tmp_path / "demo.TextGrid")
-    (tmp_path / "demo.lab").write_text("k\n", encoding="utf-8")
+    (tmp_path / "demo.lab").write_text("mfaletterk\n", encoding="utf-8")
     (tmp_path / "demo_ref.txt").write_text("K\n", encoding="utf-8")
     token = {
-        "word": "k", "start_s": 0.06, "end_s": 0.42,
+        "word": "mfaletterk", "start_s": 0.06, "end_s": 0.42,
         "canonical_span": row["canonical_span"],
         "canonical_unit": row["canonical_unit"],
         "canonical_unit_sha256": row["canonical_unit_sha256"],
@@ -931,11 +931,11 @@ def test_raw_authority_bundle_allows_missing_processed_geometry_until_adjust(tmp
           "source_ctc_ordinal": 0}], "K")[0]
     bundle = tmp_path
     ctc.write_textgrid([row], 1.0, bundle / "demo.TextGrid")
-    (bundle / "demo.lab").write_text("k\n", encoding="utf-8")
+    (bundle / "demo.lab").write_text("mfaletterk\n", encoding="utf-8")
     (bundle / "demo_ref.txt").write_text("K\n", encoding="utf-8")
     path = bundle / "demo_tokens.jsonl"
     path.write_text(json.dumps({
-        "word": "k", "start_s": 0.06, "end_s": 0.12,
+        "word": "mfaletterk", "start_s": 0.06, "end_s": 0.12,
         "canonical_span": row["canonical_span"],
         "canonical_unit": row["canonical_unit"],
         "canonical_unit_sha256": row["canonical_unit_sha256"],
