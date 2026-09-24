@@ -1212,7 +1212,11 @@ def assemble_tts_rows(config: Mapping[str, Any], workspace: str | os.PathLike[st
         enriched["phones"] = list(alignment.get("native_phones", []))
         record = build_training_record(enriched, train_wav=train_ref["path"], alignment_wav=align_ref["path"],
                                        speaker=manifest[uid].get("speaker"),
-                                       text_layers=alignment.get("frontend") or manifest[uid].get("frontend"),
+                                       text_layers={
+                                           **dict(alignment.get("frontend") or manifest[uid].get("frontend") or {}),
+                                           "orig_text": str(manifest[uid].get("orig_text", manifest[uid].get("text", ""))),
+                                           "canonical_text": str(manifest[uid].get("canonical_spoken_text", manifest[uid].get("text", ""))),
+                                       },
                                        audio_receipt=dict(audio_receipt), sample_rate=16000)
         record.update({"locked_aliases": list(locked), "native_inventory": alignment["native_inventory"],
                        "raw_mfa": alignment["raw_mfa"], "reading_evidence": alignment["reading_evidence"],

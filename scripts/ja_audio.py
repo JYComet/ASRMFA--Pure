@@ -125,6 +125,40 @@ def _resample(signal: np.ndarray, source_rate: int, target_rate: int) -> np.ndar
     return _resample_with_details(signal, source_rate, target_rate)[0]
 
 
+def _normalize_edge_silence(signal: np.ndarray, rate: int, *,
+                            target_seconds: float = 0.5,
+                            threshold: float = 0.001,
+                            frame_length: int = 1024) -> tuple[np.ndarray, dict[str, int]]:
+    """Port the edge RMS scan and 0.5 s target from trim_silence_batch.py."""
+    if signal.ndim != 1 or rate <= 0 or target_seconds < 0 or frame_length <= 0:
+        raise AudioContractError("invalid edge silence normalization input")
+    count = len(signal) // frame_length
+    if count:
+        frames = signal[:count * frame_length].reshape(count, frame_length)
+        rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
+        voiced = rms >= threshold
+        lead = (int(np.argmax(voiced)) if voiced.any() else count) * frame_length
+        tail = (int(np.argmax(voiced[::-1])) if voiced.any() else count) * frame_length
+    else:
+        lead = tail = 0
+    target = int(target_seconds * rate)
+    crop_before, crop_after = max(0, lead - target), max(0, tail - target)
+    pad_before, pad_after = max(0, target - lead), max(0, target - tail)
+    if crop_before + crop_after > len(signal):
+        # All-silence audio has no lexical owner; retain the target-sized
+        # quiet axis without allowing two independent crops to cross.
+        crop_after = max(0, len(signal) - crop_before)
+    end = len(signal) - crop_after if crop_after else len(signal)
+    core = signal[crop_before:end]
+    normalized = np.pad(core, (pad_before, pad_after), mode="constant")
+    return normalized, {
+        "target_frames": target,
+        "detected_before_frames": lead, "detected_after_frames": tail,
+        "crop_before_frames": crop_before, "crop_after_frames": crop_after,
+        "pad_before_frames": pad_before, "pad_after_frames": pad_after,
+    }
+
+
 def _write_pcm16(path: Path, signal: np.ndarray, sample_rate: int) -> None:
     path = path.expanduser().absolute()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -140,7 +174,8 @@ def _write_pcm16(path: Path, signal: np.ndarray, sample_rate: int) -> None:
 
 
 def transform_audio(source: str | Path, *, sample_rate: int = 16000,
-                    trim_start_frames: int = 0, trim_end_frames: int = 0) -> dict[str, Any]:
+                    trim_start_frames: int = 0, trim_end_frames: int = 0,
+                    normalize_edges: bool = False) -> dict[str, Any]:
     """Decode, downmix and resample without implicit silence deletion.
 
     Trimming is opt-in and only removes explicitly requested edge frames.  No
@@ -158,7 +193,18 @@ def transform_audio(source: str | Path, *, sample_rate: int = 16000,
     if trim_start_frames + trim_end_frames > len(mono):
         raise AudioContractError("edge trims remove the complete source")
     cropped = mono[trim_start_frames:end]
+    edge = None
+    if normalize_edges:
+        # The old pipeline normalizes before making the 16 kHz MFA copy.
+        # Train and alignment WAVs must observe the same source-rate scan.
+        cropped, edge = _normalize_edge_silence(cropped, source_rate)
     output, resample_details = _resample_with_details(cropped, source_rate, sample_rate)
+    edge_pad_before = ((edge["pad_before_frames"] * sample_rate + source_rate // 2)
+                       // source_rate) if edge else 0
+    edge_pad_after = ((edge["pad_after_frames"] * sample_rate + source_rate // 2)
+                      // source_rate) if edge else 0
+    if edge is not None:
+        edge["sample_rate"] = source_rate
     if source_rate == sample_rate:
         method = "pcm16_reencode_v1"
         resample_fields: dict[str, Any] = {
@@ -186,7 +232,8 @@ def transform_audio(source: str | Path, *, sample_rate: int = 16000,
     transform = {
         "source_start": int(trim_start_frames),
         "source_end": int(source_info["frames"] - trim_end_frames),
-        "output_start": 0,
+        "output_start": ((edge["pad_before_frames"] - edge["crop_before_frames"]) * sample_rate
+                         + source_rate // 2) // source_rate if edge else 0,
         "output_frames": target_frames,
         "source_rate": int(source_rate),
         "target_rate": int(sample_rate),
@@ -203,11 +250,13 @@ def transform_audio(source: str | Path, *, sample_rate: int = 16000,
         "crop_end_frames": int(trim_end_frames),
         "raw_resample_frames": int(resample_details["raw_resample_frames"]),
         "crop_after_frames": int(resample_details["crop_after_frames"]),
-        "pad_before_frames": 0,
-        "pad_after_frames": int(resample_details["pad_after_frames"]),
+        "pad_before_frames": edge_pad_before,
+        "pad_after_frames": int(resample_details["pad_after_frames"]) + edge_pad_after,
+        "edge_normalization": edge,
         "crop": {"start_frames": int(trim_start_frames), "end_frames": int(trim_end_frames),
                  "after_resample_frames": int(resample_details["crop_after_frames"])},
-        "pad": {"before_frames": 0, "after_frames": int(resample_details["pad_after_frames"])},
+        "pad": {"before_frames": edge_pad_before,
+                "after_frames": int(resample_details["pad_after_frames"]) + edge_pad_after},
         **resample_fields,
     }
     return {
@@ -222,10 +271,12 @@ def transform_audio(source: str | Path, *, sample_rate: int = 16000,
 
 
 def prepare_alignment_wav(source: str | Path, target: str | Path, *, sample_rate: int = 16000,
-                          trim_start_frames: int = 0, trim_end_frames: int = 0) -> dict[str, Any]:
+                          trim_start_frames: int = 0, trim_end_frames: int = 0,
+                          normalize_edges: bool = False) -> dict[str, Any]:
     source_info = inspect_wav(source)
     if (source_info["sample_rate"] == sample_rate and source_info["channels"] == 1 and
-            source_info["sample_width"] == 2 and trim_start_frames == 0 and trim_end_frames == 0):
+            source_info["sample_width"] == 2 and trim_start_frames == 0 and trim_end_frames == 0
+            and not normalize_edges):
         target_path = Path(target).expanduser().absolute()
         target_path.parent.mkdir(parents=True, exist_ok=True)
         with wave.open(str(source), "rb") as inp:
@@ -253,7 +304,8 @@ def prepare_alignment_wav(source: str | Path, target: str | Path, *, sample_rate
                 "sample_transform": transform}
     transformed = transform_audio(source, sample_rate=sample_rate,
                                    trim_start_frames=trim_start_frames,
-                                   trim_end_frames=trim_end_frames)
+                                   trim_end_frames=trim_end_frames,
+                                   normalize_edges=normalize_edges)
     target_path = Path(target).expanduser().absolute()
     _write_pcm16(target_path, transformed.pop("signal"), sample_rate)
     output_info = inspect_wav(target_path)
@@ -263,9 +315,10 @@ def prepare_alignment_wav(source: str | Path, target: str | Path, *, sample_rate
     return transformed
 
 
-def prepare_training_wav(source: str | Path, target: str | Path) -> dict[str, Any]:
+def prepare_training_wav(source: str | Path, target: str | Path, *,
+                         normalize_edges: bool = False) -> dict[str, Any]:
     source_info = inspect_wav(source)
-    if source_info["channels"] == 1 and source_info["sample_width"] == 2:
+    if source_info["channels"] == 1 and source_info["sample_width"] == 2 and not normalize_edges:
         target_path = Path(target).expanduser().absolute()
         target_path.parent.mkdir(parents=True, exist_ok=True)
         with wave.open(str(source), "rb") as inp:
@@ -291,7 +344,8 @@ def prepare_training_wav(source: str | Path, target: str | Path) -> dict[str, An
         return {"source": source_info, "source_frames": source_info["frames"], "output_frames": source_info["frames"],
                 "sample_rate": source_info["sample_rate"], "trimmed_frames": 0, "output": output,
                 "sample_transform": transform}
-    transformed = transform_audio(source, sample_rate=source_info["sample_rate"])
+    transformed = transform_audio(source, sample_rate=source_info["sample_rate"],
+                                  normalize_edges=normalize_edges)
     signal = transformed.pop("signal")
     target_path = Path(target).expanduser().absolute()
     _write_pcm16(target_path, signal, source_info["sample_rate"])
@@ -391,8 +445,8 @@ def audio_stage(config: Mapping[str, Any], stage_dir: Path):
                 raise AudioContractError("manifest row has no source WAV")
             train = stage_dir / f"train__{stem}.wav"
             alignment = stage_dir / f"alignment__{stem}.wav"
-            train_info = prepare_training_wav(source, train)
-            align_info = prepare_alignment_wav(source, alignment)
+            train_info = prepare_training_wav(source, train, normalize_edges=True)
+            align_info = prepare_alignment_wav(source, alignment, normalize_edges=True)
             receipt = make_audio_receipt(
                 uid, source, train, alignment,
                 train_transform=train_info.get("sample_transform", {}),

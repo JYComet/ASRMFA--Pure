@@ -102,7 +102,7 @@ def test_export_writes_exact_five_track_textgrid(tmp_path: Path):
 def test_writer_preserves_whitespace_punctuation_quotes_and_one_sample_boundaries(tmp_path: Path):
     record = training_record_v2_fixture(tmp_path, text='  「声"」!  ', phone_bounds=[(0, 1), (1, 2), (2, 8000), (8000, 16000)])
     grid = parse_textgrid_text(render_textgrid(record))
-    assert reconstruct_display(grid, record["display_attachments"]) == '  「声"」!  '
+    assert reconstruct_display(grid, record["display_attachments"]) == '<sp1>  「声"」!  '
     assert all(tier_is_continuous(tier, 0, 16000) for tier in grid["tiers"])
     assert boundaries(grid, "mfa_phone")[:2] == [(0, 1), (1, 2)]
     assert labels(grid, "original_text")[0].endswith('「声"」!')
@@ -112,4 +112,4 @@ def test_empty_coverage_intervals_are_not_authoritative_phones(tmp_path: Path):
     record = training_record_with_initial_gap(tmp_path)
     grid = parse_textgrid_text(render_textgrid(record))
     assert len(authoritative_segments(record, "mfa_phone")) == 2
-    assert labels(grid, "mfa_phone")[0] == ""
+    assert labels(grid, "mfa_phone")[0] == "<sp1>"

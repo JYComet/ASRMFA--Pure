@@ -469,6 +469,35 @@ def _verify_semantic_artifact(record: Mapping[str, Any], phones: Sequence[Mappin
         errors.append(_error("semantic_relation_ambiguous", str(exc), str(path)))
 
 
+def _replay_edge_normalization(signal: "np.ndarray", rate: int,
+                               declared: Mapping[str, Any]) -> "np.ndarray":
+    """Independently replay the source pipeline's 1024-frame edge RMS scan."""
+    frame_length = 1024
+    target = rate // 2
+    count = len(signal) // frame_length
+    if count:
+        frames = signal[:count * frame_length].reshape(count, frame_length)
+        voiced = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1)) >= 0.001
+        before = (int(np.argmax(voiced)) if voiced.any() else count) * frame_length
+        after = (int(np.argmax(voiced[::-1])) if voiced.any() else count) * frame_length
+    else:
+        before = after = 0
+    crop_before, crop_after = max(0, before - target), max(0, after - target)
+    pad_before, pad_after = max(0, target - before), max(0, target - after)
+    if crop_before + crop_after > len(signal):
+        crop_after = max(0, len(signal) - crop_before)
+    expected = {
+        "target_frames": target, "detected_before_frames": before,
+        "detected_after_frames": after, "crop_before_frames": crop_before,
+        "crop_after_frames": crop_after, "pad_before_frames": pad_before,
+        "pad_after_frames": pad_after,
+    }
+    if declared.get("sample_rate", rate) != rate or any(declared.get(key) != value for key, value in expected.items()):
+        raise ValueError("edge silence receipt disagrees with independent RMS scan")
+    end = len(signal) - crop_after if crop_after else len(signal)
+    return np.pad(signal[crop_before:end], (pad_before, pad_after))
+
+
 def _replay_pcm16_transform(source_path: str, output_path: str, recipe: Mapping[str, Any]) -> bool:
     source_info, source_payload = _wav_payload(source_path)
     output_info, output_payload = _wav_payload(output_path)
@@ -480,11 +509,19 @@ def _replay_pcm16_transform(source_path: str, output_path: str, recipe: Mapping[
     if start < 0 or end < start or end > source_info["frames"]:
         raise ValueError("invalid source crop")
     cropped = source_signal[start:end]
+    edge = recipe.get("edge_normalization")
+    if edge is not None:
+        if not isinstance(edge, Mapping):
+            return False
+        cropped = _replay_edge_normalization(cropped, source_info["sample_rate"], edge)
+        shift = edge["pad_before_frames"] - edge["crop_before_frames"]
+        expected_origin = (shift * int(recipe.get("target_rate", output_info["sample_rate"]))
+                           + source_info["sample_rate"] // 2) // source_info["sample_rate"]
+        if recipe.get("output_start") != expected_origin:
+            return False
     target_rate = int(recipe.get("target_rate", recipe.get("sample_rate", output_info["sample_rate"])))
     target_frames = int(recipe.get("output_frames", output_info["frames"]))
-    theoretical_frames = _half_up_frames(end - start, source_info["sample_rate"], target_rate)
-    if target_frames != theoretical_frames:
-        return False
+    theoretical_frames = _half_up_frames(len(cropped), source_info["sample_rate"], target_rate)
     if source_info["sample_rate"] == target_rate:
         expected = cropped
     else:
@@ -497,7 +534,9 @@ def _replay_pcm16_transform(source_path: str, output_path: str, recipe: Mapping[
     if target_frames <= 0:
         target_frames = _half_up_frames(len(cropped), source_info["sample_rate"], target_rate)
     if expected.shape[0] < target_frames: expected = np.pad(expected, (0, target_frames - expected.shape[0]))
-    expected = expected[:target_frames]
+    expected = expected[:theoretical_frames]
+    if target_frames != theoretical_frames or target_frames != len(expected):
+        return False
     expected_payload = np.rint(np.clip(expected, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
     return output_info["sample_rate"] == target_rate and output_info["channels"] == 1 and output_info["sample_width"] == 2 and output_info["frames"] == target_frames and output_payload == expected_payload
 
@@ -578,9 +617,148 @@ def _verify_raw_runs(record: Mapping[str, Any], phones: Sequence[Mapping[str, An
         errors.append(_error("alignment_invalid", f"phone raw interval {run_id}/{interval_id} is not represented in raw MFA"))
 
 
+def _verify_training_record_v2(record: Mapping[str, Any], root: Path | None) -> list[dict[str, Any]]:
+    """Independently check v2 audio replay and all three phone sample axes."""
+    errors: list[dict[str, Any]] = []
+    uid = record.get("uid")
+    if not isinstance(uid, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", uid):
+        errors.append(_error("schema_invalid", "v2 uid is not a safe artifact identity"))
+    rate = record.get("sample_rate")
+    frame_count = record.get("frame_count")
+    if type(rate) is not int or rate <= 0 or type(frame_count) is not int or frame_count <= 0:
+        return [_error("schema_invalid", "v2 requires a positive integer sample axis")]
+    for key in ("train_wav", "alignment_wav"):
+        if isinstance(record.get(key), Mapping):
+            _verify_audio(record[key], key, errors)
+        else:
+            errors.append(_error("source_audio_invalid", f"{key} metadata is missing"))
+    if isinstance(record.get("alignment_wav"), Mapping) and record["alignment_wav"].get("frames") != frame_count:
+        errors.append(_error("audio_transform_invalid", "v2 frame_count differs from alignment WAV"))
+    receipt = record.get("audio_transform")
+    if not isinstance(receipt, Mapping) or receipt.get("schema") != "audio-transform-receipt-v2":
+        errors.append(_error("audio_transform_invalid", "v2 audio receipt is missing"))
+        return errors
+    source = receipt.get("source")
+    if not isinstance(source, Mapping):
+        errors.append(_error("source_audio_invalid", "v2 source WAV is missing"))
+        return errors
+    _verify_audio(source, "source", errors)
+    source_path = source.get("path")
+    for key, recipe_key in (("train_wav", "train_transform"), ("alignment_wav", "alignment_transform")):
+        info, recipe = record.get(key), receipt.get(recipe_key)
+        if not isinstance(info, Mapping) or not isinstance(recipe, Mapping):
+            errors.append(_error("audio_transform_invalid", f"v2 {recipe_key} is missing"))
+            continue
+        bound = receipt.get("train" if key == "train_wav" else "alignment")
+        if not isinstance(bound, Mapping) or any(info.get(field) != bound.get(field) for field in ("path", "sha256", "frames", "sample_rate")):
+            errors.append(_error("receipt_hash_mismatch", f"v2 {key} differs from receipt"))
+        if isinstance(source_path, str) and isinstance(info.get("path"), str):
+            try:
+                if not _replay_pcm16_transform(source_path, info["path"], recipe):
+                    errors.append(_error("audio_transform_invalid", f"v2 {key} replay differs"))
+            except (OSError, wave.Error, ValueError, RuntimeError, TypeError, KeyError) as exc:
+                errors.append(_error("audio_transform_invalid", f"v2 {key} replay: {exc}"))
+    recipe = receipt.get("alignment_transform")
+    train_recipe = receipt.get("train_transform")
+    if not isinstance(recipe, Mapping):
+        return errors
+    if (not isinstance(train_recipe, Mapping)
+            or train_recipe.get("edge_normalization") != recipe.get("edge_normalization")):
+        errors.append(_error("audio_transform_invalid", "train and alignment edge scans differ"))
+    if receipt.get("sample_transform") != recipe:
+        errors.append(_error("audio_transform_invalid", "sample_transform alias differs from alignment recipe"))
+    if record.get("source_sample_rate") != source.get("sample_rate"):
+        errors.append(_error("audio_transform_invalid", "v2 source sample rate differs from source WAV"))
+    if isinstance(record.get("train_wav"), Mapping) and record.get("train_sample_rate") != record["train_wav"].get("sample_rate"):
+        errors.append(_error("audio_transform_invalid", "v2 train sample rate differs from train WAV"))
+    words = record.get("words")
+    phones = record.get("native_phones")
+    if not isinstance(words, list) or not words or not isinstance(phones, list) or not phones:
+        errors.append(_error("tts_invalid", "v2 words and native_phones must be non-empty"))
+        return errors
+    for label, rows in (("words", words), ("native_phones", phones)):
+        previous = -1
+        for index, row in enumerate(rows):
+            if not isinstance(row, Mapping):
+                errors.append(_error("alignment_invalid", f"{label}[{index}] is not an object"))
+                continue
+            start, end = row.get("start_sample"), row.get("end_sample")
+            if type(start) is not int or type(end) is not int or start < previous or end <= start or end > frame_count:
+                errors.append(_error("alignment_invalid", f"{label}[{index}] exceeds the sample axis"))
+                continue
+            previous = end
+    train_rate = record.get("train_sample_rate")
+    source_rate = record.get("source_sample_rate")
+    output_origin = recipe.get("output_start", 0)
+    source_offset = recipe.get("source_start", 0)
+    if (type(train_rate) is not int or train_rate <= 0 or type(source_rate) is not int or source_rate <= 0
+            or type(output_origin) is not int or type(source_offset) is not int):
+        errors.append(_error("audio_transform_invalid", "v2 sample rates or source offset are missing"))
+        return errors
+    for index, phone in enumerate(phones):
+        if not isinstance(phone, Mapping) or type(phone.get("start_sample")) is not int or type(phone.get("end_sample")) is not int:
+            continue
+        start, end = phone["start_sample"], phone["end_sample"]
+        expected_train = ((start * train_rate + rate // 2) // rate, (end * train_rate + rate // 2) // rate)
+        expected_source = (
+            source_offset + ((start - output_origin) * source_rate + rate // 2) // rate,
+            source_offset + ((end - output_origin) * source_rate + rate // 2) // rate,
+        )
+        if (phone.get("train_start_sample"), phone.get("train_end_sample")) != expected_train:
+            errors.append(_error("audio_transform_invalid", "v2 train sample projection differs", f"native_phones[{index}]"))
+        if (phone.get("source_start_sample"), phone.get("source_end_sample")) != expected_source:
+            errors.append(_error("audio_transform_invalid", "v2 source sample projection differs", f"native_phones[{index}]"))
+        source_frames = source.get("frames")
+        if type(source_frames) is not int or expected_source[0] < 0 or expected_source[1] > source_frames:
+            errors.append(_error("audio_transform_invalid", "v2 source sample projection escapes WAV", f"native_phones[{index}]"))
+    native_rows = [row for row in phones if isinstance(row, Mapping)]
+    raw_mfa = record.get("raw_mfa")
+    if not isinstance(raw_mfa, Mapping) or not isinstance(raw_mfa.get("runs"), list) or not raw_mfa["runs"]:
+        errors.append(_error("publish_blocked", "v2 raw MFA run evidence is missing"))
+    else:
+        _verify_raw_runs(record, native_rows, root, errors)
+        _verify_inventory_artifact(record, native_rows, root, errors)
+        _verify_locked_dictionary(record, native_rows, root, errors)
+    reading = record.get("reading_evidence")
+    if not isinstance(reading, Mapping) or not isinstance(reading.get("locks"), list) or not reading["locks"]:
+        errors.append(_error("reading_unresolved", "v2 locked reading evidence is missing"))
+    else:
+        _verify_reading_artifact(record, root, errors)
+    _verify_semantic_artifact(record, native_rows, root, errors)
+    partition = record.get("partition")
+    expected_units = {str(word.get("unit_id")) for word in words if isinstance(word, Mapping)}
+    if not isinstance(partition, Mapping):
+        errors.append(_error("partition_not_exact", "v2 unit partition is missing"))
+    else:
+        buckets = [partition.get(name) for name in ("verified", "rejected", "unresolved")]
+        if any(not isinstance(bucket, list) or any(not isinstance(item, str) for item in bucket)
+               for bucket in buckets):
+            errors.append(_error("partition_not_exact", "v2 unit partition has invalid buckets"))
+        else:
+            values = [item for bucket in buckets for item in bucket]
+            if len(values) != len(set(values)) or set(values) != expected_units:
+                errors.append(_error("partition_not_exact", "v2 unit partition is incomplete or duplicated"))
+    graph = record.get("mora_graph")
+    if any(row.get("language") == "ja" for row in native_rows):
+        if (not isinstance(graph, Mapping) or not isinstance(graph.get("moras"), list)
+                or not isinstance(graph.get("relations"), list) or not graph["moras"] or not graph["relations"]):
+            errors.append(_error("mora_phone_relation_unresolved", "v2 Japanese mora graph is missing"))
+        else:
+            mora_ids = {row.get("mora_id") for row in graph["moras"] if isinstance(row, Mapping)}
+            phone_ids = {row.get("phone_id") for row in native_rows if row.get("language") == "ja"}
+            pairs = {(row.get("mora_id"), row.get("phone_id")) for row in graph["relations"] if isinstance(row, Mapping)}
+            if (len(mora_ids) != len(graph["moras"]) or
+                    {mora for mora, _ in pairs} != mora_ids or
+                    {phone for _, phone in pairs} != phone_ids):
+                errors.append(_error("mora_phone_relation_unresolved", "v2 mora graph does not cover Japanese phones"))
+    return errors
+
+
 def verify_training_record(record: Mapping[str, Any], *, root: Path | None = None) -> list[dict[str, Any]]:
     """Return independent contract errors for one tts-training-record-v1."""
     errors: list[dict[str, Any]] = []
+    if record.get("schema") == "tts-training-record-v2":
+        return _verify_training_record_v2(record, root)
     if record.get("schema") != "tts-training-record-v1":
         errors.append(_error("schema_unknown", "unexpected training record schema")); return errors
     uid = record.get("uid")
@@ -1158,6 +1336,109 @@ def _external_gate_inputs(root: Path, gate_payload: Mapping[str, Any], gate_name
     return gold, list(result_rows)
 
 
+def _v2_source_marks(record: Mapping[str, Any]) -> dict[int, str]:
+    words = record.get("words")
+    layer = record.get("text_layers")
+    if not isinstance(words, list) or not words or not isinstance(layer, Mapping):
+        return {}
+    punctuation = frozenset("、。，．,.!?！？；;：:…〜～「」『』（）()・")
+    for key in ("orig_text", "canonical_text"):
+        source = layer.get(key)
+        if not isinstance(source, str):
+            continue
+        spans = [word.get("orig_span") or word.get("char_span") if key == "orig_text"
+                 else word.get("char_span") or word.get("canonical_span") for word in words]
+        if (not all(isinstance(span, (list, tuple)) and len(span) == 2 and
+                    type(span[0]) is int and type(span[1]) is int for span in spans)
+                or not all(source[span[0]:span[1]] == word.get("source_text")
+                           for span, word in zip(spans, words))):
+            continue
+        marks = {
+            index: "".join(ch for ch in source[spans[index - 1][1]:
+                    spans[index][0] if index < len(words) else len(source)] if ch in punctuation)
+            for index in range(1, len(words) + 1)
+        }
+        marks[0] = "".join(ch for ch in source[:spans[0][0]] if ch in punctuation)
+        return marks
+    return {}
+
+
+def _verify_v2_textgrid(record: Mapping[str, Any], root: Path, errors: list[dict[str, Any]]) -> None:
+    uid = record.get("uid")
+    if not isinstance(uid, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", uid):
+        errors.append(_error("schema_invalid", "v2 TextGrid uid is unsafe"))
+        return
+    candidate = root / "stages" / "tts" / f"{uid}.TextGrid"
+    matches = sorted(root.rglob(f"{uid}.TextGrid"))
+    if len(matches) != 1 or matches[0].is_symlink():
+        errors.append(_error("receipt_output_missing", "v2 requires exactly one TextGrid", str(candidate)))
+        return
+    path = matches[0]
+    try:
+        tiers = _textgrid_parse(path)
+        names = ("original_text", "kana", "mfa_phone", "phone_kana", "phone_tone")
+        if set(tiers) != set(names) or len(tiers) != len(names):
+            errors.append(_error("tts_invalid", "v2 TextGrid does not have exactly five tracks", str(path)))
+            return
+        rate, frames = int(record["sample_rate"]), int(record["frame_count"])
+        for name in names:
+            intervals = tiers[name]
+            previous = 0
+            for item in intervals:
+                start, end = round(item["xmin"] * rate), round(item["xmax"] * rate)
+                if start != previous or end <= start or end > frames:
+                    errors.append(_error("tts_invalid", f"v2 {name} has a gap, overlap, or invalid axis", str(path)))
+                    break
+                previous = end
+            if previous != frames:
+                errors.append(_error("tts_invalid", f"v2 {name} does not cover the WAV axis", str(path)))
+        words = record.get("words", [])
+        phones = record.get("native_phones", [])
+        source_marks = _v2_source_marks(record)
+        for name, owners, label in (
+            ("original_text", words, lambda row: str(row.get("source_text", ""))),
+            ("kana", words, lambda row: str(row.get("kana", "")) if row.get("language") == "ja" else ""),
+            ("mfa_phone", phones, lambda row: f'{row.get("language")}:{row.get("native_phone")}'),
+            ("phone_kana", phones, lambda row: str(row.get("phone_kana", ""))),
+            ("phone_tone", phones, lambda row: str(row.get("phone_tone", ""))),
+        ):
+            rows = tiers[name]
+            for owner_index, owner in enumerate(owners):
+                if not isinstance(owner, Mapping):
+                    continue
+                found = [item for item in rows
+                         if (round(item["xmin"] * rate), round(item["xmax"] * rate))
+                         == (owner.get("start_sample"), owner.get("end_sample"))]
+                expected = label(owner)
+                if name in {"original_text", "kana"}:
+                    if owner_index == 0:
+                        expected = source_marks.get(0, "") + expected
+                    next_start = owners[owner_index + 1]["start_sample"] if owner_index + 1 < len(owners) else frames
+                    if owner.get("end_sample") == next_start:
+                        expected += source_marks.get(owner_index + 1, "")
+                if name == "original_text" and owner.get("start_sample") == 0 and owner is words[0]:
+                    expected = "<sp1>" + expected
+                if len(found) != 1 or found[0]["text"] != expected:
+                    errors.append(_error("tts_invalid", f"v2 {name} lexical/phone owner differs", str(path)))
+                    break
+        if words and words[0].get("start_sample", 0) > 0:
+            for name in names:
+                if not tiers[name] or tiers[name][0]["text"] != "<sp1>":
+                    errors.append(_error("tts_invalid", f"v2 {name} lacks leading <sp1>", str(path)))
+        for index, mark in source_marks.items():
+            if not mark:
+                continue
+            gap_start = words[index - 1]["end_sample"]
+            gap_end = words[index]["start_sample"] if index < len(words) else frames
+            if gap_end > gap_start:
+                found = [item for item in tiers["original_text"]
+                         if (round(item["xmin"] * rate), round(item["xmax"] * rate)) == (gap_start, gap_end)]
+                if len(found) != 1 or found[0]["text"] != mark:
+                    errors.append(_error("tts_invalid", "v2 source punctuation does not own its local silence", str(path)))
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, IndexError) as exc:
+        errors.append(_error("tts_invalid", f"v2 TextGrid: {exc}", str(path)))
+
+
 def verify_workspace(workspace: str | Path) -> dict[str, Any]:
     """Verify a fresh output directory and return a machine-readable report."""
     root = Path(workspace).expanduser().absolute(); errors: list[dict[str, Any]] = []
@@ -1180,6 +1461,9 @@ def verify_workspace(workspace: str | Path) -> dict[str, Any]:
         if row.get("uid") in seen_uid: errors.append(_error("schema_invalid", "duplicate uid", f"row[{index}]"))
         seen_uid.add(row.get("uid"))
         errors.extend(verify_training_record(row, root=root))
+        if row.get("schema") == "tts-training-record-v2":
+            _verify_v2_textgrid(row, root, errors)
+            continue
         # Legacy offline fixtures can still be inspected, but a production
         # publication needs the upstream evidence references below.  These are
         # release blockers until W3's stage-input bridge supplies them.

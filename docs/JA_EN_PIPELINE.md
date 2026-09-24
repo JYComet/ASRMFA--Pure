@@ -40,8 +40,12 @@ python scripts/verify_ja_en_tts.py --workspace /data/runs/ja_en_v1 --integrity-o
 `--check` 只验证 manifest、配置和路径，不加载 ASR/MFA。`--stage` 使用逗号
 分隔的阶段名，`--resume` 会先重算 identity、文件集合和 receipt hash；源文件、
 模型、配置、schema 或实现 digest 改变时 fail closed。每条记录的输出包括
-`tts_training_records.jsonl` 和同 uid 的 TextGrid，后者固定包含 `words`、
-`phones`、`language` 三个 tier；phone label 使用 `ja:` 或 `en:` 前缀。
+`tts_training_records.jsonl` 和同 uid 的 TextGrid。v2 TextGrid 固定包含
+`original_text`、`kana`、`mfa_phone`、`phone_kana`、`phone_tone` 五层；
+MFA phone label 使用 `ja:` 或 `en:` 前缀。`original_text` 句首带 `<sp1>`；
+参考文本中有精确词位置的日文标点占用对应的局部静音。没有停顿的标点留在
+左侧显示词内，不修改声学 phone 边界。未被标点占用的空隙按旧中文管线
+0.2/0.5/1.5 秒门槛标为 `<sp0>` 至 `<sp3>`。
 多 token 记录使用 `selected_readings[token_id]` 与 `reading_evidence.locks[]`；只有单个
 lexical token 才可使用 scalar `selected_reading`。每个 phone 同时保留 16 kHz alignment、
 train 和 source 三个整数 sample axis（包括 `train_start_sample`/`train_end_sample`、
@@ -106,6 +110,22 @@ provider smoke 也使用同一份配置和新的 workspace：先运行 `--check`
 canary 结果必须使用相同 `target_id` 和完整唯一 `id` 集合；verifier 会根据预测
 seam sample 与 gold sample 重新计算 MAE/P95，不接受 producer 直接提交的
 `seam_error_ms` 或单独的 `status: PASS`。
+
+## 后处理迁移与异常复核
+
+音频阶段先在源采样率上按旧版 `trim_silence_batch.py` 的 1024 帧 RMS
+检测首尾静音，再将两端补零或裁到 0.5 秒；训练 WAV 与 16 kHz MFA WAV
+使用同一次源率扫描。收据记录源率检测结果、目标率补零帧数和时轴位移，
+独立 verifier 会从原始 WAV 重放两份输出。TextGrid 则按旧版
+`postprocess_textgrids.py` 的局部停顿归属、句首 `<sp1>` 和 `<spN>`
+时长分级规则投射到日文五层结构。
+
+已按 `REGRESSION_ARCHIVE.md` 复核 Case 19（句首静音丢失）、20（尾标点
+误剥离）、21（`<spN>` 与标点混淆）、22（标点被静音覆盖）、35（词层
+空隙）、46（标点与 phone 重叠）、66（派生层不同步）、98（音频轴差异）
+及 253–256（无停顿和组合标点）。针对性回归集中在
+`tests/test_ja_postprocess_migration.py`，并由五层输出、音频轴和独立
+verifier 测试交叉验证。无停顿标点只保留显示，不凭文本制造有声边界。
 
 ## 模型选择和安装边界
 

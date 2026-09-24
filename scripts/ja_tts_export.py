@@ -198,8 +198,9 @@ def _normalise_words(alignment: Mapping[str, Any], sample_rate: int) -> list[dic
         if language not in {"ja", "en"}:
             raise ValueError(f"word {index} has unknown language")
         words.append({**row, "unit_id": str(row.get("unit_id", f"unit_{index:06d}")),
-                      "text": str(row.get("text", "")), "language": language,
-                      "start_sample": start, "end_sample": end})
+                      "text": str(row.get("text", "")),
+                      "source_text": row.get("source_text", row.get("text")),
+                      "language": language, "start_sample": start, "end_sample": end})
     return words
 
 
@@ -274,8 +275,25 @@ def build_training_record(
     if not words:
         raise ValueError("alignment words are required; ownership cannot be inferred")
     for index, word in enumerate(words):
-        if not isinstance(word.get("source_text"), str) or not isinstance(word.get("kana"), str):
-            raise ValueError(f"word {index} lacks supplied source_text/kana")
+        if not isinstance(word.get("source_text"), str):
+            raise ValueError(f"word {index} lacks supplied source_text")
+        if "kana" not in word:
+            if word["language"] == "en":
+                word["kana"] = ""
+            else:
+                owner_ids = {word["unit_id"], str(word.get("token_id", ""))}
+                moras = [row for row in alignment.get("moras", [])
+                         if row.get("token_id") in owner_ids or row.get("unit_id") in owner_ids]
+                if moras:
+                    moras.sort(key=lambda row: int(row.get("mora_index", 0)))
+                    word["kana"] = "".join(str(row["kana"]) for row in moras)
+                else:
+                    selected = alignment.get("selected_readings") or {}
+                    word["kana"] = selected.get(word["unit_id"]) or selected.get(str(word.get("token_id", "")))
+                    if word["kana"] is None and len(words) == 1:
+                        word["kana"] = alignment.get("selected_reading")
+        if not isinstance(word.get("kana"), str):
+            raise ValueError(f"word {index} lacks locked kana reading")
     phones = _normalise_phones(alignment, rate, words)
     if any(phone["end_sample"] > align_info["frames"] for phone in phones):
         raise ValueError("native phone exceeds authoritative alignment frame count")
@@ -347,9 +365,12 @@ def build_training_record(
     source_rate = int(source_info["sample_rate"])
     sample_transform = audio_receipt.get("sample_transform")
     source_offset = int(sample_transform.get("source_start", 0))
+    output_origin = int(sample_transform.get("output_start", 0))
     for phone in phones:
-        phone["source_start_sample"] = source_offset + int((phone["start_sample"] * source_rate + rate // 2) // rate)
-        phone["source_end_sample"] = source_offset + int((phone["end_sample"] * source_rate + rate // 2) // rate)
+        # Edge normalization shifts the alignment axis relative to the
+        # unpadded source. The receipt binds that shift in target samples.
+        phone["source_start_sample"] = source_offset + int(((phone["start_sample"] - output_origin) * source_rate + rate // 2) // rate)
+        phone["source_end_sample"] = source_offset + int(((phone["end_sample"] - output_origin) * source_rate + rate // 2) // rate)
     record["source_sample_rate"] = source_rate
     record["audio_transform"] = dict(audio_receipt)
     for field in ("locked_aliases", "native_inventory", "raw_mfa", "reading_evidence", "partition"):
@@ -385,6 +406,57 @@ def _quote(value: Any) -> str:
 
 
 TIER_NAMES = ("original_text", "kana", "mfa_phone", "phone_kana", "phone_tone")
+_REFERENCE_PUNCTUATION = frozenset("、。，．,.!?！？；;：:…〜～「」『』（）()・")
+
+
+def _silence_label(frames: int, rate: int) -> str:
+    """Use the Chinese postprocessor's 0.2/0.5/1.5 s pause classes."""
+    if frames * 5 < rate:
+        return "<sp0>"
+    if frames * 2 < rate:
+        return "<sp1>"
+    if frames * 2 < rate * 3:
+        return "<sp2>"
+    return "<sp3>"
+
+
+def _reference_gap_marks(record: Mapping[str, Any], words: Sequence[Mapping[str, Any]]) -> dict[int, str]:
+    """Bind source punctuation to lexical boundaries using frozen char spans."""
+    layer = record.get("text_layers") or {}
+    if not isinstance(layer, Mapping):
+        return {}
+    for source_key in ("orig_text", "canonical_text"):
+        source = layer.get(source_key)
+        if not isinstance(source, str):
+            continue
+        spans: list[tuple[int, int]] = []
+        cursor = 0
+        for word in words:
+            span = word.get("orig_span") if source_key == "orig_text" else None
+            span = span or word.get("char_span") or word.get("canonical_span")
+            if (not isinstance(span, (list, tuple)) or len(span) != 2
+                    or type(span[0]) is not int or type(span[1]) is not int):
+                break
+            start, end = span
+            if (start < cursor or end <= start or end > len(source)
+                    or source[start:end] != str(word.get("source_text", ""))):
+                break
+            spans.append((start, end))
+            cursor = end
+        if len(spans) != len(words):
+            continue
+        marks: dict[int, str] = {}
+        leading = "".join(ch for ch in source[:spans[0][0]] if ch in _REFERENCE_PUNCTUATION) if spans else ""
+        if leading:
+            marks[0] = leading
+        for boundary in range(1, len(words) + 1):
+            left = spans[boundary - 1][1]
+            right = spans[boundary][0] if boundary < len(words) else len(source)
+            punctuation = "".join(ch for ch in source[left:right] if ch in _REFERENCE_PUNCTUATION)
+            if punctuation:
+                marks[boundary] = punctuation
+        return marks
+    return {}
 
 
 def _word_interval(word: Mapping[str, Any], text: str) -> dict[str, Any]:
@@ -404,25 +476,44 @@ def _native_label(phone: Mapping[str, Any]) -> str:
 
 
 def _continuous_tier(name: str, segments: Sequence[Mapping[str, Any]], record: Mapping[str, Any]) -> dict[str, Any]:
-    """Fill non-authoritative display gaps without changing supplied segments."""
+    """Fill display gaps with the source pipeline's silence classes."""
     frame_count = _int(record.get("frame_count"), "frame_count")
+    rate = _int(record.get("sample_rate"), "sample_rate")
     ordered = sorted((dict(segment) for segment in segments), key=lambda item: (item["start_sample"], item["end_sample"]))
+    gap_marks = record.get("_gap_marks", {}) if isinstance(record.get("_gap_marks"), Mapping) else {}
     intervals: list[dict[str, Any]] = []
     cursor = 0
-    for segment in ordered:
+    for index, segment in enumerate(ordered):
         start = _int(segment.get("start_sample"), f"{name}.start_sample")
         end = _int(segment.get("end_sample"), f"{name}.end_sample")
         if start < cursor or start < 0 or end <= start or end > frame_count:
             raise ValueError(f"{name} intervals overlap or exceed the authoritative sample axis")
         if start > cursor:
-            intervals.append({"start_sample": cursor, "end_sample": start, "text": ""})
-        intervals.append({"start_sample": start, "end_sample": end, "text": str(segment["text"]),
+            mark = str(gap_marks.get(index, "")) if index > 0 and name in {"original_text", "kana"} else ""
+            label = mark or ("<sp1>" if cursor == 0 else _silence_label(start - cursor, rate))
+            intervals.append({"start_sample": cursor, "end_sample": start, "text": label})
+        display_text = str(segment["text"])
+        if name in {"original_text", "kana"}:
+            if index == 0:
+                display_text = str(gap_marks.get(0, "")) + display_text
+            next_start = ordered[index + 1]["start_sample"] if index + 1 < len(ordered) else frame_count
+            if end == next_start:
+                # A source mark without an acoustic gap remains visible on
+                # its left lexical owner; no phone or word boundary is carved.
+                display_text += str(gap_marks.get(index + 1, ""))
+        intervals.append({"start_sample": start, "end_sample": end, "text": display_text,
                           "segment_id": segment.get("segment_id")})
         cursor = end
     if cursor < frame_count:
-        intervals.append({"start_sample": cursor, "end_sample": frame_count, "text": ""})
+        mark = str(gap_marks.get(len(ordered), "")) if name in {"original_text", "kana"} else ""
+        label = mark or ("<sp1>" if cursor == 0 else _silence_label(frame_count - cursor, rate))
+        intervals.append({"start_sample": cursor, "end_sample": frame_count, "text": label})
     if not intervals and frame_count:
-        intervals.append({"start_sample": 0, "end_sample": frame_count, "text": ""})
+        intervals.append({"start_sample": 0, "end_sample": frame_count, "text": "<sp1>"})
+    if name == "original_text" and intervals and intervals[0]["start_sample"] == 0:
+        first = intervals[0]
+        if first["text"] != "<sp1>" and not first["text"].startswith("<sp1>"):
+            first["text"] = "<sp1>" + first["text"]
     return {"name": name, "intervals": intervals}
 
 
@@ -432,12 +523,13 @@ def build_five_track_tiers(record: Mapping[str, Any]) -> list[dict[str, Any]]:
     phones = record.get("native_phones")
     if not isinstance(words, list) or not isinstance(phones, list):
         raise ValueError("five-track TextGrid requires words and native_phones")
+    with_marks = {**record, "_gap_marks": _reference_gap_marks(record, words)}
     return [
-        _continuous_tier("original_text", [_word_interval(word, str(word["source_text"])) for word in words], record),
-        _continuous_tier("kana", [_word_interval(word, str(word["kana"]) if word.get("language") == "ja" else "") for word in words], record),
-        _continuous_tier("mfa_phone", [_phone_interval(phone, _native_label(phone)) for phone in phones], record),
-        _continuous_tier("phone_kana", [_phone_interval(phone, str(phone["phone_kana"])) for phone in phones], record),
-        _continuous_tier("phone_tone", [_phone_interval(phone, str(phone["phone_tone"])) for phone in phones], record),
+        _continuous_tier("original_text", [_word_interval(word, str(word["source_text"])) for word in words], with_marks),
+        _continuous_tier("kana", [_word_interval(word, str(word["kana"]) if word.get("language") == "ja" else "") for word in words], with_marks),
+        _continuous_tier("mfa_phone", [_phone_interval(phone, _native_label(phone)) for phone in phones], with_marks),
+        _continuous_tier("phone_kana", [_phone_interval(phone, str(phone["phone_kana"])) for phone in phones], with_marks),
+        _continuous_tier("phone_tone", [_phone_interval(phone, str(phone["phone_tone"])) for phone in phones], with_marks),
     ]
 
 

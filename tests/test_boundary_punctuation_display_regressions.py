@@ -1593,6 +1593,6 @@ def test_five_track_writer_escapes_display_quotes_without_rounding_sample_edges(
         ],
     }
     textgrid = render_textgrid(record)
-    assert 'text = "「声""」!"' in textgrid
+    assert 'text = "<sp1>「声""」!"' in textgrid
     assert "xmax = 0.000062500" in textgrid
     assert textgrid.count("name = ") == 5
