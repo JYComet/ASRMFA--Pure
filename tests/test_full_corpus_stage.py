@@ -114,3 +114,74 @@ def test_stage_rejects_reference_changed_after_preflight(tmp_path):
         assert "frozen reference hash drift" in str(exc)
     else:
         raise AssertionError("changed frozen reference was staged")
+
+
+def test_gamesl_publication_rolls_back_entire_group_and_can_retry(tmp_path, monkeypatch):
+    receipts = []
+    for stem in ("u1", "u2"):
+        source = tmp_path / f"{stem}.wav"
+        source.write_bytes(f"new-{stem}".encode())
+        receipts.append(type("Receipt", (), {
+            "gamesl_wav": source, "game": "鸣潮", "speaker": "今汐",
+            "run_stem": stem, "gamesl_wav_sha256": _sha256(source),
+        })())
+    root = tmp_path / "GAMESL"
+    target = root / "鸣潮" / "今汐" / "u1.wav"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"old-u1")
+    real_replace = __import__("os").replace
+    failed = False
+
+    def fail_second_target(src, dst):
+        nonlocal failed
+        if Path(dst) == root / "鸣潮" / "今汐" / "u2.wav" and not failed:
+            failed = True
+            raise OSError("injected second GAMESL replace failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("scripts.full_corpus_stage.os.replace", fail_second_target)
+    try:
+        publish_gamesl(receipts, root, tmp_path / "rollback")
+    except OSError as exc:
+        assert "injected" in str(exc)
+    else:
+        raise AssertionError("injected GAMESL transaction failure was ignored")
+    assert target.read_bytes() == b"old-u1"
+    assert not (root / "鸣潮" / "今汐" / "u2.wav").exists()
+
+    monkeypatch.setattr("scripts.full_corpus_stage.os.replace", real_replace)
+    result = publish_gamesl(receipts, root, tmp_path / "rollback")
+    assert result["published_count"] == 2
+    assert target.read_bytes() == b"new-u1"
+    assert (root / "鸣潮" / "今汐" / "u2.wav").read_bytes() == b"new-u2"
+
+
+def test_gamesl_parent_fsync_failure_restores_already_replaced_targets(tmp_path, monkeypatch):
+    source = tmp_path / "u1.wav"
+    source.write_bytes(b"new-u1")
+    receipt = type("Receipt", (), {
+        "gamesl_wav": source, "game": "鸣潮", "speaker": "今汐",
+        "run_stem": "u1", "gamesl_wav_sha256": _sha256(source),
+    })()
+    root = tmp_path / "GAMESL"
+    target = root / "鸣潮" / "今汐" / "u1.wav"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"old-u1")
+    real_sync = __import__("scripts.full_corpus_transaction", fromlist=["_fsync_dir"])._fsync_dir
+    failed = False
+
+    def fail_once_on_target(directory):
+        nonlocal failed
+        if Path(directory) == target.parent and not failed:
+            failed = True
+            raise OSError("injected target directory fsync failure")
+        return real_sync(directory)
+
+    monkeypatch.setattr("scripts.full_corpus_transaction._fsync_dir", fail_once_on_target)
+    try:
+        publish_gamesl([receipt], root, tmp_path / "rollback")
+    except OSError as exc:
+        assert "fsync" in str(exc)
+    else:
+        raise AssertionError("injected directory fsync failure was ignored")
+    assert target.read_bytes() == b"old-u1"

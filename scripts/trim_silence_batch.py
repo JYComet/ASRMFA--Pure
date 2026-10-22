@@ -41,6 +41,16 @@ try:
 except ImportError:
     from .audio_utils import resample_audio
 
+try:
+    from resource_budget import resolve_worker_count
+except ImportError:
+    from .resource_budget import resolve_worker_count
+
+try:
+    from trim_receipts import collect_audio, file_record, input_identity, verify_complete, write_receipt
+except ImportError:
+    from .trim_receipts import collect_audio, file_record, input_identity, verify_complete, write_receipt
+
 
 def _detect_silence_at_beginning_vec(
     wav: np.ndarray, sr: int, silence_threshold: float = 0.01, frame_length: int = 1024
@@ -263,16 +273,21 @@ def process_one_file(
     rel_path = input_wav.relative_to(input_root)
     output_path = output_root / rel_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    soundfile.write(str(output_path), trimmed, sr)
+    temporary = output_path.with_name(output_path.name + ".tmp")
+    try:
+        soundfile.write(str(temporary), trimmed, sr, format="WAV")
+        os.replace(temporary, output_path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
     return str(input_wav), str(output_path), len(audio), len(trimmed), sr
 
 
 def collect_wavs(input_root: Path):
-    return [p for p in input_root.rglob("*.wav") if p.is_file()]
+    return collect_audio(input_root)
 
 
-def main():
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Batch trim excessive silence for wav files (no segmentation)."
     )
@@ -297,28 +312,58 @@ def main():
         default=max(1, min(32, (os.cpu_count() or 1) + 4)),
         help="Number of parallel workers",
     )
-    args = parser.parse_args()
+    parser.add_argument("--cpu-budget", type=int, default=None,
+                        help="Optional caller CPU budget for this stage.")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Rebuild derived WAVs and the stage receipt.")
+    args = parser.parse_args(argv)
 
     input_root = Path(args.input_dir).resolve()
     output_root = Path(args.output_dir).resolve()
+    if output_root == input_root or output_root.is_relative_to(input_root):
+        print("ERROR: trim output must be outside the input tree")
+        return 1
+    parameters = {key: getattr(args, key) for key in (
+        "max_silence_sec", "sil_vol_threshold", "sil_len_threshold", "normalize_edges",
+        "target_edge_silence_sec", "edge_silence_threshold", "edge_frame_length", "target_sr")}
+    try:
+        identity = input_identity(input_root, parameters)
+        wav_files = [input_root / row["path"] for row in identity["inputs"]]
+        if output_root.is_symlink():
+            raise ValueError("trim output must not be a symlink")
+        if output_root.exists() and any(output_root.iterdir()) and not args.overwrite:
+            verify_complete(output_root, identity)
+            print(f"Trim identity and all outputs verified; reusing {len(wav_files)} WAVs")
+            return 0
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
     output_root.mkdir(parents=True, exist_ok=True)
-
-    if not input_root.exists() or not input_root.is_dir():
-        raise FileNotFoundError(f"Input directory not found: {input_root}")
-
-    wav_files = collect_wavs(input_root)
+    if args.overwrite:
+        for path in output_root.rglob("*"):
+            if path.suffix.lower() == ".wav":
+                if path.is_symlink() or not path.is_file():
+                    print(f"ERROR: unsafe trim output: {path}")
+                    return 1
+                path.unlink()
     total = len(wav_files)
     if total == 0:
         print(f"No wav files found under: {input_root}")
-        return
+        return 1
 
+    args.workers = resolve_worker_count(
+        args.workers, cpu_budget=args.cpu_budget,
+        item_count=total if args.cpu_budget is not None else None,
+        stage_cap=32 if args.cpu_budget is not None else None,
+        automatic=args.workers)
     print(f"Found {total} wav files. Start processing with workers={args.workers}")
     ok = 0
     fail = 0
+    outputs, failures = [], []
 
     from concurrent.futures import ProcessPoolExecutor as _PPE
     with _PPE(max_workers=args.workers) as executor:
-        futures = [
+        futures = {
             executor.submit(
                 process_one_file,
                 wav,
@@ -332,24 +377,32 @@ def main():
                 args.edge_silence_threshold,
                 args.edge_frame_length,
                 args.target_sr,
-            )
+            ): wav
             for wav in wav_files
-        ]
+        }
 
         for idx, fut in enumerate(as_completed(futures), start=1):
             try:
                 in_path, out_path, before_n, after_n, sr = fut.result()
                 ok += 1
+                outputs.append(file_record(Path(out_path), output_root))
                 print(
                     f"[{idx}/{total}] OK {in_path} -> {out_path} "
                     f"({before_n / sr:.2f}s -> {after_n / sr:.2f}s)"
                 )
             except Exception as e:
                 fail += 1
+                failures.append({"stem": futures[fut].stem,
+                                 "path": futures[fut].relative_to(input_root).as_posix(),
+                                 "reason": "trim_failed", "detail": str(e)})
                 print(f"[{idx}/{total}] FAIL {e}")
 
     print(f"Done. success={ok}, failed={fail}, total={total}")
+    if input_identity(input_root, parameters) != identity:
+        failures.append({"stem": "__stage__", "reason": "source_changed_during_trim"})
+    write_receipt(output_root, identity, outputs, failures)
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

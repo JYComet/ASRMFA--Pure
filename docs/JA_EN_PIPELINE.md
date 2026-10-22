@@ -31,7 +31,9 @@ mora 内部时间。
 ```bash
 python scripts/run_ja_en_pipeline.py --config configs/japanese_english_tts.yaml --check
 python scripts/run_ja_en_pipeline.py --config configs/japanese_english_tts.yaml --inspect
-python scripts/run_ja_en_pipeline.py --config configs/japanese_english_tts.yaml --stage inventory,audio,asr,reading,frontend,semantic,anchors,align,merge,tts,verify
+python scripts/run_ja_en_pipeline.py --config configs/japanese_english_tts.yaml
+# 完整生产 DAG 默认来自 PRODUCTION_STAGES；显式选择阶段时请保留 prosody：
+python scripts/run_ja_en_pipeline.py --config configs/japanese_english_tts.yaml --stage inventory,audio,asr,reading,frontend,semantic,anchors,align,merge,prosody,tts,verify
 python scripts/run_ja_en_pipeline.py --config configs/japanese_english_tts.yaml --resume --stage tts,verify
 python scripts/verify_ja_en_tts.py --workspace /data/runs/ja_en_v1
 python scripts/verify_ja_en_tts.py --workspace /data/runs/ja_en_v1 --integrity-only
@@ -39,7 +41,7 @@ python scripts/verify_ja_en_tts.py --workspace /data/runs/ja_en_v1 --integrity-o
 
 `--check` 只验证 manifest、配置和路径，不加载 ASR/MFA。`--stage` 使用逗号
 分隔的阶段名，`--resume` 会先重算 identity、文件集合和 receipt hash；源文件、
-模型、配置、schema 或实现 digest 改变时 fail closed。每条记录的输出包括
+模型、配置、schema 或实现 digest 改变时 fail closed。子集恢复会先校验 workspace 中历史阶段的 receipt、输出哈希和 cache identity，再把有效的 COMPLETE 阶段计入整次运行状态；缺失或损坏的历史阶段不会得到 COMPLETE。每条记录的输出包括
 `tts_training_records.jsonl` 和同 uid 的 TextGrid。v2 TextGrid 固定包含
 `original_text`、`kana`、`mfa_phone`、`phone_kana`、`phone_tone` 五层；
 MFA phone label 使用 `ja:` 或 `en:` 前缀。`original_text` 句首带 `<sp1>`；
@@ -63,20 +65,31 @@ run-root/
   config.yaml
 ```
 
-manifest 是 JSONL，每行至少有稳定 `uid`、`wav` 和 `text`：
+manifest 是 JSONL。有参考模式（`asr.reference_mode: authority`）每行需要稳定 `uid`、`wav` 和 `text`：
 
 ```json
 {"uid":"line-0001","wav":"audio/line-0001.wav","text":"さくら","speaker":"spk-a"}
 ```
+
+无参考模式设置 `asr.reference_mode: fallback`，输入 manifest 每行只需要
+`uid` 和 `wav`，不要复制 TXT 到这个 manifest。`asr` 阶段先使用旧版
+`scripts/run_pipeline.py --mode qwen3asr` 的 `transcript_only` profile 对
+音频阶段生成的 16 kHz WAV 盲识别；配置本机 `asr.qwen_model`、
+`asr.qwen_runtime`、`asr.language: Japanese`。识别产物和旧版原始 receipt 保存在
+`stages/asr/qwen3asr/`，逐条哈希校验后生成
+`stages/asr/resolved_manifest.jsonl`。此文件的 `text_origin` 为
+`qwen3asr_transcript_only`，后续日文阶段读取它，原输入清单保持无文本。
+`qwen_only_dev` 只表明开发测试，不构成生产 reading 的三家族证据。
 
 上游 stage 注册 TTS 与 Julius adapter 后，TTS stage 会读取已准备好的
 `alignment.jsonl`。每行必须绑定 `uid`、`train_wav`、`alignment_wav` 和
 `ja-en-alignment-v2` 内容；缺任何绑定都会返回 `BLOCKED/REJECTED`。建议每次改动
 模型、前端选项、字典、gold 或 manifest 都使用新的 workspace。
 
-provider smoke 也使用同一份配置和新的 workspace：先运行 `--check`，再按依赖顺序运行
-`--stage inventory,audio,asr,reading,frontend,semantic,anchors,align,merge,tts,verify`（只恢复已准备好的 TTS
-输入时可用 `--resume --stage tts,verify`）；这些阶段只有在对应本地 runtime、模型 revision
+provider smoke 也使用同一份配置和新的 workspace：先运行 `--check`，再直接运行默认完整生产 DAG（阶段顺序唯一来源为
+`PRODUCTION_STAGES`）。只有需要显式选择阶段时才传 `--stage`，并包含
+`prosody`：`inventory,audio,asr,reading,frontend,semantic,anchors,align,merge,prosody,tts,verify`。只恢复已准备好的 TTS
+输入时可用 `--resume --stage tts,verify`；这些阶段只有在对应本地 runtime、模型 revision
 和 receipt 已绑定时才会进入 `COMPLETE`。没有 runtime 的环境会保持 `BLOCKED`，
 不会把接口检查当成真实 ASR/MFA 质量认证。
 

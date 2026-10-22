@@ -263,10 +263,17 @@
 | 253–256 | 2026-09-14 | scripts/postprocess_textgrids.py, scripts/qwen3_prealign.py, scripts/run_pipeline.py, Qwen/filter/lifecycle/MFA 相关测试 | Qwen 无停顿标点、多音字、组合标点和 MFA 导出舍入误过滤 |
 | 257 | 2026-09-15 | scripts/full_corpus_publish.py（_validate_evidence、_validate_grid、validate_chunk_result）, scripts/full_corpus_orchestrator.py （_validate_completed_chunk、run_full）, tests/test_full_corpus_publish.py, tests/test_full_corpus_orchestrator.py | 过滤件被正式输出契约复检导致单条过滤扩散为整块失败 |
 | 258 | 2026-09-18 | scripts/ctc_prealign.py, tests/test_ctc_dictionary_transaction.py | 成功的 all-GPU 提交每次泄漏一个词典备份文件 |
+| 259 | 2026-09-30 | scripts/streaming_pipeline.py（_verify_final_publication_manifest、_load_complete_dataset_receipt、_aggregate_dataset_publication） | staging 证据通过但终态 TextGrid 被改写后仍接受 COMPLETE |
+| 260 | 2026-10-22 | run_pipeline.py, trim_silence_batch.py, trim_receipts.py | 裁剪失败与非空目录复用导致原始输入从统计分母消失 |
+| 261 | 2026-10-22 | run_pipeline.py, reference_inputs.py, qwen3_prealign.py | 参考文本布局和 offset 在父级选择与 Qwen 之间不一致 |
+| 262 | 2026-10-22 | qwen3_prealign.py | Qwen 逐条产物落盘但末尾才提交身份，导致进程中断无法恢复 |
+| 263 | 2026-10-22 | full_corpus_publish.py, full_corpus_stage.py, full_corpus_transaction.py | 逐文件发布失败只回滚当前项，导致一组结果混合且阻断重跑 |
+| 264 | 2026-10-22 | streaming_pipeline.py | 数据集 completed 提前返回绕过源内容与最终发布验证 |
+| 265 | 2026-10-22 | run_pipeline.py, run_ja_en_pipeline.py, docs/JA_EN_PIPELINE.md | 手写阶段列表和共享列表修改使正常运行或局部恢复缺少必需阶段 |
 
 ### 索引完整性与非 Case 章节
 
-截至 2026-09-18，Case 索引已覆盖 Case 1–258，每个存在的编号各出现一次；Case 标题与
+截至 2026-10-22，Case 索引已覆盖 Case 1–265，每个存在的编号各出现一次；Case 标题与
 正文均可按同一编号定位。Case 242 在正文中不存在（编号直接由 241 跳到 243），是真实
 空缺而非索引遗漏；Case 253–256 在正文中以单个合并章节书写，索引按同一形式记一行。
 除 Case 条目外，文档还包含以下纳入索引范围的专题章节：
@@ -13506,3 +13513,133 @@ python3 -m pytest -q -p no:cacheprovider tests/test_ctc_dictionary_transaction.p
 
 - `dict/.mfa_ipa.dict.previous-*`（9 个，已 untrack 并在 `.gitignore` 中加
   `dict/.*.previous-*`、`dict/.*.candidate-*`、`dict/.*.FAILED-*`）
+
+## Case 259 — 批量发布必须核验终态文件内容（2026-09-30）
+
+### 现象
+
+批次 staging 的收据和文件仍然完整，但正式 `output/a.TextGrid` 被改写为
+`tampered\n` 后，旧 `_load_complete_dataset_receipt` 仍接受已有 COMPLETE 收据。
+修复后，同一复现返回 `None`；新聚合过程中若先复制的 sibling 被改写，提交前抛出
+`final publication manifest mismatch`，不能签发成功收据。
+
+### 根因链
+
+1. 每个批次在 staging 中独立保存文件摘要，并通过 `_load_trusted_batch_evidence` 校验。
+2. 正式目录与 staging 是不同的物理副本；staging 通过不代表正式目录仍与之相同。
+3. COMPLETE 恢复路径检查 stem 集合和汇总报告摘要，没有将终态 TextGrid 内容与
+   staging 证据逐项比较。同名改写保留了 stem 集合，绕过了成功状态的实际内容约束。
+4. 发布效率优化移除逐批扫描累计目标目录后，必须以一次最终完整比较覆盖所有 sibling，
+   同时在恢复 COMPLETE 时执行相同的独立比较。
+
+### 修复位置
+
+- `scripts/streaming_pipeline.py`：`_publication_tree`（约 1190 行）拒绝符号链接目录及非普通文件。
+- `_copy_publication_tree`（约 1350 行）返回本批经过复制校验的清单，避免反复哈希此前批次。
+- `_verify_final_publication_manifest`（约 1497 行）比较 output/filtered 的完整相对路径、大小、
+  SHA-256 与 trusted batch evidence 的并集；重复目标和额外文件失败关闭。
+- `_load_complete_dataset_receipt`（约 1793 行）和 `_aggregate_dataset_publication`
+  （约 1906 行）在接受或生成 COMPLETE 前调用最终验证，不改变收据 schema。
+
+### 验证方法
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  tests/test_streaming_publication_copy.py \
+  tests/test_streaming_publication_contract.py
+```
+
+- `test_complete_dataset_resume_rejects_terminal_content_corruption`：发布完成后仅改写终态文件。
+- `test_aggregation_rejects_tamper_after_an_earlier_sibling_copy`：在第一批复制后注入改写。
+- `test_complete_dataset_resume_rejects_extra_terminal_file`：发布完成后新增未登记文件。
+- `test_aggregation_rejects_source_mutation_after_trusted_evidence`：验证后改写、删除或新增
+  staging 文件（包括顶层与嵌套非 TextGrid metadata）仍失败关闭。
+- `test_copy_publication_tree_hashes_only_current_batch_targets`：10 个单文件批次的复制阶段
+  目标哈希读取从 55 次降为 10 次；最终完整校验独立保留。
+
+本 Case 属于证据判定与实际发布状态不一致的逻辑冲突；仅优化重复 I/O 不足以修复它。
+
+
+## Case 260: 裁剪失败与非空目录复用导致原始输入从统计分母消失
+
+日期：2026-10-22。文件：`run_pipeline.py, trim_silence_batch.py, trim_receipts.py`。
+
+旧版两条输入 good/bad 中，bad WAV 无法解码时裁剪日志为 success=1/failed=1，进程却返回 0；随后分母由裁剪输出扫描成一条。非空输出即跳过，也使 overwrite=True 不能重建旧音频。
+
+根因链：裁剪 worker 异常仅打印 → 目录被视作完整阶段 → 后续从派生产物冻结 source。现在 `step_trim_silence` 在调用子进程前冻结原始 source/eligible；`main` 逐条保存成功/失败收据并返回非零；收据绑定源文件、参数、实现及全部输出 SHA-256，恢复拒绝缺失或改写的文件。覆盖通过 --overwrite 显式下传；封存 CTC 禁止原地重做音频。
+
+修复位置：`scripts/run_pipeline.py::step_trim_silence`（约 1456 行）、`_freeze_pre_ctc_stems`（约 1601 行）；`scripts/trim_silence_batch.py::main`（约 290 行）；`scripts/trim_receipts.py::verify_complete`。
+
+验证：`python -m pytest -q tests/test_pipeline_input_contracts.py`。断言坏 WAV 非零、两个源仍在分母、输入变化和输出篡改拒绝恢复、overwrite 重建帧数。
+
+
+## Case 261: 参考文本布局和 offset 在父级选择与 Qwen 之间不一致
+
+日期：2026-10-22。文件：`run_pipeline.py, reference_inputs.py, qwen3_prealign.py`。
+
+旧版 authority 只在根目录查 stem.txt，子目录的合法参考被排除；auto 模式把 line_qwen3-api.txt 忽略后调用 ASR，用“再见…”替代“你好”。a/b/c 的 offset=1,limit=2 实际选择 a/b。
+
+根因链：父级和 producer 分别实现参考发现 → 后缀及递归规则不同；父级仅 limit 切片 → stems_file 分支不再传 offset。现在双方共用 `resolve_references/load_reference_texts`，精确文件名优先，同优先级歧义拒绝，真实带 _qwen3 后缀的 stem 保持 literal 精确匹配。父级先应用 offset 再 limit，已存在选择清单必须与本次选择一致；排除原因区分 offset、limit、缺参考和不支持语言。
+
+修复位置：`scripts/reference_inputs.py::resolve_references`；`scripts/run_pipeline.py::_freeze_pre_ctc_stems`（约 1601 行）；`scripts/qwen3_prealign.py::run_qwen3_hf`。
+
+验证：`python -m pytest -q tests/test_pipeline_input_contracts.py tests/test_reference_inputs.py tests/test_qwen3_prealign.py`。检查 nested/legacy suffix 的 authority、offset 选择 b/c、选择参数改变拒绝恢复和歧义拒绝。
+
+
+## Case 262: Qwen 逐条产物落盘但末尾才提交身份，导致进程中断无法恢复
+
+日期：2026-10-22。文件：`qwen3_prealign.py`。
+
+旧版第一条 bundle 成功、第二条中断后，第一条 TextGrid 存在而 identity 不存在；重跑因非空目录无身份拒绝。按提交顺序等待 future 同时使快 GPU 等待慢首项。
+
+根因链：逐条写产物 → 仅正常退出循环才写 manifest/identity/receipt；调度只有消费队首结果后才补任务。现在启动时保存独立 progress identity，完整 bundle 提交后原子更新含文件哈希的 checkpoint；恢复核验 seed 和已提交文件，清理未提交残片，空 checkpoint、初始 identity 与 checkpoint 两次写入之间、最终 metadata 写入及清理两次 unlink 之间的窗口同样可恢复。最终 identity 不匹配仍拒绝，raw 封存约束保留。完成事件驱动 worker 补任务，producer 按完成顺序立即落盘 checkpoint，最终 manifest 独立排序；辅助有序接口保留有界重排缓存。
+
+修复位置：`scripts/qwen3_prealign.py::_load_progress`（约 364 行）、`infer_qwen_items`（约 444 行）、`run_qwen3_hf`（约 543 行）。
+
+验证：`python -m pytest -q tests/test_qwen3_prealign.py tests/test_qwen3_gpu_process_isolation.py`。覆盖首项之前、第二项、manifest 后、identity 后中断；检查篡改拒绝及快设备提前补任务。
+
+
+## Case 263: 逐文件发布失败只回滚当前项，导致一组结果混合且阻断重跑
+
+日期：2026-10-22。文件：`full_corpus_publish.py, full_corpus_stage.py, full_corpus_transaction.py`。
+
+旧版两个已有目标发布时第二项失败，第一项保留新字节、第二项保留旧字节；首项 rollback 残留使重跑报冲突，整组没有成功发布收据。
+
+根因链：每项自行备份/替换 → except 只处理当前项 → 编排器仅成功返回才写组收据。现在 TextGrid 与 GAMESL 两个入口共用组事务 helper：完整准备并校验全部副本、持久化 journal、逐项提交；任一提交异常逆序恢复整组，原先没有的目标也会移除；启动时恢复遗留 journal，历史 rollback 使用独立快照名保留。
+
+修复位置：`scripts/full_corpus_transaction.py::publish_files`（约 127 行）、`recover_transactions`（约 109 行）；`full_corpus_publish.py::publish_chunk`（约 317 行）；`full_corpus_stage.py::publish_gamesl`（约 304 行）。保持 0915ALL 暂存、GAMESL、计算、TextGrid 发布的原顺序；不把跨目录逐文件替换描述成对并发读者的瞬时版本切换。
+
+验证：`python -m pytest -q tests/test_full_corpus_publish.py tests/test_full_corpus_stage.py tests/test_full_corpus_orchestrator.py`。注入第 N 项复制、替换和目录 fsync 失败，检查全部目标还原、重跑成功，并模拟进程崩溃后恢复 journal。
+
+
+## Case 264: 数据集 completed 提前返回绕过源内容与最终发布验证
+
+日期：2026-10-22。文件：`streaming_pipeline.py`。
+
+旧版 checkpoint 标记全部数据集完成后，在 live inventory 检查前直接返回 True。合成输入中源 WAV 已改写、发布目录不存在，恢复仍报告成功。兼容缓存缺少 source_inventory 时仅检查 stem 集合。
+
+根因链：checkpoint 被当成成功凭证 → 完成项先过滤 → 源/终态哈希检查不再运行。现在 completed 只是恢复索引，必须先验证 live source，再以 COMPLETE publication receipt、批次证据和实际终态文件验证跳过资格。缺来源清单的新执行先冻结并持久化内容身份，旧 checkpoint/旧发布不能通过现场生成的新身份被追认为可信成功。
+
+修复位置：`scripts/streaming_pipeline.py::_validate_frozen_cache_inventory`（约 1328 行）、`run_batch`（约 3977 行）及 pipelined 入口；实际行号随新增冻结 helper 位移。
+
+验证：`python -m pytest -q tests/test_streaming_checkpoint_contract.py tests/test_streaming_publication_contract.py tests/test_streaming_ctc_cache_isolation.py`。覆盖源改写、缺最终收据、合法 COMPLETE 命中、新执行现场冻结和旧完成状态拒绝。
+
+
+## Case 265: 手写阶段列表和共享列表修改使正常运行或局部恢复缺少必需阶段
+
+日期：2026-10-22。文件：`run_pipeline.py, run_ja_en_pipeline.py, docs/JA_EN_PIPELINE.md`。
+
+旧版中文入口对共享 STEP_ORDER 执行 remove，关闭 strict_ok 的调用可能影响同进程后续调用；零散 --skip-* 可以从正常处理序列挖掉中间阶段。日英文档漏写 prosody，局部恢复只汇总本轮结果，即使历史阶段有效仍无法成为工作区 COMPLETE。
+
+根因链：多处复制步骤列表/原地修改 → 执行形状随调用漂移；本次调用范围与工作区整体状态混为一体。现在中文统一 NORMALIZATION_STAGES/ALIGNMENT_STAGES，`plan_pipeline_steps` 返回新列表，参数变化不移除处理中间步骤，skip flag 打洞及范围外 stop-after 明确拒绝；完整/恢复/维护执行范围写入 pipeline_plan.json 与会计收据。每个成功并通过输出验证的步骤再提交 pipeline_execution.json，绑定连续完成前缀、配置、代码及当前证据头；恢复或单步必须证明全部前置阶段，重验裁剪源/产物、resample 目录内容摘要和 CTC raw/work 文件。已有 16 kHz 文件也必须有匹配的历史执行摘要，不能仅凭文件数重新签发 lineage。旧工作区缺执行收据时明确拒绝，不凭目录存在追认阶段。日英默认使用 PRODUCTION_STAGES，恢复合并经过收据、文件哈希、cache identity 验证的历史状态，文档无需手写完整阶段。
+
+修复位置：`scripts/run_pipeline.py::plan_pipeline_steps`（约 7048 行）、`initialize_stage_execution`（约 7123 行）、`record_stage_execution`（约 7174 行）；`scripts/run_ja_en_pipeline.py::dispatch`（约 1092 行）、`_stage_receipt`（约 494 行）。0915ALL 原 strict_ok=false/外层发布门禁与声学参数保留。
+
+验证：`python -m pytest -q tests/test_pipeline_stage_plan.py tests/test_ja_en_foundation.py tests/test_ja_resume_identity.py`。覆盖 authority/fallback 参数矩阵、可选审计不污染下一次调用、跳步拒绝、准备后连续恢复、无执行收据拒绝、真实 trim 完成后恢复及源改写拒绝、损坏历史收据拒绝及完整 workspace 汇总。
+
+
+### 2026-10-22 本轮集成验证
+
+`PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider`：1825 passed、37 skipped，45.04 秒。`git diff --check` 与变更 Python 语法解析通过。
+
+使用独立确定性假后端对照修改前快照：authority 的 15 个 CTC/manifest 文件、fallback 的 13 个文件和两份实际裁剪 WAV 均逐字节一致。新执行/进度收据与身份元数据不作为声学内容一致性对象。未运行真实 GPU 模型，未重跑或改写 0915ALL 生产数据；生产基准配置文件保持原字节。

@@ -4,6 +4,33 @@
 
 设计与迁移说明见 [Qwen3 主管线设计](docs/superpowers/specs/2026-09-14-qwen3-main-pipeline-design.md)。MFA 锚点修正和对齐算法保持；主流程不回退 FunASR/NVASR。
 
+## 统一生产流程与恢复
+
+以 `configs/qwen3_0915all_full_20260914.yaml` 对应的 0915ALL 完整生产批次为流程基准。
+正常运行使用同一套处理阶段，修改输入、参考文本模式、资源预算和声学参数即可；
+游戏音频的首尾补静音、v5 原音频轴等差异由暂存参数决定。批量入口仍为
+`python scripts/full_corpus_orchestrator.py run --config <生产配置>`；新任务先完成该入口要求的
+`prepare`、`preflight`、`canary`，不要直接覆盖既有 0915ALL 产物。
+
+中文处理顺序统一为：音频准备 → Qwen 预对齐 → 标点、数字、ria、英语规范化 →
+能量边界调整 → 中文 MFA → 英语 MFA → 五层后处理 → 发布验证。
+CTC 导入与分阶段 GPU/CPU 执行复用同一处理顺序，并验证已存在的前置产物。
+`postprocess.strict_ok` 控制独立严格审计；0915ALL 保留原来的外层发布验证策略，
+不会因本次整理擅自改变其过滤门槛。
+
+每次主管线调用会写入 `workspace/pipeline_plan.json`，列出完整流程、本次执行范围和恢复所需前置阶段。
+成功步骤另写入 `pipeline_execution.json`；恢复会核对连续完成前缀、配置、实现和证据文件，
+并重验裁剪输入输出及 CTC raw/work 内容。仅有阶段计划或中间目录不能证明前置步骤已完成。
+没有执行收据的旧工作区应使用新工作区完整重做，不能自动追认历史步骤。
+`--skip-to` 只用于从已有证据恢复连续的后续阶段，`--step` 用于显式维护；
+`--stop-after` 必须处于本次执行范围，不能用零散 `--skip-*` 从正常流程中挖掉中间步骤。
+默认完整运行不需要手写阶段列表。
+
+裁剪现在按 `.trim_receipt.json` 验证输入、参数和全部输出；任一文件失败会返回非零，
+失败源仍保留在会计分母中。未封存的裁剪产物可以用 `--overwrite` 重建；已有封存 CTC 的
+工作区应使用新的工作区重做音频准备。Qwen 中断恢复按逐条文件哈希 checkpoint 复用已提交的完整结果。
+旧流式缓存缺少来源清单时，新的执行可现场冻结来源；旧完成状态必须重新建立证据，不能据此跳过验证。
+
 ## 前提条件
 
 - Conda (Miniconda 或 Anaconda)
@@ -153,15 +180,24 @@ python scripts/streaming_pipeline.py --config configs/batch_all.yaml --pipelined
 两个队列受限于缓冲区；每个 MFA（含英语 MFA）进程池的 `num_jobs` 也会被限制在主机
 CPU 预算以内。配置或命令行中的较大数值是请求值，不会绕过该上限。
 
+CPU 预算还会传入裁剪、重采样、CTC 边界调整、英文准备和后处理等辅助进程池。
+pipelined 模式按阶段所需的 CPU 额度排队，GPU 侧准备与 CPU 对齐阶段共用总预算；
+额度释放后再向下一阶段队列投递，单核配置也能正常推进。未显式指定预算时，
+批量调度器使用主机 CPU 数规划；直接运行单条主管线或阶段脚本仍保留原有默认值。
+
 常用资源控制如下：
 
 | 控制项 | 作用 |
 |------|------|
+| `--cpu-budget N` | 本次调用的正整数 CPU 预算；批量入口按 worker 分配并下传，主管线继续限制各阶段的辅助进程池。 |
 | `streaming.num_gpus` / `--gpus N` | GPU worker 数；未指定或为 `0` 时自动检测。 |
 | `pipelined.cpu_workers` / `--cpu-workers N` | pipelined 模式的 CPU worker 数；`0` 为自动规划。 |
 | `mfa.num_jobs`、`mfa_en.num_jobs` / `--mfa-jobs N`、`--mfa-en-jobs N` | 每个 worker 的 MFA 请求值；资源规划器会按 CPU 预算截断。 |
 | `mfa.dither`、`mfa_en.dither` | MFCC dither；默认 `0.0`，确保相同输入和配置的 MFA 边界可重复。生产与单条恢复都会显式传给 MFA。 |
 | `streaming.prefetch_buffer`、`streaming.upload_buffer` | 两个有界队列的容量；增大可提高吞吐，但需要更多本地 NVMe 空间。 |
+
+收据提交会复用同一次提交内的 CTC 文件摘要；发布会复用已经验证的批次清单，
+减少重复读取。恢复与最终发布仍独立核验实际文件内容，模型、规范化顺序和过滤规则保持不变。
 
 MFA 声学模型元数据通常自带 `dither: 1`。随机 dither 会使同一音频的边界在多次运行间漂移，
 甚至影响临界音素 QC；本项目因此把中文、英文、分片和单条恢复命令统一固定为 `0.0`。

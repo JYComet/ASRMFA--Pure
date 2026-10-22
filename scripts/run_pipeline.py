@@ -2,9 +2,11 @@
 """
 Complete Chinese MFA forced alignment pipeline.
 
-Full mode:  trim -> resample -> prealign -> normalize -> adjust -> validate -> align -> postprocess
-ctc_ready:  link -> normalize_punct -> normalize -> normalize_en -> resample -> adjust -> align -> postprocess
-            (skip trim/prealign — use pre-existing NVASR CTC output)
+Full mode: audio preparation -> Qwen prealign -> shared normalization spine
+           -> energy adjustment -> Chinese MFA -> English MFA -> postprocess
+           -> configured independent audit / outer publication validation.
+ctc_ready imports existing evidenced CTC and uses the same processing spine.
+The resolved complete/resume/maintenance route is saved as pipeline_plan.json.
 
 Usage:
   # Full pipeline
@@ -44,6 +46,8 @@ DEFAULT_CONFIG = PROJECT_ROOT / "config.yaml"
 
 # ── Shared pipeline utilities (canonical implementations in pipeline_utils.py) ──
 sys.path.insert(0, str(SCRIPTS_DIR))
+from reference_inputs import load_reference_texts
+from trim_receipts import collect_audio, input_identity as trim_input_identity, verify_complete as verify_trim_complete
 from pipeline_utils import (
     parse_ctc_normalization_marker,
     find_mfa_python, get_mfa_env, resolve_mfa_dither, require_mfa_anchor_support,
@@ -71,6 +75,7 @@ from pipeline_utils import (
     CTC_RAW_MANIFEST_SCHEMA, CTC_WORK_RECEIPT_SCHEMA,
     write_ctc_raw_manifest, validate_ctc_raw_manifest,
     materialize_ctc_work, write_ctc_work_receipt,
+    CtcWorkCommitSnapshot,
     validate_ctc_work_receipt,
     MFA_ALIGNMENT_AXIS_RECEIPT_V2_SCHEMA,
     make_mfa_alignment_axis_receipt_v2,
@@ -80,6 +85,7 @@ from pipeline_utils import (
     classify_input_path,
     resolve_ctc_prealign_provider,
 )
+from resource_budget import resolve_worker_count
 
 
 _NATIVE_MIN_UTTERANCE_S = 0.11
@@ -1341,7 +1347,8 @@ def _ensure_ctc_work(ctx: dict, *, overwrite: bool = False) -> Path | None:
 
 
 def _ctc_work_freshness_fingerprints(ctx: dict, work: Path,
-                                     receipt: dict) -> dict:
+                                     receipt: dict,
+                                     snapshot: CtcWorkCommitSnapshot | None = None) -> dict:
     """Build a content-bound freshness block for derived CTC work."""
     raw = Path(ctx["ctc_pretg"])
     raw_manifest = Path(ctx.get("ctc_raw_manifest", raw / CTC_RAW_MANIFEST_NAME))
@@ -1354,12 +1361,15 @@ def _ctc_work_freshness_fingerprints(ctx: dict, work: Path,
                             ("qwen3_hf_backend.py", "qwen3_prealign.py", "qwen3_timestamp_normalization.py"))
     producer = {str(path.relative_to(PROJECT_ROOT)): _sha256_file(path)
                 for path in module_paths if path.is_file()}
-    rows = []
-    for path in sorted(work.iterdir()):
-        if path.name == CTC_WORK_RECEIPT_NAME or not path.is_file() or path.is_symlink():
-            continue
-        rows.append({"name": path.name, "size": path.stat().st_size,
-                     "sha256": _sha256_file(path)})
+    if snapshot is None:
+        rows = []
+        for path in sorted(work.iterdir()):
+            if path.name == CTC_WORK_RECEIPT_NAME or not path.is_file() or path.is_symlink():
+                continue
+            rows.append({"name": path.name, "size": path.stat().st_size,
+                         "sha256": _sha256_file(path)})
+    else:
+        rows = [dict(row) for row in snapshot.freshness_rows]
     expected = tuple(ctx.get("expected_stems",
                              ctx.get("accounting_eligible_stems", ())))
     return make_pipeline_resume_fingerprints(
@@ -1378,9 +1388,13 @@ def _ctc_work_freshness_fingerprints(ctx: dict, work: Path,
     )
 
 
-def _write_ctc_work_freshness(ctx: dict, work: Path, receipt: dict) -> dict:
+def _write_ctc_work_freshness(ctx: dict, work: Path, receipt: dict,
+                              snapshot: CtcWorkCommitSnapshot | None = None) -> dict:
     receipt = dict(receipt)
-    receipt["fingerprints"] = _ctc_work_freshness_fingerprints(ctx, work, receipt)
+    receipt["fingerprints"] = _ctc_work_freshness_fingerprints(
+        ctx, work, receipt, snapshot=snapshot)
+    if snapshot is not None:
+        snapshot.validate_current(work, Path(ctx.get("ctc_raw_manifest", "")))
     identity = dict(receipt)
     identity.pop("identity", None)
     receipt["identity"] = stable_json_digest(identity)
@@ -1414,15 +1428,17 @@ def _record_ctc_work_stage(ctx: dict, stage: str, *, status: str = "completed") 
     raw_manifest = Path(ctx.get("ctc_raw_manifest", ""))
     try:
         prior = json.loads((work / CTC_WORK_RECEIPT_NAME).read_text(encoding="utf-8"))
+        snapshot = CtcWorkCommitSnapshot.capture(work, raw_manifest)
         ledger = list(prior.get("transform_ledger", []))
         ledger.append({"stage": stage, "status": status,
                        "work_files_digest": stable_json_digest(
-                           [{"name": p.name, "sha256": _sha256_file(p)}
-                            for p in sorted(work.iterdir())
-                            if p.is_file() and p.name != CTC_WORK_RECEIPT_NAME])})
+                           [{"name": row["name"], "sha256": row["sha256"]}
+                            for row in snapshot.freshness_rows])})
         receipt = write_ctc_work_receipt(work, raw_manifest,
-                                         transform_ledger=ledger)
-        receipt = _write_ctc_work_freshness(ctx, work, receipt)
+                                         transform_ledger=ledger,
+                                         snapshot=snapshot)
+        receipt = _write_ctc_work_freshness(ctx, work, receipt,
+                                            snapshot=snapshot)
         ctx["ctc_work_receipt"] = receipt
         return 0
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1440,28 +1456,55 @@ def _record_ctc_work_stage(ctx: dict, stage: str, *, status: str = "completed") 
 def step_trim_silence(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     tc = cfg["trim"]
     wav_out = ctx["audio_dir"]
-    if wav_out.exists() and any(wav_out.iterdir()) and not args.force:
-        print(f"  Output exists: {wav_out}. Use --force to re-run.")
-        return 0
+    try:
+        source_stems = tuple(sorted(path.stem for path in collect_audio(Path(ctx["data_dir"]))))
+    except (OSError, ValueError) as exc:
+        print(f"  ERROR: unable to freeze trim inputs: {exc}")
+        return 1
+    # Freeze before the child can fail: derived output must never define the
+    # original source denominator of a partially completed preprocessing run.
+    ctx["accounting_source_stems"] = source_stems
+    ctx["accounting_eligible_stems"] = source_stems
+    ctx["accounting_exclusions"] = ()
+    ctx["trim_source_stems"] = source_stems
+    ctx["trim_validated"] = False
+    if (getattr(args, "overwrite", False)
+            and (Path(ctx.get("ctc_pretg", Path(ctx["workspace"]) / "ctc_pretg")) /
+                 CTC_RAW_MANIFEST_NAME).is_file()):
+        print("  ERROR: cannot rebuild trim beneath sealed CTC; use a fresh workspace")
+        return 1
     trim_args = [
         "--input-dir", str(ctx["data_dir"]), "--output-dir", str(wav_out),
         "--max-silence-sec", str(tc["max_silence_sec"]),
         "--sil-vol-threshold", str(tc["sil_vol_threshold"]),
         "--sil-len-threshold", str(tc["sil_len_threshold"]),
         "--workers", str(tc["workers"]),
+        "--target-edge-silence-sec", str(tc["target_edge_silence_sec"]),
+        "--edge-silence-threshold", str(tc["edge_silence_threshold"]),
+        "--edge-frame-length", str(tc["edge_frame_length"]),
     ]
+    if getattr(args, "cpu_budget", None) is not None:
+        trim_args += ["--cpu-budget", str(args.cpu_budget)]
     if tc.get("normalize_edges"):
-        trim_args += [
-            "--normalize-edges",
-            "--target-edge-silence-sec", str(tc["target_edge_silence_sec"]),
-            "--edge-silence-threshold", str(tc["edge_silence_threshold"]),
-            "--edge-frame-length", str(tc["edge_frame_length"]),
-        ]
+        trim_args += ["--normalize-edges"]
     if tc.get("target_sr"):
         trim_args += ["--target-sr", str(int(tc["target_sr"]))]
-    return run_python(SCRIPTS_DIR / "trim_silence_batch.py", trim_args, mfa_python,
-                      ctx["models_dir"],
-                      "Step 1: Audio Preprocessing")
+    if getattr(args, "overwrite", False):
+        trim_args.append("--overwrite")
+    rc = run_python(SCRIPTS_DIR / "trim_silence_batch.py", trim_args, mfa_python,
+                    ctx["models_dir"], "Step 1: Audio Preprocessing")
+    if rc != 0:
+        return rc
+    parameters = {key: tc.get(key) for key in (
+        "max_silence_sec", "sil_vol_threshold", "sil_len_threshold", "normalize_edges",
+        "target_edge_silence_sec", "edge_silence_threshold", "edge_frame_length", "target_sr")}
+    try:
+        verify_trim_complete(Path(wav_out), trim_input_identity(Path(ctx["data_dir"]), parameters))
+    except (OSError, ValueError) as exc:
+        print(f"  ERROR: trim output verification failed: {exc}")
+        return 1
+    ctx["trim_validated"] = True
+    return 0
 
 
 def _resample_one(wav_path: Path, audio_dir: Path, out_dir: Path,
@@ -1567,15 +1610,21 @@ def _freeze_pre_ctc_stems(cfg: dict, ctx: dict) -> tuple[str, ...] | None:
         return tuple(ctx.get("expected_stems", ())) or None
     if ctx.get("expected_stems"):
         return tuple(ctx["expected_stems"])
+    if ctx.get("trim_source_stems") and not ctx.get("trim_validated"):
+        print("  ERROR: cannot freeze a partial trim output as the source inventory")
+        return None
 
     audio_dir = Path(ctx["audio_dir"])
     workspace = Path(ctx["workspace"])
     manifest = workspace / "pre_ctc_stems.txt"
     prealign_cfg = cfg.get("ctc_prealign", {})
     limit = int(prealign_cfg.get("limit", 0) or 0)
+    offset = int(prealign_cfg.get("offset", 0) or 0)
     fixed_manifest = prealign_cfg.get("selection_manifest")
     fixed_expected_hash = prealign_cfg.get("selection_stems_sha256")
     try:
+        if offset < 0 or limit < 0:
+            raise ValueError("pre-CTC offset/limit must be non-negative")
         entries = sorted(
             (path for path in audio_dir.rglob("*.wav")
              if path.is_file() and not path.is_symlink()),
@@ -1598,6 +1647,26 @@ def _freeze_pre_ctc_stems(cfg: dict, ctx: dict) -> tuple[str, ...] | None:
             print("  ERROR: pre-CTC physical WAV denominator is empty")
             return None
 
+        candidate = universe[offset:]
+        candidate = candidate[:limit] if limit > 0 else candidate
+        candidate_set = set(candidate)
+        exclusions = {stem: "pre_ctc_offset" if i < offset else "pre_ctc_limit"
+                      for i, stem in enumerate(universe) if stem not in candidate_set}
+        if resolve_reference_mode(cfg) == "authority":
+            references = load_reference_texts(Path(ctx.get("data_dir", audio_dir)), candidate)
+            selected_with_ref = []
+            for stem in candidate:
+                reference = references.get(stem, "")
+                if not reference:
+                    exclusions[stem] = "missing_reference"
+                elif any(0x3041 <= ord(ch) <= 0x3096 or ord(ch) in (0x309D, 0x309E)
+                         or 0x30A1 <= ord(ch) <= 0x30FA or ord(ch) in (0x30FD, 0x30FE)
+                         for ch in reference):
+                    exclusions[stem] = "unsupported_reference_language"
+                else:
+                    selected_with_ref.append(stem)
+            candidate = tuple(selected_with_ref)
+
         if fixed_manifest:
             fixed_path = resolve_input_path(str(fixed_manifest), PROJECT_ROOT)
             if not fixed_path.is_file():
@@ -1606,13 +1675,17 @@ def _freeze_pre_ctc_stems(cfg: dict, ctx: dict) -> tuple[str, ...] | None:
             selected = tuple(payload.get("stems", ())) if isinstance(payload, dict) else ()
             declared_hash = payload.get("stems_sha256") if isinstance(payload, dict) else None
             expected_hash = fixed_expected_hash or declared_hash
-            if (not selected or len(selected) != 1000
+            if (not selected
                     or payload.get("count") != len(selected)
                     or stable_json_digest(sorted(selected)) != expected_hash
                     or (declared_hash is not None and declared_hash != expected_hash)):
                 raise ValueError("fixed selection manifest count/hash contract failed")
             if len(set(selected)) != len(selected) or tuple(sorted(selected)) != selected:
                 raise ValueError("fixed selection manifest must be sorted and unique")
+            if any(stem not in by_stem for stem in selected):
+                raise ValueError("fixed selection references missing source WAVs")
+            selected_set = set(selected)
+            exclusions = {stem: "selection_manifest" for stem in universe if stem not in selected_set}
             selection_source = f"fixed_manifest:{fixed_path}"
         elif manifest.is_file():
             selected = tuple(line.strip() for line in
@@ -1620,38 +1693,12 @@ def _freeze_pre_ctc_stems(cfg: dict, ctx: dict) -> tuple[str, ...] | None:
                              if line.strip())
             if (not selected or selected != tuple(sorted(set(selected)))
                     or any(stem not in by_stem for stem in selected)
-                    or (limit > 0 and len(selected) > limit)):
+                    or selected != candidate):
                 print("  ERROR: invalid pre-CTC stem selection manifest")
                 return None
             selection_source = "existing_manifest"
         else:
-            selected = universe[:limit] if limit > 0 else universe
-            # In authority (reference) mode a non-empty, non-Japanese reference
-            # text is required; exclude empty/missing and kana-bearing stems so
-            # the frozen denominator agrees with ctc_prealign's
-            # _reference_inventory.
-            if (cfg.get("reference_mode") == "authority"
-                    and not prealign_cfg.get("allow_missing_reference", False)):
-                _txt_root = Path(ctx["data_dir"])
-                _selected_with_ref = []
-                for _stem in selected:
-                    _txt = _txt_root / f"{_stem}.txt"
-                    try:
-                        _ref = _txt.read_text(encoding="utf-8").strip() if _txt.is_file() else ""
-                    except OSError:
-                        _ref = ""
-                    if not _ref:
-                        continue
-                    _kana = any(
-                        0x3041 <= ord(_ch) <= 0x3096
-                        or ord(_ch) in (0x309D, 0x309E)
-                        or 0x30A1 <= ord(_ch) <= 0x30FA
-                        or ord(_ch) in (0x30FD, 0x30FE)
-                        for _ch in _ref)
-                    if _kana:
-                        continue
-                    _selected_with_ref.append(_stem)
-                selected = _selected_with_ref
+            selected = candidate
             manifest.parent.mkdir(parents=True, exist_ok=True)
             manifest.write_text("\n".join(selected) + "\n", encoding="utf-8")
             selection_source = "physical_wav_scan"
@@ -1677,15 +1724,17 @@ def _freeze_pre_ctc_stems(cfg: dict, ctx: dict) -> tuple[str, ...] | None:
             "source_count": len(universe),
             "selected_count": len(selected),
             "limit": limit,
+            "offset": offset,
             "stems": list(selected),
         }
         # Keep the physical source universe distinct from the selected
         # denominator in the final accounting receipt.
         ctx["accounting_source_stems"] = universe
         ctx["accounting_eligible_stems"] = selected
+        selected_set = set(selected)
         ctx["accounting_exclusions"] = tuple(
-            {"stem": stem, "reason": "pre_ctc_limit"}
-            for stem in universe if stem not in set(selected))
+            {"stem": stem, "reason": exclusions.get(stem, "selection_manifest")}
+            for stem in universe if stem not in selected_set)
         print(f"  Frozen pre-CTC stems: {len(selected)}/{len(universe)}"
               f" (limit={ctx['pre_ctc_selection']['limit']},"
               f" source={selection_source})")
@@ -1930,6 +1979,12 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         except OSError:
             pass
     if existing_count >= len(wavs) and not overwrite:
+        execution = ctx.get("pipeline_execution_state")
+        if isinstance(execution, dict):
+            previous_audio = execution.get("resample_audio")
+            if previous_audio is None or previous_audio != _path_fingerprint(mfa_audio_dir):
+                print("  ERROR: existing resample outputs lack matching execution evidence; use --overwrite")
+                return 1
         print(f"  {existing_count} resampled WAVs already exist. Use --overwrite to redo.")
         if selected_stems:
             entries = list(mfa_audio_dir.iterdir())
@@ -1953,6 +2008,9 @@ def step_resample_for_mfa(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
 
     n_workers = min(resolve_num_jobs(cfg.get("mfa", {}).get("num_jobs", 0)),
                     len(wavs), mp.cpu_count())
+    n_workers = resolve_worker_count(
+        n_workers, cpu_budget=getattr(args, "cpu_budget", None),
+        item_count=len(wavs), stage_cap=mp.cpu_count(), automatic=n_workers)
     done = skipped = 0
     actions: dict[str, int] = {}
 
@@ -2025,7 +2083,9 @@ def step_mfa_validate(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         "--acoustic_model_path", acoustic_model_arg,
         "--audio_directory", str(ctx["mfa_audio_dir"]),
         "--temporary_directory", str(ctx["temp_dir"]),
-        "--num_jobs", str(resolve_num_jobs(mc.get("num_jobs", 0))),
+        "--num_jobs", str(resolve_worker_count(
+            resolve_num_jobs(mc.get("num_jobs", 0)),
+            cpu_budget=getattr(args, "cpu_budget", None))),
         "--dither", str(resolve_mfa_dither(mc.get("dither", 0.0))),
         "--overwrite",
     ]
@@ -3370,6 +3430,8 @@ def step_normalize_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     nw = en_cfg.get("normalize_workers", 0)
     if nw > 0:
         norm_en_args += ["--workers", str(nw)]
+    if getattr(args, "cpu_budget", None) is not None:
+        norm_en_args += ["--cpu-budget", str(args.cpu_budget)]
     if ctx.get("mfa_dict"):
         norm_en_args += ["--dict-path", str(ctx["mfa_dict"])]
     rc = run_python(
@@ -3497,6 +3559,8 @@ def step_adjust_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         ]
         if args.overwrite:
             adjust_args.append("--overwrite")
+        if getattr(args, "cpu_budget", None) is not None:
+            adjust_args += ["--cpu-budget", str(args.cpu_budget)]
         rc = run_python(
             SCRIPTS_DIR / "adjust_ctc_boundaries.py", adjust_args, mfa_python,
             ctx["models_dir"], "Step 5: Build processed CTC geometry")
@@ -3546,6 +3610,8 @@ def step_adjust_ctc(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         adjust_args += ["--limit", str(ac["limit"])]
     if args.overwrite:
         adjust_args.append("--overwrite")
+    if getattr(args, "cpu_budget", None) is not None:
+        adjust_args += ["--cpu-budget", str(args.cpu_budget)]
 
     rc = run_python(SCRIPTS_DIR / "adjust_ctc_boundaries.py", adjust_args, mfa_python,
                     ctx["models_dir"], "Step 5: Adjust CTC boundaries (energy-based)")
@@ -4463,7 +4529,9 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         "--audio_directory", str(ctx["mfa_audio_dir"]),
         "--temporary_directory", str(ctx["temp_dir"]),
         "--output_format", mc.get("output_format", "long_textgrid"),
-        "--num_jobs", str(resolve_num_jobs(mc.get("num_jobs", 0))),
+        "--num_jobs", str(resolve_worker_count(
+            resolve_num_jobs(mc.get("num_jobs", 0)),
+            cpu_budget=getattr(args, "cpu_budget", None))),
         "--dither", str(resolve_mfa_dither(mc.get("dither", 0.0))),
         "--overwrite", "--no_textgrid_cleanup",
     ]
@@ -4564,7 +4632,9 @@ def step_mfa_align(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         workspace=ctx["workspace"],
         mfa_python=mfa_python,
         models_dir=ctx["models_dir"],
-        num_jobs=resolve_num_jobs(mc.get("num_jobs", 0)),
+        num_jobs=resolve_worker_count(
+            resolve_num_jobs(mc.get("num_jobs", 0)),
+            cpu_budget=getattr(args, "cpu_budget", None)),
         single_speaker=mc.get("single_speaker", False),
         no_tokenization=mc.get("no_tokenization", False),
         beam=mc.get("beam", 20),
@@ -4824,6 +4894,8 @@ def step_mfa_align_en(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
     cw = en_cfg.get("corpus_workers", 0)
     if cw > 0:
         align_en_args += ["--corpus-workers", str(cw)]
+    if getattr(args, "cpu_budget", None) is not None:
+        align_en_args += ["--cpu-budget", str(args.cpu_budget)]
     if args.python:
         align_en_args += ["--python", str(mfa_python)]
 
@@ -5130,6 +5202,8 @@ def step_postprocess(args, cfg: dict, mfa_python: Path, ctx: dict) -> int:
         pp_args.append("--no-handle-unexpected-sil")
     if pc.get("workers", 0) > 0:
         pp_args += ["--workers", str(pc["workers"])]
+    if getattr(args, "cpu_budget", None) is not None:
+        pp_args += ["--cpu-budget", str(args.cpu_budget)]
     axis_args = _axis_interface_args(ctx)
     if axis_args is None:
         return 1
@@ -6970,10 +7044,168 @@ STEPS = {
     "strict_ok": ("Independent strict-ok audit and manifest", step_strict_ok),
 }
 
-FULL_STEP_ORDER = ["trim", "resample", "prealign", "normalize_punct", "normalize", "normalize_ria", "normalize_en", "adjust", "align", "align_en", "postprocess", "strict_ok"]
-CTC_READY_STEP_ORDER = ["link", "normalize_punct", "normalize", "normalize_ria", "normalize_en", "resample", "adjust", "align", "align_en", "postprocess", "strict_ok"]
-STRICT_CTC_READY_STEP_ORDER = ["link", "normalize_punct", "normalize", "normalize_ria", "normalize_en", "resample", "adjust", "align", "align_en", "postprocess", "strict_ok"]
-NVASR_FALLBACK_STEP_ORDER = ["pad_silence", "prealign", "normalize_punct", "normalize", "normalize_ria", "normalize_en", "resample", "adjust", "align", "align_en", "postprocess", "strict_ok"]
+# One shared processing spine, matching the 0915ALL production run. Importing
+# existing CTC changes the acquisition prefix, never the downstream sequence.
+NORMALIZATION_STAGES = ("normalize_punct", "normalize", "normalize_ria", "normalize_en")
+ALIGNMENT_STAGES = ("adjust", "align", "align_en", "postprocess", "strict_ok")
+FULL_STEP_ORDER = ["trim", "resample", "prealign", *NORMALIZATION_STAGES, *ALIGNMENT_STAGES]
+CTC_READY_STEP_ORDER = ["link", *NORMALIZATION_STAGES, "resample", *ALIGNMENT_STAGES]
+STRICT_CTC_READY_STEP_ORDER = list(CTC_READY_STEP_ORDER)
+NVASR_FALLBACK_STEP_ORDER = ["pad_silence", "prealign", *NORMALIZATION_STAGES, "resample", *ALIGNMENT_STAGES]
+
+
+def plan_pipeline_steps(args, cfg: dict, mode: str, *, strict_ready: bool = False) -> dict:
+    """Resolve complete/resume/maintenance runs without mutating shared orders.
+
+    A resume is a contiguous suffix of the same production route. Individual
+    skip flags cannot create unnoticed holes inside that route. Prerequisite
+    stages remain recorded even when receipt-validated outputs are reused.
+    """
+    orders = {"full": FULL_STEP_ORDER, "ctc_ready": CTC_READY_STEP_ORDER,
+              "nvrasr_fallback": NVASR_FALLBACK_STEP_ORDER}
+    if mode not in orders:
+        raise ValueError(f"no ordinary pipeline stage route for mode={mode}")
+    order = list(orders[mode])
+    if not cfg.get("postprocess", {}).get("strict_ok", True):
+        order.remove("strict_ok")
+    single, resume, stop = (getattr(args, key, None) for key in ("step", "skip_to", "stop_after"))
+    if single and resume:
+        raise ValueError("--step and --skip-to are mutually exclusive")
+    prerequisites = []
+    invocation = "complete"
+    if single:
+        if single not in STEPS:
+            raise ValueError(f"unknown --step {single!r}")
+        selected = [single]
+        prerequisites = order[:order.index(single)] if single in order else []
+        invocation = "maintenance"
+    elif resume:
+        if resume not in order:
+            raise ValueError(f"--skip-to {resume!r} is not in the {mode} route")
+        prerequisites = order[:order.index(resume)]
+        selected = order[order.index(resume):]
+        invocation = "resume"
+    else:
+        selected = list(order)
+    omitted = [stage for stage in selected if getattr(args, f"skip_{stage}", False)]
+    if omitted:
+        raise ValueError("skip flags would omit required stages: " + ", ".join(omitted)
+                         + "; use --skip-to for receipt-validated resume or --step for maintenance")
+    if getattr(args, "scan_only", False):
+        if mode != "ctc_ready":
+            raise ValueError("--scan-only requires ctc_ready; full preprocessing changes audio")
+        selected, prerequisites, invocation = ["link"], [], "scan"
+    if stop:
+        if stop not in selected:
+            raise ValueError(f"--stop-after {stop!r} is outside the selected stage range")
+        selected = selected[:selected.index(stop) + 1]
+        invocation = "partial"
+    if strict_ready and selected != STRICT_CTC_READY_STEP_ORDER:
+        raise ValueError("strict v4 requires the complete no-padding stage route")
+    return {"schema": "pipeline-stage-plan-v1", "baseline": "0915all",
+            "mode": mode, "invocation": invocation, "production_steps": order,
+            "prerequisite_steps": prerequisites, "execution_steps": selected,
+            "audit_policy": "strict_ok" if "strict_ok" in order else "outer_publication_gate"}
+
+
+def _execution_evidence(ctx: dict) -> dict:
+    """Bind the current receipt heads; consumers still validate artifact bytes."""
+    paths = [Path(ctx["workspace"]) / name for name in (
+        ".mfa_input_axis_receipt.json", ".mfa_alignment_axis_receipt.json")]
+    for key, names in (
+        ("audio_dir", (".trim_receipt.json",)),
+        ("ctc_pretg", (CTC_RAW_MANIFEST_NAME, ".ctc_run_receipt.json")),
+        ("ctc_pretg_adj", (CTC_WORK_RECEIPT_NAME,)),
+        ("en_phones_dir", ("en_alignment_manifest.json",)),
+    ):
+        if key in ctx:
+            paths.extend(Path(ctx[key]) / name for name in names)
+    evidence = {}
+    for path in paths:
+        if path.is_symlink():
+            raise ValueError(f"unsafe execution evidence: {path}")
+        if path.is_file():
+            evidence[str(path.resolve())] = _sha256_file(path)
+    return evidence
+
+
+def initialize_stage_execution(ctx: dict, cfg: dict, plan: dict) -> None:
+    """Require proof of a contiguous completed prefix before skipping it."""
+    path = Path(ctx["workspace"]) / "pipeline_execution.json"
+    identity = {"mode": plan["mode"], "production_steps": plan["production_steps"],
+                "config_digest": stable_json_digest(cfg),
+                "implementation_digest": _sha256_file(Path(__file__))}
+    completed = []
+    resample_audio = None
+    prerequisites = plan["prerequisite_steps"]
+    if prerequisites:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("missing pipeline execution receipt for prerequisites; "
+                             "run the complete pipeline in a fresh workspace")
+        state = json.loads(path.read_text(encoding="utf-8"))
+        checksum = state.pop("receipt_digest", None)
+        if (state.get("schema") != "pipeline-execution-v1"
+                or checksum != stable_json_digest(state) or state.get("identity") != identity):
+            raise ValueError("pipeline execution receipt identity changed or is corrupt")
+        completed = state.get("completed_steps", [])
+        if (not isinstance(completed, list)
+                or completed != plan["production_steps"][:len(completed)]
+                or completed[:len(prerequisites)] != prerequisites):
+            raise ValueError("pipeline execution receipt does not prove every prerequisite")
+        if state.get("evidence") != _execution_evidence(ctx):
+            raise ValueError("pipeline execution receipt evidence changed")
+        resample_audio = state.get("resample_audio")
+        if "resample" in prerequisites:
+            if (not isinstance(resample_audio, dict)
+                    or resample_audio != _path_fingerprint(Path(ctx["mfa_audio_dir"]))):
+                raise ValueError("resample outputs differ from the completed execution receipt")
+        if "trim" in prerequisites:
+            tc = cfg["trim"]
+            parameters = {key: tc.get(key) for key in (
+                "max_silence_sec", "sil_vol_threshold", "sil_len_threshold", "normalize_edges",
+                "target_edge_silence_sec", "edge_silence_threshold", "edge_frame_length", "target_sr")}
+            verify_trim_complete(Path(ctx["audio_dir"]),
+                                 trim_input_identity(Path(ctx["data_dir"]), parameters))
+        if "prealign" in prerequisites or "link" in prerequisites:
+            raw = Path(ctx["ctc_pretg"])
+            if not (raw / CTC_RAW_MANIFEST_NAME).is_file():
+                raise ValueError("missing sealed CTC prerequisite evidence")
+            errors = validate_ctc_raw_manifest(raw)
+            if errors:
+                raise ValueError("CTC prerequisite failed: " + "; ".join(errors[:3]))
+            work = Path(ctx["ctc_pretg_adj"])
+            if any(stage in prerequisites for stage in NORMALIZATION_STAGES):
+                errors = validate_ctc_work_receipt(work, raw / CTC_RAW_MANIFEST_NAME)
+                if errors:
+                    raise ValueError("CTC work prerequisite failed: " + "; ".join(errors[:3]))
+        # Re-executing an earlier stage invalidates all following completions.
+        completed = list(prerequisites)
+    ctx["pipeline_execution_state"] = {
+        "schema": "pipeline-execution-v1", "identity": identity,
+        "completed_steps": completed, "evidence": _execution_evidence(ctx),
+    }
+    if resample_audio is not None:
+        ctx["pipeline_execution_state"]["resample_audio"] = resample_audio
+
+
+def record_stage_execution(ctx: dict, stage: str) -> None:
+    state = ctx["pipeline_execution_state"]
+    completed, order = state["completed_steps"], state["identity"]["production_steps"]
+    if len(completed) < len(order) and order[len(completed)] == stage:
+        completed.append(stage)
+    if stage == "resample" and "resample" in completed:
+        state["resample_audio"] = _path_fingerprint(Path(ctx["mfa_audio_dir"]))
+    state["evidence"] = _execution_evidence(ctx)
+    payload = dict(state)
+    payload["receipt_digest"] = stable_json_digest(payload)
+    path = Path(ctx["workspace"]) / "pipeline_execution.json"
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9828,6 +10060,8 @@ def main() -> int:
                         help="Override mfa.num_jobs for this invocation (must be positive).")
     parser.add_argument("--mfa-en-jobs", type=int, default=None, metavar="N",
                         help="Override mfa_en.num_jobs for this invocation (must be positive).")
+    parser.add_argument("--cpu-budget", type=int, default=None, metavar="N",
+                        help="Positive caller CPU budget for all child stage pools.")
     parser.add_argument("--list-steps", action="store_true")
     parser.add_argument("--data-dir", type=str, default=None,
                         help="Override input directory from config.")
@@ -9941,6 +10175,9 @@ def main() -> int:
     parser.add_argument("--cache-dir", type=str, default=None,
                         help="Custom cache directory (default: <project>/cache/).")
     args = parser.parse_args()
+
+    if args.cpu_budget is not None and args.cpu_budget <= 0:
+        parser.error("--cpu-budget must be positive")
 
     if args.list_steps:
         for name, (desc, _) in STEPS.items():
@@ -10494,74 +10731,15 @@ def main() -> int:
         print(f"ERROR: MFA dictionary not found at {mfa_dict}")
         sys.exit(1)
 
-    # Resolve steps — order depends on pipeline mode
-    if mode == "ctc_ready":
-        step_order = (STRICT_CTC_READY_STEP_ORDER
-                      if _strict_ready else CTC_READY_STEP_ORDER)
-    elif mode == "nvrasr_fallback":
-        step_order = NVASR_FALLBACK_STEP_ORDER
-    else:
-        step_order = FULL_STEP_ORDER
-    if not _strict_ok and "strict_ok" in step_order:
-        step_order.remove("strict_ok")
-
-    # ctc_ready mode: skip trim/prealign unconditionally (CTC already exists)
-    if mode == "ctc_ready":
-        for skip_s in ("trim", "prealign"):
-            setattr(args, f"skip_{skip_s}", True)
-
-    # nvrasr_fallback mode: skip trim (audio is pre-trimmed), keep prealign
-    if mode == "nvrasr_fallback":
-        setattr(args, "skip_trim", True)
-
-    # Skip standalone MFA validate when configured (align validates internally)
-    if cfg.get("mfa", {}).get("skip_validate", True):
-        setattr(args, "skip_validate", True)
-        if "validate" in step_order:
-            step_order.remove("validate")
-
-    if args.step:
-        if args.step not in STEPS:
-            print(f"Unknown step: {args.step}")
-            sys.exit(1)
-        run_list = [args.step]
-    elif args.skip_to:
-        if args.skip_to not in STEPS:
-            print(f"Unknown step: {args.skip_to}")
-            sys.exit(1)
-        if args.skip_to not in step_order:
-            print(f"ERROR: --skip-to '{args.skip_to}' is not in the '{mode}' route.")
-            print(f"  Allowed steps: {' '.join(step_order)}")
-            return 1
-        run_list = step_order[step_order.index(args.skip_to):]
-    else:
-        run_list = list(step_order)
-
-    # --scan-only: only run the link step (single-dataset mode)
-    if args.scan_only and mode in ("full", "ctc_ready"):
-        if "link" in run_list:
-            run_list = ["link"]
-        elif mode == "ctc_ready":
-            run_list = run_list[:1]  # ctc_ready first step is link (read-only)
-        else:
-            print("ERROR: --scan-only in full mode without link would run trim"
-                  " (modifies audio). Use ctc_ready mode for read-only scan.")
-            return 1
-        print(f"  Scan-only mode: running only {run_list}")
-    elif args.scan_only and mode == "nvrasr_fallback":
-        print("  Scan-only mode: nvrasr_fallback has no link step, nothing to scan.")
-        return 0
-
-    run_list = [s for s in run_list if not getattr(args, f"skip_{s}", False)]
-
-    if (_strict_ready and (run_list != STRICT_CTC_READY_STEP_ORDER
-                           or "pad_silence" in run_list)):
-        print("ERROR: strict v4 requires the complete no-padding stage route")
+    # Every invocation is planned from the same production spine. Split GPU/CPU
+    # execution uses an explicit contiguous prefix/suffix and preserves its
+    # prerequisites in the plan rather than editing a global stage list.
+    try:
+        stage_plan = plan_pipeline_steps(args, cfg, mode, strict_ready=_strict_ready)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
         return 1
-
-    if not run_list:
-        print("No steps to run.")
-        return 0
+    run_list = list(stage_plan["execution_steps"])
 
     try:
         en_phones_dir = resolve_workspace_namespace(
@@ -10601,6 +10779,11 @@ def main() -> int:
                 d.mkdir(parents=True, exist_ok=True)
                 created.add(d)
 
+    plan_path = workspace / "pipeline_plan.json"
+    plan_temporary = plan_path.with_name(plan_path.name + ".tmp")
+    plan_temporary.write_text(json.dumps(stage_plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(plan_temporary, plan_path)
+
     print(f"\n{'#'*60}")
     print(f"  Chinese MFA Pipeline  [{mode}]")
     print(f"  Input:  {data_dir}")
@@ -10620,6 +10803,7 @@ def main() -> int:
         "config_path": config_path,
         "mfa_python": str(mfa_python),
         "reference_mode": resolve_reference_mode(cfg),
+        "stage_plan": stage_plan,
         # Freeze the route shape before any resume/manifest fast path.  The
         # link step refreshes this from the validated eligible set; keeping
         # the flag in ctx also prevents a resumed explicit subset from
@@ -10691,6 +10875,12 @@ def main() -> int:
             print("ERROR: unable to restore frozen pre-CTC denominator for resume")
             return 1
 
+    try:
+        initialize_stage_execution(ctx, cfg, stage_plan)
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"ERROR: prerequisite stage verification failed: {exc}")
+        return 1
+
     failed = []
     for step_name in run_list:
         desc, func = STEPS[step_name]
@@ -10730,6 +10920,14 @@ def main() -> int:
                     break
             else:
                 print(f"  [VALIDATE] {step_name} — OK")
+        if rc == 0 and f"validate:{step_name}" not in failed:
+            try:
+                record_stage_execution(ctx, step_name)
+            except (OSError, ValueError, TypeError) as exc:
+                print(f"  ERROR: failed to commit stage execution evidence: {exc}")
+                failed.append(f"execution_receipt:{step_name}")
+                if not args.force:
+                    break
         if args.stop_after and step_name == args.stop_after:
             print(f"\n  Stopped after '{step_name}' (--stop-after). Pipeline partial complete.")
             break
@@ -10814,7 +11012,8 @@ def main() -> int:
     _eligible_set = set(_eligible_stems)
     _observed_filtered = (set(_filtered_stems) | (_eligible_set - set(_output_stems))) & _eligible_set
     try:
-        _pipeline_extra = {"failed_steps": list(failed), "source_frozen": True}
+        _pipeline_extra = {"failed_steps": list(failed), "source_frozen": True,
+                           "stage_plan": stage_plan}
         if isinstance(ctx.get("pre_ctc_selection"), dict):
             _pipeline_extra["pre_ctc_selection"] = ctx["pre_ctc_selection"]
         _filtered_reason_map = ctx.get("filtered_reason_map", {})

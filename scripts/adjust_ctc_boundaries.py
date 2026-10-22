@@ -36,6 +36,7 @@ from pipeline_utils import (
     write_ctc_work_receipt, validate_ctc_work_receipt,
     find_wav,
 )
+from resource_budget import resolve_worker_count
 
 ADJUSTED_SPAN_BASIS = (
     "ctc_spike_anchor_forced_correspondence_envelope_v1")
@@ -679,6 +680,8 @@ def main():
                         help="Print per-stem adjustment details.")
     parser.add_argument("--geometry-only", action="store_true",
                         help="Create processed CTC geometry without energy refinement.")
+    parser.add_argument("--cpu-budget", type=int, default=None,
+                        help="Optional caller CPU budget for this stage.")
     args = parser.parse_args()
 
     args.output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -780,6 +783,10 @@ def main():
         n_workers = min(n_workers, 32)   # local NVMe → up to 32 workers per batch
     else:
         n_workers = min(n_workers, 8)    # network FS → safe cap
+    n_workers = resolve_worker_count(
+        n_workers, cpu_budget=args.cpu_budget, item_count=len(stems),
+        stage_cap=32 if _on_local else 8,
+        automatic=n_workers)
     totals = {"start_adj": 0, "end_extend": 0, "end_shorten": 0,
               "punct_adj": 0, "files": 0}
     expected = set(stems)

@@ -4,10 +4,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections import Counter
+
+try:
+    from scripts.full_corpus_transaction import publish_files
+except ModuleNotFoundError:
+    from full_corpus_transaction import publish_files
 
 try:
     from scripts.speaker_namespace import publication_speaker
@@ -312,7 +316,7 @@ def _pub_rows(publication):
 
 def publish_chunk(publication, output_root: Path, rollback_root: Path | None = None) -> dict:
     output_root, rollback_root = Path(output_root), Path(rollback_root or Path(output_root) / "_rollback")
-    replacements = []
+    entries = []
     for row in _pub_rows(publication):
         source = Path(row.source)
         speaker = str(row.speaker or "_default")
@@ -324,45 +328,14 @@ def publish_chunk(publication, output_root: Path, rollback_root: Path | None = N
             raise ValueError("publication target escapes output root")
         if source.is_symlink() or not source.is_file():
             raise ValueError(f"unsafe publication source: {source}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        old_hash, rollback = None, None
         if target.exists() or target.is_symlink():
             if target.is_symlink() or not target.is_file():
                 raise ValueError(f"unsafe publication target: {target}")
-            old_hash = _sha256(target)
-            rollback = (rollback_root / ("_filtered" if row.kind == "filtered" else "") /
-                        speaker / target.name).resolve(strict=False)
-            if rollback_root.resolve() not in rollback.parents:
-                raise ValueError("rollback target escapes root")
-            if rollback.exists() or rollback.is_symlink():
-                raise ValueError(f"rollback artifact already exists: {rollback}")
-            rollback.parent.mkdir(parents=True, exist_ok=True)
-            temporary_rollback = rollback.with_name(rollback.name + ".tmp")
-            shutil.copyfile(target, temporary_rollback)
-            with temporary_rollback.open("rb") as handle:
-                os.fsync(handle.fileno())
-            if _sha256(temporary_rollback) != old_hash:
-                temporary_rollback.unlink(missing_ok=True)
-                raise ValueError("rollback copy digest mismatch")
-            os.replace(temporary_rollback, rollback)
-        temporary = target.with_name(target.name + ".tmp")
-        try:
-            shutil.copyfile(source, temporary)
-            os.replace(temporary, target)
-            _fsync_parent(target)
-        except Exception:
-            temporary.unlink(missing_ok=True)
-            if rollback is not None and rollback.exists():
-                target.unlink(missing_ok=True)
-                shutil.copyfile(rollback, temporary)
-                with temporary.open("rb") as handle:
-                    os.fsync(handle.fileno())
-                os.replace(temporary, target)
-                _fsync_parent(target)
-            raise
-        replacements.append({"stem": row.stem, "kind": row.kind, "speaker": speaker,
-                             "target": str(target), "rollback": str(rollback) if rollback else None,
-                             "old_sha256": old_hash, "new_sha256": _sha256(target)})
+        entries.append({"stem": row.stem, "kind": row.kind, "speaker": speaker,
+                        "source": source, "target": target,
+                        "rollback_parts": (("_filtered",) if row.kind == "filtered" else ()) +
+                                          (speaker,)})
+    replacements = publish_files(entries, rollback_root, (output_root,))
     return {"published_count": len(replacements),
             "replaced_count": sum(row["old_sha256"] is not None for row in replacements),
             "replacements": replacements, "rollback_root": str(rollback_root),

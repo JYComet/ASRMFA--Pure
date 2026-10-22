@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -383,12 +384,133 @@ def _failed_spec(spec: Mapping[str, Any], reason: str) -> ProviderResult:
                           error={"reason": reason})
 
 
+def resolve_blind_transcripts(rows: Sequence[Mapping[str, Any]], stem_by_uid: Mapping[str, str],
+                              run_root: Path) -> list[dict[str, Any]]:
+    """Bind the old transcript-only receipt and every transcript to source UIDs."""
+    receipt_path = run_root / ".qwen3asr_run_receipt.json"
+    manifest_path = run_root / "qwen3asr_manifest.json"
+    if not receipt_path.is_file() or not manifest_path.is_file() or receipt_path.is_symlink() or manifest_path.is_symlink():
+        raise ValueError("missing qwen3asr receipt or manifest")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected = set(stem_by_uid.values())
+    if (receipt.get("status") != "COMPLETE" or receipt.get("failed_count") != 0
+            or set(manifest.get("source_stems", [])) != expected
+            or set(manifest.get("success", [])) != expected or manifest.get("failed")):
+        raise ValueError("incomplete qwen3asr transcription")
+    records = {record.get("stem"): record for record in manifest.get("success_records", [])}
+    if set(records) != expected:
+        raise ValueError("missing qwen3asr success records")
+    resolved = []
+    for row in rows:
+        uid = str(row.get("uid", row.get("id", "")))
+        stem = stem_by_uid[uid]
+        record = records[stem]
+        relative = f"transcripts/{stem}_qwen3.txt"
+        if record.get("path") != relative:
+            raise ValueError(f"invalid transcript path for {uid}")
+        transcript = run_root / relative
+        if transcript.is_symlink() or not transcript.is_file():
+            raise ValueError(f"missing transcript for {uid}")
+        payload = transcript.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != record.get("sha256"):
+            raise ValueError(f"transcript hash mismatch for {uid}")
+        text = payload.decode("utf-8-sig").strip()
+        if not text:
+            raise ValueError(f"empty transcript for {uid}")
+        item = dict(row)
+        item.pop("orig_text", None)
+        item["text"] = text
+        item["text_origin"] = "qwen3asr_transcript_only"
+        item["asr_transcript_sha256"] = record["sha256"]
+        resolved.append(item)
+    return resolved
+
+
+def _blind_asr_stage(config: Mapping[str, Any], stage_dir: Path, rows: Sequence[Mapping[str, Any]]):
+    try:
+        from .ja_en_schema import StageResult, atomic_write_json, make_receipt
+    except ImportError:
+        from ja_en_schema import StageResult, atomic_write_json, make_receipt
+    import yaml
+    section = config.get("asr", {}) or {}
+    runtime = str(section.get("qwen_runtime") or section.get("runtime_python") or sys.executable)
+    model = str(section.get("qwen_model") or "")
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    input_dir = stage_dir / "blind_wav"
+    input_dir.mkdir(exist_ok=True)
+    audio_rows = {str(item.get("uid")): item for item in _jsonl(stage_dir.parent / "audio" / "audio_transform_receipts.jsonl")}
+    stem_by_uid: dict[str, str] = {}
+    try:
+        if section.get("profile", "qwen_only_dev") != "qwen_only_dev":
+            raise ValueError("transcript_only fallback supplies Qwen evidence only; use qwen_only_dev")
+        if not model or not Path(model).is_dir():
+            raise ValueError("qwen_model must be an existing local model directory")
+        if not Path(runtime).is_file():
+            raise ValueError("qwen_runtime must be an existing Python executable")
+        for index, row in enumerate(rows):
+            uid = str(row.get("uid", row.get("id", "")))
+            audio = audio_rows.get(uid, {})
+            source = audio.get("alignment", {}).get("path")
+            if audio.get("status") != "verified" or not isinstance(source, str) or not Path(source).is_file():
+                raise ValueError(f"missing verified alignment WAV for {uid}")
+            stem = f"asr_{index:06d}"
+            stem_by_uid[uid] = stem
+            shutil.copyfile(source, input_dir / f"{stem}.wav")
+        run_root = stage_dir / "qwen3asr"
+        old_config = {
+            "mode": "qwen3asr", "data_dir": str(input_dir),
+            "qwen3asr": {
+                "profile": "transcript_only", "model_path": model, "output_dir": str(run_root),
+                "python": runtime, "device": str(section.get("device", "cuda:0")),
+                "dtype": str(section.get("dtype", "bfloat16")),
+                "language": str(section.get("language", "Japanese")), "context": "",
+                "batch_size": 1, "max_new_tokens": int(section.get("max_new_tokens", 2048)),
+            },
+        }
+        old_config_path = stage_dir / "qwen3asr_config.yaml"
+        old_config_path.write_text(yaml.safe_dump(old_config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        old_entry = Path(__file__).resolve().parent / "run_pipeline.py"
+        completed = subprocess.run([runtime, str(old_entry), "--config", str(old_config_path), "--mode", "qwen3asr"],
+                                   text=True, capture_output=True, timeout=int(section.get("timeout_s", 3600)))
+        log_path = stage_dir / "qwen3asr_run.log"
+        log_path.write_text(completed.stdout + "\n" + completed.stderr, encoding="utf-8")
+        if completed.returncode:
+            raise ValueError(f"old qwen3asr pipeline exited {completed.returncode}; see {log_path}")
+        resolved = resolve_blind_transcripts(rows, stem_by_uid, run_root)
+        manifest_path = stage_dir / "resolved_manifest.jsonl"
+        _write_jsonl(manifest_path, resolved)
+        evidence_path = stage_dir / "asr_evidence.jsonl"
+        evidence = [{"schema": "ja-asr-evidence-v2", "uid": str(item.get("uid", item.get("id", ""))),
+                     "source_wav": item.get("wav", item.get("source_wav", item.get("audio"))),
+                     "orig_text": None, "providers": [{"provider": "qwen3-asr", "family": "qwen", "status": "ok",
+                     "asr_text": item["text"], "artifact_path": str(run_root / f"transcripts/{stem_by_uid[str(item.get('uid', item.get('id', '')))]}_qwen3.txt"),
+                     "artifact_sha256": item["asr_transcript_sha256"]}],
+                     "family_vote_policy": "one_per_family", "production_profile": section.get("profile"),
+                     "reference_mode": "fallback", "status": "COMPLETE", "required_families": ["qwen"],
+                     "observed_families": ["qwen"]} for item in resolved]
+        _write_jsonl(evidence_path, evidence)
+        outputs = [manifest_path, evidence_path, run_root / "qwen3asr_manifest.json",
+                   run_root / ".qwen3asr_run_receipt.json", log_path]
+        status, errors = "COMPLETE", []
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        outputs = []
+        status, errors = "BLOCKED", [{"code": "asr_unavailable", "message": str(exc)}]
+    receipt_path = stage_dir / "receipt.json"
+    atomic_write_json(receipt_path, make_receipt(stage="asr", status=status,
+                      inputs={"source_manifest": str(config["input_manifest"]), "reference_mode": "fallback"},
+                      outputs=outputs, errors=errors), workspace=stage_dir.parent.parent)
+    return StageResult(stage="asr", status=status, receipt_path=str(receipt_path))
+
+
 def asr_stage(config: Mapping[str, Any], stage_dir: Path):
     try:
         from .ja_en_schema import StageResult, atomic_write_json, make_receipt
     except ImportError:
         from ja_en_schema import StageResult, atomic_write_json, make_receipt
     rows = _manifest_rows(config)
+    if (config.get("asr", {}) or {}).get("reference_mode") == "fallback":
+        return _blind_asr_stage(config, stage_dir, rows)
     audio_receipts = _jsonl(stage_dir.parent / "audio" / "audio_transform_receipts.jsonl")
     audio_by_uid = {str(row.get("uid")): row for row in audio_receipts}
     specs = provider_specs(config)

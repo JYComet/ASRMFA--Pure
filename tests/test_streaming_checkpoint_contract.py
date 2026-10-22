@@ -137,20 +137,212 @@ def test_no_resume_replaces_stale_batch_progress_identity(tmp_path):
 
 
 def test_run_batch_reports_already_completed_as_success(tmp_path):
-    cache_path = tmp_path / "run.cache.json"
-    cache = _cache({"name": "a", "audio_dir": "a", "stems": ["1"]})
-    cache_path.write_text(json.dumps(cache), encoding="utf-8")
-    args = _args(
-        tmp_path,
-        batch_size=2,
-        batch_cache=cache_path,
-        no_resume=False,
-        limit_datasets=0,
-    )
+    args, cache = _completed_run_fixture(tmp_path)
+    dataset_root = tmp_path / "output" / "a"
+    local = _checkpoint_batch_fixture(tmp_path, ["1"])
+    assert streaming._publish_batch_to_staging(
+        local, dataset_root, 0, ["1"],
+        config_sha256=streaming._sha256_file(args.config),
+        cache_sha256=streaming._sha256_file(args.batch_cache),
+        implementation_sha256=args._implementation_sha256)
+    streaming._aggregate_dataset_publication(
+        dataset_root, "a", ["1"], [0],
+        config_sha256=streaming._sha256_file(args.config),
+        cache_sha256=streaming._sha256_file(args.batch_cache),
+        implementation_sha256=args._implementation_sha256,
+        receipt_mode="staged")
     identity = streaming._checkpoint_identity(cache, args)
-    _write_checkpoint(cache_path.with_name("run.cache.checkpoint.json"), identity,
+    _write_checkpoint(args.batch_cache.with_name("run.cache.checkpoint.json"), identity,
                       completed=["a"])
     assert streaming.run_batch(args) is True
+
+
+def test_completed_scan_cache_uses_verified_final_source_stems(tmp_path):
+    args, cache = _completed_run_fixture(tmp_path)
+    dataset = cache["datasets"][0]
+    dataset.pop("stems")
+    row = dataset["source_inventory"]["files"][0]
+    row["path"] = "1.wav"
+    args.batch_cache.write_text(json.dumps(cache), encoding="utf-8")
+    args._batch_cache_data = cache
+    args.no_resume = False
+    root = tmp_path / "output" / "a"
+    local = _checkpoint_batch_fixture(tmp_path, ["1"])
+    assert streaming._publish_batch_to_staging(
+        local, root, 0, ["1"],
+        config_sha256=streaming._sha256_file(args.config),
+        cache_sha256=streaming._sha256_file(args.batch_cache),
+        implementation_sha256=args._implementation_sha256)
+    streaming._aggregate_dataset_publication(
+        root, "a", ["1"], [0],
+        config_sha256=streaming._sha256_file(args.config),
+        cache_sha256=streaming._sha256_file(args.batch_cache),
+        implementation_sha256=args._implementation_sha256,
+        receipt_mode="staged")
+    _write_checkpoint(
+        args.batch_cache.with_name("run.cache.checkpoint.json"),
+        streaming._checkpoint_identity(cache, args), completed=["a"])
+
+    assert streaming.run_batch(args) is True
+
+
+def test_run_batch_rejects_completed_checkpoint_when_source_hash_changed(tmp_path):
+    args, cache = _completed_run_fixture(tmp_path)
+    cache["datasets"][0]["source_inventory"]["files"][0]["sha256"] = "0" * 64
+    args.batch_cache.write_text(json.dumps(cache), encoding="utf-8")
+    identity = streaming._checkpoint_identity(cache, args)
+    _write_checkpoint(args.batch_cache.with_name("run.cache.checkpoint.json"),
+                      identity, completed=["a"])
+
+    assert streaming.run_batch(args) is False
+
+
+def test_run_batch_rejects_completed_checkpoint_without_valid_final_receipt(tmp_path):
+    args, cache = _completed_run_fixture(tmp_path)
+    identity = streaming._checkpoint_identity(cache, args)
+    _write_checkpoint(args.batch_cache.with_name("run.cache.checkpoint.json"),
+                      identity, completed=["a"])
+    output = tmp_path / "output" / "a" / "output"
+    output.mkdir(parents=True)
+    (output / "1.TextGrid").write_text("unreceipted\n", encoding="utf-8")
+
+    assert streaming.run_batch(args) is False
+
+
+def test_run_batch_no_resume_freezes_and_persists_legacy_source_inventory(
+        tmp_path, monkeypatch):
+    args, cache = _completed_run_fixture(tmp_path)
+    cache["datasets"][0].pop("stems")
+    cache["datasets"][0].pop("source_inventory")
+    args.batch_cache.write_text(json.dumps(cache), encoding="utf-8")
+    args._batch_cache_data = cache
+    args.no_resume = True
+    args.pipelined = True
+    args.cpu_workers = 1
+    args._local_work_drives = (args.local_work,)
+    args.output_dir = None
+    args.nas_output = None
+    args.force_stage = False
+
+    monkeypatch.setattr(streaming, "_ensure_mfa_model_extracted", lambda: None)
+    monkeypatch.setattr(streaming, "plan_streaming_resources", lambda **_kwargs: {
+        "cpu_workers": 1, "mfa_jobs_per_worker": 1,
+        "mfa_en_jobs_per_worker": 1, "worker_cpu_budget": 1,
+    })
+    received = {}
+
+    def dispatch(received_args, *, validated_frozen_cache=None):
+        received["cache"] = validated_frozen_cache
+        return True
+
+    monkeypatch.setattr(streaming, "run_pipelined_batch", dispatch)
+
+    assert streaming.run_batch(args) is True
+    persisted = json.loads(args.batch_cache.read_text(encoding="utf-8"))
+    frozen = persisted["datasets"][0]["source_inventory"]
+    assert frozen["count"] == 1
+    assert frozen["files"] == [{
+        "stem": "1", "path": "1.wav", "size": 3,
+        "sha256": streaming._sha256_file(tmp_path / "audio" / "1.wav"),
+    }]
+    assert received["cache"]["datasets"][0]["source_inventory"] == frozen
+
+
+def test_legacy_completed_checkpoint_cannot_survive_live_inventory_freeze(
+        tmp_path):
+    args, cache = _completed_run_fixture(tmp_path)
+    cache["datasets"][0].pop("source_inventory")
+    args.batch_cache.write_text(json.dumps(cache), encoding="utf-8")
+    args._batch_cache_data = cache
+    old_cache_sha = streaming._sha256_file(args.batch_cache)
+    local = _checkpoint_batch_fixture(tmp_path, ["1"])
+    dataset_root = tmp_path / "output" / "a"
+    assert streaming._publish_batch_to_staging(
+        local, dataset_root, 0, ["1"],
+        config_sha256=streaming._sha256_file(args.config),
+        cache_sha256=old_cache_sha,
+        implementation_sha256=streaming._implementation_sha256())
+    streaming._aggregate_dataset_publication(
+        dataset_root, "a", ["1"], [0],
+        config_sha256=streaming._sha256_file(args.config),
+        cache_sha256=old_cache_sha,
+        implementation_sha256=streaming._implementation_sha256(),
+        receipt_mode="staged")
+    old_identity = streaming._checkpoint_identity(cache, args)
+    _write_checkpoint(args.batch_cache.with_name("run.cache.checkpoint.json"),
+                      old_identity, completed=["a"])
+
+    assert streaming.run_batch(args) is False
+    updated = json.loads(args.batch_cache.read_text(encoding="utf-8"))
+    assert "source_inventory" in updated["datasets"][0]
+
+
+def test_direct_pipelined_entrypoint_freezes_before_checkpoint_identity(tmp_path):
+    args, cache = _completed_run_fixture(tmp_path)
+    cache["datasets"][0].pop("stems")
+    cache["datasets"][0].pop("source_inventory")
+    args.batch_cache.write_text(json.dumps(cache), encoding="utf-8")
+    args._batch_cache_data = cache
+    args.no_resume = False
+    args.pipelined = True
+    old_identity = streaming._checkpoint_identity(cache, args)
+    _write_checkpoint(args.batch_cache.with_name("run.cache.checkpoint.json"),
+                      old_identity, completed=["a"])
+
+    assert streaming.run_pipelined_batch(args) is False
+    persisted = json.loads(args.batch_cache.read_text(encoding="utf-8"))
+    assert "source_inventory" in persisted["datasets"][0]
+
+
+def _completed_run_fixture(tmp_path):
+    audio = tmp_path / "audio"
+    audio.mkdir()
+    wav = audio / "1.wav"
+    wav.write_bytes(b"wav")
+    cache = _cache({
+        "name": "a", "audio_dir": str(audio), "stems": ["1"],
+        "source_inventory": {"count": 1, "files": [{
+            "stem": "1", "size": wav.stat().st_size,
+            "sha256": streaming._sha256_file(wav),
+        }]},
+    })
+    cache["output_root"] = str(tmp_path / "output")
+    cache_path = tmp_path / "run.cache.json"
+    cache_path.write_text(json.dumps(cache), encoding="utf-8")
+    config = tmp_path / "config.yaml"
+    config.write_text("mode: nvrasr_fallback\n", encoding="utf-8")
+    args = _args(
+        tmp_path, batch_size=2, batch_cache=cache_path, config=config,
+        no_resume=False, limit_datasets=0, local_work=tmp_path / "work",
+        python=sys.executable, gpus=1, cpu_workers=1, pipelined=False,
+        stage_all=True, no_overwrite=False, no_force=False,
+        parallel_datasets=1, mfa_jobs=None, mfa_en_jobs=None,
+    )
+    args.config = config
+    args._config = {"streaming": {"batch_size": 2}}
+    args._implementation_sha256 = streaming._implementation_sha256()
+    return args, cache
+
+
+def _checkpoint_batch_fixture(tmp_path, stems):
+    local = tmp_path / "local-complete"
+    output = local / "output"
+    filtered = local / "workspace" / "filtered"
+    output.mkdir(parents=True)
+    filtered.mkdir(parents=True)
+    for stem in stems:
+        (output / f"{stem}.TextGrid").write_text(
+            f"grid-{stem}\n", encoding="utf-8")
+    (output / "postprocess_report.jsonl").write_text(
+        "".join(json.dumps({"stem": stem, "status": "ok"}) + "\n"
+                for stem in stems), encoding="utf-8")
+    receipt = streaming.make_pipeline_accounting_receipt(
+        stems, stems, [], stems, [], run_id="fixture", mode="pipelined",
+        route=["fixture"], shards=[{"shard_id": "fixture", "stems": stems}],
+    )
+    (local / "workspace" / ".pipeline_run_receipt_v2.json").write_text(
+        json.dumps(receipt), encoding="utf-8")
+    return local
 
 
 @pytest.mark.parametrize(("runner_result", "expected_rc"), [(True, 0), (False, 1)])

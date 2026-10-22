@@ -373,7 +373,8 @@ def validate_exact_partition(
     return normalized
 
 
-def validate_manifest(manifest: Any, *, workspace: os.PathLike[str] | str | None = None) -> list[dict[str, Any]]:
+def validate_manifest(manifest: Any, *, workspace: os.PathLike[str] | str | None = None,
+                      allow_missing_text: bool = False) -> list[dict[str, Any]]:
     """Validate source rows while allowing authorized absolute source paths.
 
     Source audio is an input and may live outside the output workspace.  Only
@@ -394,7 +395,8 @@ def validate_manifest(manifest: Any, *, workspace: os.PathLike[str] | str | None
         if uid in seen:
             raise JAContractError("manifest_duplicate_id", uid, f"$[{index}].uid")
         seen.add(uid)
-        if not isinstance(row.get("text", row.get("orig_text")), str) or not row.get("text", row.get("orig_text")).strip():
+        if not allow_missing_text and (not isinstance(row.get("text", row.get("orig_text")), str)
+                                       or not row.get("text", row.get("orig_text")).strip()):
             raise JAContractError("manifest_invalid", "non-empty text is required", f"$[{index}].text")
         audio_fields = [row.get(key) for key in ("wav", "audio", "source_wav")]
         if not any(isinstance(value, str) and value.strip() for value in audio_fields):
@@ -435,6 +437,8 @@ def validate_config(config: Any, *, config_path: os.PathLike[str] | str | None =
         if key in config and not isinstance(config[key], Mapping):
             raise JAContractError("config_malformed", "section must be a mapping", f"$.{key}")
     asr = config.get("asr", {})
+    if asr and asr.get("reference_mode", "authority") not in {"authority", "fallback"}:
+        raise JAContractError("config_malformed", "asr.reference_mode must be authority or fallback", "$.asr.reference_mode")
     if asr and asr.get("profile") not in {"qwen_only_dev", "baseline_3family", "extended_5model"}:
         raise JAContractError("config_malformed", "unsupported ASR profile", "$.asr.profile")
     if asr and asr.get("family_vote_policy") != "one_per_family":

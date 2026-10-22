@@ -193,8 +193,28 @@ def test_textgrid_parser_unescapes_quotes_and_rejects_nan(tmp_path: Path):
         _textgrid_parse(invalid)
 
 
-def test_three_uid_bound_fixture_integrity_and_evidence_tamper(tmp_path: Path):
-    """JA, EN, and one UID with both language runs use full unit evidence."""
+def test_bound_fixture_integrity_and_evidence_tamper(tmp_path: Path):
+    """Offline integrity is distinct from production release readiness."""
+    out = _record(tmp_path)
+    good = verify_workspace(out)
+
+    assert good["integrity_ok"] is True
+    assert good["release_ready"] is False
+    assert good["status"] == "BLOCKED"
+    assert any(error["code"] == "publish_blocked" for error in good["errors"])
+
+    records_path = out / "tts_training_records.jsonl"
+    row = json.loads(records_path.read_text(encoding="utf-8"))
+    row["phones"][0]["native_phone"] = "tampered"
+    records_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    bad = verify_workspace(out)
+    assert bad["integrity_ok"] is False
+    assert any(error["code"] == "receipt_hash_mismatch" for error in bad["errors"])
+
+
+def test_three_uid_legacy_fixture_rejects_raw_sample_ownership_and_tampering(tmp_path: Path):
+    """The old JA/EN/mixed fixture has invalid raw coordinates and must fail closed."""
     import copy, hashlib, zipfile
     from scripts.ja_en_schema import artifact_record, make_receipt, sha256_file
     from scripts.ja_tts_export import render_textgrid
@@ -266,10 +286,16 @@ def test_three_uid_bound_fixture_integrity_and_evidence_tamper(tmp_path: Path):
         (stage / "receipt.json").write_text(json.dumps(make_receipt(stage=name, status="RUNNING" if name == "verify" else "COMPLETE", outputs=[alias_path] if name == "semantic" else [])), encoding="utf-8")
     root_receipt = make_receipt(stage="verify", status="PENDING", inputs={"stages": stages, "artifacts": [artifact_record(manifest), artifact_record(out / "supply_chain_lock.json")]}, outputs=all_paths)
     (out / "receipt.json").write_text(json.dumps(root_receipt), encoding="utf-8")
-    good = verify_workspace(out)
-    if not good["integrity_ok"]:
-        print(good["errors"])
-        raise AssertionError(good["errors"])
+    assert {row["uid"] for row in rows} == {"ja", "en", "mix"}
+    rejected = verify_workspace(out)
+    assert rejected["integrity_ok"] is False
+    assert rejected["status"] == "REJECTED"
+    messages = [error["message"] for error in rejected["errors"]]
+    assert any("raw MFA sample coordinates differ from record" in message for message in messages)
+    assert any("raw MFA interval escapes run ownership" in message for message in messages)
+
     rows[2]["phones"][0]["native_phone"] = "tampered"
     jsonl.write_text("".join(json.dumps(x) + "\n" for x in rows), encoding="utf-8")
-    bad = verify_workspace(out); assert bad["integrity_ok"] is False
+    bad = verify_workspace(out)
+    assert bad["integrity_ok"] is False
+    assert any(error["code"] == "receipt_hash_mismatch" for error in bad["errors"])

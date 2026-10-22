@@ -70,6 +70,51 @@ def test_resource_plan_caps_ordinary_workers_and_both_mfa_pools():
     assert plan["mfa_en_jobs_per_worker"] == 4
     assert plan["cpu_workers"] * plan["mfa_jobs_per_worker"] <= plan["cpu_budget"]
     assert plan["cpu_workers"] * plan["mfa_en_jobs_per_worker"] <= plan["cpu_budget"]
+    assert plan["worker_cpu_budget"] == 4
+    assert plan["auxiliary_workers_cap"] == 4
+
+
+def test_cpu_phase_command_passes_phase_budget_to_child():
+    command = streaming._build_cpu_phase_command(
+        mfa_python=Path("/python"), config=Path("config.yaml"),
+        local_audio=Path("batch/audio"), local_ctc=Path("batch/ctc"),
+        local_output=Path("batch/output"), local_workspace=Path("batch/workspace"),
+        producer_mode="nvrasr_fallback", allow_overwrite=True,
+        allow_force=True, sealed_ctc_raw=True, skip_pad_silence=True,
+        mfa_num_jobs=4, mfa_en_num_jobs=2, cpu_budget=4,
+    )
+    assert command[command.index("--mfa-jobs") + 1] == "4"
+    assert command[command.index("--mfa-en-jobs") + 1] == "2"
+    assert command[command.index("--cpu-budget") + 1] == "4"
+
+
+def test_gpu_phase_command_passes_producer_weight(tmp_path, monkeypatch):
+    source = tmp_path / "source.wav"
+    source.write_bytes(b"wav")
+    commands = []
+
+    monkeypatch.setattr(streaming, "get_mfa_env", lambda *_args: {})
+
+    def failed_child(command, **_kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(streaming.subprocess, "run", failed_child)
+    ok = streaming._run_gpu_phase(
+        ds={"name": "demo", "audio_dir": str(tmp_path),
+            "ctc_dir": str(tmp_path / "ctc")},
+        batch_idx=0, batch_stems=["source"], layout_map={},
+        wav_index={"source": source}, text_index=None,
+        local_base=tmp_path / "work", config=tmp_path / "config.yaml",
+        mfa_python=tmp_path / "python", models_dir=tmp_path / "models",
+        batch_size=1, python_path=None, device="", persist_cache=False,
+        cpu_budget=1,
+    )
+
+    assert ok is False
+    assert len(commands) == 3  # failed producer retries preserve the same budget
+    assert all(command[command.index("--cpu-budget") + 1] == "1"
+               for command in commands)
 
 
 def test_resource_plan_pipelined_defaults_and_queues_are_bounded():
@@ -88,6 +133,12 @@ def test_resource_plan_pipelined_defaults_and_queues_are_bounded():
     assert plan["mfa_en_jobs_per_worker"] == 8
     assert plan["gpu_queue_size"] == 8
     assert plan["cpu_queue_size"] == 8
+
+
+@pytest.mark.parametrize("budget", [0, -1])
+def test_resource_plan_rejects_nonpositive_budget(budget):
+    with pytest.raises(ValueError, match="cpu_budget must be positive"):
+        streaming.plan_streaming_resources(cpu_budget=budget)
 
 
 def test_gpu_phase_fails_before_subprocess_when_audio_is_missing(tmp_path, monkeypatch):
@@ -599,8 +650,10 @@ def test_production_entrypoints_compute_and_propagate_implementation_fingerprint
     monkeypatch.setattr(streaming, "_implementation_sha256", fingerprint)
     monkeypatch.setattr(
         streaming, "_validate_frozen_cache_inventory",
-        lambda cache: inventory_calls.append(cache),
+        lambda cache, **_kwargs: inventory_calls.append(cache),
     )
+    monkeypatch.setattr(streaming, "_persist_source_inventories",
+                        lambda *_args, **_kwargs: None)
     monkeypatch.setattr(streaming, "_ensure_mfa_model_extracted",
                         lambda: True)
     args = _pipelined_exception_args(tmp_path, stems=["s00"])
@@ -666,7 +719,9 @@ def test_unexpected_cpu_phase_exception_stops_workers_and_drains_queued_work(
     checkpoint = {}
 
     monkeypatch.setattr(streaming, "_validate_frozen_cache_inventory",
-                        lambda _cache: None)
+                        lambda _cache, **_kwargs: None)
+    monkeypatch.setattr(streaming, "_persist_source_inventories",
+                        lambda *_args, **_kwargs: None)
     monkeypatch.setattr(streaming, "_ensure_mfa_model_extracted",
                         lambda: True)
     monkeypatch.setattr(streaming, "_load_trusted_batch_evidence",
@@ -741,7 +796,9 @@ def test_unexpected_gpu_phase_exception_is_accounted_and_preserved(
     checkpoint = {}
 
     monkeypatch.setattr(streaming, "_validate_frozen_cache_inventory",
-                        lambda _cache: None)
+                        lambda _cache, **_kwargs: None)
+    monkeypatch.setattr(streaming, "_persist_source_inventories",
+                        lambda *_args, **_kwargs: None)
     monkeypatch.setattr(streaming, "_ensure_mfa_model_extracted",
                         lambda: True)
     monkeypatch.setattr(streaming, "_load_trusted_batch_evidence",
@@ -793,7 +850,9 @@ def test_unexpected_gpu_phase_exception_is_accounted_and_preserved(
 
 def _make_successful_pipelined_finalize(monkeypatch, checkpoint):
     monkeypatch.setattr(streaming, "_validate_frozen_cache_inventory",
-                        lambda _cache: None)
+                        lambda _cache, **_kwargs: None)
+    monkeypatch.setattr(streaming, "_persist_source_inventories",
+                        lambda *_args, **_kwargs: None)
     monkeypatch.setattr(streaming, "_ensure_mfa_model_extracted",
                         lambda: True)
     monkeypatch.setattr(streaming, "_save_checkpoint",
@@ -847,3 +906,61 @@ def test_pipelined_summary_counts_trusted_and_new_successes_only(
     assert gpu_calls == [1]
     assert cpu_calls == [1]
     assert "2/2 batches OK" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("budget", [1, 8])
+def test_pipelined_admission_bounds_real_phase_overlap(tmp_path, monkeypatch, budget):
+    args = _pipelined_exception_args(
+        tmp_path, stems=[f"s{index:02d}" for index in range(8)],
+        gpus=2, upload_buffer=1)
+    args.cpu_budget = budget
+    args.cpu_workers = 2
+    args.mfa_jobs = 3
+    args.mfa_en_jobs = 2
+    checkpoint = {}
+    _make_successful_pipelined_finalize(monkeypatch, checkpoint)
+    monkeypatch.setattr(streaming, "_load_trusted_batch_evidence",
+                        lambda *_args, **_kwargs: None)
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+    calls = []
+    ceiling = budget // min(2, budget)
+
+    def phase(kind, **kwargs):
+        nonlocal active, peak
+        weight = kwargs["cpu_budget"]
+        if kind == "gpu":
+            assert weight == 1
+        else:
+            assert kwargs["mfa_num_jobs"] == min(3, ceiling)
+            assert kwargs["mfa_en_num_jobs"] == min(2, ceiling)
+            assert weight == ceiling
+        with lock:
+            active += weight
+            peak = max(peak, active)
+            calls.append((kind, kwargs["batch_idx"]))
+        try:
+            time.sleep(0.005)
+            return True
+        finally:
+            with lock:
+                active -= weight
+
+    monkeypatch.setattr(streaming, "_run_gpu_phase",
+                        lambda **kwargs: phase("gpu", **kwargs))
+    monkeypatch.setattr(streaming, "_run_cpu_phase",
+                        lambda **kwargs: phase("cpu", **kwargs))
+    results = []
+    runner = threading.Thread(
+        target=lambda: results.append(streaming.run_pipelined_batch(args)),
+        daemon=True)
+    runner.start()
+    runner.join(timeout=5)
+    assert not runner.is_alive(), "bounded queues and CPU admission must make progress"
+    assert results == [True]
+    assert 0 < peak <= budget
+    assert active == 0
+    assert sorted(calls) == sorted((kind, index)
+                                   for kind in ("gpu", "cpu") for index in range(8))
+    assert checkpoint == {"completed": {"demo"}, "failed": set()}

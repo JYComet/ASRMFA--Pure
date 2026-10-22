@@ -241,6 +241,132 @@ def test_batch_publication_isolated_and_hash_verified(tmp_path):
         dataset, 0, ["a", "b"], config_sha256="cfg", cache_sha256="cache") is None
 
 
+def test_complete_dataset_resume_rejects_terminal_content_corruption(tmp_path):
+    dataset = tmp_path / "dataset"
+    local = _batch(tmp_path, 0, ["a"], ["a"], [])
+    assert streaming._publish_batch_to_staging(local, dataset, 0, ["a"])
+    streaming._aggregate_dataset_publication(dataset, "demo", ["a"], [0])
+
+    (dataset / "output/a.TextGrid").write_text("tampered\n", encoding="utf-8")
+
+    assert streaming._load_complete_dataset_receipt(
+        dataset, "demo", ["a"], [0]) is None
+
+
+def test_aggregation_rejects_tamper_after_an_earlier_sibling_copy(
+        tmp_path, monkeypatch):
+    dataset = tmp_path / "dataset"
+    first = _batch(tmp_path, 0, ["a"], ["a"], [])
+    second = _batch(tmp_path, 1, ["b"], ["b"], [])
+    assert streaming._publish_batch_to_staging(first, dataset, 0, ["a"])
+    assert streaming._publish_batch_to_staging(second, dataset, 1, ["b"])
+
+    original_copy = streaming._copy_textgrid_tree
+    calls = 0
+
+    def copy_then_tamper(source, target, **kwargs):
+        nonlocal calls
+        manifest = original_copy(source, target, **kwargs)
+        calls += 1
+        if calls == 1:
+            (target / "a.TextGrid").write_text("tampered\n", encoding="utf-8")
+        return manifest
+
+    monkeypatch.setattr(streaming, "_copy_textgrid_tree", copy_then_tamper)
+    with pytest.raises(ValueError, match="final publication"):
+        streaming._aggregate_dataset_publication(
+            dataset, "demo", ["a", "b"], [0, 1])
+
+
+def test_aggregation_hashes_trusted_staging_source_once(tmp_path, monkeypatch):
+    dataset = tmp_path / "dataset"
+    local = _batch(tmp_path, 0, ["a"], ["a"], [])
+    assert streaming._publish_batch_to_staging(local, dataset, 0, ["a"])
+    staging_file = dataset / ".staging/batch_0000/output/a.TextGrid"
+    source_hashes = []
+    original_hash = streaming._sha256_file
+
+    def counted(path):
+        digest = original_hash(path)
+        if path == staging_file:
+            source_hashes.append(path)
+        return digest
+
+    monkeypatch.setattr(streaming, "_sha256_file", counted)
+    streaming._aggregate_dataset_publication(dataset, "demo", ["a"], [0])
+
+    assert source_hashes == [staging_file]
+
+
+def test_aggregation_rejects_non_textgrid_trusted_bucket(tmp_path):
+    dataset = tmp_path / "dataset"
+    local = _batch(tmp_path, 0, ["a"], ["a"], [])
+    assert streaming._publish_batch_to_staging(local, dataset, 0, ["a"])
+    extra = dataset / ".staging/batch_0000/output/metadata.json"
+    extra.write_text("metadata\n", encoding="utf-8")
+    evidence_path = dataset / ".batch_evidence/batch_0000/batch_receipt.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["artifacts"]["output/metadata.json"] = {
+        "size": extra.stat().st_size,
+        "sha256": streaming._sha256_file(extra),
+    }
+    evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="non-TextGrid"):
+        streaming._aggregate_dataset_publication(
+            dataset, "demo", ["a"], [0])
+
+
+@pytest.mark.parametrize("mutation", [
+    "rewrite", "extra", "extra_metadata", "nested_metadata", "missing",
+])
+def test_aggregation_rejects_source_mutation_after_trusted_evidence(
+        tmp_path, monkeypatch, mutation):
+    dataset = tmp_path / "dataset"
+    local = _batch(tmp_path, 0, ["a"], ["a"], [])
+    assert streaming._publish_batch_to_staging(local, dataset, 0, ["a"])
+    original_load = streaming._load_trusted_batch_evidence
+    mutated = False
+
+    def load_then_mutate(*args, **kwargs):
+        nonlocal mutated
+        evidence = original_load(*args, **kwargs)
+        if evidence is not None and not mutated:
+            mutated = True
+            source = dataset / ".staging/batch_0000/output/a.TextGrid"
+            if mutation == "rewrite":
+                source.write_text("changed!\n", encoding="utf-8")
+            elif mutation == "extra":
+                (source.parent / "extra.TextGrid").write_text(
+                    "extra\n", encoding="utf-8")
+            elif mutation in {"extra_metadata", "nested_metadata"}:
+                extra = source.parent / (
+                    "nested/metadata.json" if mutation == "nested_metadata"
+                    else "metadata.json")
+                extra.parent.mkdir(exist_ok=True)
+                extra.write_text("{}\n", encoding="utf-8")
+            else:
+                source.unlink()
+        return evidence
+
+    monkeypatch.setattr(streaming, "_load_trusted_batch_evidence", load_then_mutate)
+    with pytest.raises(ValueError):
+        streaming._aggregate_dataset_publication(
+            dataset, "demo", ["a"], [0])
+
+
+def test_complete_dataset_resume_rejects_extra_terminal_file(tmp_path):
+    dataset = tmp_path / "dataset"
+    local = _batch(tmp_path, 0, ["a"], ["a"], [])
+    assert streaming._publish_batch_to_staging(local, dataset, 0, ["a"])
+    streaming._aggregate_dataset_publication(dataset, "demo", ["a"], [0])
+
+    (dataset / "output/extra.TextGrid").write_text("extra\n", encoding="utf-8")
+
+    assert streaming._load_complete_dataset_receipt(
+        dataset, "demo", ["a"], [0]) is None
+
+
 def test_existing_staging_conflict_is_fail_closed(tmp_path):
     dataset = tmp_path / "dataset"
     local = _batch(tmp_path, 0, ["a"], ["a"], [])
@@ -858,7 +984,7 @@ def test_pipelined_validates_frozen_inventory_before_output_resolution(monkeypat
     config_path.write_text("mode: nvrasr_fallback\n", encoding="utf-8")
     events = []
 
-    def reject(_cache):
+    def reject(_cache, **_kwargs):
         events.append("validate")
         raise ValueError("source hash mismatch")
 
@@ -888,6 +1014,53 @@ def test_frozen_inventory_rejects_changed_source_hash(tmp_path):
     }]}
     with pytest.raises(ValueError, match="source inventory hash mismatch"):
         streaming._validate_frozen_cache_inventory(cache)
+
+
+def test_frozen_inventory_rejects_cache_without_source_inventory(tmp_path):
+    audio = tmp_path / "audio"
+    audio.mkdir()
+    (audio / "one.wav").write_bytes(b"one")
+    cache = {"datasets": [{
+        "name": "demo", "audio_dir": str(audio), "stems": ["one"],
+    }]}
+
+    with pytest.raises(ValueError, match="source inventory is missing"):
+        streaming._validate_frozen_cache_inventory(cache)
+
+
+def test_legacy_scan_cache_can_freeze_and_validate_recursive_source_inventory(
+        tmp_path):
+    audio = tmp_path / "audio"
+    nested = audio / "speaker"
+    nested.mkdir(parents=True)
+    (audio / "flat.wav").write_bytes(b"flat")
+    (nested / "nested.wav").write_bytes(b"nested")
+    cache = {"datasets": [{
+        "name": "demo", "audio_dir": str(audio),
+    }]}
+
+    streaming._validate_frozen_cache_inventory(cache, freeze_missing=True)
+    inventory = cache["datasets"][0]["source_inventory"]
+    assert inventory == {"count": 2, "files": [
+        {"path": "flat.wav", "stem": "flat", "size": 4,
+         "sha256": streaming._sha256_file(audio / "flat.wav")},
+        {"path": "speaker/nested.wav", "stem": "nested", "size": 6,
+         "sha256": streaming._sha256_file(nested / "nested.wav")},
+    ]}
+    streaming._validate_frozen_cache_inventory(cache)
+
+
+def test_complete_dataset_resume_enforces_effective_batch_size(tmp_path):
+    dataset = tmp_path / "dataset"
+    local = _batch(tmp_path, 0, ["a", "b"], ["a", "b"], [])
+    assert streaming._publish_batch_to_staging(local, dataset, 0, ["a", "b"])
+    streaming._aggregate_dataset_publication(
+        dataset, "demo", ["a", "b"], [0])
+
+    assert streaming._load_complete_dataset_receipt(
+        dataset, "demo", ["a", "b"], [0], batch_size=2) is not None
+    assert streaming._load_complete_dataset_receipt(
+        dataset, "demo", ["a", "b"], [0], batch_size=1) is None
 
 
 def _frozen_inventory_cache(audio: Path, stems: list[str]) -> dict:

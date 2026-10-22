@@ -11,7 +11,7 @@ import pytest
 from scripts import streaming_pipeline as stream
 
 
-def test_copy_publication_tree_accepts_existing_sibling_shard(tmp_path, monkeypatch):
+def test_copy_publication_tree_accepts_existing_sibling_shard(tmp_path):
     source = tmp_path / "source"
     target = tmp_path / "target"
     source.mkdir()
@@ -19,19 +19,75 @@ def test_copy_publication_tree_accepts_existing_sibling_shard(tmp_path, monkeypa
     (source / "new.TextGrid").write_text("new", encoding="utf-8")
     (target / "old.TextGrid").write_text("old", encoding="utf-8")
 
-    original = stream._publication_tree
-    calls = []
-
-    def counted(path):
-        calls.append(path)
-        return original(path)
-
-    monkeypatch.setattr(stream, "_publication_tree", counted)
-    stream._copy_publication_tree(source, target)
+    manifest = stream._copy_publication_tree(source, target)
 
     assert (target / "old.TextGrid").read_text(encoding="utf-8") == "old"
     assert (target / "new.TextGrid").read_text(encoding="utf-8") == "new"
-    assert calls.count(target) == 1
+    assert manifest == {
+        "new.TextGrid": {
+            "size": 3,
+            "sha256": stream._sha256_file(source / "new.TextGrid"),
+        },
+    }
+
+
+def test_copy_publication_tree_hashes_only_current_batch_targets(
+        tmp_path, monkeypatch):
+    target = tmp_path / "target"
+    target.mkdir()
+    target_hashes = []
+    original_hash = stream._sha256_file
+
+    def counted(path):
+        digest = original_hash(path)
+        if path.parent == target:
+            target_hashes.append(path.name)
+        return digest
+
+    monkeypatch.setattr(stream, "_sha256_file", counted)
+    for index in range(10):
+        source = tmp_path / f"source-{index}"
+        source.mkdir()
+        (source / f"batch-{index}.TextGrid").write_text(
+            f"batch-{index}", encoding="utf-8")
+        stream._copy_publication_tree(source, target)
+
+    assert target_hashes == [f"batch-{index}.TextGrid" for index in range(10)]
+
+
+def test_copy_publication_tree_uses_expected_manifest_without_source_hash(
+        tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    (source / "one.TextGrid").write_text("one", encoding="utf-8")
+    expected = stream._publication_tree(source)
+    original_hash = stream._sha256_file
+    source_hashes = []
+
+    def counted(path):
+        if path.parent == source:
+            source_hashes.append(path)
+        return original_hash(path)
+
+    monkeypatch.setattr(stream, "_sha256_file", counted)
+    assert stream._copy_publication_tree(
+        source, target, expected_manifest=expected) == expected
+    assert source_hashes == []
+
+
+def test_copy_publication_tree_rejects_symlink_directory(tmp_path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "nested.TextGrid").write_text("nested", encoding="utf-8")
+    (source / "nested").symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        stream._copy_publication_tree(source, target)
 
 
 def test_copy_publication_tree_rejects_conflicting_hash(tmp_path):

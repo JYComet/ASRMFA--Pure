@@ -12,9 +12,11 @@ import os
 import platform
 import re
 import shutil
+import stat as stat_module
 import subprocess
 import sys
 import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -978,16 +980,198 @@ def _ctc_work_files(work_dir: Path, raw_manifest: dict) -> tuple[list[dict], lis
     return records, ref_rows
 
 
+@dataclass(frozen=True)
+class CtcWorkCommitSnapshot:
+    """One validated, commit-local inventory of a CTC work tree.
+
+    The snapshot is intentionally not a cache.  It is valid only for the
+    exact work root and raw manifest identity captured together, and its
+    stat observations are checked immediately before a receipt is written.
+    Consumer and resume validators continue to perform their own hashing.
+    """
+
+    work_root: str
+    raw_manifest_path: str
+    raw_root: str
+    raw_manifest_identity: str
+    files: tuple[dict, ...]
+    ref: tuple[dict, ...]
+    freshness_rows: tuple[dict, ...]
+    _raw_observations: tuple[tuple[str, tuple[int, int, int, int, int, int]], ...]
+    _work_observations: tuple[tuple[str, tuple[int, int, int, int, int, int]], ...]
+
+    @staticmethod
+    def _stat_identity(path: Path) -> tuple[int, int, int, int, int, int]:
+        stat = os.lstat(path)
+        if stat_module.S_ISLNK(stat.st_mode) or not stat_module.S_ISREG(stat.st_mode):
+            raise ValueError(f"CTC snapshot path is missing/unsafe: {path.name}")
+        return CtcWorkCommitSnapshot._stat_identity_from_stat(stat)
+
+    @staticmethod
+    def _stat_identity_from_stat(stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
+        return (stat.st_dev, stat.st_ino, stat.st_size,
+                stat.st_mtime_ns, stat.st_ctime_ns, stat.st_mode)
+
+    @classmethod
+    def capture(cls, work_dir: Path, raw_manifest_path: Path) -> "CtcWorkCommitSnapshot":
+        work_dir = Path(work_dir)
+        raw_manifest_path = Path(raw_manifest_path)
+        work_stat = os.lstat(work_dir)
+        if stat_module.S_ISLNK(work_stat.st_mode) or not stat_module.S_ISDIR(work_stat.st_mode):
+            raise ValueError(f"CTC snapshot work root is not a regular directory: {work_dir}")
+        raw_manifest_stat = os.lstat(raw_manifest_path)
+        if (stat_module.S_ISLNK(raw_manifest_stat.st_mode)
+                or not stat_module.S_ISREG(raw_manifest_stat.st_mode)):
+            raise ValueError("CTC snapshot raw manifest is missing/unsafe")
+        try:
+            raw_manifest = json.loads(raw_manifest_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"CTC snapshot raw manifest unreadable: {exc}") from exc
+        raw_root = Path(str(raw_manifest.get("raw_root", "")))
+        raw_root_stat = os.lstat(raw_root)
+        if stat_module.S_ISLNK(raw_root_stat.st_mode) or not stat_module.S_ISDIR(raw_root_stat.st_mode):
+            raise ValueError("CTC snapshot raw root is not a regular directory")
+        if raw_manifest_path.resolve() != raw_root / CTC_RAW_MANIFEST_NAME:
+            raise ValueError("CTC snapshot raw manifest/root mismatch")
+
+        raw_observations: dict[str, tuple[int, int, int, int, int, int]] = {
+            raw_manifest_path.name: cls._stat_identity_from_stat(raw_manifest_stat),
+        }
+        work_observations: dict[str, tuple[int, int, int, int, int, int]] = {}
+
+        def observe(path: Path, observations: dict) -> tuple[int, int, int, int, int, int]:
+            identity = cls._stat_identity(path)
+            observations[path.name] = identity
+            return identity
+
+        for row in raw_manifest.get("files", []):
+            observe(raw_root / str(row["name"]), raw_observations)
+        producer = raw_manifest.get("producer_receipt")
+        if not isinstance(producer, dict):
+            raise ValueError("CTC snapshot producer receipt binding missing")
+        observe(raw_root / str(producer.get("name", ".ctc_run_receipt.json")),
+                raw_observations)
+
+        errors = validate_ctc_raw_manifest(raw_root, raw_manifest)
+        if errors:
+            raise ValueError("cannot capture invalid raw manifest: " + "; ".join(errors))
+
+        with os.scandir(work_dir) as entries:
+            work_entries = sorted(entries, key=lambda entry: entry.name)
+        for child in work_entries:
+            if child.name == CTC_WORK_RECEIPT_NAME:
+                child_stat = child.stat(follow_symlinks=False)
+                if stat_module.S_ISLNK(child_stat.st_mode):
+                    raise ValueError("CTC snapshot receipt is symlinked")
+                continue
+            child_stat = child.stat(follow_symlinks=False)
+            if stat_module.S_ISLNK(child_stat.st_mode):
+                raise ValueError(f"CTC snapshot work inventory contains symlink: {child.name}")
+            if stat_module.S_ISDIR(child_stat.st_mode):
+                continue
+            if not stat_module.S_ISREG(child_stat.st_mode):
+                raise ValueError(f"CTC snapshot work inventory contains unsafe path: {child.name}")
+            work_observations[child.name] = cls._stat_identity_from_stat(child_stat)
+
+        records: list[dict] = []
+        for row in raw_manifest.get("files", []):
+            name = str(row["name"])
+            stat_identity = work_observations.get(name)
+            if stat_identity is None:
+                raise ValueError(f"CTC snapshot work artifact missing: {name}")
+            records.append({"stem": row["stem"], "suffix": row["suffix"],
+                            "name": name, "size": stat_identity[2],
+                            "sha256": _sha256_file(work_dir / name)})
+
+        refs: list[dict] = []
+        for stem in raw_manifest.get("stems", []):
+            name = f"{stem}_ref.txt"
+            stat_identity = work_observations.get(name)
+            if stat_identity is not None:
+                refs.append({"stem": stem, "suffix": "_ref.txt",
+                             "name": name, "size": stat_identity[2],
+                             "sha256": _sha256_file(work_dir / name)})
+
+        freshness: list[dict] = []
+        record_hashes = {row["name"]: row["sha256"] for row in records}
+        record_hashes.update({row["name"]: row["sha256"] for row in refs})
+        for child in work_entries:
+            if child.name == CTC_WORK_RECEIPT_NAME or child.name not in work_observations:
+                continue
+            stat_identity = work_observations[child.name]
+            row = {"name": child.name, "size": stat_identity[2],
+                   "sha256": record_hashes.get(child.name)}
+            if row["sha256"] is None:
+                row["sha256"] = _sha256_file(work_dir / child.name)
+            freshness.append(row)
+
+        return cls(
+            work_root=str(work_dir.resolve()),
+            raw_manifest_path=str(raw_manifest_path.resolve()),
+            raw_root=str(raw_root.resolve()),
+            raw_manifest_identity=str(raw_manifest.get("identity")),
+            files=tuple(records), ref=tuple(refs),
+            freshness_rows=tuple(freshness),
+            _raw_observations=tuple(raw_observations.items()),
+            _work_observations=tuple(work_observations.items()),
+        )
+
+    def validate_current(self, work_dir: Path, raw_manifest_path: Path) -> None:
+        work_dir = Path(work_dir)
+        raw_manifest_path = Path(raw_manifest_path)
+        if str(work_dir.resolve()) != self.work_root:
+            raise ValueError("CTC snapshot work root mismatch")
+        if str(raw_manifest_path.resolve()) != self.raw_manifest_path:
+            raise ValueError("CTC snapshot raw manifest path mismatch")
+        raw_observations = dict(self._raw_observations)
+        work_observations = dict(self._work_observations)
+        try:
+            manifest = json.loads(raw_manifest_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"CTC snapshot raw manifest unreadable: {exc}") from exc
+        if (manifest.get("identity") != self.raw_manifest_identity
+                or str(Path(str(manifest.get("raw_root", ""))).resolve()) != self.raw_root):
+            raise ValueError("CTC snapshot raw identity mismatch")
+        for name, identity in raw_observations.items():
+            if self._stat_identity(Path(self.raw_root) / name) != identity:
+                raise ValueError(f"CTC snapshot path changed: {name}")
+        with os.scandir(work_dir) as entries:
+            children = sorted(entries, key=lambda entry: entry.name)
+        current_names = set()
+        for child in children:
+            child_stat = child.stat(follow_symlinks=False)
+            if stat_module.S_ISLNK(child_stat.st_mode):
+                raise ValueError("CTC snapshot work inventory contains symlink")
+            if child.name == CTC_WORK_RECEIPT_NAME or stat_module.S_ISDIR(child_stat.st_mode):
+                continue
+            if not stat_module.S_ISREG(child_stat.st_mode):
+                raise ValueError(f"CTC snapshot work inventory contains unsafe path: {child.name}")
+            current_names.add(child.name)
+            if child.name not in work_observations:
+                raise ValueError("CTC snapshot work inventory changed")
+            if self._stat_identity_from_stat(child_stat) != work_observations[child.name]:
+                raise ValueError(f"CTC snapshot path changed: {child.name}")
+        if current_names != set(work_observations):
+            raise ValueError("CTC snapshot work inventory changed")
+
+
 def write_ctc_work_receipt(work_dir: Path, raw_manifest_path: Path,
                            *, transform_ledger: list[dict] | None = None,
-                           work_root: Path | None = None) -> dict:
+                           work_root: Path | None = None,
+                           snapshot: CtcWorkCommitSnapshot | None = None) -> dict:
     """Refresh the derived work receipt after a completed work transform."""
     work_dir = Path(work_dir); raw_manifest_path = Path(raw_manifest_path)
     raw_manifest = json.loads(raw_manifest_path.read_text(encoding="utf-8"))
-    errors = validate_ctc_raw_manifest(Path(raw_manifest["raw_root"]), raw_manifest)
-    if errors:
-        raise ValueError("cannot bind invalid raw manifest: " + "; ".join(errors))
-    records, ref_rows = _ctc_work_files(work_dir, raw_manifest)
+    if snapshot is None:
+        errors = validate_ctc_raw_manifest(Path(raw_manifest["raw_root"]), raw_manifest)
+        if errors:
+            raise ValueError("cannot bind invalid raw manifest: " + "; ".join(errors))
+        records, ref_rows = _ctc_work_files(work_dir, raw_manifest)
+    else:
+        snapshot.validate_current(work_dir, raw_manifest_path)
+        if work_root is not None and Path(work_root).resolve() != Path(snapshot.work_root):
+            raise ValueError("CTC snapshot work root mismatch")
+        records, ref_rows = list(snapshot.files), list(snapshot.ref)
     ledger = list(transform_ledger or [])
     payload = {
         "schema": CTC_WORK_RECEIPT_SCHEMA,

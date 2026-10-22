@@ -55,6 +55,10 @@ from pipeline_utils import (
     validate_ctc_run_receipt_v2,
     make_pipeline_accounting_receipt, validate_pipeline_accounting_receipt,
 )
+from resource_budget import (
+    PhaseAdmissionCancelled,
+    WeightedAdmissionGate,
+)
 
 
 def plan_streaming_resources(
@@ -81,7 +85,10 @@ def plan_streaming_resources(
     The result intentionally contains only plain integers so launchers and
     tests can use it without constructing argparse objects.
     """
-    budget = max(1, int(cpu_budget or (os.cpu_count() or 1)))
+    if cpu_budget is not None and int(cpu_budget) <= 0:
+        raise ValueError("cpu_budget must be positive")
+    budget = max(1, int(cpu_budget if cpu_budget is not None
+                         else (os.cpu_count() or 1)))
     requested_gpu = max(1, int(requested_gpu_workers or 1))
     if batch_count is not None:
         requested_gpu = min(requested_gpu, max(1, batch_count))
@@ -116,6 +123,11 @@ def plan_streaming_resources(
         "cpu_workers": cpu_workers,
         "mfa_jobs_per_worker": mfa_jobs,
         "mfa_en_jobs_per_worker": mfa_en_jobs,
+        # Auxiliary pools (adjust/corpus/normalization/postprocess) are
+        # independently clamped by the child run_pipeline budget.  Keep a
+        # small explicit cap for admission accounting of one phase.
+        "auxiliary_workers_cap": max(1, min(8, jobs_ceiling)),
+        "worker_cpu_budget": jobs_ceiling,
         "batch_size": max(1, int(batch_size)),
         "gpu_queue_size": max(1, int(gpu_queue_size or default_gpu_queue)),
         "cpu_queue_size": max(1, int(cpu_queue_size or default_cpu_queue)),
@@ -806,6 +818,7 @@ def _process_one_batch(
     mfa_en_num_jobs: int = 0,
     allow_overwrite: bool = True,
     allow_force: bool = True,
+    cpu_budget: int | None = None,
 ) -> bool:
     """Phase 2: NVMe → NVMe. Run run_pipeline.py on locally-staged data.
 
@@ -864,6 +877,8 @@ def _process_one_batch(
         cmd += ["--mfa-jobs", str(mfa_num_jobs)]
     if mfa_en_num_jobs > 0:
         cmd += ["--mfa-en-jobs", str(mfa_en_num_jobs)]
+    if cpu_budget is not None:
+        cmd += ["--cpu-budget", str(cpu_budget)]
 
     t0 = time.time()
     env = get_mfa_env(mfa_python, models_dir)
@@ -1043,6 +1058,7 @@ def run_single_batch(
     receipt_mode: str = "streaming",
     receipt_route: list[str] | None = None,
     require_zero_filtered: bool = False,
+    cpu_budget: int | None = None,
 ) -> bool:
     """Process a single batch end-to-end (original streaming behavior).
 
@@ -1070,6 +1086,7 @@ def run_single_batch(
         mode=mode, device=device,
         restore_cache=True, persist_cache_on_failure=True,
         mfa_num_jobs=mfa_num_jobs, mfa_en_num_jobs=mfa_en_num_jobs,
+        cpu_budget=cpu_budget,
     )
     if not ok:
         return False
@@ -1175,17 +1192,39 @@ def _implementation_sha256() -> str:
 
 def _publication_tree(root: Path) -> dict[str, dict[str, object]]:
     """Return a deterministic file/size/hash manifest for a publication tree."""
-    if not root.is_dir() or root.is_symlink():
+    if root.is_symlink():
+        raise ValueError(f"publication tree contains symlink: {root}")
+    if not root.is_dir():
         return {}
     result: dict[str, dict[str, object]] = {}
     for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
         if path.is_symlink():
             raise ValueError(f"publication tree contains symlink: {path}")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ValueError(f"publication tree contains non-file: {path}")
         rel = path.relative_to(root).as_posix()
         result[rel] = {"size": path.stat().st_size,
                        "sha256": _sha256_file(path)}
+    return result
+
+
+def _publication_tree_inventory(root: Path) -> dict[str, int]:
+    """Enumerate a publication tree without reading file contents."""
+    if root.is_symlink():
+        raise ValueError(f"publication tree contains symlink: {root}")
+    if not root.is_dir():
+        return {}
+    result: dict[str, int] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"publication tree contains symlink: {path}")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ValueError(f"publication tree contains non-file: {path}")
+        result[path.relative_to(root).as_posix()] = path.stat().st_size
     return result
 
 
@@ -1263,61 +1302,200 @@ def _validate_zero_filtered_report(report_path: Path,
     return _validate_zero_filtered_report_rows(rows, output_stems)
 
 
-def _validate_frozen_cache_inventory(cache: dict) -> None:
-    """Fail closed when an explicit cache no longer names the source WAV set."""
+def _walk_source_wavs(audio_dir: Path) -> list[tuple[Path, int]]:
+    """List WAV files recursively without following symlinks."""
+    found: list[tuple[Path, int]] = []
+    if audio_dir.is_symlink() or not audio_dir.is_dir():
+        raise ValueError(f"cache source directory is unsafe or missing: {audio_dir}")
+
+    def visit(directory: Path) -> None:
+        with os.scandir(str(directory)) as iterator:
+            children = sorted(iterator, key=lambda item: item.name)
+        for entry in children:
+            entry_path = Path(entry.path)
+            metadata = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError(f"cache source contains symlink: {entry_path}")
+            if stat.S_ISDIR(metadata.st_mode):
+                visit(entry_path)
+            elif Path(entry.name).suffix.lower() == ".wav":
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError(f"cache source WAV is not regular: {entry_path}")
+                found.append((entry_path, metadata.st_size))
+
+    visit(audio_dir)
+    return found
+
+
+def _validate_frozen_cache_inventory(cache: dict, *,
+                                     freeze_missing: bool = False) -> bool:
+    """Validate or optionally freeze each dataset's live WAV inventory.
+
+    The return value is true if this call created any source inventories.
+    Explicit-stem caches preserve their existing inventory schema.  Older scan
+    caches without stems record path-based WAV identities, since paths are the
+    only source identity they contain before execution discovers CTC coverage.
+    """
+    changed_cache = False
     for dataset in cache.get("datasets", []):
         validation_started = time.monotonic()
         stems = dataset.get("stems")
-        if not isinstance(stems, list):
-            continue  # legacy multi-dataset caches are validated by their CTC scan
-        expected = [str(stem) for stem in stems]
-        if expected != sorted(expected) or len(expected) != len(set(expected)):
-            raise ValueError(f"cache stems are not sorted and unique: {dataset.get('name')}")
         audio_dir = resolve_input_path(str(dataset.get("audio_dir", "")))
-        entries: list[tuple[Path, int]] = []
-        with os.scandir(str(audio_dir)) as directory_entries:
-            for entry in directory_entries:
-                if Path(entry.name).suffix.lower() != ".wav":
-                    continue
-                entry_stat = entry.stat(follow_symlinks=False)
-                if stat.S_ISLNK(entry_stat.st_mode):
-                    raise ValueError(f"cache source contains symlink WAV: {audio_dir}")
-                if not stat.S_ISREG(entry_stat.st_mode):
-                    continue
-                entries.append((Path(entry.path),
-                                entry_stat.st_size))
-        actual = sorted(path.stem for path, _size in entries)
-        if actual != expected:
-            raise ValueError(
-                f"cache/source stem mismatch for {dataset.get('name')}: "
-                f"cache={len(expected)} source={len(actual)}")
+        if audio_dir.is_symlink() or not audio_dir.is_dir():
+            raise ValueError(f"cache source directory is unsafe or missing: {audio_dir}")
+        explicit_stems = isinstance(stems, list)
+        if explicit_stems:
+            expected = [str(stem) for stem in stems]
+            if (not expected or expected != sorted(expected)
+                    or len(expected) != len(set(expected))):
+                raise ValueError(
+                    f"cache stems are empty, unsorted, or duplicated: "
+                    f"{dataset.get('name')}")
+            entries: list[tuple[Path, int]] = []
+            with os.scandir(str(audio_dir)) as directory_entries:
+                for entry in directory_entries:
+                    if Path(entry.name).suffix.lower() != ".wav":
+                        continue
+                    entry_stat = entry.stat(follow_symlinks=False)
+                    if stat.S_ISLNK(entry_stat.st_mode):
+                        raise ValueError(
+                            f"cache source contains symlink WAV: {audio_dir}")
+                    if stat.S_ISREG(entry_stat.st_mode):
+                        entries.append((Path(entry.path), entry_stat.st_size))
+            entries.sort(key=lambda item: item[0].stem)
+            actual = sorted(path.stem for path, _size in entries)
+            if actual != expected:
+                raise ValueError(
+                    f"cache/source stem mismatch for {dataset.get('name')}: "
+                    f"cache={len(expected)} source={len(actual)}")
+            cache_keys = expected
+        else:
+            entries = _walk_source_wavs(audio_dir)
+            if not entries:
+                raise ValueError(f"cache source inventory is empty: {dataset.get('name')}")
+            actual_stems = [path.stem for path, _size in entries]
+            if len(actual_stems) != len(set(actual_stems)):
+                raise ValueError(
+                    f"cache source contains duplicate WAV stems: {dataset.get('name')}")
+            cache_keys = [path.relative_to(audio_dir).as_posix()
+                          for path, _size in entries]
         inventory = dataset.get("source_inventory")
+        frozen_this_dataset = False
         if not isinstance(inventory, dict):
-            continue
+            if not freeze_missing:
+                raise ValueError(
+                    f"source inventory is missing: {dataset.get('name')}")
+            rows = []
+            for path, size in entries:
+                row = {"stem": path.stem, "size": size,
+                       "sha256": _sha256_file(path)}
+                if not explicit_stems:
+                    row["path"] = path.relative_to(audio_dir).as_posix()
+                rows.append(row)
+            inventory = {"count": len(rows), "files": rows}
+            dataset["source_inventory"] = inventory
+            changed_cache = True
+            frozen_this_dataset = True
         rows = inventory.get("files")
         if not isinstance(rows, list) or inventory.get("count") != len(rows):
             raise ValueError(f"invalid source inventory: {dataset.get('name')}")
-        by_stem = {row.get("stem"): row for row in rows if isinstance(row, dict)}
-        if set(by_stem) != set(expected) or len(by_stem) != len(rows):
-            raise ValueError(f"source inventory stem mismatch: {dataset.get('name')}")
+        if explicit_stems:
+            by_key = {row.get("stem"): row for row in rows
+                      if isinstance(row, dict)}
+        else:
+            by_key = {row.get("path"): row for row in rows
+                      if isinstance(row, dict)}
+        if set(by_key) != set(cache_keys) or len(by_key) != len(rows):
+            raise ValueError(f"source inventory identity mismatch: {dataset.get('name')}")
         for path, size in entries:
-            row = by_stem[path.stem]
-            actual_sha256 = _sha256_file(path)
-            if (row.get("size") != size
+            key = path.stem if explicit_stems else path.relative_to(audio_dir).as_posix()
+            row = by_key[key]
+            if frozen_this_dataset:
+                # Hashes were just captured while building this inventory.
+                actual_sha256 = row.get("sha256")
+            else:
+                actual_sha256 = _sha256_file(path)
+            if (row.get("stem") != path.stem
+                    or row.get("size") != size
                     or row.get("sha256") != actual_sha256):
                 raise ValueError(f"source inventory hash mismatch: {path}")
         print(f"  Frozen source validated: {dataset.get('name')} "
               f"({len(entries)} WAVs, "
               f"{time.monotonic() - validation_started:.2f}s)")
+    return changed_cache
 
 
-def _copy_publication_tree(source: Path, target: Path) -> None:
-    """Copy a tree without overwriting a conflicting existing artifact."""
-    expected = _publication_tree(source)
+def _persist_source_inventories(cache_path: Path, cache: dict) -> None:
+    """Persist freshly frozen inventory fields before deriving cache identity."""
+    try:
+        persisted = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(f"cannot read batch cache for inventory update: {exc}") from exc
+    persisted_datasets = persisted.get("datasets")
+    if not isinstance(persisted_datasets, list):
+        raise ValueError("batch cache datasets are invalid during inventory update")
+    by_name = {str(row.get("name", "")): row for row in persisted_datasets
+               if isinstance(row, dict)}
+    changed = False
+    for dataset in cache.get("datasets", []):
+        name = str(dataset.get("name", ""))
+        inventory = dataset.get("source_inventory")
+        stored = by_name.get(name)
+        if not isinstance(inventory, dict) or stored is None:
+            raise ValueError(f"cannot persist source inventory for {name}")
+        if "source_inventory" in stored:
+            if stored["source_inventory"] != inventory:
+                raise ValueError(f"batch cache inventory changed for {name}")
+        else:
+            stored["source_inventory"] = inventory
+            changed = True
+    if not changed:
+        return
+    temporary = cache_path.with_name(cache_path.name + f".tmp.{os.getpid()}")
+    try:
+        temporary.write_text(
+            json.dumps(persisted, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8")
+        temporary.replace(cache_path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _copy_publication_tree(
+        source: Path, target: Path, *,
+        expected_manifest: dict[str, dict[str, object]] | None = None,
+        ) -> dict[str, dict[str, object]]:
+    """Copy a tree and return the validated manifest for this source batch."""
+    if expected_manifest is None:
+        expected = _publication_tree(source)
+    else:
+        inventory = _publication_tree_inventory(source)
+        expected = dict(expected_manifest)
+        if set(inventory) != set(expected):
+            raise ValueError(f"publication source inventory mismatch: {source}")
+        for rel, metadata in expected.items():
+            if (not isinstance(metadata, dict)
+                    or not isinstance(metadata.get("size"), int)
+                    or not isinstance(metadata.get("sha256"), str)
+                    or inventory[rel] != metadata["size"]):
+                raise ValueError(f"publication source inventory mismatch: {source}")
+    if target.is_symlink():
+        raise ValueError(f"publication target contains symlink: {target}")
     target.mkdir(parents=True, exist_ok=True)
+    _publication_tree_inventory(target)
+    validated: set[str] = set()
     for rel, metadata in expected.items():
         src = source / rel
         dst = target / rel
+        parent = target
+        for part in Path(rel).parts[:-1]:
+            parent /= part
+            if parent.is_symlink():
+                raise ValueError(f"publication target contains symlink: {parent}")
         dst.parent.mkdir(parents=True, exist_ok=True)
         if dst.exists() or dst.is_symlink():
             if dst.is_symlink() or not dst.is_file():
@@ -1325,36 +1503,57 @@ def _copy_publication_tree(source: Path, target: Path) -> None:
             actual = {"size": dst.stat().st_size, "sha256": _sha256_file(dst)}
             if actual != metadata:
                 raise ValueError(f"publication target hash conflict: {dst}")
+            validated.add(rel)
             continue
         shutil.copyfile(str(src), str(dst))
-    # ``target`` accumulates sibling batches, so equality with this shard is
-    # neither required nor expected.  Scan/hash it once and verify every file
-    # from this shard against its exact metadata.  The former expression
-    # rebuilt and re-hashed the whole NAS target once per source file (O(n²))
-    # and, when extra sibling files existed, checked only names rather than
-    # the expected size/hash pair.
-    actual = _publication_tree(target)
-    mismatches = {
-        rel: {"expected": metadata, "actual": actual.get(rel)}
-        for rel, metadata in expected.items()
-        if actual.get(rel) != metadata
-    }
-    if mismatches:
-        sample = next(iter(mismatches.items()))
-        raise ValueError(
-            f"publication verification failed: {source} -> {target}: {sample}")
+    for rel, metadata in expected.items():
+        if rel in validated:
+            continue
+        dst = target / rel
+        if (not dst.is_file() or dst.is_symlink()
+                or {"size": dst.stat().st_size,
+                    "sha256": _sha256_file(dst)} != metadata):
+            raise ValueError(
+                f"publication verification failed: {source} -> {target}: {rel}")
+    return expected
 
 
-def _copy_textgrid_tree(source: Path, target: Path) -> None:
+def _copy_textgrid_tree(
+        source: Path, target: Path, *,
+        expected_manifest: dict[str, dict[str, object]] | None = None,
+        ) -> dict[str, dict[str, object]]:
     """Copy only terminal TextGrid artifacts into a publication tree."""
+    if source.is_symlink():
+        raise ValueError(f"invalid TextGrid artifact: {source}")
+    if target.is_symlink():
+        raise ValueError(f"publication target contains symlink: {target}")
     target.mkdir(parents=True, exist_ok=True)
+    _publication_tree_inventory(target)
     expected: dict[str, dict[str, object]] = {}
+    source_textgrids: dict[str, Path] = {}
     if source.is_dir() and not source.is_symlink():
-        for path in sorted(source.glob("*.TextGrid")):
-            if path.is_symlink() or not path.is_file():
+        for path in sorted(source.rglob("*")):
+            if path.is_symlink():
                 raise ValueError(f"invalid TextGrid artifact: {path}")
-            expected[path.name] = {"size": path.stat().st_size,
-                                   "sha256": _sha256_file(path)}
+        for path in sorted(source.glob("*.TextGrid")):
+            if not path.is_file():
+                raise ValueError(f"invalid TextGrid artifact: {path}")
+            source_textgrids[path.name] = path
+            if expected_manifest is None:
+                expected[path.name] = {"size": path.stat().st_size,
+                                       "sha256": _sha256_file(path)}
+    if expected_manifest is not None:
+        expected = dict(expected_manifest)
+        inventory = _publication_tree_inventory(source)
+        if set(inventory) != set(expected) or set(source_textgrids) != set(expected):
+            raise ValueError(f"TextGrid source inventory mismatch: {source}")
+        for rel, metadata in expected.items():
+            if (not isinstance(metadata, dict)
+                    or not isinstance(metadata.get("size"), int)
+                    or not isinstance(metadata.get("sha256"), str)
+                    or inventory[rel] != metadata["size"]):
+                raise ValueError(f"TextGrid source inventory mismatch: {source}")
+    validated: set[str] = set()
     for rel, metadata in expected.items():
         dst = target / rel
         if dst.exists() or dst.is_symlink():
@@ -1362,15 +1561,79 @@ def _copy_textgrid_tree(source: Path, target: Path) -> None:
                 raise ValueError(f"publication target conflict: {dst}")
             if {"size": dst.stat().st_size, "sha256": _sha256_file(dst)} != metadata:
                 raise ValueError(f"publication target hash conflict: {dst}")
+            validated.add(rel)
         else:
             shutil.copyfile(str(source / rel), str(dst))
-    if _publication_tree(target) != expected:
-        raise ValueError(f"TextGrid publication verification failed: {source} -> {target}")
+    for rel, metadata in expected.items():
+        if rel in validated:
+            continue
+        dst = target / rel
+        if (not dst.is_file() or dst.is_symlink()
+                or {"size": dst.stat().st_size,
+                    "sha256": _sha256_file(dst)} != metadata):
+            raise ValueError(
+                f"TextGrid publication verification failed: {source} -> {target}")
+    return expected
 
 
 def _batch_evidence_path(dataset_root: Path, batch_idx: int) -> Path:
     return (dataset_root / ".batch_evidence" /
             f"batch_{batch_idx:04d}" / "batch_receipt.json")
+
+
+def _publication_artifact_manifest(
+        evidences: list[dict]) -> dict[str, dict[str, object]]:
+    """Build the terminal output/filtered manifest from trusted batch evidence."""
+    expected: dict[str, dict[str, object]] = {}
+    for evidence in evidences:
+        for bucket in ("output", "filtered"):
+            for rel, metadata in _publication_bucket_manifest(
+                    evidence, bucket).items():
+                target_rel = f"{bucket}/{rel}"
+                if target_rel in expected:
+                    raise ValueError(
+                        f"conflicting duplicate target path: {target_rel}")
+                expected[target_rel] = metadata
+    return expected
+
+
+def _publication_bucket_manifest(
+        evidence: dict, bucket: str) -> dict[str, dict[str, object]]:
+    """Extract one terminal publication bucket from trusted evidence."""
+    artifacts = evidence.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise ValueError("trusted batch evidence has no artifact manifest")
+    prefix = f"{bucket}/"
+    result = {rel[len(prefix):]: metadata for rel, metadata in artifacts.items()
+              if isinstance(rel, str) and rel.startswith(prefix)}
+    if any(Path(rel).name != rel or not rel.endswith(".TextGrid")
+           for rel in result):
+        raise ValueError(f"trusted {bucket} bucket contains non-TextGrid artifact")
+    return result
+
+
+def _verify_final_publication_manifest(
+        dataset_root: Path, evidences: list[dict], *,
+        report_sha256: str | None = None) -> None:
+    """Verify terminal bytes exactly equal the union of trusted batch artifacts."""
+    expected = _publication_artifact_manifest(evidences)
+    actual: dict[str, dict[str, object]] = {}
+    for bucket in ("output", "filtered"):
+        for rel, metadata in _publication_tree(dataset_root / bucket).items():
+            actual[f"{bucket}/{rel}"] = metadata
+    if report_sha256 is not None:
+        report_path = dataset_root / "output" / "postprocess_report.jsonl"
+        if (not report_path.is_file() or report_path.is_symlink()
+                or _sha256_file(report_path) != report_sha256):
+            raise ValueError("final publication report mismatch")
+        actual["output/postprocess_report.jsonl"] = {
+            "size": report_path.stat().st_size,
+            "sha256": report_sha256,
+        }
+        expected["output/postprocess_report.jsonl"] = actual[
+            "output/postprocess_report.jsonl"]
+    if actual != expected:
+        raise ValueError("final publication manifest mismatch")
 
 
 def _load_trusted_batch_evidence(
@@ -1591,15 +1854,25 @@ def _publish_batch_to_staging(
     evidence_tmp = dataset_root / ".batch_evidence" / f".batch_{batch_idx:04d}.tmp.{os.getpid()}"
     try:
         staging_tmp.mkdir(parents=True, exist_ok=False)
-        _copy_textgrid_tree(local_output, staging_tmp / "output")
-        _copy_textgrid_tree(local_filtered, staging_tmp / "filtered")
+        output_manifest = _copy_textgrid_tree(local_output, staging_tmp / "output")
+        filtered_manifest = _copy_textgrid_tree(
+            local_filtered, staging_tmp / "filtered")
         # Adjusted CTC is an isolated batch artifact.  It is part of the
         # trusted evidence manifest, but intentionally is not copied by the
         # dataset aggregator into terminal output/filtered trees.
         local_adj = local_dir / "workspace" / "ctc_pretg_adj"
+        adjusted_manifest: dict[str, dict[str, object]] = {}
         if local_adj.exists() or local_adj.is_symlink():
-            _copy_publication_tree(local_adj, staging_tmp / "ctc_pretg_adj")
-        artifacts = _publication_tree(staging_tmp)
+            adjusted_manifest = _copy_publication_tree(
+                local_adj, staging_tmp / "ctc_pretg_adj")
+        artifacts = {
+            **{f"output/{rel}": metadata
+               for rel, metadata in output_manifest.items()},
+            **{f"filtered/{rel}": metadata
+               for rel, metadata in filtered_manifest.items()},
+            **{f"ctc_pretg_adj/{rel}": metadata
+               for rel, metadata in adjusted_manifest.items()},
+        }
         evidence_tmp.mkdir(parents=True, exist_ok=False)
         report_target = evidence_tmp / "postprocess_report.jsonl"
         shutil.copyfile(str(report), str(report_target))
@@ -1639,7 +1912,7 @@ def _load_complete_dataset_receipt(
     dataset_root: Path, dataset_name: str, source_stems: list[str],
     batch_indices: list[int], *, config_sha256: str = "", cache_sha256: str = "",
     implementation_sha256: str = "", receipt_mode: str = "pipelined",
-    require_zero_filtered: bool = False,
+    require_zero_filtered: bool = False, batch_size: int | None = None,
 ) -> dict | None:
     """Accept a dataset resume only when both final receipts are complete."""
     dataset_path = dataset_root / ".streaming_dataset_receipt_v1.json"
@@ -1652,6 +1925,14 @@ def _load_complete_dataset_receipt(
         final = json.loads(final_path.read_text(encoding="utf-8"))
         expected_source = sorted(str(stem) for stem in source_stems)
         expected_indices = sorted(set(batch_indices))
+        if (not expected_source
+                or len(expected_source) != len(set(expected_source))):
+            return None
+        if (batch_size is not None
+                and (isinstance(batch_size, bool)
+                     or not isinstance(batch_size, int)
+                     or batch_size <= 0)):
+            return None
         if (dataset_receipt.get("schema") != STREAMING_DATASET_RECEIPT_SCHEMA
                 or dataset_receipt.get("status") != "COMPLETE"
                 or dataset_receipt.get("dataset") != dataset_name
@@ -1692,17 +1973,34 @@ def _load_complete_dataset_receipt(
             return None
         if require_zero_filtered and final_filtered_bucket.get("stems", []):
             return None
+        trusted_evidences = []
+        evidence_stems: list[str] = []
         for batch_index, expected_hash in zip(expected_indices, batch_hashes):
             evidence_path = _batch_evidence_path(dataset_root, batch_index)
             evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-            if (evidence.get("receipt_sha256") != expected_hash
-                    or _load_trusted_batch_evidence(
+            trusted = _load_trusted_batch_evidence(
                         dataset_root, batch_index, evidence.get("stems", []),
                         config_sha256=config_sha256,
                         cache_sha256=cache_sha256,
                         implementation_sha256=implementation_sha256,
-                        require_zero_filtered=require_zero_filtered) is None):
+                        require_zero_filtered=require_zero_filtered)
+            if (evidence.get("receipt_sha256") != expected_hash
+                    or trusted is None):
                 return None
+            if batch_size is not None:
+                batch_stems = trusted.get("stems")
+                if (not isinstance(batch_stems, list)
+                        or not batch_stems
+                        or len(batch_stems) > batch_size
+                        or any(not isinstance(stem, str) for stem in batch_stems)):
+                    return None
+                evidence_stems.extend(batch_stems)
+            trusted_evidences.append(trusted)
+        if (batch_size is not None
+                and (len(evidence_stems) != len(expected_source)
+                     or sorted(evidence_stems) != expected_source
+                     or len(evidence_stems) != len(set(evidence_stems)))):
+            return None
         final_output = {p.stem for p in (dataset_root / "output").glob("*.TextGrid")}
         final_filtered = {p.stem for p in (dataset_root / "filtered").glob("*.TextGrid")}
         if (final_output & final_filtered
@@ -1715,6 +2013,10 @@ def _load_complete_dataset_receipt(
         if (dataset_receipt.get("outputs", {}).get("report_sha256")
                 != _sha256_file(report_path)):
             return None
+        _verify_final_publication_manifest(
+            dataset_root, trusted_evidences,
+            report_sha256=dataset_receipt.get("outputs", {}).get(
+                "report_sha256"))
         if (require_zero_filtered
                 and not _validate_zero_filtered_report(
                     report_path, final_output)):
@@ -1850,8 +2152,12 @@ def _aggregate_dataset_publication(
 
     for evidence in evidences:
         batch_root = dataset_root / ".staging" / f"batch_{evidence['batch_index']:04d}"
-        _copy_publication_tree(batch_root / "output", dataset_root / "output")
-        _copy_publication_tree(batch_root / "filtered", dataset_root / "filtered")
+        _copy_textgrid_tree(
+            batch_root / "output", dataset_root / "output",
+            expected_manifest=_publication_bucket_manifest(evidence, "output"))
+        _copy_textgrid_tree(
+            batch_root / "filtered", dataset_root / "filtered",
+            expected_manifest=_publication_bucket_manifest(evidence, "filtered"))
     report_text = "\n".join(row for row in report_rows if row.strip()) + "\n"
     report_path = dataset_root / "output" / "postprocess_report.jsonl"
     if report_path.exists() and report_path.read_text(encoding="utf-8") != report_text:
@@ -1859,6 +2165,8 @@ def _aggregate_dataset_publication(
     report_tmp = report_path.with_name(report_path.name + f".tmp.{os.getpid()}")
     report_tmp.write_text(report_text, encoding="utf-8")
     report_tmp.replace(report_path)
+    _verify_final_publication_manifest(
+        dataset_root, evidences, report_sha256=_sha256_file(report_path))
     final_already_valid = False
     if final_path.exists() or final_path.is_symlink():
         try:
@@ -2148,7 +2456,8 @@ class StreamingPipeline:
                  mfa_num_jobs: int = 0,
                  mfa_en_num_jobs: int = 0,
                  allow_overwrite: bool = True,
-                 allow_force: bool = True):
+                 allow_force: bool = True,
+                 cpu_budget: int | None = None):
         self.bm = batch_mgr
         self.pipeline_script = pipeline_script
         self.config_path = config_path
@@ -2158,6 +2467,7 @@ class StreamingPipeline:
 
         self.mfa_num_jobs = mfa_num_jobs
         self.mfa_en_num_jobs = mfa_en_num_jobs
+        self.cpu_budget = cpu_budget
         self.allow_overwrite = allow_overwrite
         self.allow_force = allow_force
 
@@ -2359,6 +2669,8 @@ class StreamingPipeline:
             cmd += ["--mfa-jobs", str(self.mfa_num_jobs)]
         if self.mfa_en_num_jobs > 0:
             cmd += ["--mfa-en-jobs", str(self.mfa_en_num_jobs)]
+        if self.cpu_budget is not None:
+            cmd += ["--cpu-budget", str(self.cpu_budget)]
 
         t0 = time.time()
         try:
@@ -2546,6 +2858,8 @@ Examples:
                              "Set > 1 to utilize multi-core per batch. Requires pre-extracted model.")
     parser.add_argument("--mfa-en-jobs", type=int, default=None,
                         help="English MFA num_jobs per worker; capped by the same CPU budget.")
+    parser.add_argument("--cpu-budget", type=int, default=None,
+                        help="Positive CPU budget propagated to child stage pools.")
     parser.add_argument("--pipelined", action="store_true",
                         help="Enable pipelined GPU/CPU mode: NVASR and MFA run in parallel stages. "
                              "GPU workers process prealign, CPU workers process MFA alignment. "
@@ -2582,6 +2896,9 @@ Examples:
     parser.add_argument("--no-force", action="store_true",
                         help="Disable --force in child processes (respect strict configs).")
     args = parser.parse_args()
+
+    if args.cpu_budget is not None and args.cpu_budget <= 0:
+        parser.error("--cpu-budget must be positive")
 
     # ── Load config for streaming defaults ──
     import yaml as _yaml
@@ -2714,6 +3031,7 @@ Examples:
             mfa_num_jobs=(args.mfa_jobs if args.mfa_jobs is not None
                           else cfg.get("mfa", {}).get("num_jobs", 0)),
             mfa_en_num_jobs=cfg.get("mfa_en", {}).get("num_jobs", 0),
+            cpu_budget=args.cpu_budget,
             mode=_streaming_producer_mode(args.mode, cfg.get("mode")),
         )
         if not ok:
@@ -2762,6 +3080,7 @@ def run_single_dataset(
     device: str = "",
     parallel_batches: int = 4,
     mode: str | None = None,
+    cpu_budget: int | None = None,
 ) -> bool:
     """Run pipeline for a single dataset.  Returns True on success.
 
@@ -2874,6 +3193,7 @@ def run_single_dataset(
         wav_index=wav_index,
     )
     resources = plan_streaming_resources(
+        cpu_budget=cpu_budget,
         requested_cpu_workers=parallel_batches,
         requested_mfa_jobs=mfa_num_jobs if mfa_num_jobs > 0 else None,
         config_mfa_en_jobs=mfa_en_num_jobs,
@@ -2883,6 +3203,10 @@ def run_single_dataset(
     parallel_batches = resources["cpu_workers"]
     mfa_num_jobs = resources["mfa_jobs_per_worker"]
     mfa_en_num_jobs = resources["mfa_en_jobs_per_worker"]
+    # The single-dataset scheduler also owns the host allocation.  Child
+    # stages receive their per-worker share even when the caller accepts the
+    # planner's automatic host budget.
+    child_cpu_budget = resources["worker_cpu_budget"]
 
     if not staged and mode == "nvrasr_fallback":
         # The legacy interleaved class copies a pre-existing CTC bundle and
@@ -2904,6 +3228,7 @@ def run_single_dataset(
             upload_buffer=upload_buffer,
             mfa_num_jobs=mfa_num_jobs,
             mfa_en_num_jobs=mfa_en_num_jobs,
+            cpu_budget=child_cpu_budget,
         )
         return pipeline.run()
 
@@ -2969,6 +3294,7 @@ def run_single_dataset(
             persist_cache_on_failure=False,
             mfa_num_jobs=mfa_num_jobs,
             mfa_en_num_jobs=mfa_en_num_jobs,
+            cpu_budget=child_cpu_budget,
         )
 
     n_proc = min(parallel_batches, len(staged_dirs))
@@ -3144,6 +3470,7 @@ def _checkpoint_identity(cache: dict, args) -> dict[str, object]:
         "parallel_datasets": getattr(args, "parallel_datasets", None),
         "mfa_jobs": getattr(args, "mfa_jobs", None),
         "mfa_en_jobs": getattr(args, "mfa_en_jobs", None),
+        "cpu_budget": getattr(args, "cpu_budget", None),
         "gpus": getattr(args, "gpus", None),
         "pipelined": bool(getattr(args, "pipelined", False)),
     }
@@ -3299,6 +3626,7 @@ def _execute_staged(
     allow_force: bool = True,
     config_sha256: str = "", cache_sha256: str = "",
     implementation_sha256: str = "", require_zero_filtered: bool = False,
+    cpu_budget: int | None = None,
 ) -> tuple[int, list[str]]:
     """Three-phase staged execution: Stage All → Process All → Upload All.
 
@@ -3464,6 +3792,7 @@ def _execute_staged(
                     persist_cache_on_failure=False, # upload in Phase 3
                     mfa_num_jobs=mfa_num_jobs,
                     mfa_en_num_jobs=mfa_en_num_jobs,
+                    cpu_budget=cpu_budget,
                     allow_overwrite=allow_overwrite,
                     allow_force=allow_force,
                 )
@@ -3704,7 +4033,89 @@ def run_batch(args) -> bool:
         print("ERROR: No datasets in cache!")
         sys.exit(1)
 
+    # Freeze legacy scan-cache inventories and persist them before deriving
+    # either checkpoint identity or evidence cache hashes.  This changes the
+    # cache identity, so old receipts cannot inherit trust from a new snapshot.
+    try:
+        _validate_frozen_cache_inventory(cache, freeze_missing=True)
+        _persist_source_inventories(cache_path, cache)
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"ERROR: frozen cache inventory validation failed: {exc}")
+        return False
     checkpoint_identity = _checkpoint_identity(cache, args)
+    config_sha256 = _sha256_file(args.config)
+    cache_sha256 = _sha256_file(cache_path)
+
+    def completed_publication_is_valid(dataset: dict) -> bool:
+        dataset_name = str(dataset.get("name", ""))
+        if getattr(args, "limit", 0):
+            # Limited runs can split the complete/fallback partitions before
+            # assigning batch indices.  Their plan is rebuilt below on a full
+            # run, so do not infer it from a completed receipt here.
+            return False
+        root = resolve_input_path(
+            cache.get("output_root", "").rstrip("/"), PROJECT_ROOT
+        ) / dataset_name
+        dataset_receipt_path = root / ".streaming_dataset_receipt_v1.json"
+        try:
+            if dataset_receipt_path.is_symlink():
+                return False
+            dataset_receipt = json.loads(
+                dataset_receipt_path.read_text(encoding="utf-8"))
+            source_stems = dataset.get("stems")
+            if isinstance(source_stems, list):
+                source_stems = sorted(str(stem) for stem in source_stems)
+            else:
+                final_receipt_path = root / ".pipeline_run_receipt_v2.json"
+                if final_receipt_path.is_symlink():
+                    return False
+                final_receipt = json.loads(
+                    final_receipt_path.read_text(encoding="utf-8"))
+                receipt_source = final_receipt.get("source", {})
+                source_stems = receipt_source.get("stems")
+                inventory_stems = {
+                    row.get("stem")
+                    for row in dataset.get("source_inventory", {}).get("files", [])
+                    if isinstance(row, dict)
+                }
+                if (not isinstance(source_stems, list)
+                        or not set(source_stems).issubset(inventory_stems)):
+                    return False
+            batch_count = dataset_receipt.get("batch_count")
+            receipt_mode = dataset_receipt.get("receipt_mode")
+            batch_size = int(args.batch_size)
+            if (batch_size <= 0 or not isinstance(source_stems, list)
+                    or any(not isinstance(stem, str) for stem in source_stems)
+                    or len(source_stems) != len(set(source_stems))):
+                return False
+            minimum_batches = (len(source_stems) + batch_size - 1) // batch_size
+            maximum_batches = minimum_batches + (
+                0 if receipt_mode == "pipelined" else 1)
+            if (isinstance(batch_count, bool)
+                    or not isinstance(batch_count, int)
+                    or not source_stems
+                    or batch_count < minimum_batches
+                    or batch_count > maximum_batches
+                    or receipt_mode not in {"pipelined", "staged", "streaming"}
+                    or (args.pipelined and receipt_mode != "pipelined")
+                    or (not args.pipelined
+                        and receipt_mode not in {"staged", "streaming"})):
+                return False
+            require_zero_filtered = bool(
+                (getattr(args, "_config", {}) or {})
+                .get("pipelined", {}).get("require_zero_filtered", False))
+            return _load_complete_dataset_receipt(
+                root, dataset_name, source_stems, list(range(batch_count)),
+                config_sha256=config_sha256,
+                cache_sha256=cache_sha256,
+                implementation_sha256=implementation_sha256,
+                receipt_mode=receipt_mode,
+                require_zero_filtered=require_zero_filtered,
+                batch_size=batch_size,
+            ) is not None
+        except (OSError, UnicodeError, TypeError, ValueError,
+                json.JSONDecodeError):
+            return False
 
     # ── Resume: skip already-completed datasets ──
     completed_set: set[str] = set()
@@ -3716,8 +4127,18 @@ def run_batch(args) -> bool:
             print(f"ERROR: {exc}")
             return False
         if completed_set:
-            # A dataset checkpoint is written only after final publication;
-            # individual batch resume below remains evidence-gated.
+            # A dataset checkpoint is only an index into prior work.  Require
+            # current source identity and a verified COMPLETE public receipt
+            # before treating it as a successful no-op.
+            invalid_completed = [
+                d["name"] for d in all_datasets
+                if d["name"] in completed_set
+                and not completed_publication_is_valid(d)
+            ]
+            if invalid_completed:
+                print("ERROR: completed checkpoint has no valid COMPLETE "
+                      "publication for: " + ", ".join(invalid_completed))
+                return False
             pending = [d for d in all_datasets if d["name"] not in completed_set]
             skipped = len(all_datasets) - len(pending)
             print(f"\n  Resume: {skipped} already completed, {len(pending)} remaining")
@@ -3725,16 +4146,6 @@ def run_batch(args) -> bool:
     if not all_datasets:
         print("All datasets already completed!")
         return True
-
-    # Freeze and validate the source inventory before resolving output paths,
-    # creating worker directories, or launching any child pipeline.
-    try:
-        _validate_frozen_cache_inventory(cache)
-    except (OSError, TypeError, ValueError) as exc:
-        print(f"ERROR: frozen cache inventory validation failed: {exc}")
-        return False
-    config_sha256 = _sha256_file(args.config)
-    cache_sha256 = _sha256_file(cache_path)
 
     datasets = all_datasets[:args.limit_datasets] if args.limit_datasets > 0 else all_datasets
 
@@ -3767,7 +4178,7 @@ def run_batch(args) -> bool:
     config_mfa_jobs = _cfg.get("mfa", {}).get("num_jobs", 0) if _cfg else 0
     config_mfa_en_jobs = _cfg.get("mfa_en", {}).get("num_jobs", 0) if _cfg else 0
     _resource_plan = plan_streaming_resources(
-        cpu_budget=cpu_count,
+        cpu_budget=getattr(args, "cpu_budget", None),
         requested_gpu_workers=args.gpus,
         requested_cpu_workers=(
             args.cpu_workers if args.pipelined else parallel),
@@ -3808,6 +4219,10 @@ def run_batch(args) -> bool:
         _cfg.setdefault("mfa_en", {})["num_jobs"] = _effective_mfa_en_jobs
     args._effective_mfa_jobs = _effective_mfa_jobs
     args._effective_mfa_en_jobs = _effective_mfa_en_jobs
+    # Batch scheduling owns the host allocation even when the user did not
+    # pass --cpu-budget.  Pass each child's per-worker share so its stage
+    # pools cannot recreate the host-wide automatic defaults.
+    args._effective_cpu_budget = _resource_plan["worker_cpu_budget"]
 
     # ── Resolve overwrite/force policy ──
     # CLI --no-overwrite/--no-force override config; default True for backward compat.
@@ -4110,6 +4525,7 @@ def run_batch(args) -> bool:
             batch_size=args.batch_size,
             mfa_num_jobs=getattr(args, '_effective_mfa_jobs', 0),
             mfa_en_num_jobs=getattr(args, '_effective_mfa_en_jobs', 0),
+            cpu_budget=getattr(args, '_effective_cpu_budget', None),
             allow_overwrite=getattr(args, '_allow_overwrite', True),
             allow_force=getattr(args, '_allow_force', True),
             config_sha256=config_sha256, cache_sha256=cache_sha256,
@@ -4179,6 +4595,7 @@ def run_batch(args) -> bool:
                             device=device_str,
                             mfa_num_jobs=getattr(args, '_effective_mfa_jobs', 0),
                             mfa_en_num_jobs=getattr(args, '_effective_mfa_en_jobs', 0),
+                            cpu_budget=getattr(args, '_effective_cpu_budget', None),
                             config_sha256=config_sha256, cache_sha256=cache_sha256,
                             implementation_sha256=implementation_sha256,
                             require_zero_filtered=require_zero_filtered,
@@ -4382,6 +4799,7 @@ def _run_gpu_phase(
     persist_cache: bool = True,
     allow_overwrite: bool = True,
     allow_force: bool = True,
+    cpu_budget: int | None = None,
 ) -> bool:
     """GPU phase: prefetch WAVs + NVASR prealign + normalize -> CTC output.
 
@@ -4461,6 +4879,8 @@ def _run_gpu_phase(
         cmd.append("--overwrite")
     if allow_force:
         cmd.append("--force")
+    if cpu_budget is not None:
+        cmd += ["--cpu-budget", str(cpu_budget)]
     if device:
         cmd += ["--device", "cuda:0"]  # CUDA_VISIBLE_DEVICES remaps this
     env = get_mfa_env(mfa_python, models_dir)
@@ -4531,7 +4951,8 @@ def _build_cpu_phase_command(
         local_ctc: Path, local_output: Path, local_workspace: Path,
         producer_mode: str, allow_overwrite: bool, allow_force: bool,
         sealed_ctc_raw: bool, skip_pad_silence: bool,
-        mfa_num_jobs: int = 0, mfa_en_num_jobs: int = 0) -> list[str]:
+        mfa_num_jobs: int = 0, mfa_en_num_jobs: int = 0,
+        cpu_budget: int | None = None) -> list[str]:
     """Build the CPU command for the explicit GPU/CTC producer route.
 
     A fallback GPU producer already owns the raw CTC workspace and its mode
@@ -4572,6 +4993,8 @@ def _build_cpu_phase_command(
         cmd += ["--mfa-jobs", str(mfa_num_jobs)]
     if mfa_en_num_jobs > 0:
         cmd += ["--mfa-en-jobs", str(mfa_en_num_jobs)]
+    if cpu_budget is not None:
+        cmd += ["--cpu-budget", str(cpu_budget)]
     return cmd
 
 
@@ -4593,6 +5016,7 @@ def _run_cpu_phase(
     producer_mode: str = "ctc_ready",
     preserve_successful_workspaces: bool = False,
     require_zero_filtered: bool = False,
+    cpu_budget: int | None = None,
 ) -> bool:
     """CPU phase: read CTC from local workspace + run MFA align + postprocess.
 
@@ -4702,6 +5126,7 @@ def _run_cpu_phase(
         sealed_ctc_raw=_sealed_ctc_raw,
         skip_pad_silence=(local_workspace / "padded_audio").exists(),
         mfa_num_jobs=mfa_num_jobs, mfa_en_num_jobs=mfa_en_num_jobs,
+        cpu_budget=cpu_budget,
     )
     env = get_mfa_env(mfa_python, models_dir)
     _mfa_root = local_workspace / "mfa_root"
@@ -4783,7 +5208,8 @@ def run_pipelined_batch(
     # arbitrary boolean or stale digest is deliberately insufficient.
     if validated_frozen_cache is not cache:
         try:
-            _validate_frozen_cache_inventory(cache)
+            _validate_frozen_cache_inventory(cache, freeze_missing=True)
+            _persist_source_inventories(cache_path, cache)
         except (OSError, TypeError, ValueError) as exc:
             print(f"ERROR: frozen cache inventory validation failed: {exc}")
             return False
@@ -4900,7 +5326,7 @@ def run_pipelined_batch(
 
     total_batches = len(all_gpu_batches)
     resource_plan = plan_streaming_resources(
-        cpu_budget=os.cpu_count() or 1,
+        cpu_budget=getattr(args, "cpu_budget", None),
         requested_gpu_workers=n_gpu_workers,
         requested_cpu_workers=requested_cpu_workers,
         requested_mfa_jobs=getattr(args, "mfa_jobs", None),
@@ -4928,6 +5354,18 @@ def run_pipelined_batch(
     cpu_queue: _queue.Queue = _queue.Queue(maxsize=resource_plan["cpu_queue_size"])
     stop_event = threading.Event()
     failure_event = threading.Event()
+    phase_gate = WeightedAdmissionGate(resource_plan["cpu_budget"])
+    gpu_phase_weight = 1
+    cpu_phase_weight = max(
+        resource_plan["mfa_jobs_per_worker"],
+        resource_plan["mfa_en_jobs_per_worker"],
+        resource_plan["auxiliary_workers_cap"],
+    )
+
+    def signal_pipeline_failure() -> None:
+        failure_event.set()
+        stop_event.set()
+        phase_gate.wake_all()
 
     def put_with_stop(target: _queue.Queue, item: object) -> bool:
         while not stop_event.is_set():
@@ -5062,18 +5500,20 @@ def run_pipelined_batch(
                           f"{ds_name}/{batch_idx:04d}")
                     continue
 
-                ok = _run_gpu_phase(
-                    ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
-                    layout_map=layout_map, wav_index=wav_index, text_index=text_index,
-                    local_base=local_base, config=args.config,
-                    mfa_python=mfa_python, models_dir=models_dir,
-                    batch_size=args.batch_size, python_path=args.python,
-                    device=device_str,
-                    nas_output_dir=nas_output_root / ds_name,
-                    persist_cache=bool(pipeline_cfg.get("restore_ctc_cache", True)),
-                    allow_overwrite=getattr(args, '_allow_overwrite', True),
-                    allow_force=getattr(args, '_allow_force', True),
-                )
+                with phase_gate.lease(gpu_phase_weight, stop_event):
+                    ok = _run_gpu_phase(
+                        ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
+                        layout_map=layout_map, wav_index=wav_index, text_index=text_index,
+                        local_base=local_base, config=args.config,
+                        mfa_python=mfa_python, models_dir=models_dir,
+                        batch_size=args.batch_size, python_path=args.python,
+                        device=device_str,
+                        nas_output_dir=nas_output_root / ds_name,
+                        persist_cache=bool(pipeline_cfg.get("restore_ctc_cache", True)),
+                        allow_overwrite=getattr(args, '_allow_overwrite', True),
+                        allow_force=getattr(args, '_allow_force', True),
+                        cpu_budget=gpu_phase_weight,
+                    )
                 if ok:
                     cpu_item = (ds, batch_idx, batch_stems,
                                 local_base, producer_mode)
@@ -5087,13 +5527,14 @@ def run_pipelined_batch(
                             local_base, batch_idx, ds_name,
                             reason="downstream-stop GPU result")
                         account_gpu_batch_failure(ds, batch_idx, local_base)
-                        failure_event.set()
-                        stop_event.set()
+                        signal_pipeline_failure()
                         break
                 else:
                     account_gpu_batch_failure(ds, batch_idx, local_base)
-                    failure_event.set()
-                    stop_event.set()
+                    signal_pipeline_failure()
+            except PhaseAdmissionCancelled:
+                account_gpu_batch_failure(ds, batch_idx, local_base)
+                break
             except Exception as exc:
                 print(f"  [GPU{device_str}] unexpected batch exception "
                       f"{ds_name}/{batch_idx:04d}: {type(exc).__name__}: {exc}")
@@ -5101,8 +5542,7 @@ def run_pipelined_batch(
                     local_base, batch_idx, ds_name,
                     reason="unexpected GPU failure")
                 account_gpu_batch_failure(ds, batch_idx, local_base)
-                failure_event.set()
-                stop_event.set()
+                signal_pipeline_failure()
                 break
 
     _GPU_SENTINEL = object()
@@ -5118,8 +5558,7 @@ def run_pipelined_batch(
                     return
         except Exception as exc:
             print(f"  [GPU QUEUE] feeder failure: {exc}")
-            failure_event.set()
-            stop_event.set()
+            signal_pipeline_failure()
 
     # ── CPU worker ──
     def cpu_worker(wid: int) -> tuple[int, list[str]]:
@@ -5143,25 +5582,30 @@ def run_pipelined_batch(
 
             unexpected_error = None
             try:
-                ok = _run_cpu_phase(
-                    ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
-                    local_base=local_base, config=args.config,
-                    mfa_python=mfa_python, models_dir=models_dir,
-                    nas_output=nas_output,
-                    batch_size=args.batch_size, python_path=args.python,
-                    mfa_num_jobs=resource_plan["mfa_jobs_per_worker"],
-                    mfa_en_num_jobs=resource_plan["mfa_en_jobs_per_worker"],
-                    allow_overwrite=getattr(args, '_allow_overwrite', True),
-                    allow_force=getattr(args, '_allow_force', True),
-                    restore_cache=bool(pipeline_cfg.get("restore_ctc_cache", True)),
-                    config_sha256=config_sha256,
-                    cache_sha256=cache_sha256,
-                    implementation_sha256=implementation_sha256,
-                    upload_lock=upload_lock,
-                    producer_mode=producer_mode,
-                    preserve_successful_workspaces=preserve_successful_workspaces,
-                    require_zero_filtered=require_zero_filtered,
-                )
+                with phase_gate.lease(cpu_phase_weight, stop_event):
+                    ok = _run_cpu_phase(
+                        ds=ds, batch_idx=batch_idx, batch_stems=batch_stems,
+                        local_base=local_base, config=args.config,
+                        mfa_python=mfa_python, models_dir=models_dir,
+                        nas_output=nas_output,
+                        batch_size=args.batch_size, python_path=args.python,
+                        mfa_num_jobs=resource_plan["mfa_jobs_per_worker"],
+                        mfa_en_num_jobs=resource_plan["mfa_en_jobs_per_worker"],
+                        cpu_budget=cpu_phase_weight,
+                        allow_overwrite=getattr(args, '_allow_overwrite', True),
+                        allow_force=getattr(args, '_allow_force', True),
+                        restore_cache=bool(pipeline_cfg.get("restore_ctc_cache", True)),
+                        config_sha256=config_sha256,
+                        cache_sha256=cache_sha256,
+                        implementation_sha256=implementation_sha256,
+                        upload_lock=upload_lock,
+                        producer_mode=producer_mode,
+                        preserve_successful_workspaces=preserve_successful_workspaces,
+                        require_zero_filtered=require_zero_filtered,
+                    )
+            except PhaseAdmissionCancelled as exc:
+                unexpected_error = exc
+                ok = False
             except Exception as exc:
                 unexpected_error = exc
                 ok = False
@@ -5194,8 +5638,7 @@ def run_pipelined_batch(
                     print(f"  [CPU{wid}] {ds_name} — {status} "
                           f"({tracker['done']}/{tracker['total']} batches)")
             if unexpected_error is not None or not ok:
-                failure_event.set()
-                stop_event.set()
+                signal_pipeline_failure()
                 break
         return w_ok, w_fails
 
@@ -5216,8 +5659,7 @@ def run_pipelined_batch(
                     fut.result()
                 except Exception as exc:
                     print(f"  [GPU] worker exception: {type(exc).__name__}: {exc}")
-                    failure_event.set()
-                    stop_event.set()
+                    signal_pipeline_failure()
         finally:
             # Sentinel insertion is valid only after every producer future is
             # quiescent.  This wait is also the guard for an exception raised

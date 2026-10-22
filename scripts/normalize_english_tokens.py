@@ -31,6 +31,7 @@ from pipeline_utils import (
     is_word_like, is_punct, extract_word_chars,
 )
 from postprocess_textgrids import Interval, Tier, parse_textgrid, write_textgrid
+from resource_budget import resolve_worker_count
 
 # Lazy import — only needed for CJK pinyin fragments in mixed text.
 # Pure English processing can proceed without pypinyin.
@@ -720,6 +721,8 @@ def main() -> int:
                         help="MFA dictionary path (for auto-adding missing English tokens)")
     parser.add_argument("--workers", type=int, default=0,
                         help="Number of parallel workers (0=auto: min(32, cpu_count))")
+    parser.add_argument("--cpu-budget", type=int, default=None,
+                        help="Optional caller CPU budget for this stage.")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -751,7 +754,10 @@ def main() -> int:
         # Parallel: each stem is independent (separate .lab / .TextGrid / _tokens.jsonl)
         _max_w = min(32, os.cpu_count(), len(stem_list))
         n_workers = args.workers if args.workers > 0 else _max_w
-        n_workers = min(n_workers, len(stem_list))  # don't exceed work items
+        n_workers = resolve_worker_count(
+            n_workers, cpu_budget=args.cpu_budget, item_count=len(stem_list),
+            stage_cap=32 if args.cpu_budget is not None else None,
+            automatic=_max_w)
         print(f"  Processing {len(stem_list)} stems with {n_workers} workers...")
         changed = 0
         errors = 0

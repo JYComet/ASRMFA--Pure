@@ -18,8 +18,7 @@ import os
 import re
 import sys
 import wave
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -40,9 +39,11 @@ except ModuleNotFoundError:
 try:
     from english_units import parse_english_units, project_authority_semantics
     from pipeline_utils import validate_ctc_transcript_bundle, CTC_SUFFIXES
+    from reference_inputs import load_reference_texts, ReferenceInputError
 except ModuleNotFoundError:
     from .english_units import parse_english_units, project_authority_semantics
     from .pipeline_utils import validate_ctc_transcript_bundle, CTC_SUFFIXES
+    from .reference_inputs import load_reference_texts, ReferenceInputError
 
 try:
     from pipeline_utils import (compute_model_tree_digest,
@@ -225,15 +226,6 @@ def _select_wavs(files: list[Path], section: dict[str, Any],
     return files
 
 
-def _references(data_dir: Path) -> dict[str, str]:
-    result: dict[str, str] = {}
-    for path in sorted(data_dir.rglob("*.txt"), key=lambda p: p.as_posix()):
-        if path.is_symlink() or path.stem in result:
-            raise Qwen3PrealignError(f"ambiguous/symlink reference: {path}")
-        result[path.stem] = path.read_text(encoding="utf-8-sig").strip()
-    return result
-
-
 def _lexical_plan(text: str) -> list[dict[str, Any]]:
     """Use the shared MFA lexical contract before requesting model times."""
     authorities = parse_english_units(text)
@@ -357,6 +349,69 @@ def _write_identity(path: Path, payload: dict[str, Any]) -> None:
     _atomic_text(path, json.dumps(body, ensure_ascii=False, indent=2) + "\n")
 
 
+def _bundle_hashes(output_dir: Path, stem: str) -> dict[str, str]:
+    names = [f"{stem}{suffix}" for suffix in CTC_SUFFIXES]
+    names.extend([f"{stem}_ref.txt"] if (output_dir / f"{stem}_ref.txt").exists() else [])
+    hashes = {}
+    for name in names:
+        path = output_dir / name
+        if path.is_symlink() or not path.is_file():
+            raise Qwen3PrealignError(f"incomplete committed Qwen bundle: {name}")
+        hashes[name] = _sha256(path)
+    return hashes
+
+
+def _load_progress(output_dir: Path, seed: dict[str, Any], eligible: set[str]):
+    identity_path = output_dir / ".qwen3_hf_progress_identity.json"
+    checkpoint_path = output_dir / ".qwen3_hf_progress.json"
+    if not identity_path.exists() and not checkpoint_path.exists():
+        return {}, []
+    try:
+        if identity_path.is_symlink() or checkpoint_path.is_symlink():
+            raise ValueError("symlink progress metadata")
+        body = json.loads(identity_path.read_text(encoding="utf-8"))
+        digest = body.pop("identity_digest")
+        if digest != _stable_digest(body) or body != seed:
+            raise ValueError("progress identity changed")
+        if not checkpoint_path.exists():
+            if (output_dir / ".qwen3_hf_identity.json").is_file():
+                # Cleanup removes checkpoint first. Finalized evidence below
+                # must independently validate before any result can be reused.
+                return {}, []
+            if (output_dir / ".ctc_raw_manifest.json").exists():
+                raise ValueError("sealed CTC cannot reconstruct missing progress")
+            # Startup may stop between writing identity and the empty commit.
+            # This certifies no bundles; uncommitted results will be rebuilt.
+            _write_progress(checkpoint_path, digest, {})
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        checkpoint_digest = checkpoint.pop("checkpoint_digest")
+        if checkpoint_digest != _stable_digest(checkpoint):
+            raise ValueError("tampered progress checkpoint")
+        if checkpoint.get("schema") != "qwen3-hf-progress-v1" or checkpoint.get("identity_digest") != digest:
+            raise ValueError("progress checkpoint identity mismatch")
+        items = checkpoint.get("items")
+        if not isinstance(items, dict) or not set(items) <= eligible:
+            raise ValueError("changed progress membership")
+        records = []
+        for stem, item in items.items():
+            expected_files = _bundle_hashes(output_dir, stem)
+            if item.get("files") != expected_files:
+                raise ValueError(f"tampered committed bundle: {stem}")
+            if not isinstance(item.get("record"), dict) or Path(item["record"].get("lab", "")).name != f"{stem}.lab":
+                raise ValueError(f"invalid committed record: {stem}")
+            records.append(item["record"])
+        return items, records
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, Qwen3PrealignError) as exc:
+        raise Qwen3PrealignError(f"Qwen progress identity changed or artifacts tampered: {exc}; use a fresh output directory") from exc
+
+
+def _write_progress(path: Path, seed_digest: str, items: dict[str, Any]) -> None:
+    body = {"schema": "qwen3-hf-progress-v1", "identity_digest": seed_digest,
+            "items": items}
+    body["checkpoint_digest"] = _stable_digest(body)
+    _atomic_text(path, json.dumps(body, ensure_ascii=False, indent=2) + "\n")
+
+
 _PROCESS_QWEN_BACKEND = None
 _PROCESS_QWEN_SETTINGS = None
 
@@ -397,7 +452,7 @@ def _infer_qwen_process(wav, reference, reference_mode):
 
 
 def infer_qwen_items(wavs, refs, reference_mode, settings, *, devices,
-                     backend=None, backend_factory=None):
+                     backend=None, backend_factory=None, ordered=True):
     """Bounded, ordered inference with one model owner per visible GPU.
 
     batch_size controls queued items per device; native model requests remain
@@ -433,29 +488,64 @@ def infer_qwen_items(wavs, refs, reference_mode, settings, *, devices,
             for device in devices]
     else:
         executors = [ThreadPoolExecutor(max_workers=1) for _ in devices]
-    queue = deque()
+    capacity = max(1, settings.batch_size) * len(devices)
     source = iter(enumerate(wavs))
+    inflight = {}
+    completed = {}
+    next_yield = 0
+    device_loads = [0 for _ in devices]
+    device_cursor = 0
+
     def submit_next():
+        nonlocal device_cursor
         item = next(source, None)
         if item is None:
             return False
         index, wav = item
-        device_index = index % len(devices)
+        minimum_load = min(device_loads)
+        device_index = next((device_cursor + offset) % len(devices)
+                            for offset in range(len(devices))
+                            if device_loads[(device_cursor + offset) % len(devices)] == minimum_load)
+        device_cursor = (device_index + 1) % len(devices)
+        device_loads[device_index] += 1
         if native_processes:
             future = executors[device_index].submit(
                 _infer_qwen_process, wav, refs.get(wav.stem), reference_mode)
         else:
             future = executors[device_index].submit(infer, wav, device_index)
-        queue.append((wav, future))
+        inflight[future] = (index, wav, device_index)
         return True
+
     try:
-        for _ in range(max(1, settings.batch_size) * len(devices)):
-            if not submit_next():
-                break
-        while queue:
-            wav, future = queue.popleft()
-            yield wav, future.result()
-            submit_next()
+        while len(inflight) < capacity and submit_next():
+            pass
+        while inflight or completed:
+            # Drain completed workers and refill their slots while holding only
+            # a bounded reorder cache. Results are yielded in source order.
+            ready = [future for future in inflight if future.done()]
+            if not ready:
+                ready, _ = wait(tuple(inflight), return_when=FIRST_COMPLETED)
+            for future in ready:
+                index, wav, device_index = inflight.pop(future)
+                device_loads[device_index] -= 1
+                try:
+                    completed[index] = (wav, future.result())
+                except Exception as exc:
+                    completed[index] = (wav, exc)
+            if not ordered:
+                # The producer can commit independent bundles immediately;
+                # final manifests are sorted separately for deterministic output.
+                for index in sorted(completed):
+                    yield completed[index]
+                completed.clear()
+            while len(inflight) < capacity and len(completed) < capacity and submit_next():
+                pass
+            while next_yield in completed:
+                wav, result = completed.pop(next_yield)
+                next_yield += 1
+                yield wav, result
+                while len(inflight) < capacity and len(completed) < capacity and submit_next():
+                    pass
     finally:
         for executor in executors:
             executor.shutdown(wait=True, cancel_futures=True)
@@ -491,8 +581,11 @@ def run_qwen3_hf(cfg: dict[str, Any], project_root: Path,
     wavs = _select_wavs(_source_wavs(audio_dir), section, project_root)
     if not wavs:
         raise Qwen3PrealignError("qwen3_hf source inventory is empty")
-    refs = _references(data_dir)
     expected = {wav.stem for wav in wavs}
+    try:
+        refs = load_reference_texts(data_dir, expected)
+    except ReferenceInputError as exc:
+        raise Qwen3PrealignError(str(exc)) from exc
     eligible = expected.copy()
     exclusions: dict[str, str] = {}
     if reference_mode == "authority":
@@ -586,10 +679,23 @@ def run_qwen3_hf(cfg: dict[str, Any], project_root: Path,
         raise Qwen3PrealignError("no eligible audio with reference text")
     selected_stems = sorted(eligible)
     old_identity_path = output_dir / ".qwen3_hf_identity.json"
+    progress_path = output_dir / ".qwen3_hf_progress.json"
+    progress_identity_path = output_dir / ".qwen3_hf_progress_identity.json"
+    progress_seed = _identity_payload(
+        settings=settings, runtime=runtime, asr_digest=asr_digest,
+        aligner_digest=aligner_digest, input_digest=input_digest,
+        reference_digest=reference_digest, output_digest="", stems=selected_stems)
+    progress_seed_digest = _stable_digest(progress_seed)
     if output_dir.is_symlink():
         raise Qwen3PrealignError("Qwen output directory must not be a symlink")
     prior_produced: list[str] = []
     prior_records: list[dict[str, Any]] = []
+    progress_items, progress_records = (
+        _load_progress(output_dir, progress_seed, eligible)
+        if output_dir.exists() else ({}, []))
+    has_valid_progress = (progress_identity_path.is_file()
+                          and progress_path.is_file())
+    metadata_incomplete = False
     if old_identity_path.is_file():
         try:
             if old_identity_path.is_symlink():
@@ -602,7 +708,8 @@ def run_qwen3_hf(cfg: dict[str, Any], project_root: Path,
                        for suffix in (*CTC_SUFFIXES, "_ref.txt")}
             allowed.update({"manifest.json", ".ctc_normalized", ".qwen3_hf_identity.json",
                             ".ctc_run_receipt.json", ".pipeline_run_receipt_v2.json",
-                            ".ctc_raw_manifest.json", "summary.txt"})
+                            ".ctc_raw_manifest.json", "summary.txt",
+                            ".qwen3_hf_progress.json", ".qwen3_hf_progress_identity.json"})
             if any(path.name not in allowed or not path.is_file() or path.is_symlink()
                    for path in output_dir.iterdir()):
                 raise ValueError("unexpected or tampered output namespace")
@@ -620,6 +727,9 @@ def run_qwen3_hf(cfg: dict[str, Any], project_root: Path,
                 raise ValueError("changed configuration or tampered output")
             for name in (".ctc_run_receipt.json", ".pipeline_run_receipt_v2.json"):
                 receipt_path = output_dir / name
+                if not receipt_path.exists() and has_valid_progress:
+                    metadata_incomplete = True
+                    continue
                 receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
                 if receipt_path.is_symlink() or receipt.get("extra", {}).get("identity_digest") != recorded_digest:
                     raise ValueError("tampered producer receipt")
@@ -634,17 +744,49 @@ def run_qwen3_hf(cfg: dict[str, Any], project_root: Path,
                                 "path": str(settings.forced_aligner_model_path),
                                 "tree_digest": aligner_digest, "files": aligner_files}):
                         raise ValueError("tampered model/output receipt")
-            if set(prior_produced) == eligible:
+            if set(prior_produced) == eligible and has_valid_progress:
+                metadata_incomplete = metadata_incomplete or not (output_dir / "summary.txt").is_file()
+            if set(prior_produced) == eligible and not metadata_incomplete:
                 print("Qwen3 HF prealign identity matches; reusing existing artifacts")
+                progress_path.unlink(missing_ok=True)
+                progress_identity_path.unlink(missing_ok=True)
                 return 0
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise Qwen3PrealignError(f"Qwen identity changed or artifacts tampered: {exc}; use a fresh output directory") from exc
-    elif output_dir.exists() and any(output_dir.iterdir()):
-        raise Qwen3PrealignError("missing Qwen identity in nonempty output directory; use a fresh directory")
+    else:
+        progress_items, progress_records = _load_progress(output_dir, progress_seed, eligible) if output_dir.exists() else ({}, [])
+        if output_dir.exists():
+            allowed_progress = {f"{stem}{suffix}" for stem in selected_stems
+                                for suffix in (*CTC_SUFFIXES, "_ref.txt")}
+            allowed_progress.update({".qwen3_hf_progress.json", ".qwen3_hf_progress_identity.json",
+                                     "manifest.json", ".ctc_normalized"})
+            if any(path.name not in allowed_progress or path.is_symlink() or not path.is_file()
+                   for path in output_dir.iterdir()):
+                raise Qwen3PrealignError("unexpected file in resumable Qwen output directory")
+        if has_valid_progress:
+            prior_records = progress_records
+            prior_produced = list(progress_items)
+        elif output_dir.exists() and any(output_dir.iterdir()):
+            raise Qwen3PrealignError("missing Qwen identity in nonempty output directory; use a fresh directory")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if progress_identity_path.exists():
+            _load_progress(output_dir, progress_seed, eligible)
+        else:
+            _write_identity(progress_identity_path, progress_seed)
+            _write_progress(progress_path, progress_seed_digest, {})
+    if old_identity_path.is_file():
+        progress_items = {stem: {"files": _bundle_hashes(output_dir, stem), "record": record}
+                          for stem, record in zip(prior_produced, prior_records)}
+        _write_identity(progress_identity_path, progress_seed)
+        _write_progress(progress_path, progress_seed_digest, progress_items)
     pending = eligible - set(prior_produced)
+    for stem in pending:
+        # Files from an uncommitted inference are not trusted on resume.
+        for suffix in (*CTC_SUFFIXES, "_ref.txt"):
+            (output_dir / f"{stem}{suffix}").unlink(missing_ok=True)
     inferences = infer_qwen_items([wav for wav in wavs if wav.stem in pending],
                                  refs, reference_mode, settings,
-                                 devices=devices, backend=backend)
+                                 devices=devices, backend=backend, ordered=False)
     produced: list[str] = list(prior_produced)
     failures: list[str] = []
     records: list[dict[str, Any]] = list(prior_records)
@@ -740,10 +882,18 @@ def run_qwen3_hf(cfg: dict[str, Any], project_root: Path,
                                 "lexical_timing_source": "qwen3_forced_aligner_hf",
                                 "duration_s": duration, "n_words": len(rows), "n_punct": len(pause_entries),
                                 "_words": [{"word": row["word"], "start": row["start_s"], "end": row["end_s"]} for row in rows]})
+                progress_items[stem] = {"files": _bundle_hashes(output_dir, stem),
+                                        "record": records[-1]}
+                _write_progress(progress_path, progress_seed_digest, progress_items)
                 produced.append(stem)
             except Exception as exc:
                 print(f"FAIL {stem}: {exc}")
                 failures.append(stem)
+                progress_items.pop(stem, None)
+                if records and Path(records[-1].get("lab", "")).name == f"{stem}.lab":
+                    records.pop()
+                if stem in produced:
+                    produced.remove(stem)
                 for suffix in (*CTC_SUFFIXES, "_ref.txt"):
                     (output_dir / f"{stem}{suffix}").unlink(missing_ok=True)
     finally:
@@ -765,6 +915,10 @@ def run_qwen3_hf(cfg: dict[str, Any], project_root: Path,
                           model_tree_digest=producer_model_digest, model_file_manifest=producer_model_files,
                           dict_path=dictionary_path or Path(""), dict_digest=dictionary_digest,
                           input_stems=sorted(eligible), output_stems=sorted(produced),
+                          audio_bindings=[
+                              {"stem": wav.stem, "path": str(wav.resolve()),
+                               **read_wav_metadata(wav)}
+                              for wav in wavs if wav.stem in eligible],
                           extra={"provider": "qwen3_hf", "runtime": runtime,
                                  "forced_aligner_model": {
                                      "path": str(settings.forced_aligner_model_path),
@@ -784,6 +938,8 @@ def run_qwen3_hf(cfg: dict[str, Any], project_root: Path,
     write_pipeline_accounting_receipt(output_dir, receipt)
     summary = f"Files: {len(expected)} total, {len(produced)} OK, {len(failures)} failed\n"
     _atomic_text(output_dir / "summary.txt", summary)
+    progress_path.unlink(missing_ok=True)
+    progress_identity_path.unlink(missing_ok=True)
     return 1 if failures and not section.get("allow_item_failures", False) else 0
 
 

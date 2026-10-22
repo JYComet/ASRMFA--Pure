@@ -308,3 +308,76 @@ def test_config_relative_accent_lexicon_symlink_is_rejected_after_resolution(tmp
     with pytest.raises(JAContractError) as error:
         preflight(config, config_path=config_path)
     assert error.value.code == "config_path_invalid"
+
+
+def test_resume_subset_uses_verified_complete_history_for_workspace_status(tmp_path, monkeypatch):
+    config_path, config = _config(tmp_path)
+    monkeypatch.setattr(pipeline, "_prepare_stage_config", lambda _config, _stage, _workspace: {})
+
+    def complete_handler(stage):
+        def handler(_config, stage_dir):
+            output = stage_dir / f"{stage}.json"
+            output.write_text(json.dumps({"stage": stage}), encoding="utf-8")
+            receipt = make_receipt(stage=stage, status="COMPLETE", outputs=[output])
+            atomic_write_json(stage_dir / "receipt.json", receipt, workspace=stage_dir.parent.parent)
+            return pipeline.StageResult(stage, "COMPLETE", str(stage_dir / "receipt.json"))
+        return handler
+
+    for stage in PRODUCTION_STAGES:
+        monkeypatch.setitem(pipeline._STAGE_REGISTRY, stage, (complete_handler(stage), stage))
+
+    dispatch(config, config_path, list(PRODUCTION_STAGES))
+    results = dispatch(config, config_path, ["tts", "verify"], resume=True)
+
+    assert [result.status for result in results] == ["COMPLETE", "COMPLETE"]
+    root_receipt = json.loads((Path(config["workspace"]) / "receipt.json").read_text(encoding="utf-8"))
+    assert root_receipt["status"] == "COMPLETE"
+    assert root_receipt["inputs"]["stages"] == list(PRODUCTION_STAGES)
+    assert root_receipt["stage_results"] == {stage: "COMPLETE" for stage in PRODUCTION_STAGES}
+
+
+def test_resume_subset_does_not_count_missing_history_as_complete(tmp_path, monkeypatch):
+    config_path, config = _config(tmp_path)
+    monkeypatch.setattr(pipeline, "_prepare_stage_config", lambda _config, _stage, _workspace: {})
+
+    def complete_handler(stage):
+        def handler(_config, stage_dir):
+            output = stage_dir / f"{stage}.json"
+            output.write_text(json.dumps({"stage": stage}), encoding="utf-8")
+            atomic_write_json(stage_dir / "receipt.json", make_receipt(stage=stage, status="COMPLETE", outputs=[output]), workspace=stage_dir.parent.parent)
+            return pipeline.StageResult(stage, "COMPLETE", str(stage_dir / "receipt.json"))
+        return handler
+
+    for stage in PRODUCTION_STAGES:
+        monkeypatch.setitem(pipeline._STAGE_REGISTRY, stage, (complete_handler(stage), stage))
+    dispatch(config, config_path, list(PRODUCTION_STAGES))
+
+    shutil = __import__("shutil")
+    shutil.rmtree(Path(config["workspace"]) / "stages" / "inventory")
+    with pytest.raises(JAContractError, match="output is missing"):
+        dispatch(config, config_path, ["tts", "verify"], resume=True)
+
+
+def test_resume_rejects_receipt_bound_to_another_stage_namespace(tmp_path, monkeypatch):
+    config_path, config = _config(tmp_path)
+    monkeypatch.setattr(pipeline, "_prepare_stage_config", lambda _config, _stage, _workspace: {})
+
+    def complete_handler(stage):
+        def handler(_config, stage_dir):
+            output = stage_dir / f"{stage}.json"
+            output.write_text(json.dumps({"stage": stage}), encoding="utf-8")
+            atomic_write_json(stage_dir / "receipt.json", make_receipt(stage=stage, status="COMPLETE", outputs=[output]), workspace=stage_dir.parent.parent)
+            return pipeline.StageResult(stage, "COMPLETE", str(stage_dir / "receipt.json"))
+        return handler
+
+    for stage in PRODUCTION_STAGES:
+        monkeypatch.setitem(pipeline._STAGE_REGISTRY, stage, (complete_handler(stage), stage))
+    dispatch(config, config_path, list(PRODUCTION_STAGES))
+
+    receipt_path = Path(config["workspace"]) / "stages" / "inventory" / "receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["stage"] = "audio"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(JAContractError, match="does not match its namespace"):
+        dispatch(config, config_path, ["tts", "verify"], resume=True)

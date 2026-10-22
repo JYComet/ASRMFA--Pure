@@ -57,6 +57,7 @@ from english_units import (
     merge_authority_fragment_group,
     parse_english_units,
 )
+from resource_budget import resolve_worker_count
 
 # English MFA phone inventory — vowels, consonants, and stress markers
 _ENGLISH_VOWELS = {
@@ -1238,7 +1239,8 @@ def build_en_corpus(en_segments: dict[str, list[dict]],
                     padding_ms: float = 50.0,
                     min_segment_dur_ms: float = 150.0,
                     corpus_workers: int = 0,
-                    strict: bool = False) -> dict[str, list[dict]]:
+                    strict: bool = False,
+                    cpu_budget: int | None = None) -> dict[str, list[dict]]:
     """Extract English audio segments and build MFA corpus.
 
     Writes {stem}_seg{idx}.wav and {stem}_seg{idx}.lab to corpus_dir.
@@ -1276,7 +1278,10 @@ def build_en_corpus(en_segments: dict[str, list[dict]],
     else:
         _max_w = min(16, os.cpu_count(), len(stem_items))
         n_workers = corpus_workers if corpus_workers > 0 else _max_w
-        n_workers = min(n_workers, len(stem_items))
+        n_workers = resolve_worker_count(
+            n_workers, cpu_budget=cpu_budget, item_count=len(stem_items),
+            stage_cap=16 if cpu_budget is not None else None,
+            automatic=_max_w)
         print(f"  Building English corpus: {len(stem_items)} stems,"
               f" {n_workers} workers")
         ctx = __import__('multiprocessing').get_context("fork")
@@ -1979,6 +1984,8 @@ def main():
                         help="Enable MFA extra fine-tuning pass (default: disabled)")
     parser.add_argument("--corpus-workers", type=int, default=0,
                         help="Parallel workers for English corpus building (0=auto)")
+    parser.add_argument("--cpu-budget", type=int, default=None,
+                        help="Optional caller CPU budget for this stage.")
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--g2p-timeout", type=int, default=300)
     parser.add_argument("--strict-provenance", action="store_true")
@@ -2082,6 +2089,7 @@ def main():
         padding_ms=args.padding_ms,
         min_segment_dur_ms=args.min_segment_dur_ms,
         corpus_workers=args.corpus_workers,
+        cpu_budget=args.cpu_budget,
         strict=args.strict_provenance,
     )
 
@@ -2165,11 +2173,18 @@ def main():
             print("ERROR: strict MFA input hashing failed; MFA was not started")
             return 1
 
+    effective_num_jobs = args.num_jobs
+    if args.cpu_budget is not None:
+        # Preserve configured MFA job/shard parameters; an outer budget may
+        # only lower the requested process count.
+        effective_num_jobs = resolve_worker_count(
+            args.num_jobs, cpu_budget=args.cpu_budget)
+
     # Step 4: Run English MFA
     outcome = run_en_mfa(
         en_corpus_dir, dict_path, args.acoustic_model,
         en_aligned_dir, en_work_dir,
-        mfa_python, models_dir, args.num_jobs,
+        mfa_python, models_dir, effective_num_jobs,
         beam=args.beam, retry_beam=args.retry_beam,
         fine_tune=args.fine_tune, timeout=args.timeout,
         strict=args.strict_provenance, dither=args.dither,

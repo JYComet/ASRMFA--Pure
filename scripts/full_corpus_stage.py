@@ -10,6 +10,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Mapping
 
+try:
+    from scripts.full_corpus_transaction import publish_files
+except ModuleNotFoundError:
+    from full_corpus_transaction import publish_files
+
 import numpy as np
 import soundfile as sf
 
@@ -297,7 +302,7 @@ def stage_item(item: InventoryItem, chunk_input: Path,
 
 def publish_gamesl(receipts, gamesl_root: Path, rollback_root: Path) -> dict:
     gamesl_root, rollback_root = Path(gamesl_root), Path(rollback_root)
-    replacements = []
+    entries = []
     for receipt in receipts:
         if receipt.gamesl_wav is None:
             continue
@@ -306,48 +311,14 @@ def publish_gamesl(receipts, gamesl_root: Path, rollback_root: Path) -> dict:
         source = Path(receipt.gamesl_wav)
         if source.is_symlink() or not source.is_file():
             raise ValueError(f"unsafe staged GAMESL source: {source}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        old_hash = None
-        rollback = None
         if target.exists() or target.is_symlink():
             if target.is_symlink() or not target.is_file():
                 raise ValueError(f"unsafe GAMESL target: {target}")
-            old_hash = _sha256(target)
-            rollback = _safe_target(rollback_root, receipt.game or "_default",
-                                    receipt.speaker, target.name)
-            if rollback.exists() or rollback.is_symlink():
-                raise ValueError(f"rollback artifact already exists: {rollback}")
-            rollback.parent.mkdir(parents=True, exist_ok=True)
-            temporary_rollback = rollback.with_name(rollback.name + ".tmp")
-            shutil.copyfile(target, temporary_rollback)
-            with temporary_rollback.open("rb") as handle:
-                os.fsync(handle.fileno())
-            if _sha256(temporary_rollback) != old_hash:
-                temporary_rollback.unlink(missing_ok=True)
-                raise ValueError("rollback copy digest mismatch")
-            os.replace(temporary_rollback, rollback)
-        temporary = target.with_name(target.name + ".tmp")
-        try:
-            shutil.copyfile(source, temporary)
-            if _sha256(temporary) != receipt.gamesl_wav_sha256:
-                raise ValueError("staged GAMESL digest changed")
-            os.replace(temporary, target)
-            _fsync_parent(target)
-        except Exception:
-            temporary.unlink(missing_ok=True)
-            if rollback is not None and rollback.exists():
-                # The target may already have been replaced before a later
-                # durability/hash operation failed.  Restore unconditionally
-                # so callers never observe a half-installed new target.
-                target.unlink(missing_ok=True)
-                shutil.copyfile(rollback, temporary)
-                with temporary.open("rb") as handle:
-                    os.fsync(handle.fileno())
-                os.replace(temporary, target)
-                _fsync_parent(target)
-            raise
-        replacements.append({"stem": receipt.run_stem, "kind": "gamesl", "target": str(target), "rollback": str(rollback) if rollback else None,
-                             "old_sha256": old_hash, "new_sha256": _sha256(target)})
+        entries.append({"stem": receipt.run_stem, "kind": "gamesl",
+                        "source": source, "target": target,
+                        "expected_sha256": receipt.gamesl_wav_sha256,
+                        "rollback_parts": (receipt.game or "_default", receipt.speaker)})
+    replacements = publish_files(entries, rollback_root, (gamesl_root,))
     return {"replaced_count": sum(row["old_sha256"] is not None for row in replacements),
             "published_count": len(replacements), "replacements": replacements,
             "rollback_root": str(rollback_root)}

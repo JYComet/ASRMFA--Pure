@@ -60,6 +60,7 @@ from pipeline_utils import (
     is_silence, EN_PHONE_PREFIX,
     validate_ctc_raw_manifest, validate_ctc_work_receipt,
 )
+from resource_budget import resolve_worker_count
 from nvv_contract import (build_nvv_contract, audit_nvv_contract,
                           NVV_CONTRACT_REASON)
 from english_units import (
@@ -20213,6 +20214,8 @@ def main() -> int:
                         help="Output path for tone reference table")
     parser.add_argument("--workers", type=int, default=0,
                         help="Parallel workers for postprocessing (0=auto: cpu_count, 1=serial).")
+    parser.add_argument("--cpu-budget", type=int, default=None,
+                        help="Optional caller CPU budget for this stage.")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--merge-silence", action=argparse.BooleanOptionalAction, default=True,
                         help="Resolve final visual-word <sp0>/<sp1> gaps by bidirectional energy ownership.")
@@ -20380,10 +20383,11 @@ def main() -> int:
     # Resolve worker count
     import multiprocessing as mp
     import platform as _plat
-    n_workers = args.workers
-    if n_workers <= 0:
-        n_workers = min(32, len(tg_paths))  # cap at 32 — 384 forks on EPYC is wasteful
-    n_workers = min(n_workers, len(tg_paths))
+    automatic_workers = min(32, len(tg_paths))  # cap at 32 — 384 forks on EPYC is wasteful
+    n_workers = resolve_worker_count(
+        args.workers, cpu_budget=args.cpu_budget, item_count=len(tg_paths),
+        stage_cap=32 if args.cpu_budget is not None else None,
+        automatic=automatic_workers)
 
     rp = args.output_dir / "postprocess_report.jsonl"
     _is_win = _plat.system() == "Windows"

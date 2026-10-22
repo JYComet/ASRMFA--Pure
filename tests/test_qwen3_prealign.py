@@ -49,6 +49,83 @@ class FakeBackend:
         pass
 
 
+def test_fast_completed_item_is_checkpointed_before_slow_first_item(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    import qwen3_prealign as producer
+
+    data, output = tmp_path / "data", tmp_path / "out"
+    data.mkdir()
+    _wav(data / "a.wav")
+    _wav(data / "b.wav")
+    release, committed = threading.Event(), threading.Event()
+
+    class Backend(FakeBackend):
+        def align(self, audio, text, **kwargs):
+            if audio.stem == "a":
+                assert release.wait(5), "test did not release slow inference"
+            return super().align(audio, text, **kwargs)
+
+    original_infer, original_progress = producer.infer_qwen_items, producer._write_progress
+
+    def multi_device(wavs, refs, mode, settings, **kwargs):
+        return original_infer(wavs, refs, mode, settings, devices=["fake:0", "fake:1"],
+                              backend_factory=lambda *_a, **_k: Backend({"a": "家", "b": "家"}),
+                              **({"ordered": kwargs["ordered"]} if "ordered" in kwargs else {}))
+
+    def progress(path, seed, items):
+        original_progress(path, seed, items)
+        if "b" in items:
+            committed.set()
+
+    monkeypatch.setattr(producer, "infer_qwen_items", multi_device)
+    monkeypatch.setattr(producer, "_write_progress", progress)
+    cfg = _cfg(tmp_path, data, output, reference_mode="fallback")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(producer.run_qwen3_hf, cfg, tmp_path, backend=FakeBackend({}))
+        try:
+            assert committed.wait(2), "fast item was blocked from checkpoint by slow first item"
+            checkpoint = json.loads((output / ".qwen3_hf_progress.json").read_text())
+            assert set(checkpoint["items"]) == {"b"}
+        finally:
+            release.set()
+        assert future.result(timeout=5) == 0
+
+
+def test_completed_run_tolerates_interrupted_progress_cleanup(tmp_path):
+    import qwen3_prealign as producer
+    data, output = tmp_path / "data", tmp_path / "out"
+    data.mkdir()
+    _wav(data / "a.wav")
+    cfg = _cfg(tmp_path, data, output, reference_mode="fallback")
+    assert producer.run_qwen3_hf(cfg, tmp_path, backend=FakeBackend({"a": "家"})) == 0
+    identity = json.loads((output / ".qwen3_hf_identity.json").read_text())
+    identity.pop("identity_digest")
+    identity["output_digest"] = ""
+    producer._write_identity(output / ".qwen3_hf_progress_identity.json", identity)
+    backend = FakeBackend({})
+    assert producer.run_qwen3_hf(cfg, tmp_path, backend=backend) == 0
+    assert backend.transcribe_calls == []
+
+
+def test_matching_initial_identity_without_checkpoint_can_resume(tmp_path, monkeypatch):
+    import qwen3_prealign as producer
+    data, output = tmp_path / "data", tmp_path / "out"
+    data.mkdir()
+    _wav(data / "a.wav")
+    cfg = _cfg(tmp_path, data, output, reference_mode="fallback")
+    original = producer._write_progress
+
+    def interrupted(*_args):
+        raise KeyboardInterrupt("before initial checkpoint")
+
+    monkeypatch.setattr(producer, "_write_progress", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        producer.run_qwen3_hf(cfg, tmp_path, backend=FakeBackend({"a": "家"}))
+    monkeypatch.setattr(producer, "_write_progress", original)
+    assert producer.run_qwen3_hf(cfg, tmp_path, backend=FakeBackend({"a": "家"})) == 0
+
+
 def test_producer_keeps_punctuation_as_pinyin_phrase_boundary(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
@@ -125,6 +202,25 @@ def test_reference_authority_skips_asr_and_writes_six_artifacts(tmp_path: Path):
     assert manifest[0]["content_authority"] == "reference"
     assert manifest[0]["text_asr"] == ""
     assert json.loads((output / ".qwen3_hf_identity.json").read_text(encoding="utf-8"))["models"]
+
+
+@pytest.mark.parametrize("reference_mode", ["authority", "fallback"])
+def test_qwen_receipt_binds_source_audio(tmp_path: Path, reference_mode: str):
+    from pipeline_utils import validate_ctc_run_receipt_v2
+
+    data = tmp_path / "data"
+    data.mkdir()
+    _wav(data / "sample.wav")
+    if reference_mode == "authority":
+        (data / "sample.txt").write_text("你好", encoding="utf-8")
+    output = tmp_path / "out"
+
+    assert run_qwen3_hf(
+        _cfg(tmp_path, data, output, reference_mode=reference_mode),
+        tmp_path, backend=FakeBackend({"sample": "你好"}),
+    ) == 0
+    receipt = json.loads((output / ".ctc_run_receipt.json").read_text(encoding="utf-8"))
+    assert validate_ctc_run_receipt_v2(receipt, expected_stems=["sample"], audio_root=data) == []
 
 
 def test_no_reference_uses_asr_and_honors_audio_selector(tmp_path: Path):
@@ -537,3 +633,181 @@ def test_pipeline_dispatch_seals_qwen_bundle_and_resumes(tmp_path, monkeypatch):
     cfg["ctc_prealign"]["provider"] = "qwen3_hf"
     assert pipeline.step_prealign(args, cfg, Path(sys.executable), ctx) == 0
     assert transform_stems == [("a",), ("a",)]
+
+
+def test_completed_fast_gpu_refills_while_first_item_is_still_running(tmp_path):
+    import threading
+    import time
+    import qwen3_prealign
+    from qwen3_hf_backend import Qwen3HFSettings
+
+    release_first = threading.Event()
+    third_started = threading.Event()
+    started = []
+    lock = threading.Lock()
+
+    class Backend:
+        def transcribe(self, audio, *, language=None, context=""):
+            with lock:
+                started.append(audio.stem)
+                if audio.stem == "c":
+                    third_started.set()
+            if audio.stem == "a":
+                assert release_first.wait(2)
+            return "家"
+
+        def align(self, audio, text, *, language="Chinese"):
+            return [{"unit": "家", "start_s": 0.1, "end_s": 0.2}]
+
+    wavs = [Path("a.wav"), Path("b.wav"), Path("c.wav")]
+    settings = Qwen3HFSettings(Path("asr"), Path("aligner"), device="cuda:0", batch_size=1)
+    iterator = qwen3_prealign.infer_qwen_items(
+        wavs, {}, "fallback", settings, devices=["cuda:0", "cuda:1"], backend_factory=lambda *_a, **_k: Backend())
+    received = []
+    consumer = threading.Thread(target=lambda: received.extend(iterator))
+    consumer.start()
+    try:
+        assert third_started.wait(1), "completed GPU slot did not receive next item"
+    finally:
+        release_first.set()
+        consumer.join(3)
+        iterator.close()
+    assert [wav.stem for wav, _ in received] == ["a", "b", "c"]
+
+
+def test_completed_bundle_is_checkpointed_before_later_interrupt(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    _wav(data / "a.wav"); _wav(data / "b.wav")
+    (data / "a.txt").write_text("家", encoding="utf-8")
+    (data / "b.txt").write_text("家", encoding="utf-8")
+    output = tmp_path / "out"
+
+    class InterruptingBackend(FakeBackend):
+        def transcribe(self, audio, *, language=None, context=""):
+            if audio.stem == "b":
+                raise KeyboardInterrupt()
+            return super().transcribe(audio, language=language, context=context)
+
+    cfg = _cfg(tmp_path, data, output, reference_mode="fallback")
+    (data / "a.txt").unlink(); (data / "b.txt").unlink()
+    with pytest.raises(KeyboardInterrupt):
+        run_qwen3_hf(cfg, tmp_path, backend=InterruptingBackend({"a": "家"}))
+    checkpoint = output / ".qwen3_hf_progress.json"
+    assert checkpoint.is_file()
+
+    # A sidecar left by an uncommitted inference must not enter the resumed bundle.
+    (output / "b_ref.txt").write_text("stale", encoding="utf-8")
+    resumed = FakeBackend({"b": "家"})
+    assert run_qwen3_hf(cfg, tmp_path, backend=resumed) == 0
+    assert not (output / "b_ref.txt").exists()
+    assert resumed.transcribe_calls == ["b"]
+    assert len(resumed.align_calls) == 1 and resumed.align_calls[0][0] == "b"
+
+
+def test_resume_rejects_tampered_checkpointed_bundle_before_inference(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    _wav(data / "a.wav"); _wav(data / "b.wav")
+    output = tmp_path / "out"
+
+    class InterruptingBackend(FakeBackend):
+        def transcribe(self, audio, *, language=None, context=""):
+            if audio.stem == "b":
+                raise KeyboardInterrupt()
+            return "家"
+
+    cfg = _cfg(tmp_path, data, output, reference_mode="fallback")
+    with pytest.raises(KeyboardInterrupt):
+        run_qwen3_hf(cfg, tmp_path, backend=InterruptingBackend({}))
+    with (output / "a_tokens.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write("tampered\n")
+
+    backend = FakeBackend({"a": "家", "b": "家"})
+    with pytest.raises(Qwen3PrealignError, match="tampered|changed"):
+        run_qwen3_hf(cfg, tmp_path, backend=backend)
+    assert backend.transcribe_calls == backend.align_calls == []
+
+
+def test_resume_accepts_valid_empty_progress_checkpoint(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    _wav(data / "a.wav")
+    output = tmp_path / "out"
+
+    class StopBeforeFirst(FakeBackend):
+        def transcribe(self, audio, *, language=None, context=""):
+            raise KeyboardInterrupt()
+
+    cfg = _cfg(tmp_path, data, output, reference_mode="fallback")
+    with pytest.raises(KeyboardInterrupt):
+        run_qwen3_hf(cfg, tmp_path, backend=StopBeforeFirst({}))
+    checkpoint = json.loads((output / ".qwen3_hf_progress.json").read_text())
+    assert checkpoint["items"] == {}
+
+    resumed = FakeBackend({"a": "家"})
+    assert run_qwen3_hf(cfg, tmp_path, backend=resumed) == 0
+    assert resumed.transcribe_calls == ["a"]
+
+
+@pytest.mark.parametrize("interrupt_after", ["manifest.json", ".qwen3_hf_identity.json"])
+def test_resume_rebuilds_unsealed_final_metadata(tmp_path, monkeypatch, interrupt_after):
+    import qwen3_prealign
+
+    data = tmp_path / "data"
+    data.mkdir()
+    _wav(data / "a.wav")
+    output = tmp_path / "out"
+    cfg = _cfg(tmp_path, data, output, reference_mode="fallback")
+    backend = FakeBackend({"a": "家"})
+    original_atomic_text = qwen3_prealign._atomic_text
+    interrupted = False
+
+    def stop_after_write(path, text):
+        nonlocal interrupted
+        original_atomic_text(path, text)
+        if path.name == interrupt_after and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(qwen3_prealign, "_atomic_text", stop_after_write)
+    with pytest.raises(KeyboardInterrupt):
+        run_qwen3_hf(cfg, tmp_path, backend=backend)
+    assert interrupted
+    monkeypatch.setattr(qwen3_prealign, "_atomic_text", original_atomic_text)
+
+    resumed = FakeBackend({"a": "must not run"})
+    assert run_qwen3_hf(cfg, tmp_path, backend=resumed) == 0
+    assert resumed.transcribe_calls == resumed.align_calls == []
+    assert (output / ".ctc_run_receipt.json").is_file()
+    assert (output / ".pipeline_run_receipt_v2.json").is_file()
+
+
+def test_resume_does_not_repair_tampered_final_identity(tmp_path, monkeypatch):
+    import qwen3_prealign
+
+    data = tmp_path / "data"
+    data.mkdir()
+    _wav(data / "a.wav")
+    output = tmp_path / "out"
+    cfg = _cfg(tmp_path, data, output, reference_mode="fallback")
+    original_atomic_text = qwen3_prealign._atomic_text
+
+    def stop_after_identity(path, text):
+        original_atomic_text(path, text)
+        if path.name == ".qwen3_hf_identity.json":
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(qwen3_prealign, "_atomic_text", stop_after_identity)
+    with pytest.raises(KeyboardInterrupt):
+        run_qwen3_hf(cfg, tmp_path, backend=FakeBackend({"a": "家"}))
+    monkeypatch.setattr(qwen3_prealign, "_atomic_text", original_atomic_text)
+
+    identity_path = output / ".qwen3_hf_identity.json"
+    identity = json.loads(identity_path.read_text())
+    identity["provider"] = "tampered"
+    identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    backend = FakeBackend({"a": "家"})
+    with pytest.raises(Qwen3PrealignError, match="identity|tampered|changed"):
+        run_qwen3_hf(cfg, tmp_path, backend=backend)
+    assert backend.transcribe_calls == backend.align_calls == []

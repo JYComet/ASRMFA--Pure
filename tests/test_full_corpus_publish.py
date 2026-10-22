@@ -168,3 +168,118 @@ def test_textgrid_parser_imports_when_orchestrator_runs_as_direct_script(tmp_pat
     result = subprocess.run([sys.executable, "-c", code], cwd=tmp_path,
                             env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_chunk_publication_rolls_back_entire_group_and_can_retry(tmp_path, monkeypatch):
+    first, second = tmp_path / "one.TextGrid", tmp_path / "two.TextGrid"
+    first.write_text("new-one")
+    second.write_text("new-two")
+    out = tmp_path / "public"
+    old_target = out / "speaker" / first.name
+    old_target.parent.mkdir(parents=True)
+    old_target.write_text("old-one")
+    publication = {"accepted": [
+        {"stem": "one", "path": first, "speaker": "speaker"},
+        {"stem": "two", "path": second, "speaker": "speaker"},
+    ], "filtered": []}
+    real_replace = os.replace
+    failed = False
+
+    def fail_second_target(src, dst):
+        nonlocal failed
+        if Path(dst) == out / "speaker" / second.name and not failed:
+            failed = True
+            raise OSError("injected second target replace failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("scripts.full_corpus_publish.os.replace", fail_second_target)
+    try:
+        publish_chunk(publication, out)
+    except OSError as exc:
+        assert "injected" in str(exc)
+    else:
+        raise AssertionError("injected transaction failure was ignored")
+    assert old_target.read_text() == "old-one"
+    assert not (out / "speaker" / second.name).exists()
+
+    monkeypatch.setattr("scripts.full_corpus_publish.os.replace", real_replace)
+    receipt = publish_chunk(publication, out)
+    assert receipt["published_count"] == 2
+    assert old_target.read_text() == "new-one"
+    assert (out / "speaker" / second.name).read_text() == "new-two"
+
+
+def test_chunk_publication_recovers_stranded_journal_before_retry(tmp_path):
+    first, second = tmp_path / "one.TextGrid", tmp_path / "two.TextGrid"
+    first.write_text("new-one")
+    second.write_text("new-two")
+    out = tmp_path / "public"
+    old_target = out / "speaker" / first.name
+    old_target.parent.mkdir(parents=True)
+    old_target.write_text("old-one")
+    publication = {"accepted": [
+        {"stem": "one", "path": first, "speaker": "speaker"},
+        {"stem": "two", "path": second, "speaker": "speaker"},
+    ], "filtered": []}
+    code = r'''
+import os
+from pathlib import Path
+from scripts.full_corpus_publish import publish_chunk
+import scripts.full_corpus_publish as pubmod
+root = Path(os.environ["CASE_ROOT"])
+first, second = root / "one.TextGrid", root / "two.TextGrid"
+out = root / "public"
+pub = {"accepted": [
+    {"stem": "one", "path": first, "speaker": "speaker"},
+    {"stem": "two", "path": second, "speaker": "speaker"}], "filtered": []}
+real_replace = os.replace
+def crash_after_first(src, dst):
+    result = real_replace(src, dst)
+    if Path(dst) == out / "speaker" / first.name:
+        os._exit(23)
+    return result
+pubmod.os.replace = crash_after_first
+publish_chunk(pub, out)
+'''
+    env = dict(os.environ, CASE_ROOT=str(tmp_path))
+    result = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1], env=env)
+    assert result.returncode == 23
+    assert old_target.read_text() == "new-one"
+    receipt = publish_chunk(publication, out)
+    assert receipt["published_count"] == 2
+    assert old_target.read_text() == "new-one"
+
+
+def test_chunk_copy_failure_during_prepare_leaves_all_targets_untouched(tmp_path, monkeypatch):
+    first, second = tmp_path / "one.TextGrid", tmp_path / "two.TextGrid"
+    first.write_text("new-one")
+    second.write_text("new-two")
+    out = tmp_path / "public"
+    target_one = out / "speaker" / first.name
+    target_two = out / "speaker" / second.name
+    target_one.parent.mkdir(parents=True)
+    target_one.write_text("old-one")
+    target_two.write_text("old-two")
+    publication = {"accepted": [
+        {"stem": "one", "path": first, "speaker": "speaker"},
+        {"stem": "two", "path": second, "speaker": "speaker"},
+    ], "filtered": []}
+    real_copy = __import__("shutil").copyfile
+    failed = False
+
+    def fail_second_source(src, dst, *args, **kwargs):
+        nonlocal failed
+        if Path(src) == second and not failed:
+            failed = True
+            raise OSError("injected second source copy failure")
+        return real_copy(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr("scripts.full_corpus_transaction.shutil.copyfile", fail_second_source)
+    try:
+        publish_chunk(publication, out)
+    except OSError as exc:
+        assert "injected" in str(exc)
+    else:
+        raise AssertionError("injected prepare copy failure was ignored")
+    assert target_one.read_text() == "old-one"
+    assert target_two.read_text() == "old-two"

@@ -1,0 +1,95 @@
+{
+  "scope": "synthetic normalized-skip lifecycle and publication copy only",
+  "stems": 100,
+  "batches": 10,
+  "repetitions": 3,
+  "equivalence": "work bytes, published bytes and receipt fields match except code identity",
+  "runs": {
+    "baseline": [
+      {
+        "normalize_seconds": 0.8592519704252481,
+        "normalize_hash_reads": {
+          "raw": 8445,
+          "work": 14432,
+          "other": 33
+        },
+        "copy_seconds": 0.005306973122060299,
+        "target_hash_reads": 55
+      },
+      {
+        "normalize_seconds": 0.85347437299788,
+        "normalize_hash_reads": {
+          "raw": 8445,
+          "work": 14432,
+          "other": 33
+        },
+        "copy_seconds": 0.00512272771447897,
+        "target_hash_reads": 55
+      },
+      {
+        "normalize_seconds": 0.8517909497022629,
+        "normalize_hash_reads": {
+          "raw": 8445,
+          "work": 14432,
+          "other": 33
+        },
+        "copy_seconds": 0.00512146670371294,
+        "target_hash_reads": 55
+      }
+    ],
+    "candidate": [
+      {
+        "normalize_seconds": 0.8173489151522517,
+        "normalize_hash_reads": {
+          "raw": 8445,
+          "work": 9624,
+          "other": 33
+        },
+        "copy_seconds": 0.003962821327149868,
+        "target_hash_reads": 10
+      },
+      {
+        "normalize_seconds": 0.7851052610203624,
+        "normalize_hash_reads": {
+          "raw": 8445,
+          "work": 9624,
+          "other": 33
+        },
+        "copy_seconds": 0.003972865641117096,
+        "target_hash_reads": 10
+      },
+      {
+        "normalize_seconds": 0.8001971421763301,
+        "normalize_hash_reads": {
+          "raw": 8445,
+          "work": 9624,
+          "other": 33
+        },
+        "copy_seconds": 0.004204452969133854,
+        "target_hash_reads": 10
+      }
+    ]
+  },
+  "medians": {
+    "baseline": {
+      "normalize_seconds": 0.85347437299788,
+      "copy_seconds": 0.00512272771447897,
+      "target_hash_reads": 55
+    },
+    "candidate": {
+      "normalize_seconds": 0.8001971421763301,
+      "copy_seconds": 0.003972865641117096,
+      "target_hash_reads": 10
+    }
+  },
+  "baseline": {
+    "git_head": "3b81053",
+    "scripts_snapshot": "/tmp/mfa-efficiency-baseline-cv4xdbs6/scripts",
+    "note": "pre-existing working tree edits retained in snapshot"
+  },
+  "limits": [
+    "Synthetic small files on local filesystem; no real GPU/MFA inference or NAS throughput run.",
+    "Copy timings exclude final dataset aggregate verification.",
+    "Filesystem metadata checks and independent consumer/resume validation remain enabled."
+  ]
+}

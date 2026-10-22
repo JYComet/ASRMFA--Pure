@@ -123,7 +123,7 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return validate_config(value, config_path=path)
 
 
-def _load_manifest(path: Path) -> list[dict[str, Any]]:
+def _load_manifest(path: Path, *, allow_missing_text: bool = False) -> list[dict[str, Any]]:
     try:
         if path.suffix.lower() in {".jsonl", ".ndjson"}:
             rows = []
@@ -135,9 +135,9 @@ def _load_manifest(path: Path) -> list[dict[str, Any]]:
                         rows.append(json.loads(line))
                     except json.JSONDecodeError as exc:
                         raise JAContractError("manifest_invalid", str(exc), f"{path}:{line_number}") from exc
-            return validate_manifest(rows)
+            return validate_manifest(rows, allow_missing_text=allow_missing_text)
         with path.open("r", encoding="utf-8") as handle:
-            return validate_manifest(json.load(handle))
+            return validate_manifest(json.load(handle), allow_missing_text=allow_missing_text)
     except JAContractError:
         raise
     except (OSError, json.JSONDecodeError) as exc:
@@ -321,7 +321,7 @@ def preflight(config: Mapping[str, Any], *, config_path: Path | None = None) -> 
         raise JAContractError("manifest_symlink", "manifest is a symlink", str(manifest_path))
     if not manifest_path.is_file():
         raise JAContractError("manifest_invalid", "manifest file does not exist", str(manifest_path))
-    manifest = _load_manifest(manifest_path)
+    manifest = _load_manifest(manifest_path, allow_missing_text=validated.get("asr", {}).get("reference_mode") == "fallback")
     for row in manifest:
         for field in ("wav", "audio", "source_wav", "script"):
             if isinstance(row.get(field), str):
@@ -417,6 +417,8 @@ def validate_resume(workspace: Path, identity: Mapping[str, Any], *, allow_new: 
             raise JAContractError("resume_stale", "stage receipt is missing", str(stage_dir))
         receipt = load_json(receipt_path)
         validate_receipt(receipt, workspace=workspace)
+        if receipt.get("stage") != stage:
+            raise JAContractError("receipt_invalid", "stage receipt name does not match its namespace", str(receipt_path))
         expected = {receipt_path.relative_to(workspace).as_posix()}
         for output in receipt.get("outputs", []):
             expected.add(Path(output["path"]).absolute().relative_to(workspace.absolute()).as_posix())
@@ -597,6 +599,7 @@ def _run_locked_frontend_reconstruction(config: Mapping[str, Any], workspace: Pa
     reading_path = workspace / "stages" / _STAGE_REGISTRY["reading"][1] / "locked_readings.jsonl"
     if not reading_path.is_file():
         return StageResult("frontend", "BLOCKED", str(frontend_dir / "receipt.json"))
+    frontend_dir.mkdir(parents=True, exist_ok=True)
     adapter_path = frontend_dir / "locked_readings_request.jsonl"
     analysis_path = frontend_dir / "frontend_analysis.json"
     analyses: dict[str, Mapping[str, Any]] = {}
@@ -614,7 +617,7 @@ def _run_locked_frontend_reconstruction(config: Mapping[str, Any], workspace: Pa
         row.setdefault("analysis_digest", analysis.get("analysis_digest", row.get("analysis_version_digest")))
         adapted.append(json.dumps(row, ensure_ascii=False, sort_keys=True))
     adapter_path.write_text("\n".join(adapted) + ("\n" if adapted else ""), encoding="utf-8")
-    adapted_config = copy.deepcopy(dict(config))
+    adapted_config = _prepare_stage_config(config, "frontend", workspace)
     adapted_config.setdefault("frontend", {})["locked_readings_path"] = str(adapter_path)
     result = _run_stage(_STAGE_REGISTRY["frontend"][0], adapted_config, frontend_dir)
     receipt_path = frontend_dir / "receipt.json"
@@ -816,6 +819,11 @@ def _uid_error_rows(workspace: Path, stage: str, schema: str) -> list[dict[str, 
 def _prepare_stage_config(config: Mapping[str, Any], stage: str, workspace: Path) -> Mapping[str, Any]:
     """Build declared mechanical inputs from immutable upstream artifacts."""
     prepared = copy.deepcopy(dict(config))
+    if (stage not in {"inventory", "audio", "asr"}
+            and prepared.get("asr", {}).get("reference_mode") == "fallback"):
+        resolved_manifest = workspace / "stages" / "asr" / "resolved_manifest.jsonl"
+        if resolved_manifest.is_file() and not resolved_manifest.is_symlink():
+            prepared["input_manifest"] = str(resolved_manifest)
     stage_inputs = prepared.setdefault("stage_inputs", {})
     if stage == "prosody" and "prosody" not in stage_inputs:
         settings = prepared.setdefault("prosody", {})
@@ -1117,6 +1125,12 @@ def dispatch(config: Mapping[str, Any], config_path: Path, stages: list[str], *,
         if not isinstance(cached, Mapping) or not isinstance(cached.get("stages", {}), Mapping):
             raise JAContractError("cache_tampered", "stage cache is malformed", str(cache_path))
         stage_cache = {str(key): str(value) for key, value in cached["stages"].items()}
+    declared_stages = list(stages)
+    if resume:
+        declared_stages = [
+            stage for stage in STAGE_NAMES
+            if stage in stages or (workspace / "stages" / _STAGE_REGISTRY[stage][1]).is_dir()
+        ]
     with exclusive_lock(workspace / ".ja_en.lock"):
         for stage in stages:
             if stage not in STAGE_NAMES:
@@ -1124,10 +1138,21 @@ def dispatch(config: Mapping[str, Any], config_path: Path, stages: list[str], *,
             handler, namespace = _STAGE_REGISTRY[stage]
             stage_dir = workspace / "stages" / namespace
             stage_dir.mkdir(parents=True, exist_ok=True)
+            if (validated.get("asr", {}).get("reference_mode") == "fallback"
+                    and stage in PRODUCTION_STAGES[PRODUCTION_STAGES.index("asr") + 1:]
+                    and not (workspace / "stages" / "asr" / "resolved_manifest.jsonl").is_file()):
+                receipt_path = stage_dir / "receipt.json"
+                atomic_write_json(receipt_path, make_receipt(
+                    stage=stage, status="BLOCKED",
+                    errors=[{"code": "receipt_missing", "message": "blind ASR resolved_manifest.jsonl is required before downstream stages"}]),
+                    workspace=workspace)
+                results.append(StageResult(stage=stage, status="BLOCKED", receipt_path=str(receipt_path)))
+                stage_cache[stage] = _stage_cache_identity(stage, identity, validated, workspace)
+                continue
             if stage == "verify":
                 provisional = make_receipt(
                     stage="verify", status="PARTIAL",
-                    inputs={"stages": stages, "artifacts": contract_inputs},
+                    inputs={"stages": declared_stages, "artifacts": contract_inputs},
                     outputs=_workspace_output_paths(workspace),
                     params={"authoritative_root_receipt": "receipt.json", "pre_verification": True},
                     errors=[{"code": "publish_blocked", "message": "independent verification is pending"}],
@@ -1186,15 +1211,33 @@ def dispatch(config: Mapping[str, Any], config_path: Path, stages: list[str], *,
     # A stage can appear twice because reading triggers the locked frontend
     # reconstruction.  The final occurrence is the authoritative DAG state.
     stage_summary = {result.stage: result.status for result in results}
-    statuses = list(stage_summary.values())
+    if resume:
+        # A subset resume still publishes a workspace-level status.  Include
+        # historical stages only after validating their receipt/output hashes
+        # and confirming that their recorded cache key still matches the
+        # current identities and upstream receipts.
+        for historical_stage in PRODUCTION_STAGES:
+            if historical_stage in stage_summary:
+                continue
+            receipt = _stage_receipt(workspace, historical_stage)
+            if receipt is None:
+                stage_summary[historical_stage] = "BLOCKED"
+                continue
+            status = str(receipt.get("status", "BLOCKED"))
+            if status == "COMPLETE":
+                expected_cache = _stage_cache_identity(historical_stage, identity, validated, workspace)
+                if stage_cache.get(historical_stage) != expected_cache:
+                    status = "PARTIAL"
+            stage_summary[historical_stage] = status
     required_statuses = [stage_summary.get(stage, "BLOCKED") for stage in PRODUCTION_STAGES]
     full_dag_invoked = set(stages).issuperset(PRODUCTION_STAGES)
-    final_status = "COMPLETE" if full_dag_invoked and required_statuses and all(value == "COMPLETE" for value in required_statuses) else ("BLOCKED" if required_statuses and all(value == "BLOCKED" for value in required_statuses) else "PARTIAL")
+    complete_coverage = full_dag_invoked or resume
+    final_status = "COMPLETE" if complete_coverage and required_statuses and all(value == "COMPLETE" for value in required_statuses) else ("BLOCKED" if required_statuses and all(value == "BLOCKED" for value in required_statuses) else "PARTIAL")
     final_receipt = make_receipt(
         stage="verify",
         status=final_status,
-        inputs={"stages": stages, "artifacts": contract_inputs},
-        params={"autoload_handlers": autoload_handlers, "authoritative_root_receipt": "receipt.json", "independent_verifier_stage": "stages/verify/receipt.json"},
+        inputs={"stages": declared_stages, "artifacts": contract_inputs},
+        params={"autoload_handlers": autoload_handlers, "requested_stages": stages, "authoritative_root_receipt": "receipt.json", "independent_verifier_stage": "stages/verify/receipt.json"},
         errors=[] if final_status == "COMPLETE" else [{"code": "publish_blocked", "message": "one or more required stages are not COMPLETE", "stages": stage_summary}],
     )
     final_receipt["stage_results"] = stage_summary
